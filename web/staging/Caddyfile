@@ -2,7 +2,7 @@
 	local_certs
 }
 
-buzz.localhost:9443 {
+buzz.localhost:{$STAGING_PORT} {
 	@relay_socket header Upgrade websocket
 	@nip11 header Accept *application/nostr+json*
 	@web {

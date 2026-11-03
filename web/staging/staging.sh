@@ -1,14 +1,15 @@
 #!/bin/sh
-# Local staging for the web build at https://buzz.localhost:9443 (Caddy's
+# Local staging for the web build at https://buzz.localhost:$STAGING_PORT, default 9443 (Caddy's
 # local CA; browsers need its root trusted or certificate errors ignored).
 # Usage: web/staging/staging.sh up | down
 set -eu
+export STAGING_PORT="${STAGING_PORT:-9443}"
 cd "$(dirname "$0")"
 case "${1:-}" in
 up)
   # A throwaway relay key, kept out of the terminal and of Git (.env is ignored).
   [ -f .env ] || echo "BUZZ_RELAY_PRIVATE_KEY=$(openssl rand -hex 32)" >.env
-  (cd ../.. && VITE_BUZZ_COMMUNITIES=buzz.localhost:9443 bin/pnpm web:build)
+  (cd ../.. && VITE_BUZZ_COMMUNITIES=buzz.localhost:$STAGING_PORT bin/pnpm web:build)
   docker compose up -d --wait
   ;;
 down)

@@ -1,9 +1,11 @@
 import { type Browser, expect, type Page, test } from "@playwright/test";
 import { generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
 
+const port = process.env.STAGING_PORT ?? "9443";
+
 // End-to-end journey of the web build against the local staging relay. Test
 // keys only; staging data outlives a run, so names carry a run suffix.
-const community = "https://buzz.localhost:9443";
+const community = `https://buzz.localhost:${port}`;
 const run = Date.now().toString(36);
 
 async function open(browser: Browser) {
@@ -36,7 +38,7 @@ test("chats through the browser host", async ({ browser }) => {
   const alice = await open(browser);
   const aliceName = `Alice ${run}`;
   await expect(async () => {
-    await alice.getByLabel("Community URL").fill("buzz.localhost:9443");
+    await alice.getByLabel("Community URL").fill(`buzz.localhost:${port}`);
     await alice.getByRole("button", { name: "Continue" }).click();
     await expect(
       alice.getByRole("button", { name: "I already have a key" }),
@@ -72,7 +74,7 @@ test("chats through the browser host", async ({ browser }) => {
     bob.getByText("This community isn't available in this app."),
   ).toBeVisible();
   await dialog.getByRole("button", { name: "Back" }).click();
-  await join("wss://buzz.localhost:9443");
+  await join(`wss://buzz.localhost:${port}`);
   await dialog.getByRole("button", { name: "Continue" }).click();
   await dialog.getByLabel("Display name").fill(bobName);
   await dialog.getByRole("button", { name: "Publish profile & open" }).click();
@@ -148,7 +150,7 @@ test("continues with the previous PWA's identity and communities", async ({
   const page = await open(browser);
   // Our old PWA's vault (desktop/src/web/core.ts saveIdentity) and community list.
   const seeded = await page.evaluate(
-    async ({ secret, pubkey }) => {
+    async ({ secret, pubkey, port }) => {
       const wrappingKey = await crypto.subtle.generateKey(
         { name: "AES-GCM", length: 256 },
         false,
@@ -177,13 +179,17 @@ test("continues with the previous PWA's identity and communities", async ({
       localStorage.setItem(
         "buzz-communities",
         JSON.stringify([
-          { id: "a", name: "Staging", relayUrl: "wss://buzz.localhost:9443" },
+          {
+            id: "a",
+            name: "Staging",
+            relayUrl: `wss://buzz.localhost:${port}`,
+          },
           { id: "b", name: "Other", relayUrl: "wss://other.example.com" },
         ]),
       );
       return ciphertext.byteLength;
     },
-    { secret: [...secret], pubkey: getPublicKey(secret) },
+    { secret: [...secret], pubkey: getPublicKey(secret), port },
   );
   await page.reload();
   const offer = page.getByRole("alertdialog", {
@@ -199,7 +205,7 @@ test("continues with the previous PWA's identity and communities", async ({
   await page.getByRole("button", { name: /^Community switcher/ }).click();
   await page
     .getByRole("dialog")
-    .getByRole("button", { name: "buzz.localhost:9443" })
+    .getByRole("button", { name: `buzz.localhost:${port}` })
     .click();
   await shell(page);
   expect(await invoke(page, "identity_restore")).toBe(getPublicKey(secret));
