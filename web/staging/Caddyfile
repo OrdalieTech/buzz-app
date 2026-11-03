@@ -15,6 +15,9 @@ buzz.localhost:{$STAGING_PORT} {
 		header Accept *text/html*
 		not path /api/* /media/* /.well-known/* /git/*
 	}
+	handle /pair {
+		reverse_proxy pair:5000
+	}
 	handle @relay_socket {
 		reverse_proxy relay:3000
 	}

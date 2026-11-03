@@ -51,6 +51,14 @@ test("keeps the upstream anchors the web build relies on", () => {
   expect(read("src/features/identity/service.ts")).toContain(
     'import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"',
   );
+  // web/onboarding.tsx replaces these imports, and email sign-in stays hidden.
+  const welcome = read("src/features/identity/Welcome.tsx");
+  for (const anchor of [
+    'from "./ConnectChoice"',
+    'from "./KeyImport"',
+    'hidden={import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"}',
+  ])
+    expect(welcome).toContain(anchor);
   const html = read("index.html");
   expect(html).toContain('src="/src/main.tsx"');
   expect(html).toContain('content="width=device-width, initial-scale=1.0"');
