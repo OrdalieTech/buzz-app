@@ -32,6 +32,12 @@ const onboarding: Plugin = {
 
 const browserHost: Plugin = {
   name: "buzz-browser-host",
+  // Before Vite's own resolver, so the app's plugin list gains web/orb.tsx.
+  enforce: "pre",
+  resolveId(source, importer) {
+    if (source === "../bundled" && importer?.endsWith("/src/app/services.ts"))
+      return fileURLToPath(new URL("./orb.tsx", import.meta.url));
+  },
   generateBundle() {
     this.emitFile({
       type: "asset",

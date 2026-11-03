@@ -1,10 +1,13 @@
+import { schnorr } from "@noble/curves/secp256k1.js";
 import {
   finalizeEvent,
   generateSecretKey,
   getPublicKey,
   nip19,
+  nip44,
   verifyEvent,
 } from "nostr-tools";
+import { hexToBytes } from "nostr-tools/utils";
 import { beforeEach, expect, test, vi } from "vitest";
 
 // In-memory vault; IndexedDB itself is exercised by the browser run.
@@ -240,4 +243,158 @@ test("imports the previous PWA's identity and communities", async () => {
   expect(await run("legacy_communities", { saved })).toEqual([
     { relayUrl: "wss://relay.test", pubkey: viewer },
   ]);
+});
+
+test("authorizes exactly one agent key, unconditionally", async () => {
+  const tag = (await run("identity_prepare_remote_agent_authorization", {
+    owner: viewer,
+    agentPubkey: other,
+  })) as string[];
+  expect(tag.slice(0, 3)).toEqual(["auth", viewer, ""]);
+  const digest = new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(`nostr:agent-auth:${other}:`),
+    ),
+  );
+  expect(
+    schnorr.verify(hexToBytes(tag[3] ?? ""), digest, hexToBytes(viewer)),
+  ).toBe(true);
+  for (const [owner, agentPubkey, error] of [
+    [viewer, viewer, "Owner and agent pubkeys must differ"],
+    [
+      viewer,
+      other.toUpperCase(),
+      "Agent pubkey must be 64 lowercase hex characters",
+    ],
+    [other, viewer, "The agent owner is not your signed-in identity"],
+  ])
+    await expect(
+      run("identity_prepare_remote_agent_authorization", {
+        owner,
+        agentPubkey,
+      }),
+    ).rejects.toBe(error);
+});
+
+test("signs and deletes only the viewer's own agent records", async () => {
+  const record = {
+    kind: 30177,
+    created_at: 1,
+    content: "{}",
+    tags: [["d", other]],
+  };
+  await expect(
+    run("relay_sign", { community, event: record }),
+  ).resolves.toMatchObject({ kind: 30177 });
+  const deletion = (owner: string) => ({
+    kind: 5,
+    created_at: 1,
+    content: "",
+    tags: [
+      ["a", `30177:${owner}:${other}`],
+      ["k", "30177"],
+    ],
+  });
+  await expect(
+    run("relay_sign", { community, event: deletion(viewer) }),
+  ).resolves.toMatchObject({ kind: 5 });
+  await expect(
+    run("relay_sign", { community, event: deletion(other) }),
+  ).rejects.toBeTruthy();
+});
+
+const agentSecret = generateSecretKey();
+const agent = getPublicKey(agentSecret);
+const toOwner = nip44.v2.utils.getConversationKey(agentSecret, viewer);
+const seconds = () => Math.floor(Date.now() / 1000);
+
+test("decodes an agent's telemetry to its owner only", async () => {
+  const tags = [
+    ["p", viewer],
+    ["agent", agent],
+    ["frame", "telemetry"],
+  ];
+  const frame = (tags: string[][], created_at = seconds()) =>
+    finalizeEvent(
+      {
+        kind: 24200,
+        created_at,
+        tags,
+        content: nip44.v2.encrypt('{"type":"turn"}', toOwner),
+      },
+      agentSecret,
+    );
+  const event = frame(tags);
+  expect(await run("relay_agent_observer", { community, event })).toEqual({
+    id: event.id,
+    agent,
+    createdAt: event.created_at,
+    plaintext: '{"type":"turn"}',
+  });
+  for (const forged of [
+    frame([["p", other], ...tags.slice(1)]),
+    frame([...tags, ["p", viewer]]),
+    frame(tags, seconds() - 400),
+    { ...event, content: `${event.content.slice(0, -2)}AA` },
+  ])
+    await expect(
+      run("relay_agent_observer", { community, event: forged }),
+    ).rejects.toBeTruthy();
+});
+
+test("pages and decodes an agent's memory", async () => {
+  const mac = await crypto.subtle.importKey(
+    "raw",
+    new Uint8Array(toOwner),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const memory = async (body: { slug: string }, created_at: number) => {
+    const d = Buffer.from(
+      await crypto.subtle.sign(
+        "HMAC",
+        mac,
+        new TextEncoder().encode(`agent-memory/v1/d-tag\0${body.slug}`),
+      ),
+    ).toString("hex");
+    return finalizeEvent(
+      {
+        kind: 30174,
+        created_at,
+        tags: [
+          ["d", d],
+          ["p", viewer],
+        ],
+        content: nip44.v2.encrypt(JSON.stringify(body), toOwner),
+      },
+      agentSecret,
+    );
+  };
+  const events = [
+    await memory({ slug: "core", profile: "I sell." } as never, 3),
+    await memory({ slug: "mem/leads", value: "two" } as never, 2),
+    await memory({ slug: "mem/old", value: null } as never, 2),
+    await memory({ slug: "mem/leads", value: "one" } as never, 1),
+    { ...(await memory({ slug: "mem/x" }, 1)), sig: "0".repeat(128) },
+  ];
+  fetchMock.mockImplementation(
+    async () => new Response(JSON.stringify(events)),
+  );
+  const read = () =>
+    run("relay_agent_memories_read", { community, agent, slug: null });
+  expect(await read()).toEqual({
+    entries: [
+      { slug: "core", body: "I sell.", eventId: events[0]?.id, createdAt: 3 },
+      { slug: "mem/leads", body: "two", eventId: events[1]?.id, createdAt: 2 },
+    ],
+    deleted: [{ slug: "mem/old", createdAt: 2 }],
+    partial: true,
+  });
+  expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? ""))).toEqual([
+    { kinds: [30174], authors: [agent], "#p": [viewer], limit: 100 },
+  ]);
+  fetchMock.mockImplementation(async () => new Response("", { status: 403 }));
+  await expect(read()).rejects.toBe("MemoryDenied");
 });
