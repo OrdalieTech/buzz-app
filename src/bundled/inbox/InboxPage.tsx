@@ -262,8 +262,14 @@ export function InboxView({ tabs: Tabs, ...props }: InboxViewProps) {
     close: (target: PageTabTarget) => boolean,
     isOpen: (target: PageTabTarget) => boolean,
   ) => <InboxList {...props} open={open} close={close} isOpen={isOpen} />;
-  // Without the host tab workspace, rows have nowhere to open.
-  if (!Tabs) return list(never, never, never);
+  // Without the host tab workspace, rows have nowhere to open. Phones open
+  // rows as conversation visits instead, so Back returns to the list.
+  if (
+    !Tabs ||
+    (import.meta.env.VITE_BUZZ_BROWSER_HOST === "1" &&
+      matchMedia("(max-width: 650px)").matches)
+  )
+    return list(never, never, never);
   return (
     <Tabs
       id="inbox"

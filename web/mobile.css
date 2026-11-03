@@ -86,6 +86,40 @@
     max-width: none;
   }
 
+  /* Thumb-sized targets (44px) for the drawer's rows and the top bar, which
+     upstream sizes for a mouse (28 and 32px). */
+  #shell-navigation .navigation-item {
+    min-height: 2.75rem;
+  }
+  .shell-header .buzz-button[data-icon-variant] {
+    width: 2.75rem;
+    height: 2.75rem;
+  }
+  /* The page switcher's track would sit behind its lone overflow button like a
+     stuck press. */
+  .shell-page-switcher {
+    background: none;
+  }
+  /* What the closed drawer marks with a dot (DMs, mentions, thread replies)
+     shows as one dot on its toggle, so it's visible without opening it. */
+  [data-shell-sidebar-toggle] {
+    position: relative;
+  }
+  :root:has(
+      #shell-navigation:not([data-expanded="true"])
+        :is([data-channel-priority], [data-channel-activity])
+    )
+    [data-shell-sidebar-toggle]::after {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--affordance-prominent-mark);
+    content: "";
+  }
+
   /* Controls dim under the finger; a transform under a moving finger is how
      gestures get lost. */
   :is(button, [role="button"]):active:not(:disabled) {

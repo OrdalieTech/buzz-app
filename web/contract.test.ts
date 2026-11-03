@@ -77,6 +77,10 @@ test("keeps the upstream anchors the web build relies on", () => {
   expect(read("src/features/messages/MediaDownloadAction.tsx")).toContain(
     'import.meta.env.VITE_BUZZ_BROWSER_HOST === "1" && isProxySource(source)',
   );
+  // Phones open Inbox rows as conversation visits (web/mobile.css breakpoint).
+  expect(read("src/bundled/inbox/InboxPage.tsx")).toContain(
+    'matchMedia("(max-width: 650px)").matches)',
+  );
   const html = read("index.html");
   expect(html).toContain('src="/src/main.tsx"');
   expect(html).toContain('content="width=device-width, initial-scale=1.0"');
