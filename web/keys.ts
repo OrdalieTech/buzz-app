@@ -9,6 +9,11 @@ import {
 } from "nostr-tools";
 import { bytesToHex, hexToBytes } from "nostr-tools/utils";
 import { memoryAgent, memorySlug } from "../src/features/agents/memory.ts";
+import {
+  parsePrivateRecord,
+  privateCoordinate,
+  privateTag,
+} from "../src/features/channel-templates/model.ts";
 import { validateMemberAdministrationTemplate } from "../src/features/channel-members/administration-protocol.ts";
 import { validateDetailsTemplate } from "../src/features/relay/channel-details-protocol.ts";
 import { validChannelLabel } from "../src/features/relay/channel-labels.ts";
@@ -374,28 +379,24 @@ async function send(
   method: string,
   body?: string,
   signal?: AbortSignal,
+  authenticated = method === "POST",
 ): Promise<RelayResponse> {
   const headers: Record<string, string> = {};
-  if (method === "POST") {
-    const digest = await crypto.subtle.digest(
-      "SHA-256",
-      encoder.encode(body ?? ""),
-    );
-    const payload = Array.from(new Uint8Array(digest), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join("");
+  if (authenticated) {
+    const tags = [
+      ["u", url.href],
+      ["method", method],
+    ];
+    if (body !== undefined) {
+      const digest = await crypto.subtle.digest(
+        "SHA-256",
+        encoder.encode(body),
+      );
+      tags.push(["payload", bytesToHex(new Uint8Array(digest))]);
+    }
+    tags.push(["nonce", crypto.randomUUID()]);
     const auth = sign(
-      {
-        kind: 27235,
-        created_at: now(),
-        content: "",
-        tags: [
-          ["u", url.href],
-          ["method", method],
-          ["payload", payload],
-          ["nonce", crypto.randomUUID()],
-        ],
-      },
+      { kind: 27235, created_at: now(), content: "", tags },
       await secret(),
     );
     headers.Authorization = `Nostr ${btoa(JSON.stringify(auth))}`;
@@ -566,6 +567,128 @@ async function channelCommand(route: unknown, raw: unknown, signed: boolean) {
   return event;
 }
 
+/** Rust `kit::validate_ciphertext`: a channel recipe this viewer encrypted to
+ * itself, tagged with exactly its record's coordinate and tag. */
+async function admitKit(event: Args, community: string) {
+  const invalid = "Invalid channel recipe";
+  const owner = await secret();
+  if (
+    event?.kind !== 30078 ||
+    typeof event.content !== "string" ||
+    event.content.length > 64 * KIB ||
+    !Array.isArray(event.tags)
+  )
+    throw invalid;
+  let raw: Args;
+  let record: ReturnType<typeof parsePrivateRecord>;
+  try {
+    const plaintext = nip44.v2.decrypt(event.content, conversation(owner));
+    if (size(plaintext) > 48 * KIB) throw invalid;
+    raw = JSON.parse(plaintext);
+    record = parsePrivateRecord(raw, community);
+  } catch {
+    throw invalid;
+  }
+  let d = 0;
+  let t = 0;
+  for (const tag of event.tags) {
+    const [name, value] = Array.isArray(tag) && tag.length === 2 ? tag : [];
+    if (name === "d" && value === privateCoordinate(record)) d++;
+    else if (name === "t" && value === privateTag(record)) t++;
+    else if (
+      name !== "client-id" ||
+      typeof value !== "string" ||
+      size(value) > 128
+    )
+      throw invalid;
+  }
+  if (d !== 1 || t !== 1) throw invalid;
+  if (
+    raw.version === 2 ||
+    ["team-payload", "team-text"].includes(raw.value?.type)
+  ) {
+    const bound =
+      raw.version === 2 ? raw.value?.portable?.owner : raw.value?.owner;
+    if (bound !== getPublicKey(owner))
+      throw "Portable team belongs to another viewer";
+  }
+  return record;
+}
+
+// NIP-ER reminders (kind 30300), self-encrypted: Rust `relay/reminders.rs`.
+const D32 = /^[0-9a-f]{32}$/;
+const SCHEDULE = /^(0|[1-9][0-9]*)$/;
+const DAY = 86_400;
+const text = (value: unknown, max: number) =>
+  typeof value === "string" && value.length <= max;
+/** Rust `validate_content`: the `{eventId, channelId, preview, authorPubkey}` dialect. */
+function reminderContent(content: Args, status: string) {
+  const { target, note } = content ?? {};
+  const fields = target && typeof target === "object" ? target : {};
+  if (
+    !content ||
+    typeof content !== "object" ||
+    Array.isArray(content) ||
+    Object.keys(content).some(
+      (key) => !["target", "note", "status"].includes(key),
+    ) ||
+    typeof status !== "string" ||
+    content.status !== status ||
+    (note !== undefined && !text(note, 4096)) ||
+    (target === undefined
+      ? !note
+      : Array.isArray(target) ||
+        Object.keys(fields).length !== 4 ||
+        !HEX.test(fields.eventId) ||
+        !HEX.test(fields.authorPubkey) ||
+        !text(fields.channelId, 256) ||
+        !fields.channelId ||
+        !text(fields.preview, 1024))
+  )
+    throw "Invalid reminder";
+}
+/** Rust `decrypt`: a verified, self-authored reminder this client could save again. */
+function openReminder(raw: unknown, owner: Uint8Array) {
+  try {
+    const event = eventDto(raw);
+    if (
+      event.kind !== 30300 ||
+      event.pubkey !== getPublicKey(owner) ||
+      event.tags.filter((tag) => tag[0] === "d").length !== 1 ||
+      event.content.length > 64 * KIB
+    )
+      return undefined;
+    const plaintext = nip44.v2.decrypt(event.content, conversation(owner));
+    if (size(plaintext) > 16 * KIB) return undefined;
+    const content = JSON.parse(plaintext);
+    reminderContent(content, content?.status);
+    return { eventId: event.id, content };
+  } catch {
+    return undefined;
+  }
+}
+/** Rust `admit_reminder`: only a record shaped like `relay_sign_reminder` output. */
+async function admitReminder(event: Args) {
+  const owner = await secret();
+  const [d, schedule, ...rest] = Array.isArray(event?.tags) ? event.tags : [];
+  const opened = openReminder(event, owner);
+  const status = opened?.content.status;
+  if (
+    rest.length ||
+    d?.length !== 2 ||
+    d[0] !== "d" ||
+    !D32.test(d[1]) ||
+    schedule?.length !== 2 ||
+    !SCHEDULE.test(schedule[1]) ||
+    Number(schedule[1]) >= 2 ** 53 ||
+    !(schedule[0] === "not_before"
+      ? status === "pending"
+      : schedule[0] === "expiration" &&
+        (status === "done" || status === "cancelled"))
+  )
+    throw "Invalid reminder";
+}
+
 export const keyCommands: Record<string, (args: Args) => unknown> = {
   identity_restore: restore,
   identity_create: () => save(generateSecretKey()),
@@ -637,9 +760,15 @@ export const keyCommands: Record<string, (args: Args) => unknown> = {
       }
       const kind = event?.kind;
       if (kind === 41010) throw "Choose between one and eight other people.";
-      if (kind === 30078) await admitSidebar(event);
-      if (kind === 30300)
-        throw "Reminders aren't available in the browser yet.";
+      // Sidebar records and channel recipes share kind 30078 (Rust `admit_app_data`).
+      if (kind === 30078)
+        await (event.tags?.some(
+          (tag: unknown[]) =>
+            tag[0] === "d" && SIDEBAR.includes(tag[1] as string),
+        )
+          ? admitSidebar(event)
+          : admitKit(await owned(event, "Invalid channel recipe"), community));
+      if (kind === 30300) await admitReminder(event);
       if (kind === 9007) {
         const invalid =
           "Agent enrollment or channel operation unavailable or invalid";
@@ -852,6 +981,116 @@ export const keyCommands: Record<string, (args: Args) => unknown> = {
     };
   },
   relay_decode_sidebar: ({ events }) => decodeSidebar(events),
+  async relay_kit_prepare({ community, record }) {
+    origin(community);
+    try {
+      parsePrivateRecord(record, community);
+    } catch {
+      throw "Invalid channel recipe";
+    }
+    return nip44.v2.encrypt(
+      JSON.stringify(record),
+      conversation(await secret()),
+    );
+  },
+  async relay_kit_sign({ community, event }) {
+    origin(community);
+    const parsed = template(event, "Invalid channel recipe");
+    await admitKit(parsed, community);
+    return sign(parsed, await secret());
+  },
+  async relay_kit_decode({ community, events }) {
+    origin(community);
+    if (
+      !Array.isArray(events) ||
+      events.length > 16 ||
+      size(events) > 1024 * KIB
+    )
+      throw "Invalid channel recipe";
+    const decoded = [];
+    for (const raw of events) {
+      const event = await owned(raw, "Invalid channel recipe");
+      decoded.push({
+        eventId: event.id,
+        record: await admitKit(event, community),
+      });
+    }
+    return decoded;
+  },
+  async relay_decode_reminders({ events }) {
+    if (
+      !Array.isArray(events) ||
+      events.length > 256 ||
+      size(events) > 4096 * KIB
+    )
+      throw "Reminder decode capacity exceeded";
+    const owner = await secret();
+    return events.flatMap((raw) => openReminder(raw, owner) ?? []);
+  },
+  /** Rust `sign_reminder`: built from bounded intent, never caller ciphertext or tags. */
+  async relay_sign_reminder({ intent }) {
+    const invalid = "Invalid reminder";
+    const { d, createdAt, notBefore, expiration, content, ...rest } =
+      intent ?? {};
+    const at = notBefore ?? expiration;
+    const status =
+      notBefore != null
+        ? "pending"
+        : content?.status === "done"
+          ? "done"
+          : "cancelled";
+    if (
+      Object.keys(rest).length ||
+      (notBefore == null) === (expiration == null) ||
+      !Number.isSafeInteger(at) ||
+      at < 0 ||
+      (expiration != null &&
+        (at < now() + 29 * DAY || at > now() + 91 * DAY)) ||
+      typeof d !== "string" ||
+      !D32.test(d) ||
+      !Number.isSafeInteger(createdAt) ||
+      createdAt + 60 < now() ||
+      createdAt > now() + 3600
+    )
+      throw invalid;
+    reminderContent(content, status);
+    const plaintext = JSON.stringify(content);
+    if (size(plaintext) > 16 * KIB) throw invalid;
+    const owner = await secret();
+    return sign(
+      {
+        kind: 30300,
+        created_at: createdAt,
+        content: nip44.v2.encrypt(plaintext, conversation(owner)),
+        tags: [
+          ["d", d],
+          [notBefore != null ? "not_before" : "expiration", String(at)],
+        ],
+      },
+      owner,
+    );
+  },
+  /** Rust `relay_workflow_runs`: one authenticated page of a workflow's runs. */
+  relay_workflow_runs({ community, id, cursor }) {
+    const uuid = (value: unknown) =>
+      typeof value === "string" && UUID.test(value);
+    if (
+      !uuid(id) ||
+      (cursor != null &&
+        (!uuid(cursor.beforeId) ||
+          typeof cursor.before !== "string" ||
+          cursor.before.length > 40 ||
+          !/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9TZ:.+-]*$/.test(cursor.before)))
+    )
+      throw "Invalid workflow read";
+    const url = new URL(`/workflows/${id}/runs`, origin(community));
+    url.searchParams.set("limit", "20");
+    if (cursor != null) {
+      url.searchParams.set("before", cursor.before);
+      url.searchParams.set("before_id", cursor.beforeId);
+    }
+    return send(url, "GET", undefined, undefined, true);
+  },
   async relay_sign_sidebar({ coordinate, payload, createdAt }) {
     validateSidebarPayload(coordinate, payload);
     const plaintext = JSON.stringify(payload);

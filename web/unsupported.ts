@@ -2,7 +2,8 @@
 // host refuses. web/contract.test.ts fails when an upstream merge adds a
 // command that is neither here nor in commands.ts.
 export const unsupported = [
-  // Media, downloads and notifications: the next browser host phase.
+  // Upstream's isTauri() paths use the browser's own clipboard, media,
+  // download and notification APIs instead.
   "clipboard_write_text",
   "dock_permission",
   "file_download",
@@ -12,26 +13,20 @@ export const unsupported = [
   "notification_show",
   "request_notification_access",
   "unread_indicator_set",
-  // Relay features not in the browser yet: reminders, channel kits, workflow
-  // runs, Git, the staff console and agent helpers (sockets stay "public").
+  // Relay features the browser can't serve: Git reads and authorization need
+  // a local git, the staff console's admin API is private, and agent helpers
+  // are for local agents (sockets stay "public").
   "relay_admin_attachment",
-  "relay_admin_discover",
   "relay_admin_request",
   "relay_admin_save_attachment",
   "relay_agent_log_proof",
   "relay_agent_resolve",
   "relay_archive",
-  "relay_decode_reminders",
   "relay_git_authorization",
-  "relay_kit_decode",
-  "relay_kit_prepare",
-  "relay_kit_sign",
   "relay_project_git",
   "relay_project_git_cancel",
-  "relay_sign_reminder",
   "relay_socket_send",
   "relay_socket_start",
-  "relay_workflow_runs",
   // Device pairing, for later browser support.
   "pairing_account",
   "pairing_cancel",

@@ -103,6 +103,15 @@ export const commands: Record<string, Handler> = {
   relay_publish_read_state: key,
   relay_decode_sidebar: key,
   relay_sign_sidebar: key,
+  relay_kit_prepare: key,
+  relay_kit_sign: key,
+  relay_kit_decode: key,
+  relay_decode_reminders: key,
+  relay_sign_reminder: key,
+  relay_workflow_runs: key,
+  // The staff console's admin API is private to the relay host (the deploy
+  // Caddyfile 404s /api/admin/*), so no relay advertises one to the browser.
+  relay_admin_discover: () => null,
   // The relay's https://<host>/invite/<code> links open the app (Caddy serves
   // it for every page); hand the code to the join flow as buzz://join would.
   deep_link_take() {

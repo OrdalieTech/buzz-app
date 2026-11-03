@@ -9,6 +9,11 @@ import {
 } from "nostr-tools";
 import { hexToBytes } from "nostr-tools/utils";
 import { beforeEach, expect, test, vi } from "vitest";
+import {
+  parsePrivateRecord,
+  privateCoordinate,
+  privateTag,
+} from "../src/features/channel-templates/model.ts";
 
 // In-memory vault; IndexedDB itself is exercised by the browser run.
 const store = vi.hoisted(() => ({
@@ -397,4 +402,100 @@ test("pages and decodes an agent's memory", async () => {
   ]);
   fetchMock.mockImplementation(async () => new Response("", { status: 403 }));
   await expect(read()).rejects.toBe("MemoryDenied");
+});
+
+test("round-trips self-encrypted reminders and channel recipes", async () => {
+  fetchMock.mockImplementation(async () => new Response("{}"));
+  const publish = (event: unknown) =>
+    run("relay_http", {
+      community,
+      path: "/events",
+      method: "POST",
+      body: JSON.stringify(event),
+    });
+  const now = Math.floor(Date.now() / 1000);
+  const content = {
+    target: {
+      eventId: "a".repeat(64),
+      channelId: channel,
+      preview: "hi",
+      authorPubkey: other,
+    },
+    status: "pending",
+  };
+  const intent = { d: "0".repeat(32), createdAt: now, content };
+  const reminder = (await run("relay_sign_reminder", {
+    intent: { ...intent, notBefore: now + 60 },
+  })) as typeof message & { id: string };
+  expect(reminder.tags).toEqual([
+    ["d", intent.d],
+    ["not_before", String(now + 60)],
+  ]);
+  // A tampered record is skipped, not fatal to the list.
+  expect(
+    await run("relay_decode_reminders", {
+      events: [reminder, { ...reminder, content: "x" }],
+    }),
+  ).toEqual([{ eventId: reminder.id, content }]);
+  await publish(reminder);
+  for (const bad of [
+    { ...intent, notBefore: now, content: { ...content, status: "done" } },
+    { ...intent, expiration: now + 86_400 },
+    { ...intent, notBefore: now, extra: 1 },
+  ])
+    await expect(run("relay_sign_reminder", { intent: bad })).rejects.toBe(
+      "Invalid reminder",
+    );
+
+  const record = {
+    version: 1,
+    community,
+    deleted: false,
+    value: { type: "team", id: "team-one", name: "Team", agents: [] },
+  };
+  const parsed = parsePrivateRecord(record, community);
+  const tags = [
+    ["d", privateCoordinate(parsed)],
+    ["t", privateTag(parsed)],
+  ];
+  const recipe = (await run("relay_kit_sign", {
+    community,
+    event: {
+      kind: 30078,
+      created_at: 1,
+      tags,
+      content: await run("relay_kit_prepare", { community, record }),
+    },
+  })) as typeof message & { id: string };
+  expect(
+    await run("relay_kit_decode", { community, events: [recipe] }),
+  ).toEqual([{ eventId: recipe.id, record: parsed }]);
+  await publish(recipe);
+  await expect(
+    run("relay_kit_sign", {
+      community,
+      event: { ...recipe, tags: [["d", "other"], tags[1]] },
+    }),
+  ).rejects.toBe("Invalid channel recipe");
+  await expect(
+    run("relay_kit_prepare", { community: "https://relay.test", record: {} }),
+  ).rejects.toBe("Invalid channel recipe");
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+});
+
+test("reads a workflow's runs with an authenticated GET", async () => {
+  fetchMock.mockResolvedValue(new Response("[]"));
+  await run("relay_workflow_runs", { community, id: channel, cursor: null });
+  const [url, init] = fetchMock.mock.calls[0] ?? [];
+  const header = new Headers(init?.headers).get("Authorization") ?? "";
+  const auth = JSON.parse(atob(header.replace("Nostr ", "")));
+  expect(String(url)).toBe(`${community}/workflows/${channel}/runs?limit=20`);
+  expect(auth.tags.map(([name]: string[]) => name)).toEqual([
+    "u",
+    "method",
+    "nonce",
+  ]);
+  await expect(
+    run("relay_workflow_runs", { community, id: channel, cursor: {} }),
+  ).rejects.toBe("Invalid workflow read");
 });
