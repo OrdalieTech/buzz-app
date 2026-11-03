@@ -1,0 +1,127 @@
+/* Phone layout for the web build (behaviour in mobile.ts). Engages only at
+   AppShell's own 650px breakpoint, on top of upstream's narrow drawer mode:
+   a full-bleed single surface with safe areas, a drawer with a scrim, and
+   message actions on long press. Hooks are stable shell classes, ids, data
+   attributes and ARIA labels, never hashed CSS-module classes. */
+
+@media (max-width: 650px) {
+  html,
+  body {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-text-size-adjust: 100%;
+    touch-action: manipulation;
+  }
+
+  /* Follow the visual viewport (mobile.ts) so the on-screen keyboard
+     shortens the app instead of covering the composer. */
+  .shell-background {
+    position: fixed;
+    inset-inline: 0;
+    top: var(--buzz-viewport-top, 0px);
+    height: var(--buzz-viewport-height, 100dvh);
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+      env(safe-area-inset-bottom) env(safe-area-inset-left);
+    /* One flat surface: the panel runs edge to edge. `clip`, unlike
+       `hidden`, can't be scrolled sideways by focus or by the drawer's scrim. */
+    background: var(--surface);
+    overflow: clip;
+  }
+  :root[data-keyboard-open] .shell-background {
+    padding-bottom: 0;
+  }
+  .shell-body {
+    padding: 0;
+  }
+  #main-content > [data-buzz-surface] {
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  /* The system back gesture is there; forward is not a phone idiom. */
+  .shell-history [aria-label="Go forward"] {
+    display: none;
+  }
+
+  /* The drawer slides in over a scrim that closes it on tap (mobile.ts). */
+  .shell-navigation[data-expanded="true"] {
+    position: fixed;
+    z-index: 30;
+    width: min(85vw, 20rem);
+    max-width: none;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom)
+      env(safe-area-inset-left);
+    background: var(--surface);
+    transition: transform 260ms cubic-bezier(0.32, 0.72, 0, 1);
+    @starting-style {
+      transform: translateX(-100%);
+    }
+  }
+  .shell-navigation[data-expanded="true"] .shell-sidebar > * {
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  /* The scrim rides on the drawer's edge, so a drag carries it along. */
+  .shell-navigation[data-expanded="true"]::after {
+    position: absolute;
+    inset-block: 0;
+    left: 100%;
+    width: 100vw;
+    background: rgb(0 0 0 / 0.32);
+    opacity: var(--buzz-scrim, 1);
+    content: "";
+    transition: opacity 260ms ease-out;
+    @starting-style {
+      opacity: 0;
+    }
+  }
+  /* min-width outranks the sidebar's persisted desktop width (inline). */
+  .shell-navigation[data-expanded="true"]
+  :is(.shell-sidebar, .shell-sidebar-default) {
+    min-width: 100%;
+    max-width: none;
+  }
+
+  /* Controls dim under the finger; a transform under a moving finger is how
+     gestures get lost. */
+  :is(button, [role="button"]):active:not(:disabled) {
+    opacity: 0.7;
+  }
+  /* Press-and-hold on icons and avatars never pops a save-image menu. */
+  :is(button, a, [role="button"]) img {
+    -webkit-touch-callout: none;
+  }
+}
+
+/* Touch phones: message actions appear on long press, floated over the
+   row's top edge; sideways moves are swipe to reply, never a browser pan. */
+@media (max-width: 650px) and (hover: none) {
+  [data-message-id]:not([data-membership-row]) {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: pan-y;
+  }
+  [data-message-id] [data-highlight-surface] {
+    position: relative;
+  }
+  [data-message-id] [aria-label="Message actions"] {
+    position: absolute;
+    z-index: 1;
+    top: 0;
+    inset-inline-end: var(--space-2);
+    translate: 0 -100%;
+    flex-wrap: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 120ms ease-out;
+  }
+  [data-touch-actions] [aria-label="Message actions"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
