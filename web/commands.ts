@@ -80,6 +80,15 @@ export const commands: Record<string, Handler> = {
   relay_publish_read_state: key,
   relay_decode_sidebar: key,
   relay_sign_sidebar: key,
+  // Remote agents: the owner authorizes them and reads what they publish to
+  // it. None run in the browser, so the local agent list and library are empty.
+  identity_prepare_remote_agent_authorization: key,
+  relay_agent_observer: key,
+  relay_agent_memories_read: key,
+  relay_agent_library: () => ({ definitions: [], identities: [] }),
+  app_agent_list: () => [],
+  app_agent_portable: () => ({ agents: [], teams: [], warnings: [] }),
+  keep_awake_set: () => null,
   // "public" makes relay/native-socket.ts open a browser WebSocket.
   relay_socket_connect: () => "public",
   relay_socket_close: () => undefined,

@@ -7,7 +7,8 @@ import {
   nip44,
   type EventTemplate,
 } from "nostr-tools";
-import { hexToBytes } from "nostr-tools/utils";
+import { bytesToHex, hexToBytes } from "nostr-tools/utils";
+import { memoryAgent, memorySlug } from "../src/features/agents/memory.ts";
 import { validateMemberAdministrationTemplate } from "../src/features/channel-members/administration-protocol.ts";
 import { validateDetailsTemplate } from "../src/features/relay/channel-details-protocol.ts";
 import { validChannelLabel } from "../src/features/relay/channel-labels.ts";
@@ -26,6 +27,12 @@ import {
 import { projectSidebarPreferences } from "../src/features/relay/sidebar-preferences.ts";
 import { validTypingTemplate } from "../src/features/relay/typing-protocol.ts";
 import { validateWorkflowEvent } from "../src/features/workflows/protocol.ts";
+import {
+  decodeMemories,
+  decodeObserver,
+  memoryAddress,
+  memoryKey,
+} from "./agents.ts";
 import * as vault from "./vault.ts";
 
 // The browser host's key boundary, run in a dedicated Worker. Each command
@@ -42,6 +49,8 @@ type RelayResponse = {
 };
 
 const KIB = 1024;
+/** Fetch has no 2 MiB response cap, so pages are larger than native's 16. */
+const MEMORY_PAGE = 100;
 const HEX = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const INVALID_KEY = "Enter a valid nsec private key";
@@ -197,6 +206,32 @@ function messageDeletion({ content, tags }: EventTemplate) {
     kinds.every((kind) => ["7", "9", "40002"].includes(kind))
   );
 }
+/** Rust `valid_managed_agent_deletion`, limited to the viewer's own record. */
+function agentDeletion({ content, tags }: EventTemplate, viewer: string) {
+  const names = tags.map((tag) => tag[0]);
+  const [kind, owner, agent, ...rest] = (
+    pair(
+      tags.find((tag) => tag[0] === "a"),
+      "a",
+    ) ?? ""
+  ).split(":");
+  return (
+    !content &&
+    new Set(names).size === names.length &&
+    tags.every(
+      ([name, value, ...more]) =>
+        value !== undefined &&
+        !more.length &&
+        value.length <= 256 &&
+        ["a", "k", "client-id"].includes(name ?? "") &&
+        (name !== "k" || value === "30177"),
+    ) &&
+    kind === "30177" &&
+    owner === viewer &&
+    HEX.test(agent ?? "") &&
+    !rest.length
+  );
+}
 /** Rust `channel_writes::creation` (kind 9007). */
 function creation({ content, tags }: EventTemplate) {
   if (content || tags.length < 4 || tags.length > 47) return false;
@@ -275,7 +310,7 @@ function memberCommand({ kind, content, tags }: EventTemplate) {
 }
 /** Kinds the native `relay_sign` admits without a dedicated shape. */
 const PLAIN = new Set([
-  0, 7, 9, 1984, 9000, 9001, 20001, 30030, 30315, 40003, 42000,
+  0, 7, 9, 1984, 9000, 9001, 20001, 30030, 30177, 30315, 40003, 42000,
 ]);
 const SHAPES: Record<number, [(event: EventTemplate) => boolean, string]> = {
   9007: [
@@ -321,7 +356,8 @@ function validateEvent(
       throw "Relay authentication does not match this community";
     return;
   }
-  if (kind === 5 && messageDeletion(event)) return;
+  if (kind === 5 && (messageDeletion(event) || agentDeletion(event, viewer)))
+    return;
   if (kind === 5 || kind === 30620 || kind === 46020) {
     validateWorkflowEvent({ ...event, id: "", pubkey: viewer }, viewer);
     return;
@@ -535,6 +571,20 @@ export const keyCommands: Record<string, (args: Args) => unknown> = {
   identity_import: ({ nsec }) => save(parseNsec(nsec)),
   identity_export: async () => nip19.nsecEncode(await secret()),
   identity_legacy_available: async () => !!(await vault.legacyRecord()),
+  /** Rust `authorize_agent`: an unconditional NIP-OA tag for one agent key. */
+  async identity_prepare_remote_agent_authorization({ owner, agentPubkey }) {
+    if (typeof agentPubkey !== "string" || !HEX.test(agentPubkey))
+      throw "Agent pubkey must be 64 lowercase hex characters";
+    if (agentPubkey === owner) throw "Owner and agent pubkeys must differ";
+    if ((await restore()) !== owner)
+      throw "The agent owner is not your signed-in identity";
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      encoder.encode(`nostr:agent-auth:${agentPubkey}:`),
+    );
+    const sig = schnorr.sign(new Uint8Array(digest), await secret());
+    return ["auth", owner, "", bytesToHex(sig)];
+  },
   async identity_import_legacy() {
     if (await restore()) throw vault.SAVED;
     const legacy = await vault.loadLegacy().catch(() => null);
@@ -716,6 +766,63 @@ export const keyCommands: Record<string, (args: Args) => unknown> = {
     if (size(body) > 64 * KIB) throw "Invalid read-state event";
     await decodeReadState([event]);
     return send(url, "POST", body);
+  },
+  async relay_agent_observer({ community, event }) {
+    origin(community);
+    return decodeObserver(event, await secret());
+  },
+  /** Rust `relay_agent_memories_read`, paged newest first within native's
+   * budgets (9 s, 64 pages, 4096 events); a listing cut short by one of them
+   * or by rate limiting is partial. */
+  async relay_agent_memories_read({ community, agent, slug = null }) {
+    const url = requestUrl(community, "/query", "POST");
+    const owner = await secret();
+    const viewer = getPublicKey(owner);
+    if (!memoryAgent(agent, viewer) || (slug !== null && !memorySlug(slug)))
+      throw "Invalid memory target";
+    const filter: Args = {
+      kinds: [30174],
+      authors: [agent],
+      "#p": [viewer],
+      limit: MEMORY_PAGE,
+    };
+    if (slug !== null)
+      filter["#d"] = [await memoryAddress(await memoryKey(owner, agent), slug)];
+    const signal = AbortSignal.timeout(9000);
+    const events: Args[] = [];
+    const seen = new Set<unknown>();
+    let partial = true;
+    for (let page = 0; page < 64 && events.length < 4096; page++) {
+      const response = await send(
+        url,
+        "POST",
+        JSON.stringify([filter]),
+        signal,
+      );
+      if (response.status === 401 || response.status === 403)
+        throw "MemoryDenied";
+      if (response.status === 429 || response.status === 499) break;
+      const records = response.status === 200 && parse(response.body);
+      if (!Array.isArray(records) || records.length > MEMORY_PAGE)
+        throw "Memory read failed";
+      const fresh = records.filter(
+        (record) => !seen.has(record?.id) && seen.add(record?.id),
+      );
+      events.push(...fresh);
+      if (records.length < MEMORY_PAGE) partial = false;
+      if (records.length < MEMORY_PAGE || !fresh.length) break;
+      // The relay resumes after this cursor, so records sharing a second page through.
+      filter.until = records.at(-1)?.created_at;
+      filter.before_id = records.at(-1)?.id;
+    }
+    const listing = await decodeMemories(events.slice(0, 4096), owner, agent);
+    return {
+      ...listing,
+      entries: listing.entries.filter(
+        (entry) => slug === null || entry.slug === slug,
+      ),
+      partial: listing.partial || partial || events.length > 4096,
+    };
   },
   relay_decode_sidebar: ({ events }) => decodeSidebar(events),
   async relay_sign_sidebar({ coordinate, payload, createdAt }) {

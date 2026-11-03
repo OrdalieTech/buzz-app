@@ -219,7 +219,7 @@ export type AgentsNative = {
 };
 
 export const nativeAgents = (): AgentsNative | undefined =>
-  isTauri()
+  isTauri() || import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"
     ? {
         list: () => invoke("app_agent_list"),
         create: (destination, owner, agentType, name) =>

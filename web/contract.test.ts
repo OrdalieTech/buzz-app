@@ -48,8 +48,16 @@ test("has no stale or conflicting entries", () => {
 test("keeps the upstream anchors the web build relies on", () => {
   const read = (path: string) =>
     readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
-  expect(read("src/features/identity/service.ts")).toContain(
-    'import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"',
+  for (const path of [
+    "src/features/identity/service.ts",
+    "src/features/agents/native.ts",
+  ])
+    expect(read(path)).toContain(
+      'import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"',
+    );
+  // vite.web.config.ts swaps this import for web/orb.tsx.
+  expect(read("src/app/services.ts")).toContain(
+    'import { bundledPlugins } from "../bundled";',
   );
   const html = read("index.html");
   expect(html).toContain('src="/src/main.tsx"');
