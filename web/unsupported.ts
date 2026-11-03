@@ -27,7 +27,7 @@ export const unsupported = [
   "relay_project_git_cancel",
   "relay_socket_send",
   "relay_socket_start",
-  // Device pairing, for later browser support.
+  // Pair mobile hands this device's key to a phone; web/orb.tsx leaves it out.
   "pairing_account",
   "pairing_cancel",
   "pairing_confirm",

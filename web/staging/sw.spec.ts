@@ -380,7 +380,8 @@ test("signs relay media and routes notifications to their message", async ({
       (await notifications(bob.page)).find((item) => item.tag === channel),
     ).toMatchObject({
       title: `Alice ${run}`,
-      body: text,
+      // The channel's unread lines are grouped, newest last.
+      body: expect.stringContaining(text),
       data: {
         target: { kind: "conversation", channelId: channel, messageId: id },
       },
