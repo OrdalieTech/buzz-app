@@ -193,6 +193,13 @@ test("signs relay media and routes notifications to their message", async ({
 }) => {
   const alice = await signUp(browser, `Alice ${run}`);
   const bob = await signUp(browser, `Bob ${run}`);
+  // Upstream's avatar preview registers the community first, as with the dev broker.
+  expect(
+    await bob.page.evaluate(
+      async () =>
+        (await fetch("/api/relay/register", { method: "POST" })).status,
+    ),
+  ).toBe(204);
 
   // A DM from Alice carrying an image and a fast-start H.264/AAC video.
   await alice.page.getByRole("button", { name: "New message" }).click();
