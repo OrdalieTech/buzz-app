@@ -1,0 +1,38 @@
+{
+	local_certs
+}
+
+buzz.localhost:9443 {
+	@relay_socket header Upgrade websocket
+	@nip11 header Accept *application/nostr+json*
+	@web {
+		not path /
+		file {
+			root /srv/web
+		}
+	}
+	@page {
+		header Accept *text/html*
+		not path /api/* /media/* /.well-known/* /git/*
+	}
+	handle @relay_socket {
+		reverse_proxy relay:3000
+	}
+	handle @nip11 {
+		reverse_proxy relay:3000
+	}
+	handle @web {
+		root * /srv/web
+		file_server
+	}
+	handle @page {
+		root * /srv/web
+		rewrite * /index.html
+		file_server
+	}
+	handle {
+		reverse_proxy relay:3000 {
+			lb_try_duration 30s
+		}
+	}
+}
