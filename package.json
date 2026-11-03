@@ -12,6 +12,8 @@
     "dev:desktop": "vite --strictPort --force",
     "build": "pnpm typecheck && vite build",
     "preview": "vite preview",
+    "web:build": "tsc -p web && vite build --config web/vite.web.config.ts",
+    "web:test": "vitest run --config web/vitest.config.ts",
     "author:build": "node scripts/build-author.mjs",
     "buzz-mcp": "vite build --config vite.buzz-mcp.config.ts",
     "typecheck": "tsc --noEmit",
