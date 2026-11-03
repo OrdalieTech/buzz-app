@@ -2,9 +2,15 @@
 // answered here or by the key Worker. Every other command is refused, and
 // unsupported.ts lists the ones the native host registers today.
 
+import { uploadCommands } from "./uploads.ts";
+
 // biome-ignore lint/suspicious/noExplicitAny: native IPC arguments are untyped JSON.
 type Args = Record<string, any>;
-export type Handler = (args: Args, command: string) => unknown;
+export type Handler = (
+  args: Args,
+  command: string,
+  headers: Headers,
+) => unknown;
 
 let worker: Worker | undefined;
 let next = 0;
@@ -31,7 +37,7 @@ function start() {
 }
 
 /** Runs the command of the same name in the key Worker (keys.ts). */
-export const key: Handler = (args, command) =>
+export const key = (args: Args, command: string) =>
   new Promise((resolve, reject) => {
     worker ??= start();
     const id = next++;
@@ -94,4 +100,5 @@ export const commands: Record<string, Handler> = {
   // "public" makes relay/native-socket.ts open a browser WebSocket.
   relay_socket_connect: () => "public",
   relay_socket_close: () => undefined,
+  ...uploadCommands(key),
 };
