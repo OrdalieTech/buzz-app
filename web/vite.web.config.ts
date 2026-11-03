@@ -4,16 +4,25 @@ import upstream from "../vite.config.ts";
 // Browser (PWA) build of the unchanged app: the browser host in web/host.ts
 // answers the native IPC before src/main.tsx runs, so isTauri() stays false.
 
+// The installed app's name comes from the build's environment.
+const name = process.env.VITE_BUZZ_APP_NAME || "Buzz";
 const manifest = {
-  name: "Buzz",
-  short_name: "Buzz",
+  id: "/",
+  name,
+  short_name: name,
   start_url: "/",
   scope: "/",
   display: "standalone",
   background_color: "#f1f1f2",
   theme_color: "#f1f1f2",
   icons: [
-    { src: "/app-icon.png", sizes: "512x512", type: "image/png" },
+    // The artwork sits inside the maskable safe zone on a full-bleed ground.
+    {
+      src: "/app-icon.png",
+      sizes: "512x512",
+      type: "image/png",
+      purpose: "any maskable",
+    },
     { src: "/apple-touch-icon.png", sizes: "256x256", type: "image/png" },
   ],
 };
@@ -35,11 +44,16 @@ const browserHost: Plugin = {
         .replace('src="/src/main.tsx"', 'src="/web/main.ts"')
         .replace(
           'content="width=device-width, initial-scale=1.0"',
-          'content="width=device-width, initial-scale=1, viewport-fit=cover"',
+          // Android shrinks the layout for the keyboard; iOS: web/mobile.ts.
+          'content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"',
         )
         .replace(
           "</head>",
-          '  <link rel="manifest" href="/manifest.webmanifest" />\n  </head>',
+          `  <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="${name}" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  </head>`,
         ),
   },
 };
