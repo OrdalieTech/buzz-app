@@ -80,6 +80,17 @@ export const commands: Record<string, Handler> = {
   relay_publish_read_state: key,
   relay_decode_sidebar: key,
   relay_sign_sidebar: key,
+  // The relay's https://<host>/invite/<code> links open the app (Caddy serves
+  // it for every page); hand the code to the join flow as buzz://join would.
+  deep_link_take() {
+    const code = /^\/invite\/([^/]+)\/?$/.exec(location.pathname)?.[1];
+    if (!code) return [];
+    history.replaceState(history.state, "", `/${location.hash}`);
+    return [
+      `buzz://join?${new URLSearchParams({ relay: location.origin, code })}`,
+    ];
+  },
+  deep_link_watch: () => undefined,
   // "public" makes relay/native-socket.ts open a browser WebSocket.
   relay_socket_connect: () => "public",
   relay_socket_close: () => undefined,

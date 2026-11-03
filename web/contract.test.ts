@@ -51,6 +51,9 @@ test("keeps the upstream anchors the web build relies on", () => {
   expect(read("src/features/identity/service.ts")).toContain(
     'import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"',
   );
+  expect(read("src/features/navigation/deep-links.ts")).toContain(
+    'import.meta.env.VITE_BUZZ_BROWSER_HOST !== "1"',
+  );
   const html = read("index.html");
   expect(html).toContain('src="/src/main.tsx"');
   expect(html).toContain('content="width=device-width, initial-scale=1.0"');

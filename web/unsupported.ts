@@ -86,8 +86,6 @@ export const unsupported = [
   "browser_set_bounds",
   "browser_status",
   "decide",
-  "deep_link_take",
-  "deep_link_watch",
   "federated_identity_cancel_sign_in",
   "federated_identity_register",
   "federated_identity_request",

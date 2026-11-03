@@ -323,7 +323,8 @@ export function bindDeepLinks(
 /** The Tauri bridge. It carries raw URL strings from the main window's shell and
  * a queue-depth ping; no destination or account data crosses in either direction. */
 export function createDeepLinkShell(): DeepLinkShell | undefined {
-  if (!isTauri()) return undefined;
+  if (!isTauri() && import.meta.env.VITE_BUZZ_BROWSER_HOST !== "1")
+    return undefined;
   return {
     async take() {
       const urls = await invoke<unknown>("deep_link_take");

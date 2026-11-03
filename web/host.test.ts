@@ -20,3 +20,12 @@ test("delivers Channel messages through the installed callbacks", () => {
   internals.runCallback(channel.id, { index: 0, message: 7 });
   expect(received).toEqual([7]);
 });
+
+test("hands an invite page's code to the join flow once", async () => {
+  history.replaceState(null, "", "/invite/abc-123#buzz=x");
+  expect(await invoke("deep_link_take")).toEqual([
+    `buzz://join?relay=${encodeURIComponent(location.origin)}&code=abc-123`,
+  ]);
+  expect(location.pathname + location.hash).toBe("/#buzz=x");
+  expect(await invoke("deep_link_take")).toEqual([]);
+});
