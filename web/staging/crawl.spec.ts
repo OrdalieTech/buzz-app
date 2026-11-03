@@ -93,8 +93,9 @@ for (const width of [1280, 390])
     page.on("console", (message) => {
       if (message.text().startsWith("[crawl]")) console.log(message.text());
       // Relay media in a clone without its object store, the relay pacing
-      // reads (429, which the app retries) and staging's local CA, which
-      // Chromium refuses for service workers.
+      // reads (429, which the app retries), third-party APIs the app reads
+      // (GitHub answers 404 for a private repository) and staging's local CA,
+      // which Chromium refuses for service workers.
       const { url } = message.location();
       if (
         message.type() === "error" &&
@@ -103,7 +104,9 @@ for (const width of [1280, 390])
         ) &&
         !(
           /^Failed to load resource/.test(message.text()) &&
-          (/\/media(\?|\/)/.test(url) || /status of 429/.test(message.text()))
+          (/\/media(\?|\/)/.test(url) ||
+            /status of 429/.test(message.text()) ||
+            !url.startsWith(`https://${host}/`))
         )
       )
         issue(`${step}: console: ${message.text().slice(0, 300)} ${url}`);
@@ -162,11 +165,15 @@ for (const width of [1280, 390])
       if (Date.now() - started > 30_000)
         console.log(`[crawl] slow ${name}: ${Date.now() - started} ms`);
     }
-    /** Closes whatever menus and dialogs the last surface left open. */
+    /** Closes whatever menus, dialogs and panels the last surface left open. */
     async function dismiss() {
       const open = page.getByRole("menu").or(page.getByRole("dialog"));
       for (let tries = 0; tries < 4 && (await open.count()); tries++)
         await page.keyboard.press("Escape");
+      for (const close of await page
+        .getByRole("button", { name: /^Close .+ panel$/ })
+        .all())
+        await close.click({ timeout: 2000 }).catch(() => {});
     }
     const sidebar = page.getByRole("complementary", { name: "Sidebar" });
     /** On a phone the sidebar is a drawer: open it, or close it by its scrim. */
@@ -271,7 +278,8 @@ for (const width of [1280, 390])
 
     for (const name of ["Reminders", "Agents", "Workflows", "Messages"])
       await visit(`page ${name}`, async () => {
-        const tab = page.getByRole("tab", { name, exact: true });
+        // A page tab's name may carry a count, as Reminders does.
+        const tab = page.getByRole("tab", { name: new RegExp(`^${name}\\b`) });
         // A phone lists the pages behind More pages.
         if (!(await tab.isVisible()))
           await page.getByRole("button", { name: "More pages" }).click();
@@ -355,20 +363,6 @@ for (const width of [1280, 390])
         await settle();
       };
       await visit(`channel ${id}`, open);
-      await visit(`channel ${id} details`, async () => {
-        await page.getByRole("button", { name: "Channel actions" }).click();
-        await page
-          .getByRole("menuitem", { name: /details/i })
-          .first()
-          .click();
-        await settle();
-        await tabs(page.getByRole("dialog"));
-      });
-      await visit(`channel ${id} members`, async () => {
-        await page.getByRole("button", { name: "Manage members" }).click();
-        await settle();
-        await tabs(page.getByRole("dialog"));
-      });
       const actions = page.getByRole("group", { name: "Message actions" });
       const message = page
         .getByRole("region", { name: "Channel message history" })
@@ -410,7 +404,22 @@ for (const width of [1280, 390])
           await page.keyboard.press("Escape");
           await composer.clear();
         });
-      // Last: the canvas replaces the conversation in this channel's tabs.
+      // Then the panels, which cover the conversation on a phone, and the
+      // canvas, which replaces it in this channel's tabs.
+      await visit(`channel ${id} details`, async () => {
+        await page.getByRole("button", { name: "Channel actions" }).click();
+        await page
+          .getByRole("menuitem", { name: /details/i })
+          .first()
+          .click();
+        await settle();
+        await tabs(page.getByRole("dialog"));
+      });
+      await visit(`channel ${id} members`, async () => {
+        await page.getByRole("button", { name: "Manage members" }).click();
+        await settle();
+        await tabs(page.getByRole("dialog"));
+      });
       await visit(`channel ${id} canvas`, async () => {
         await page.getByRole("button", { name: "Channel actions" }).click();
         await page.getByRole("menuitem", { name: "View canvas" }).click();
