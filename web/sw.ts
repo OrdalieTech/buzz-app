@@ -49,6 +49,11 @@ function mediaTarget(request: Request) {
 }
 
 self.addEventListener("fetch", (event) => {
+  // Upstream registers a community with the dev broker before showing its
+  // protected avatars; media here needs no registration.
+  const { method, url } = event.request;
+  if (method === "POST" && url === `${self.location.origin}/api/relay/register`)
+    return event.respondWith(new Response(null, { status: 204 }));
   const target = mediaTarget(event.request);
   if (target !== undefined)
     event.respondWith(

@@ -182,8 +182,12 @@ const orb: BundledPlugin = {
 };
 
 /** The web build's plugins (src/app/services.ts): upstream's plus Orb, without
- * Builderlab, whose sign-in and hosted agents need the desktop app. */
+ * Builderlab, whose sign-in and hosted agents need the desktop app, and Pair
+ * mobile, which hands the desktop's key to a phone (a phone opens this app). */
 export const bundledPlugins: readonly BundledPlugin[] = [
-  ...upstream.filter(({ manifest }) => manifest.id !== "block.builderlab"),
+  ...upstream.filter(
+    ({ manifest }) =>
+      manifest.id !== "block.builderlab" && manifest.id !== "buzz.pairing",
+  ),
   orb,
 ];
