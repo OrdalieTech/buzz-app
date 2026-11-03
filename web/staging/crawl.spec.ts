@@ -92,8 +92,10 @@ for (const width of [1280, 390])
     let step = "start";
     page.on("console", (message) => {
       if (message.text().startsWith("[crawl]")) console.log(message.text());
-      // Relay media in a clone without its object store, and staging's
-      // local CA, which Chromium refuses for service workers.
+      // Relay media in a clone without its object store, the relay pacing
+      // reads (429, which the app retries) and staging's local CA, which
+      // Chromium refuses for service workers.
+      const { url } = message.location();
       if (
         message.type() === "error" &&
         !/^An SSL certificate error occurred when fetching the script/.test(
@@ -101,10 +103,10 @@ for (const width of [1280, 390])
         ) &&
         !(
           /^Failed to load resource/.test(message.text()) &&
-          /\/media(\?|\/)/.test(message.location().url)
+          (/\/media(\?|\/)/.test(url) || /status of 429/.test(message.text()))
         )
       )
-        issue(`${step}: console: ${message.text().slice(0, 300)}`);
+        issue(`${step}: console: ${message.text().slice(0, 300)} ${url}`);
     });
     page.on("response", (response) => {
       const url = new URL(response.url());
@@ -143,6 +145,7 @@ for (const width of [1280, 390])
       step = name;
       const started = Date.now();
       try {
+        await dismiss();
         await drawer(false);
         await open();
         visited.push(name);
@@ -155,9 +158,15 @@ for (const width of [1280, 390])
       await settle();
       for (const text of await page.getByText(FAILURE).allInnerTexts())
         issue(`${name}: shows "${text.slice(0, 200)}"`);
-      await page.keyboard.press("Escape");
+      await dismiss();
       if (Date.now() - started > 30_000)
         console.log(`[crawl] slow ${name}: ${Date.now() - started} ms`);
+    }
+    /** Closes whatever menus and dialogs the last surface left open. */
+    async function dismiss() {
+      const open = page.getByRole("menu").or(page.getByRole("dialog"));
+      for (let tries = 0; tries < 4 && (await open.count()); tries++)
+        await page.keyboard.press("Escape");
     }
     const sidebar = page.getByRole("complementary", { name: "Sidebar" });
     /** On a phone the sidebar is a drawer: open it, or close it by its scrim. */
@@ -425,19 +434,20 @@ for (const width of [1280, 390])
       name: "Settings sections",
     });
     const entries = sections.getByRole("button").or(sections.getByRole("link"));
-    const names = await entries.allInnerTexts();
-    for (const [index, name] of names.entries())
-      await visit(`settings ${name.split("\n")[0]}`, async () => {
+    for (const text of await entries.allInnerTexts()) {
+      const name = text.split("\n")[0] ?? text;
+      await visit(`settings ${name}`, async () => {
         if (!(await sections.isVisible())) {
           await me.click();
           await page
             .getByRole("menuitem", { name: "Settings", exact: true })
             .click();
         }
-        await entries.nth(index).click();
+        await entries.filter({ hasText: name }).first().click();
         await settle();
         await tabs(page.getByRole("main"));
       });
+    }
     await visit("community switcher", () =>
       page.getByRole("button", { name: /^Community switcher/ }).click(),
     );
