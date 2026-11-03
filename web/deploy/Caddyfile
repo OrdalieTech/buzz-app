@@ -13,7 +13,7 @@
 # The app has no inline scripts; its workers are same-origin files and the WebP
 # encoder needs wasm. It only talks to its own relay.
 (app) {
-	header Content-Security-Policy "default-src 'self'; base-uri 'self'; form-action 'none'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' wss://{$BUZZ_DOMAIN}; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; worker-src 'self'; manifest-src 'self'"
+	header Content-Security-Policy "default-src 'self'; base-uri 'self'; form-action 'none'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' wss://{$BUZZ_DOMAIN} https://api.github.com; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; worker-src 'self'; manifest-src 'self'"
 	root * /srv/buzz/web
 	file_server
 }
