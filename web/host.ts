@@ -16,6 +16,9 @@ Object.assign(Reflect.get(window, "__TAURI_INTERNALS__"), {
     if (!run) throw `${command} isn't available in the browser.`;
     return run(args ?? {}, command, new Headers(options?.headers));
   },
-  // Relay media keeps its URL until the media service worker signs it.
-  convertFileSrc: (url: string) => url,
+  // Relay media goes through the service worker (web/sw.ts), which signs each
+  // read, at the dev broker's same-origin path that upstream treats as relay
+  // media (isProxySource in src/features/messages/attachment-source.ts).
+  convertFileSrc: (url: string) =>
+    `/api/relay/${encodeURIComponent(new URL(url).host)}/media?url=${encodeURIComponent(url)}`,
 });

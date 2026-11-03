@@ -51,6 +51,22 @@ const saved: Handler = async (args, command) => {
   return viewer;
 };
 
+/** Withdraws this browser's push lease while the key still exists (sign-out). */
+async function revokePush() {
+  const worker = (await navigator.serviceWorker?.getRegistration())?.active;
+  if (!worker) return;
+  const { port1, port2 } = new MessageChannel();
+  const done = new Promise((resolve) => {
+    port1.onmessage = resolve;
+    setTimeout(resolve, 5000);
+  });
+  worker.postMessage(
+    { type: "buzz-push-sync", wanted: false, mentions: false, direct: false },
+    [port2],
+  );
+  await done;
+}
+
 export const commands: Record<string, Handler> = {
   identity_restore: key,
   identity_create: saved,
@@ -61,6 +77,7 @@ export const commands: Record<string, Handler> = {
   legacy_communities: (_, command) =>
     key({ saved: localStorage.getItem("buzz-communities") }, command),
   async sign_out(args, command) {
+    await revokePush();
     await key(args, command);
     if (args.wipe) {
       localStorage.clear();
@@ -106,6 +123,24 @@ export const commands: Record<string, Handler> = {
   app_agent_list: () => [],
   app_agent_portable: () => ({ agents: [], teams: [], warnings: [] }),
   keep_awake_set: () => null,
+  /** Relay media, signed by the service worker, saved the browser's way. */
+  async media_download({ source, name }) {
+    const url = new URL(source, location.href);
+    if (
+      url.origin !== location.origin ||
+      !/^\/api\/relay\/[^/]+\/media$/.test(url.pathname)
+    )
+      throw "Invalid media URL";
+    const response = await fetch(url);
+    if (!response.ok) throw "Media download failed";
+    const href = URL.createObjectURL(await response.blob());
+    Object.assign(document.createElement("a"), {
+      href,
+      download: name || url.searchParams.get("url")?.split("/").pop(),
+    }).click();
+    // Revoking at once can cancel the download in Firefox and Safari.
+    setTimeout(() => URL.revokeObjectURL(href), 60_000);
+  },
   // "public" makes relay/native-socket.ts open a browser WebSocket.
   relay_socket_connect: () => "public",
   relay_socket_close: () => undefined,

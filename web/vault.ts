@@ -42,7 +42,7 @@ function open(vault: Vault, create: boolean) {
   });
 }
 
-async function run<T>(
+export async function run<T>(
   vault: Vault,
   mode: IDBTransactionMode,
   operation: (store: IDBObjectStore) => IDBRequest<T>,

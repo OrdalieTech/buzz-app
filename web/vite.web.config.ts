@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig, loadEnv, type Plugin, type UserConfig } from "vite";
 import upstream from "../vite.config.ts";
+import { serviceWorker } from "./sw.vite.ts";
 
 // Browser (PWA) build of the unchanged app: the browser host in web/host.ts
 // answers the native IPC before src/main.tsx runs, so isTauri() stays false.
@@ -92,7 +93,12 @@ export default defineConfig(async (env) => {
     {}) as Record<string, string>;
   return {
     ...config,
-    plugins: [...(config.plugins ?? []), browserHost, onboarding],
+    plugins: [
+      ...(config.plugins ?? []),
+      browserHost,
+      onboarding,
+      serviceWorker(),
+    ],
     define: {
       ...config.define,
       "import.meta.env.VITE_BUZZ_BROWSER_HOST": JSON.stringify("1"),

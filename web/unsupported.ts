@@ -7,7 +7,6 @@ export const unsupported = [
   "dock_permission",
   "file_download",
   "media_copy_image",
-  "media_download",
   "media_stream_base",
   "notification_permission_state",
   "notification_show",
