@@ -249,6 +249,6 @@ export function createIdentity() {
 }
 export type Identity = ReturnType<typeof createIdentity>;
 export const nativeIdentityEnabled = () =>
-  isTauri() &&
-  /Mac|Win|Linux/i.test(navigator.platform) &&
+  (import.meta.env.VITE_BUZZ_BROWSER_HOST === "1" ||
+    (isTauri() && /Mac|Win|Linux/i.test(navigator.platform))) &&
   import.meta.env.VITE_BUZZ_LIVE !== "1";
