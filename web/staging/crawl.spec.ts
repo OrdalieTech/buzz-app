@@ -161,6 +161,11 @@ for (const width of [1280, 390])
       await settle();
       for (const text of await page.getByText(FAILURE).allInnerTexts())
         issue(`${name}: shows "${text.slice(0, 200)}"`);
+      const alive = await Promise.race([
+        page.evaluate(() => true),
+        new Promise((resolve) => setTimeout(resolve, 15_000, false)),
+      ]);
+      if (!alive) throw new Error(`The page stopped responding after ${name}`);
       await dismiss();
       if (Date.now() - started > 30_000)
         console.log(`[crawl] slow ${name}: ${Date.now() - started} ms`);
