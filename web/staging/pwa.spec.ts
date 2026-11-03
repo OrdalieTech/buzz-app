@@ -1,5 +1,13 @@
 import { type Browser, expect, type Page, test } from "@playwright/test";
-import { generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
+import {
+  finalizeEvent,
+  generateSecretKey,
+  getPublicKey,
+  nip19,
+  nip44,
+} from "nostr-tools";
+import { bytesToHex } from "nostr-tools/utils";
+import { derive, ecdh } from "../pairing.ts";
 
 const port = process.env.STAGING_PORT ?? "9443";
 
@@ -40,20 +48,27 @@ async function send(page: Page, text: string) {
   await expect(page.getByText(text)).toBeVisible();
 }
 
+/** First run up to the key choice for the staging community. */
+async function choose(page: Page, lane: string) {
+  const next = page.getByRole("button", { name: lane });
+  await expect(async () => {
+    // A slow first probe can land on the choice after this attempt timed out.
+    if (!(await next.isVisible())) {
+      await page.getByLabel("Community URL").fill(`buzz.localhost:${port}`);
+      await page.getByRole("button", { name: "Continue" }).click();
+    }
+    await expect(next).toBeVisible({ timeout: 2000 });
+  }).toPass();
+  await page.getByRole("button", { name: lane }).click();
+}
+
 test("chats through the browser host", async ({ browser }) => {
   // Alice brings a key through first run's "I already have a key".
   const alice = await open(browser);
   const aliceName = `Alice ${run}`;
-  await expect(async () => {
-    await alice.getByLabel("Community URL").fill(`buzz.localhost:${port}`);
-    await alice.getByRole("button", { name: "Continue" }).click();
-    await expect(
-      alice.getByRole("button", { name: "I already have a key" }),
-    ).toBeVisible({ timeout: 2000 });
-  }).toPass();
-  await alice.getByRole("button", { name: "I already have a key" }).click();
+  await choose(alice, "I already have a key");
   await alice
-    .getByLabel("Private key (nsec)")
+    .getByLabel("Private key or backup")
     .fill(nip19.nsecEncode(generateSecretKey()));
   await alice.getByRole("button", { name: "Continue with this key" }).click();
   await alice.getByRole("button", { name: "Join", exact: true }).click();
@@ -240,4 +255,141 @@ test("continues with the previous PWA's identity and communities", async ({
   await expect(page.getByLabel("Community URL")).toBeVisible();
   expect(await invoke(page, "identity_restore")).toBeNull();
   expect(await invoke(page, "identity_legacy_available")).toBe(false);
+});
+
+test("creates a key, backs it up and restores it from the backup", async ({
+  browser,
+}) => {
+  const page = await open(browser);
+  // No email sign-in in this build: the key choice is explicit.
+  await expect(page.getByLabel("Community URL")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Sign in with email" }),
+  ).toBeHidden();
+  await choose(page, "Create my key");
+  const npub = page.getByText(/^npub1/);
+  await expect(npub).toBeVisible();
+  const viewer = nip19.decode(
+    (await npub.textContent()) as `npub1${string}`,
+  ).data;
+  const proceed = page.getByRole("button", { name: "Continue" });
+  await expect(proceed).toBeDisabled();
+  const password = `staging backup ${run}`;
+  await page.getByLabel("Backup password").fill(password);
+  await page.getByLabel("Repeat password").fill(password);
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Download backup file" }).click(),
+  ]);
+  const file = await download.path();
+  // Nothing is saved before Continue.
+  expect(await invoke(page, "identity_restore")).toBeNull();
+  await proceed.click();
+  await page.getByRole("button", { name: "Join", exact: true }).click();
+  await profile(page, `Carol ${run}`);
+  expect(await invoke(page, "identity_restore")).toBe(viewer);
+
+  await invoke(page, "sign_out", { wipe: false, removeAgents: false }).catch(
+    () => {},
+  );
+  await choose(page, "I already have a key");
+  await page.getByLabel("Backup file").setInputFiles(file);
+  await page.getByLabel("Backup password").fill(password);
+  await page.getByRole("button", { name: "Continue with this key" }).click();
+  await page.getByRole("button", { name: "Join", exact: true }).click();
+  await shell(page);
+  expect(await invoke(page, "identity_restore")).toBe(viewer);
+});
+
+test("receives an identity from Buzz desktop's Pair mobile", async ({
+  browser,
+}) => {
+  // Buzz desktop's side (src-tauri/src/pairing), driven from here.
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+  const relay = `wss://buzz.localhost:${port}/pair`;
+  const source = generateSecretKey();
+  const secret = generateSecretKey();
+  const account = generateSecretKey();
+  const conversation = (peer: string) =>
+    nip44.v2.utils.getConversationKey(source, peer);
+  const inbox: Record<string, unknown>[] = [];
+  let target = "";
+  const socket = new WebSocket(relay);
+  socket.onmessage = ({ data }) => {
+    const [type, , event] = JSON.parse(String(data));
+    if (type !== "EVENT") return;
+    target = event.pubkey;
+    inbox.push(
+      JSON.parse(nip44.v2.decrypt(event.content, conversation(target))),
+    );
+  };
+  await new Promise((resolve) => {
+    socket.onopen = resolve;
+  });
+  socket.send(
+    JSON.stringify([
+      "REQ",
+      "pair",
+      { kinds: [24134], "#p": [getPublicKey(source)] },
+    ]),
+  );
+  const tell = (message: object) =>
+    socket.send(
+      JSON.stringify([
+        "EVENT",
+        finalizeEvent(
+          {
+            kind: 24134,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [["p", target]],
+            content: nip44.v2.encrypt(
+              JSON.stringify(message),
+              conversation(target),
+            ),
+          },
+          source,
+        ),
+      ]),
+    );
+
+  const page = await open(browser);
+  await choose(page, "Pair with Buzz desktop");
+  await page
+    .getByLabel("Pairing code")
+    .fill(
+      `nostrpair://${getPublicKey(source)}?secret=${bytesToHex(secret)}&relay=${encodeURIComponent(relay)}&v=1`,
+    );
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect.poll(() => inbox[0]?.type).toBe("offer");
+  const { id, sas, transcript } = await derive(
+    secret,
+    getPublicKey(source),
+    target,
+    ecdh(source, target),
+  );
+  expect(inbox[0]?.session_id).toBe(id);
+  // The user compares codes, then confirms on desktop, which sends at once.
+  await expect(
+    page.getByText(`${sas.slice(0, 3)} ${sas.slice(3)}`),
+  ).toBeVisible();
+  tell({ type: "sas-confirm", transcript_hash: transcript });
+  tell({
+    type: "payload",
+    payload_type: "custom",
+    payload: JSON.stringify({
+      relayUrl: community,
+      pubkey: getPublicKey(account),
+      nsec: nip19.nsecEncode(account),
+    }),
+  });
+  // Nothing is kept until the codes match here too.
+  expect(await invoke(page, "identity_restore")).toBeNull();
+  await page.getByRole("button", { name: "Codes match" }).click();
+  await page.getByRole("button", { name: "Join", exact: true }).click();
+  await profile(page, `Dave ${run}`);
+  expect(await invoke(page, "identity_restore")).toBe(getPublicKey(account));
+  await expect
+    .poll(() => inbox.at(-1))
+    .toEqual({ type: "complete", success: true });
+  socket.close();
 });

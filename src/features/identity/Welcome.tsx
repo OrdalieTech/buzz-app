@@ -693,6 +693,7 @@ export function Welcome({
         }
       >
         <Button
+          hidden={import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"}
           variant={auth.status === "pending" ? "outline" : "prominent"}
           size="lg"
           onClick={() => {

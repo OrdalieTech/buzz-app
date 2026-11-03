@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig, loadEnv, type Plugin, type UserConfig } from "vite";
 import upstream from "../vite.config.ts";
 
@@ -16,6 +17,17 @@ const manifest = {
     { src: "/app-icon.png", sizes: "512x512", type: "image/png" },
     { src: "/apple-touch-icon.png", sizes: "256x256", type: "image/png" },
   ],
+};
+
+// Welcome.tsx's first-run key pages, replaced by web/onboarding.tsx.
+const onboarding: Plugin = {
+  name: "buzz-web-onboarding",
+  enforce: "pre",
+  resolveId: (source, importer) =>
+    importer?.endsWith("/src/features/identity/Welcome.tsx") &&
+    ["./ConnectChoice", "./KeyImport"].includes(source)
+      ? fileURLToPath(new URL("./onboarding.tsx", import.meta.url))
+      : null,
 };
 
 const browserHost: Plugin = {
@@ -60,7 +72,7 @@ export default defineConfig(async (env) => {
     {}) as Record<string, string>;
   return {
     ...config,
-    plugins: [...(config.plugins ?? []), browserHost],
+    plugins: [...(config.plugins ?? []), browserHost, onboarding],
     define: {
       ...config.define,
       "import.meta.env.VITE_BUZZ_BROWSER_HOST": JSON.stringify("1"),

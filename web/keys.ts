@@ -26,6 +26,7 @@ import {
 import { projectSidebarPreferences } from "../src/features/relay/sidebar-preferences.ts";
 import { validTypingTemplate } from "../src/features/relay/typing-protocol.ts";
 import { validateWorkflowEvent } from "../src/features/workflows/protocol.ts";
+import { heldKey } from "./key-setup.ts";
 import * as vault from "./vault.ts";
 
 // The browser host's key boundary, run in a dedicated Worker. Each command
@@ -532,7 +533,8 @@ async function channelCommand(route: unknown, raw: unknown, signed: boolean) {
 export const keyCommands: Record<string, (args: Args) => unknown> = {
   identity_restore: restore,
   identity_create: () => save(generateSecretKey()),
-  identity_import: ({ nsec }) => save(parseNsec(nsec)),
+  // An npub names a key first run holds unsaved (key-setup.ts).
+  identity_import: ({ nsec }) => save(heldKey(nsec) ?? parseNsec(nsec)),
   identity_export: async () => nip19.nsecEncode(await secret()),
   identity_legacy_available: async () => !!(await vault.legacyRecord()),
   async identity_import_legacy() {
