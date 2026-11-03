@@ -1,0 +1,96 @@
+# The web app and its relay on one origin, {$BUZZ_DOMAIN}. Ships in the release
+# tarball with the build it serves (web/deploy/release.sh).
+
+# A relay restart or upgrade makes requests and socket reconnects wait for the
+# new container instead of failing with 502.
+(relay) {
+	reverse_proxy relay:3000 {
+		lb_try_duration 30s
+		lb_try_interval 250ms
+	}
+}
+
+# The app has no inline scripts; its workers are same-origin files and the WebP
+# encoder needs wasm. It only talks to its own relay.
+(app) {
+	header Content-Security-Policy "default-src 'self'; base-uri 'self'; form-action 'none'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' wss://{$BUZZ_DOMAIN}; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; worker-src 'self'; manifest-src 'self'"
+	root * /srv/buzz/web
+	file_server
+}
+
+{$BUZZ_DOMAIN} {
+	encode zstd gzip
+
+	# Relay surfaces that no client needs through this proxy. Workflow webhooks
+	# (/hooks/*) stay open: each one checks its own secret header.
+	@internal path /internal/* /operator/* /api/admin/* /api/nip-fi/* /_mesh/*
+	handle @internal {
+		respond 404
+	}
+
+	# Relay pages keep their own CSP; this one only forbids framing them.
+	header {
+		Content-Security-Policy "frame-ancestors 'none'"
+		Permissions-Policy "camera=(self), microphone=(self), geolocation=()"
+		Referrer-Policy "no-referrer"
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+	}
+
+	handle /pair {
+		reverse_proxy pairing:5000
+	}
+
+	# Browser push registration; relay wake delivery stays internal.
+	handle /webpush/* {
+		reverse_proxy webpush:8080
+	}
+
+	@relay_socket {
+		header Connection *Upgrade*
+		header Upgrade websocket
+	}
+	handle @relay_socket {
+		import relay
+	}
+
+	@nip11 header Accept *application/nostr+json*
+	handle @nip11 {
+		import relay
+	}
+
+	@web_asset {
+		not path /
+		file {
+			root /srv/buzz/web
+			try_files {path}
+		}
+	}
+	handle @web_asset {
+		# Content-hashed build output, only for existing files so a missing
+		# chunk is never cached as immutable. Everything else (index.html,
+		# sw.js, the manifest, the boot scripts) is revalidated.
+		@hashed path /assets/*
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
+		@unhashed not path /assets/*
+		header @unhashed Cache-Control "no-cache"
+		import app
+	}
+
+	# Every other page, /invite/<code> included (the app hands the code to its
+	# join flow), is the app; relay APIs, media, git and webhooks are not.
+	@web_route {
+		header Accept *text/html*
+		not path /api/* /media/* /.well-known/* /git/* /hooks/*
+	}
+	handle @web_route {
+		header Cache-Control "no-cache"
+		rewrite * /index.html
+		import app
+	}
+
+	handle {
+		import relay
+	}
+}

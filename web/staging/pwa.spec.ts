@@ -8,8 +8,15 @@ const port = process.env.STAGING_PORT ?? "9443";
 const community = `https://buzz.localhost:${port}`;
 const run = Date.now().toString(36);
 
+// Staging serves the production Caddyfile, so its CSP is checked here too.
+const violations: string[] = [];
+test.afterEach(() => expect(violations.splice(0)).toEqual([]));
 async function open(browser: Browser) {
   const page = await (await browser.newContext()).newPage();
+  page.on("console", (message) => {
+    if (message.text().includes("Content Security Policy"))
+      violations.push(message.text());
+  });
   await page.goto("/");
   return page;
 }

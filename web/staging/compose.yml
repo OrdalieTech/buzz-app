@@ -57,12 +57,13 @@ services:
       /bin/sh -c "mc alias set local http://minio:9000 buzz_dev buzz_dev_secret
       && mc mb --ignore-existing local/buzz-media"
 
+  # The production Caddyfile; Caddy serves .localhost names from its local CA.
   caddy:
     environment:
-      STAGING_PORT: ${STAGING_PORT:-9443}
+      BUZZ_DOMAIN: buzz.localhost:${STAGING_PORT:-9443}
     image: caddy:2-alpine
     ports:
       - "127.0.0.1:${STAGING_PORT:-9443}:${STAGING_PORT:-9443}"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ../../dist/web:/srv/web:ro
+      - ../deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../../dist/web:/srv/buzz/web:ro
