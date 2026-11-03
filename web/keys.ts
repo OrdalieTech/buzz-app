@@ -614,6 +614,31 @@ export const keyCommands: Record<string, (args: Args) => unknown> = {
   relay_http_cancel({ id }) {
     reads.get(id)?.abort();
   },
+  /** relay.rs `blossom_auth` for `PUT /upload` of bytes the page hashed. */
+  async relay_upload({ community, sha256 }) {
+    const url = new URL("/upload", origin(community));
+    if (typeof sha256 !== "string" || !HEX.test(sha256))
+      throw "Invalid upload hash";
+    const event = sign(
+      {
+        kind: 24242,
+        created_at: now(),
+        content: "Upload attachment",
+        tags: [
+          ["x", sha256],
+          ["t", "upload"],
+          ["server", url.host],
+          // The relay's strict NIP-FI window is 60 seconds.
+          ["expiration", String(now() + 60)],
+        ],
+      },
+      await secret(),
+    );
+    return {
+      url: url.href,
+      authorization: `Nostr ${btoa(JSON.stringify(event))}`,
+    };
+  },
   relay_verify_signatures({ claims }) {
     if (!Array.isArray(claims)) throw "Invalid signature claims";
     return claims.map((claim) => {

@@ -2,7 +2,7 @@
 // host refuses. web/contract.test.ts fails when an upstream merge adds a
 // command that is neither here nor in commands.ts.
 export const unsupported = [
-  // Media, uploads, downloads and notifications: the next browser host phase.
+  // Media, downloads and notifications: the next browser host phase.
   "clipboard_write_text",
   "dock_permission",
   "file_download",
@@ -11,10 +11,6 @@ export const unsupported = [
   "media_stream_base",
   "notification_permission_state",
   "notification_show",
-  "relay_upload",
-  "relay_upload_begin",
-  "relay_upload_cancel",
-  "relay_upload_chunk",
   "request_notification_access",
   "unread_indicator_set",
   // Relay features not in the browser yet: reminders, channel kits, workflow
