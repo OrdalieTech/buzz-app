@@ -70,7 +70,7 @@ test("pairs a remote agent and reads what it publishes", async ({
   }).toPass();
   await owner.getByRole("button", { name: "I already have a key" }).click();
   await owner
-    .getByLabel("Private key (nsec)")
+    .getByLabel("Private key or backup")
     .fill(nip19.nsecEncode(generateSecretKey()));
   await owner.getByRole("button", { name: "Continue with this key" }).click();
   await owner.getByRole("button", { name: "Join", exact: true }).click();

@@ -84,7 +84,7 @@ test("uploads images, HEIC, video and voice notes", async ({
     ).toBeVisible({ timeout: 2000 });
   }).toPass();
   await page.getByRole("button", { name: "I already have a key" }).click();
-  await page.getByLabel("Private key (nsec)").fill(nip19.nsecEncode(secret));
+  await page.getByLabel("Private key or backup").fill(nip19.nsecEncode(secret));
   await page.getByRole("button", { name: "Continue with this key" }).click();
   await page.getByRole("button", { name: "Join", exact: true }).click();
   await page.getByLabel("Display name").fill(`Uploader ${run}`);
