@@ -80,6 +80,24 @@ export const commands: Record<string, Handler> = {
   relay_publish_read_state: key,
   relay_decode_sidebar: key,
   relay_sign_sidebar: key,
+  /** Relay media, signed by the service worker, saved the browser's way. */
+  async media_download({ source, name }) {
+    const url = new URL(source, location.href);
+    if (
+      url.origin !== location.origin ||
+      !/^\/api\/relay\/[^/]+\/media$/.test(url.pathname)
+    )
+      throw "Invalid media URL";
+    const response = await fetch(url);
+    if (!response.ok) throw "Media download failed";
+    const href = URL.createObjectURL(await response.blob());
+    Object.assign(document.createElement("a"), {
+      href,
+      download: name || url.searchParams.get("url")?.split("/").pop(),
+    }).click();
+    // Revoking at once can cancel the download in Firefox and Safari.
+    setTimeout(() => URL.revokeObjectURL(href), 60_000);
+  },
   // "public" makes relay/native-socket.ts open a browser WebSocket.
   relay_socket_connect: () => "public",
   relay_socket_close: () => undefined,

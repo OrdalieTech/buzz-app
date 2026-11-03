@@ -15,6 +15,8 @@ services:
       BUZZ_S3_ADDRESSING_STYLE: path
       BUZZ_S3_ACCESS_KEY: buzz_dev
       BUZZ_S3_SECRET_KEY: buzz_dev_secret
+      BUZZ_PUSH_ENABLED: "true"
+      BUZZ_PUSH_GATEWAY_DELIVERY_URL: http://webpush:8080/v1/deliveries/apns
     depends_on:
       minio-init:
         condition: service_completed_successfully
@@ -56,6 +58,12 @@ services:
     entrypoint: >
       /bin/sh -c "mc alias set local http://minio:9000 buzz_dev buzz_dev_secret
       && mc mb --ignore-existing local/buzz-media"
+
+  webpush:
+    image: node:22-alpine
+    command: node /webpush.mjs
+    volumes:
+      - ./webpush.mjs:/webpush.mjs:ro
 
   caddy:
     environment:

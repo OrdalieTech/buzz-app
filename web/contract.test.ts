@@ -51,6 +51,13 @@ test("keeps the upstream anchors the web build relies on", () => {
   expect(read("src/features/identity/service.ts")).toContain(
     'import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"',
   );
+  // Relay media at the broker's proxy path, served by web/sw.ts.
+  expect(read("src/features/messages/attachment-source.ts")).toContain(
+    'url.pathname.startsWith("/api/relay") &&',
+  );
+  expect(read("src/features/messages/MediaDownloadAction.tsx")).toContain(
+    'import.meta.env.VITE_BUZZ_BROWSER_HOST === "1" && isProxySource(source)',
+  );
   const html = read("index.html");
   expect(html).toContain('src="/src/main.tsx"');
   expect(html).toContain('content="width=device-width, initial-scale=1.0"');

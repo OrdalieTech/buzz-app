@@ -6,7 +6,7 @@ import {
   DownloadIcon,
 } from "../../shared/design-system/icons";
 import { useNativeDownload } from "./use-native-download";
-import { isNativeMediaSource } from "./attachment-source";
+import { isNativeMediaSource, isProxySource } from "./attachment-source";
 
 const FAILURE_DURATION = 6000;
 
@@ -25,7 +25,11 @@ export function MediaDownloadAction({
   savedDuration?: number;
   onFeedbackVisible?: ((visible: boolean) => void) | undefined;
 }) {
-  if (!isNativeMediaSource(source)) return null;
+  if (
+    !isNativeMediaSource(source) &&
+    !(import.meta.env.VITE_BUZZ_BROWSER_HOST === "1" && isProxySource(source))
+  )
+    return null;
   return (
     <NativeMediaDownload
       key={JSON.stringify([source, name, kind])}

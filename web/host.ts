@@ -9,7 +9,10 @@ mockIPC((command, args) => {
   if (!run) throw `${command} isn't available in the browser.`;
   return run((args ?? {}) as Record<string, unknown>, command);
 });
-// Relay media keeps its URL until the media service worker signs it.
+// Relay media goes through the service worker (web/sw.ts), which signs each
+// read, at the dev broker's same-origin path that upstream treats as relay
+// media (isProxySource in src/features/messages/attachment-source.ts).
 Object.assign(Reflect.get(window, "__TAURI_INTERNALS__"), {
-  convertFileSrc: (url: string) => url,
+  convertFileSrc: (url: string) =>
+    `/api/relay/${encodeURIComponent(new URL(url).host)}/media?url=${encodeURIComponent(url)}`,
 });
