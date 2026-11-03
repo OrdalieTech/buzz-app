@@ -1,8 +1,53 @@
 import { devices, expect, type Page, test } from "@playwright/test";
+import {
+  type EventTemplate,
+  finalizeEvent,
+  generateSecretKey,
+} from "nostr-tools";
 
 const port = process.env.STAGING_PORT ?? "9443";
 const shots = process.env.PHONE_SHOTS;
 const run = Date.now().toString(36);
+// A colleague writes from Node, through Caddy's local CA.
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+/** Someone else in the community, with their own key, signed in over NIP-42. */
+async function colleague() {
+  const secret = generateSecretKey();
+  const socket = new WebSocket(`wss://buzz.localhost:${port}`);
+  const acks = new Map<string, (ok: boolean, reason: string) => void>();
+  const challenge = new Promise<string>((resolve) => {
+    socket.onmessage = ({ data }) => {
+      const [type, id, ok, reason] = JSON.parse(String(data));
+      if (type === "AUTH") resolve(id);
+      if (type === "OK") acks.get(id)?.(ok, reason);
+    };
+  });
+  const send = (type: string, template: Omit<EventTemplate, "created_at">) =>
+    new Promise<void>((resolve, reject) => {
+      const event = finalizeEvent(
+        { ...template, created_at: Math.floor(Date.now() / 1000) },
+        secret,
+      );
+      acks.set(event.id, (ok, reason) =>
+        ok ? resolve() : reject(new Error(`${template.kind}: ${reason}`)),
+      );
+      socket.send(JSON.stringify([type, event]));
+    });
+  await send("AUTH", {
+    kind: 22242,
+    content: "",
+    tags: [
+      ["relay", `wss://buzz.localhost:${port}`],
+      ["challenge", await challenge],
+    ],
+  });
+  return {
+    publish: (kind: number, tags: string[][], content = "") =>
+      send("EVENT", { kind, tags, content }),
+    close: () => socket.close(),
+  };
+}
 
 // The phone layer (web/mobile.ts, web/mobile.css) on emulated phones against
 // the local staging relay. Set PHONE_SHOTS to a directory to keep screenshots.
@@ -131,11 +176,56 @@ for (const [device, engine] of [
     await gesture(page, [width * 0.6, height / 2], [20, height / 2]);
     await expect(drawer).toBeHidden();
     await toggle.tap();
+    // Drawer rows are thumb-sized.
+    const row = page.locator("#shell-navigation .navigation-item", {
+      hasText: channel,
+    });
+    expect((await row.boundingBox())?.height).toBeGreaterThanOrEqual(44);
     await page.getByRole("button", { name: "Inbox" }).tap();
     await toggle.tap();
     await page.getByRole("button", { name: channel }).tap();
     await expect(composer).toBeVisible();
     await expect(composer).not.toBeFocused();
+
+    // A colleague mentions this phone while it reads Inbox: the closed
+    // drawer's toggle carries the channel's dot, and the mention opens from
+    // Inbox as a conversation that Back leaves for the list again.
+    const viewer = await page.evaluate(() =>
+      Reflect.get(window, "__TAURI_INTERNALS__").invoke("identity_restore"),
+    );
+    const channelId = (await row.getAttribute("data-channel-id")) as string;
+    await toggle.tap();
+    await page.getByRole("button", { name: "Inbox" }).tap();
+    const mentioned = `Can you check the deploy log, Phone ${name}?`;
+    const other = await colleague();
+    await other.publish(9021, [["h", channelId]]);
+    await other.publish(
+      9,
+      [
+        ["h", channelId],
+        ["p", viewer],
+      ],
+      mentioned,
+    );
+    other.close();
+    const item = page.getByRole("button", { name: /^Open .* in #phone-/ });
+    await expect(item).toBeVisible();
+    await expect
+      .poll(() =>
+        toggle.evaluate((el) => getComputedStyle(el, "::after").content),
+      )
+      .not.toBe("none");
+    await shot(page, `${name}-6-inbox`);
+    await item.tap();
+    await expect(page.getByText(mentioned).last()).toBeVisible();
+    await expect(item).toBeHidden();
+    await shot(page, `${name}-7-inbox-open`);
+    await page.goBack();
+    await expect(item).toBeVisible();
+    await shot(page, `${name}-8-inbox-back`);
+    await toggle.tap();
+    await row.tap();
+    await expect(composer).toBeVisible();
 
     // A long press reveals the message's actions.
     const first = page
