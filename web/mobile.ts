@@ -430,3 +430,33 @@ document.addEventListener(
       location.reload();
   });
 }
+
+// Reading only counts while focus is in the conversation
+// (src/features/messages/use-reading.ts). On desktop a channel opens into its
+// composer; on touch nothing takes focus, so nothing was ever marked read.
+// Hand focus to the message list, which takes it without raising the keyboard.
+{
+  const LIST = "[data-message-scroller]";
+  const read = (target?: EventTarget | null) => {
+    if (!touch.matches || document.querySelector(DRAWER)) return;
+    const active = document.activeElement;
+    if (active?.matches(TEXT_INPUT) || active?.closest(LIST)) return;
+    const list =
+      (target as Element | null)?.closest?.<HTMLElement>(LIST) ??
+      [...document.querySelectorAll<HTMLElement>(LIST)]
+        .filter(
+          (el) =>
+            el.getClientRects().length &&
+            !el.closest('[inert], [hidden], [aria-hidden="true"]'),
+        )
+        .at(-1);
+    list?.focus({ preventScroll: true });
+  };
+  // After the tap's own navigation and render.
+  const soon = (event: Event) => setTimeout(() => read(event.target), 400);
+  for (const type of ["click", "hashchange", "popstate"])
+    addEventListener(type, soon, { passive: true });
+  document.addEventListener("visibilitychange", (event) => {
+    if (document.visibilityState === "visible") soon(event);
+  });
+}

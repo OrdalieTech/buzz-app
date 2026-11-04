@@ -226,6 +226,21 @@ for (const [device, engine] of [
     await toggle.tap();
     await row.tap();
     await expect(composer).toBeVisible();
+    // Reading counts only with focus in the conversation, which a tap on a
+    // phone doesn't give it; the list takes it, so the mention gets read.
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => !!document.activeElement?.closest("[data-message-scroller]"),
+        ),
+      )
+      .toBe(true);
+    await expect
+      .poll(
+        () => toggle.evaluate((el) => getComputedStyle(el, "::after").content),
+        { timeout: 20_000 },
+      )
+      .toBe("none");
 
     // A long press reveals the message's actions.
     const first = page
