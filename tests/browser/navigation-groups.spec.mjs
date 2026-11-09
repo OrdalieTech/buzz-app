@@ -5,6 +5,7 @@ import { open } from "./timeline.mjs";
 import { holdReadingFocus } from "./reading.mjs";
 
 test.use({
+  enabledPlugins: ["buzz.workflows"],
   productionBroker: true,
   savedSidebar: true,
   developmentReact: true,
@@ -670,6 +671,13 @@ test("dismissing a failed move restores keyboard focus to its placement or a sur
       .getByRole("menuitemradio", { name: "Starred", exact: true })
       .click();
     await expect(error).toContainText("Relay request failed (502)");
+    // The alert arrives with the rollback, but the optimistic Starred copy of
+    // the row stays laid out while it fades out, and its removal moves every
+    // section below it. Wait for the exit, or a press on Work's header can
+    // finish on the row that slid under it, which is no click.
+    await expect(sidebar(page).locator('[data-channel-id="beta"]')).toHaveCount(
+      1,
+    );
     await expect(beta).toBeVisible();
   };
   const dismiss = async () => {
@@ -763,7 +771,7 @@ test("Create new supports cancel, moves before publication, and retries the same
     await started.promise;
     await expect(dialog).toHaveCount(0);
     const createdGroup = sidebar(page)
-      .locator("[data-sidebar-section]")
+      .locator('[data-sidebar-section^="group:"]')
       .filter({ has: page.locator("summary", { hasText: /^Launch$/ }) });
     await expect(
       createdGroup.locator('[data-channel-id="beta"]'),
@@ -820,7 +828,7 @@ test("Create new supports cancel, moves before publication, and retries the same
     await dialog.getByRole("button", { name: "Create and move" }).click();
     await nextStarted.promise;
     const nextGroup = sidebar(page)
-      .locator("[data-sidebar-section]")
+      .locator('[data-sidebar-section^="group:"]')
       .filter({
         has: page.locator("summary", { hasText: /^Follow-up$/ }),
       });
@@ -876,13 +884,18 @@ test("Create new retains its draft when preferences fail before submission and r
   await page.getByText("Diagnostics", { exact: true }).click();
   const held = gate(),
     started = gate();
+  // Transient at first, so relay recovery owns the failure and shows its notice.
+  let status = 502;
   const failLegacy = async (route) => {
     started.resolve();
     await held.promise;
-    app.report.sidebarPreferenceFailures ??= [];
-    app.report.sidebarPreferenceFailures.push(route.request().url());
+    const failed = status;
+    const failures =
+      failed === 502 ? "sidebarPreferenceFailures" : "relayFailures";
+    app.report[failures] ??= [];
+    app.report[failures].push(route.request().url());
     await route.fulfill({
-      status: 502,
+      status: failed,
       contentType: "application/json",
       body: JSON.stringify({ error: "Preferences unavailable" }),
     });
@@ -909,23 +922,30 @@ test("Create new retains its draft when preferences fail before submission and r
     );
     held.resolve();
     await failed;
-    // The one recovery notice reports it; there is no separate preferences toast.
-    // The modal makes the page inert, so match the inline notice by attribute.
-    await expect(
-      page.locator('[role="status"][aria-label="Reconnecting to relay…"]'),
-    ).toBeVisible();
     await expect(
       dialog.getByRole("button", { name: "Create and move" }),
     ).toBeDisabled();
     await expect(dialog).toBeVisible();
     await expect(field).toHaveValue("Retained launch");
     await expect(dialog.getByRole("alert")).toContainText("Retry preferences");
+    // Relay recovery owns the transient failure: it stays quiet through its
+    // delay, and there is no separate preferences toast.
+    await expect(page.locator(".buzz-toast")).toHaveCount(0);
     expect(app.report.sidebarPublications ?? []).toHaveLength(0);
     // Another failed recovery must keep both the draft and recovery action.
+    // Recovery would retry a transient failure on its own seconds later, and
+    // after the unroute below that read could remove Retry preferences while
+    // the final click is still landing. A 4xx is not transient, so recovery
+    // leaves it alone and the dialog's Retry is the only way out. The test
+    // flips the status here, not the click, so a recovery read that lands
+    // first also gets a 403 and can satisfy the response wait. Reads
+    // serialize behind the disabled Retry, so toBeEnabled still waits for the
+    // manual read.
+    status = 403;
     const retryFailed = page.waitForResponse(
       (response) =>
         new URL(response.url()).pathname.endsWith("/sidebar-preferences") &&
-        response.status() === 502,
+        response.status() === 403,
     );
     await dialog
       .getByRole("button", { name: "Retry preferences", exact: true })
@@ -949,7 +969,7 @@ test("Create new retains its draft when preferences fail before submission and r
     await dialog.getByRole("button", { name: "Create and move" }).click();
     await expect(dialog).toHaveCount(0);
     const destination = sidebar(page)
-      .locator("[data-sidebar-section]")
+      .locator('[data-sidebar-section^="group:"]')
       .filter({
         has: page.locator("summary", { hasText: /^Retained launch$/ }),
       })
@@ -995,8 +1015,6 @@ scrollTest(
     await expect(
       page.getByRole("textbox", { name: "Message #Beta", exact: true }),
     ).toBeVisible();
-    await openPage(page, "Workflows");
-    await expect(sidebar).toBeVisible();
     // Navigation reveals the current entry; keep Beta in view at a nonzero
     // offset so the warm return has no reason to move the list.
     const scroll = await sidebar.evaluate((element) => {
@@ -1007,6 +1025,8 @@ scrollTest(
       return element.scrollTop;
     });
     expect(scroll).toBeGreaterThan(100);
+    await openPage(page, "Workflows");
+    await expect(sidebar).toBeHidden();
     let release;
     const held = new Promise((resolve) => {
       release = resolve;
@@ -1024,7 +1044,7 @@ scrollTest(
         const list = document.querySelector(
           'nav[aria-label="Subscribed channels"]',
         );
-        if (list)
+        if (list?.checkVisibility())
           window.sidebarFrames.push({
             top: list.scrollTop,
             groups: Array.from(list.querySelectorAll("summary"), (el) =>
@@ -1070,9 +1090,12 @@ scrollTest(
   },
 );
 
-// Browser-owned integration: the persistent sidebar's
-// menu/dialog portals, and encrypted saves while Messages is not mounted.
-test("Move and Create stay available on Workflows", async ({ page, app }) => {
+// Browser-owned integration: menu/dialog portals, encrypted saves, and
+// retained sidebar placement across app changes and reload.
+test("Move and Create persist across apps without a sidebar", async ({
+  page,
+  app,
+}) => {
   await open(page, app);
   await openPage(page, "Workflows");
   const projects = page.getByRole("heading", {
@@ -1080,6 +1103,8 @@ test("Move and Create stay available on Workflows", async ({ page, app }) => {
     exact: true,
   });
   await expect(projects).toBeVisible();
+  await expect(sidebar(page)).toBeHidden();
+  await openPage(page, "Messages");
   const node = await sidebar(page).elementHandle();
   const menu = await openMove(page, rowIn(page, "group:work"));
   const actions = page.getByRole("menu", {
@@ -1102,9 +1127,12 @@ test("Move and Create stay available on Workflows", async ({ page, app }) => {
     ({ name }) => name === "Off-page group",
   );
   await expect(rowIn(page, `group:${section.id}`)).toBeFocused();
+  await openPage(page, "Workflows");
   await expect(projects).toBeVisible();
   expect(await node.evaluate((element) => element.isConnected)).toBe(true);
   await page.reload();
   await expect(projects).toBeVisible();
+  await expect(sidebar(page)).toBeHidden();
+  await openPage(page, "Messages");
   await expect(rowIn(page, `group:${section.id}`)).toBeVisible();
 });

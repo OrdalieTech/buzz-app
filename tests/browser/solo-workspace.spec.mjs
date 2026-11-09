@@ -188,7 +188,7 @@ test("Solo chat Activity opens the agent's profile locally, restores per convers
   await trigger.hover();
   const preview = page.getByRole("dialog", { name: "Working now" });
   await expect(preview).toBeVisible();
-  await trigger.click();
+  await preview.getByRole("button", { name: /^View .+ activity$/ }).click();
   const panel = agentProfile(page);
   await expect(panel).toBeVisible();
   await expect(panel.locator("code").first()).toHaveText(
@@ -200,6 +200,7 @@ test("Solo chat Activity opens the agent's profile locally, restores per convers
   await closeProfile(page).click();
   await expect(trigger).toBeFocused();
   await trigger.press("Enter");
+  await preview.getByRole("button", { name: /^View .+ activity$/ }).click();
   await expect(panel).toBeVisible();
   await sidebar.getByRole("button", { name: "Beta", exact: true }).click();
   await expect(panel).toHaveCount(0);
@@ -220,6 +221,7 @@ test("Solo chat Activity opens the agent's profile locally, restores per convers
   await expect(preview).toBeHidden();
   await expect(trigger).toBeFocused();
   await trigger.press("Enter");
+  await preview.getByRole("button", { name: /^View .+ activity$/ }).click();
   await expect(panel).toBeVisible();
   await openSettings(page);
   await selectSettingsSection(page, "Manage plugins");
@@ -651,16 +653,14 @@ test.describe("personal recipients", () => {
         name: "Mention a member or agent",
       });
       await expect(
-        linkedPicker.getByRole("button", {
-          name: `${brain.name} ${brain.pubkey}`,
-          exact: true,
-        }),
+        linkedPicker
+          .getByRole("button")
+          .and(page.locator(`[data-mention-choice="${brain.pubkey}"]`)),
       ).toBeVisible();
       await expect(
-        linkedPicker.getByRole("button", {
-          name: `${outsider.name} ${outsider.pubkey}`,
-          exact: true,
-        }),
+        linkedPicker
+          .getByRole("button")
+          .and(page.locator(`[data-mention-choice="${outsider.pubkey}"]`)),
       ).toHaveCount(0);
       await page.keyboard.press("Escape");
       expect(publications()).toHaveLength(1);

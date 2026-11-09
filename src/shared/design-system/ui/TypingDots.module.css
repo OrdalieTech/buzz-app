@@ -55,3 +55,11 @@
   width: calc(var(--space-1) - 1px);
   height: calc(var(--space-1) - 1px);
 }
+
+.dots[data-size="message"] {
+  gap: var(--space-1);
+}
+.dots[data-size="message"] > span {
+  width: var(--space-1);
+  height: var(--space-1);
+}

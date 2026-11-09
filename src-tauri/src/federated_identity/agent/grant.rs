@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
-use super::super::store::{self, SERVICE};
+use super::super::store;
 
 // No Debug, no IPC serialization. Only the secure store serializes this record.
 #[derive(Clone, Deserialize, Serialize)]
@@ -81,68 +81,48 @@ pub(crate) fn load(
     }
 }
 
-pub(crate) struct SecureGrantStore;
+/// Grants in the owner's bundle where it exists (see `store::BUNDLED`).
+pub(crate) struct SecureGrantStore(pub(crate) String);
 
-// Grant records share the session records' secure-store owner and lock.
+impl SecureGrantStore {
+    fn store(&self) -> Result<store::SecureStore, &'static str> {
+        Ok(store::SecureStore {
+            account: self.0.clone(),
+            root: store::root().map_err(|_| "Secure storage is unavailable")?,
+            bundled: store::BUNDLED,
+        })
+    }
+    fn raw(&self, key: &str) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str> {
+        self.store()?
+            .grant(key)
+            .map_err(|_| "Secure storage is unavailable")
+    }
+    fn set(&self, key: &str, value: Option<&[u8]>) -> Result<(), &'static str> {
+        self.store()?
+            .set_grant(key, value)
+            .map_err(|_| "Secure storage is unavailable")
+    }
+}
+
 impl GrantStore for SecureGrantStore {
     fn read(&self, key: &str) -> Result<Option<Grant>, &'static str> {
-        raw(key)?
+        self.raw(key)?
             .map(|raw| serde_json::from_slice(&raw).map_err(|_| "Stored agent grant is unreadable"))
             .transpose()
     }
     fn write(&self, key: &str, grant: &Grant) -> Result<(), &'static str> {
         let next = Zeroizing::new(serde_json::to_vec(grant).map_err(|_| "Invalid agent grant")?);
-        store::register_grant(storage_root()?, key, || {
-            let current = raw(key)?;
-            buzz_credential_store::compare_session(
-                SERVICE,
-                key,
-                current.as_deref().map(Vec::as_slice),
-                Some(&next),
-            )
-            .map_err(|_| "Secure storage is unavailable")
-        })
+        self.set(key, Some(&next))
     }
     fn pending(&self, key: &str) -> Result<bool, &'static str> {
-        raw(key).map(|raw| raw.is_some())
+        self.raw(key).map(|raw| raw.is_some())
     }
-    // Indexed like a grant, so a full Buzz sign-out erases it with them.
+    // Kept beside the grants, so a full Buzz sign-out erases it with them.
     fn set_pending(&self, key: &str, pending: bool) -> Result<(), &'static str> {
-        if !pending {
-            return self.delete(key);
-        }
-        store::register_grant(storage_root()?, key, || {
-            let current = raw(key)?;
-            buzz_credential_store::compare_session(
-                SERVICE,
-                key,
-                current.as_deref().map(Vec::as_slice),
-                Some(b"retiring".as_slice()),
-            )
-            .map_err(|_| "Secure storage is unavailable")
-        })
+        self.set(key, pending.then_some(b"retiring".as_slice()))
     }
     fn delete(&self, key: &str) -> Result<(), &'static str> {
-        store::unregister_grant(
-            storage_root()?,
-            key,
-            || match buzz_credential_store::delete_session(SERVICE, key) {
-                Ok(()) | Err(buzz_credential_store::Error::Absent) => Ok(()),
-                Err(_) => Err("Secure storage is unavailable"),
-            },
-        )
-    }
-}
-
-fn storage_root() -> Result<std::path::PathBuf, &'static str> {
-    store::root().map_err(|_| "Secure storage is unavailable")
-}
-
-fn raw(key: &str) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str> {
-    match buzz_credential_store::read_session(SERVICE, key) {
-        Ok(raw) => Ok(Some(raw)),
-        Err(buzz_credential_store::Error::Absent) => Ok(None),
-        Err(_) => Err("Secure storage is unavailable"),
+        self.set(key, None)
     }
 }
 

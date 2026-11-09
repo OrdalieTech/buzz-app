@@ -45,11 +45,13 @@ vi.mock("../bundled", async () => ({
     },
   ],
 }));
-// The browser sign-in, which the seeded account below never sends anywhere.
-vi.mock("../bundled/builderlab/oauth/first-run", () => ({
-  bundledHost: { request: vi.fn() },
+// The NIP-FI sign-in, whose seeded account below never sends anywhere.
+vi.mock("../bundled/builderlab/oauth/first-run", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("../bundled/builderlab/oauth/first-run")
+  >()),
   firstRunCredential: vi.fn(async () => ({
-    value: "private-token",
+    revision: "private-token",
     account: {
       subject: "user",
       email: "a@example.com",
@@ -91,6 +93,8 @@ beforeEach(() => {
   requests = [];
   vi.useFakeTimers({ shouldAdvanceTime: true });
   vi.stubEnv("VITE_BUZZ_LIVE", "0");
+  // First run signs in to Builderlab only in an FI build.
+  vi.stubEnv("VITE_BUZZ_FEDERATED_IDENTITY", "1");
   vi.stubEnv("VITE_BUZZ_OPEN_RELAY", "");
   vi.stubEnv(
     "VITE_BUZZ_FIRST_RUN_ACCOUNT",
@@ -225,7 +229,7 @@ function relayAnswer(args: unknown) {
 const notice = () => screen.queryByText("This destination couldn’t open");
 const joinDialog = () =>
   screen.queryByRole("dialog", { name: "Join a community" });
-/** Landing address → Connect from the choice → Create my key → the restore lifts the gate. */
+/** Landing address → Connect from the choice → setup runs on its own → the restore lifts the gate. */
 async function firstRunWithAddress(
   user: ReturnType<typeof userEvent.setup>,
   address = "relay-b.example",
@@ -237,15 +241,17 @@ async function firstRunWithAddress(
   await act(async () => {
     await vi.advanceTimersByTimeAsync(15_000);
   });
+  await user.click(
+    await screen.findByRole("button", { name: "Other options" }),
+  );
   await user.type(
-    await screen.findByRole("textbox", { name: "Community URL" }),
+    await screen.findByRole("textbox", {
+      name: "Community address or invite link",
+    }),
     `${address}{Enter}`,
   );
   await user.click(
-    await screen.findByRole("button", { name: "Sign in with email" }),
-  );
-  await user.click(
-    await screen.findByRole("button", { name: "Create my key" }),
+    await screen.findByRole("button", { name: "Sign in with Builderlab" }),
   );
   const dialog = await screen.findByRole("dialog", {
     name: "Join a community",
@@ -346,9 +352,7 @@ async function accessStep(
   dialog: HTMLElement,
 ) {
   await user.click(within(dialog).getByRole("button", { name: "Continue" }));
-  const field = await within(dialog).findByLabelText(
-    "Invite code (if required)",
-  );
+  const field = await within(dialog).findByLabelText("Invite code");
   expect(field).toHaveValue(code);
   // Nothing is claimed until the user continues from this step.
   expect(inviteRequests()).toEqual([]);
@@ -371,7 +375,7 @@ it.each([
     if (published) {
       await user.click(
         within(dialog).getByRole("checkbox", {
-          name: "I agree to this community’s Terms of Service and Privacy Notice.",
+          name: "I agree to this community’s Terms of Service.",
         }),
       );
       await user.click(
@@ -443,9 +447,7 @@ it("a refused handed-off code keeps the dialog open with the refusal and stays o
     "/api/invites/claim",
   );
   expect(joinDialog()).toBe(dialog);
-  expect(
-    within(dialog).getByLabelText("Invite code (if required)"),
-  ).toHaveValue(code);
+  expect(within(dialog).getByLabelText("Invite code")).toHaveValue(code);
   expect(current.communities.snapshot()).toMatchObject({
     memberships: [{ id: relayA }],
     selected: relayA,

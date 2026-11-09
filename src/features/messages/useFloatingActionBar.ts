@@ -7,6 +7,7 @@ import {
   type RefObject,
 } from "react";
 import { flushSync } from "react-dom";
+import { useMessageDensity } from "../../shared/theme/message-density";
 import {
   behindActiveOverlay,
   observeOverlays,
@@ -57,7 +58,11 @@ export function useMessageActionBarReady(
       document.documentElement.hasAttribute("data-keyboard-navigation"),
   );
   useEffect(() => {
-    const row = rowRef?.current;
+    // Response activity is a sibling of the painted message. Interaction with
+    // either belongs to the same message and must prepare its focus destination.
+    const row =
+      rowRef?.current?.closest<HTMLElement>("[data-message-id]") ??
+      rowRef?.current;
     if (ready || !row) return;
     const activate = () => setReady(true);
     const query = floating();
@@ -99,10 +104,13 @@ export function useFloatingActionBar(
   open: boolean,
 ) {
   const floating = useSyncExternalStore(subscribe, snapshot, () => false);
+  const compact = useMessageDensity() === "compact";
   const [revealed, setRevealed] = useState(false);
   const contentBounds = useRef<{
     content: DOMRect;
     toolbar: DOMRect;
+    /** Byline band from the content to a bar moved off the author's name. */
+    clearance: DOMRect | null;
   } | null>(null);
 
   useEffect(() => {
@@ -113,13 +121,23 @@ export function useFloatingActionBar(
       target instanceof Element && row.contains(target)
         ? target.closest(contentSelector)
         : null;
+    // The toolbar is clamped to the scroller, not the row, so a short bubble's
+    // route can cross the scroller's empty gutter. It never crosses another row.
+    const scroller = row.closest("[data-message-scroller]");
+    const routeSurface = (target: Element) =>
+      row.contains(target) ||
+      (!!scroller?.contains(target) && !target.closest("[data-layout]"));
     const hoverTarget = (target: EventTarget | null, event: PointerEvent) => {
       if (
         !(target instanceof Element) ||
         target.closest("[data-media-timecode], [data-message-reactions]")
       )
         return false;
-      if (bar.contains(target) || contentAt(target)) return true;
+      if (
+        bar.contains(target) ||
+        (compact ? row.contains(target) : contentAt(target))
+      )
+        return true;
       // Retain only an active hover: content gaps and the tapered route to the
       // toolbar are pass-through geometry, never activation or hit surfaces.
       const bounds = contentBounds.current;
@@ -130,10 +148,10 @@ export function useFloatingActionBar(
         bounds.content.height <= 0 ||
         bounds.toolbar.width <= 0 ||
         bounds.toolbar.height <= 0 ||
-        !row.contains(target)
+        !routeSurface(target)
       )
         return false;
-      const { content, toolbar } = bounds;
+      const { content, toolbar, clearance } = bounds;
       const { clientX: x, clientY: y } = event;
       if (
         target.closest("[data-message-payload]") &&
@@ -143,9 +161,23 @@ export function useFloatingActionBar(
         y <= content.bottom
       )
         return true;
-      if (y < toolbar.bottom || y > content.bottom) return false;
-      const span = content.bottom - toolbar.bottom;
-      const fraction = span > 0 ? (y - toolbar.bottom) / span : 0;
+      // A bar moved off the author's name no longer meets the content's top
+      // edge: the byline band from the content to the bar keeps the hover on
+      // the way to either end.
+      if (
+        clearance &&
+        x >= clearance.left &&
+        x <= clearance.right &&
+        y >= clearance.top &&
+        y <= clearance.bottom
+      )
+        return true;
+      // Browser hit testing can round a fractional toolbar edge inward.
+      // Keep the active path through that edge pixel until the bar takes over.
+      const toolbarBottom = Math.floor(toolbar.bottom);
+      if (y < toolbarBottom || y > content.bottom) return false;
+      const span = content.bottom - toolbarBottom;
+      const fraction = span > 0 ? (y - toolbarBottom) / span : 0;
       const left = Math.min(
         content.left,
         toolbar.left + (content.left - toolbar.left) * fraction,
@@ -156,11 +188,10 @@ export function useFloatingActionBar(
       );
       return x >= left && x <= right;
     };
-    // The row includes empty space, bylines and accessories. Only painted
-    // message content and the top-layer toolbar reveal pointer actions.
+    // Compact activates across the row; Default uses painted message content.
     const initialContent = row.querySelector(`:is(${contentSelector}):hover`);
     let hovered =
-      (!!initialContent &&
+      ((compact ? row.matches(":hover") : !!initialContent) &&
         !row.querySelector(
           ":is([data-media-timecode], [data-message-reactions]):hover",
         )) ||
@@ -172,20 +203,66 @@ export function useFloatingActionBar(
       (row.matches(":has(:focus-visible)") ||
         (document.documentElement.hasAttribute("data-keyboard-navigation") &&
           row.contains(document.activeElement)));
+    // A preview card joins the top layer after a toolbar that is already
+    // shown. Hiding that toolbar while the card is open would show it again
+    // above the card on the next hover, so this row's open preview keeps it.
+    // The card's close releases it. The selector finds a preview trigger with
+    // any popup open, not only its card: MessageLink's context menu shares
+    // the link, so that menu holds the toolbar too, hidden behind the menu.
+    let shown = false;
     const update = (focused = keyboardFocus()) => {
       const ownsPopup = !!bar.querySelector(
         '[aria-haspopup][aria-expanded="true"]',
       );
-      const next = hovered || focused || open || ownsPopup;
+      const next =
+        hovered ||
+        focused ||
+        open ||
+        ownsPopup ||
+        (shown &&
+          !!row.querySelector("[data-preview-card-trigger][data-popup-open]"));
+      shown = next;
       if (!next) row.removeAttribute("data-actions-revealed");
       setRevealed(next);
     };
+    // Pointer events outside the row never reach its listeners. Follow a
+    // retained route through the gutter until it re-enters the row or leaves.
+    let tracking = false;
+    const outside = (event: PointerEvent) => {
+      const target =
+        event.type === "pointerout" ? event.relatedTarget : event.target;
+      if (target instanceof Node && row.contains(target)) return;
+      const next = hoverTarget(target, event);
+      if (!next) track(false);
+      if (hovered === next) return;
+      hovered = next;
+      update();
+    };
+    const track = (next: boolean) => {
+      if (tracking === next) return;
+      tracking = next;
+      if (next) {
+        document.addEventListener("pointermove", outside, true);
+        document.addEventListener("pointerout", outside, true);
+      } else {
+        document.removeEventListener("pointermove", outside, true);
+        document.removeEventListener("pointerout", outside, true);
+      }
+    };
     const over = (event: PointerEvent) => {
+      track(false);
       hovered = hoverTarget(event.target, event);
       update();
     };
     const out = (event: PointerEvent) => {
       hovered = hoverTarget(event.relatedTarget, event);
+      track(
+        hovered &&
+          !(
+            event.relatedTarget instanceof Node &&
+            row.contains(event.relatedTarget)
+          ),
+      );
       update();
     };
     const move = (event: PointerEvent) => {
@@ -216,7 +293,7 @@ export function useFloatingActionBar(
       subtree: true,
       childList: true,
       attributes: true,
-      attributeFilter: ["aria-expanded"],
+      attributeFilter: ["aria-expanded", "data-popup-open"],
     });
     update();
     return () => {
@@ -225,10 +302,11 @@ export function useFloatingActionBar(
       row.removeEventListener("pointermove", move);
       row.removeEventListener("focusin", focusIn);
       row.removeEventListener("focusout", focusOut);
+      track(false);
       observer.disconnect();
       row.removeAttribute("data-actions-revealed");
     };
-  }, [floating, open, rowRef, barRef]);
+  }, [floating, compact, open, rowRef, barRef]);
 
   useLayoutEffect(() => {
     const row = rowRef?.current;
@@ -236,19 +314,34 @@ export function useFloatingActionBar(
     const slot = slotRef.current;
     if (!floating || !revealed || !row || !bar || !slot) return;
     const scroller = row.closest<HTMLElement>("[data-message-scroller]");
+    const threadRoot =
+      row.parentElement?.matches("[data-thread-rows] > [data-message-id]") ??
+      false;
     const workspaceSelector = "[data-main-workspace], [data-panel-workspace]";
     const workspace = row.closest(workspaceSelector);
     let frame = 0;
-    const updateVisibility = () => {
-      const blocked = behindActiveOverlay(row);
-      const ownsPopup = !!bar.querySelector(
+    // Returns whether the row shows as revealed. Positioning defers that row
+    // write until the bar is placed, so an offscreen frame writes nothing.
+    const updateVisibility = (reveal = true) => {
+      const trigger = bar.querySelector(
         '[aria-haspopup][aria-expanded="true"]',
       );
+      const ownsPopup = !!trigger;
+      // The bar's own menu opens beside its trigger, so the bar stays to show
+      // what the menu acts on. Pickers, modals and other popups still cover it.
+      const menu =
+        trigger?.getAttribute("aria-haspopup") === "menu"
+          ? document.getElementById(trigger.getAttribute("aria-controls") ?? "")
+          : null;
+      const blocked = behindActiveOverlay(row, menu);
       // The toolbar yields, but its popup must still identify the target message.
-      row.toggleAttribute("data-actions-revealed", !blocked || ownsPopup);
+      const revealed = !blocked || ownsPopup;
+      if (reveal) row.toggleAttribute("data-actions-revealed", revealed);
       bar.style.visibility = blocked ? "hidden" : "";
+      return revealed;
     };
     const hide = () => {
+      row.removeAttribute("data-actions-revealed");
       contentBounds.current = null;
       if (bar.hasAttribute("popover")) bar.hidePopover?.();
       // Closed popovers return to their slot's containing block. Viewport offsets
@@ -314,13 +407,17 @@ export function useFloatingActionBar(
           Math.max(whole.bottom, rect.bottom) - top,
         );
       }
+      // The author's name opens a profile; the bar must not cover it.
+      const author = row
+        .querySelector("[data-message-author]")
+        ?.getBoundingClientRect();
       if (covered(anchor)) {
         hide();
         return;
       }
       // Hide the painting and keyboard controls without moving the anchor of
       // a picker launched from this bar. Base UI owns dismissal/return focus.
-      updateVisibility();
+      const rowRevealed = updateVisibility(false);
       // Style reads are cheap here: the rect reads above already left layout clean.
       const style = getComputedStyle(bar);
       const overlap = Number.parseFloat(style.scrollMarginBlockStart) || 0;
@@ -328,6 +425,10 @@ export function useFloatingActionBar(
       const rtl = getComputedStyle(row).direction === "rtl";
       const viewport = scroller?.getBoundingClientRect();
       const rowBounds = row.getBoundingClientRect();
+      if (viewport && (threadRoot ? whole.bottom : whole.top) <= viewport.top) {
+        hide();
+        return;
+      }
       const start =
         Math.max(0, viewport?.left ?? rowBounds.left) + (viewport ? gap : 0);
       const end =
@@ -344,31 +445,77 @@ export function useFloatingActionBar(
       const width = bar.offsetWidth;
       // Layout height: an opening scale transition must not move the bar.
       const height = bar.offsetHeight;
-      // Keep main's single above location while clearing every part of the
-      // message. No attachment-specific placement or pointer anchor is needed.
-      bar.style.transformOrigin = rtl ? "left bottom" : "right bottom";
       // Only a text-first message has bubble padding to overlap.
       const aboveOverlap = first.closest("[data-message-attachments]")
         ? 0
         : overlap;
-      const top = whole.top + aboveOverlap;
-      const paintedTop = top - height;
-      if (
-        viewport &&
-        (whole.top <= viewport.top || paintedTop >= viewport.bottom)
-      ) {
+      const aboveTop = compact
+        ? rowBounds.top + overlap
+        : whole.top + aboveOverlap;
+      const abovePaintedTop = aboveTop - height;
+      // Only the thread root nests below its sticky header. Timeline and reply
+      // toolbars retain their above-message placement and clipping.
+      const nested =
+        threadRoot &&
+        !!viewport &&
+        abovePaintedTop < viewport.top + height + overlap;
+      const paintedTop = nested
+        ? Math.max(rowBounds.top + overlap, viewport.top + overlap)
+        : abovePaintedTop;
+      const top = paintedTop + height;
+      if (viewport && paintedTop >= viewport.bottom) {
         hide();
         return;
       }
+      bar.style.transformOrigin = nested
+        ? rtl
+          ? "left top"
+          : "right top"
+        : rtl
+          ? "left bottom"
+          : "right bottom";
+      // The row's siblings observer would reschedule on every row write; an
+      // unchanged toggle records no mutation.
+      row.toggleAttribute("data-actions-revealed", rowRevealed);
       // Keep the pane header clickable as actions scroll beneath its edge.
       const hidden = viewport ? viewport.top - paintedTop : 0;
       bar.style.clipPath =
         hidden > 0 ? `inset(${hidden}px -100vmax -100vmax)` : "";
-      const left = rtl ? whole.left - overlap : whole.right - width + overlap;
-      const placedLeft = Math.max(start, Math.min(left, end - width));
+      const left = compact
+        ? rtl
+          ? start
+          : end - width
+        : rtl
+          ? whole.left - overlap
+          : whole.right - width + overlap;
+      // Over a short message the bar would cover the name, so it clears the
+      // name on the side with room. A mirrored row keeps its place: its bar
+      // already ends at the avatar.
+      const cleared =
+        !compact &&
+        author?.width &&
+        author.bottom > paintedTop &&
+        author.top < top &&
+        !row.hasAttribute("data-viewer-message")
+          ? rtl
+            ? Math.min(left, author.left - gap - width)
+            : Math.max(left, author.right + gap)
+          : left;
+      const placedLeft = Math.max(start, Math.min(cleared, end - width));
+      const toolbar = new DOMRect(placedLeft, paintedTop, width, height);
+      const clearanceLeft = Math.min(whole.left, toolbar.left);
       contentBounds.current = {
         content: whole,
-        toolbar: new DOMRect(placedLeft, paintedTop, width, height),
+        toolbar,
+        clearance:
+          cleared === left
+            ? null
+            : new DOMRect(
+                clearanceLeft,
+                paintedTop,
+                Math.max(whole.right, toolbar.right) - clearanceLeft,
+                height,
+              ),
       };
       bar.style.top = `${top}px`;
       bar.style.left = `${placedLeft}px`;
@@ -476,8 +623,11 @@ export function useFloatingActionBar(
       siblings.disconnect();
       unobserveOverlays();
       hide();
+      // An overlay or positioning update can restore this attribute between a
+      // hover update removing it and React committing the hidden bar.
+      row.removeAttribute("data-actions-revealed");
     };
-  }, [floating, revealed, rowRef, barRef, slotRef]);
+  }, [floating, compact, revealed, rowRef, barRef, slotRef]);
 
   return floating;
 }

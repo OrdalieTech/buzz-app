@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime};
@@ -316,4 +317,262 @@ fn help_names_the_path_an_outside_agent_runs() {
     let usage = stdout(&helper(home.path(), None, &["--help"]));
     let path = env!("CARGO_BIN_EXE_buzz-agent-command");
     assert!(usage.contains(&format!("{path} tools")), "{usage}");
+}
+
+// The shell stands in for Buzz's process owner. The helper is a group leader,
+// exactly as the native host starts it, while the loop creates a descendant.
+struct RunningCommand {
+    host: std::process::Child,
+    group: i32,
+    child: i32,
+}
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-self.group, libc::SIGKILL);
+        }
+        let _ = self.host.kill();
+        let _ = self.host.wait();
+    }
+}
+fn running_command(home: &Path, connection: &str, label: &str) -> RunningCommand {
+    running_script(home, connection, label, "sleep 600 & echo \"$$ $!\"; wait")
+}
+fn running_script(home: &Path, connection: &str, label: &str, script: &str) -> RunningCommand {
+    use std::process::Stdio;
+    let mut host = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "set -m; \"$@\" & wait",
+            "buzz-host",
+            env!("CARGO_BIN_EXE_buzz-agent-command"),
+            "--launch",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .env("HOME", home)
+        .env("BUZZ_AGENT_CONNECTION", connection)
+        .env("BUZZ_ATTENTION_COMMAND", label)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(host.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let ids: Vec<i32> = line
+        .split_whitespace()
+        .map(|id| id.parse().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "command never started: {line}");
+    // Its direct child is the helper; get it without assuming a scheduling delay.
+    let output = Command::new("pgrep")
+        .args(["-P", &host.id().to_string()])
+        .output()
+        .unwrap();
+    let group = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    RunningCommand {
+        host,
+        group,
+        child: ids[1],
+    }
+}
+fn alive(pid: i32) -> bool {
+    // A zombie has stopped executing but awaits its new parent's reap.
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .any(|state| !state.starts_with('Z'))
+}
+fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+#[test]
+fn command_tree_exits_when_its_host_dies() {
+    let home = tempfile::tempdir().unwrap();
+    let connection = connection(&server("lifetime", &[]), "lifetime", false);
+    let mut running = running_command(home.path(), &connection, "agent/watch");
+    running.host.kill().unwrap();
+    running.host.wait().unwrap();
+    assert!(
+        wait_until(|| !alive(running.group) && !alive(running.child)),
+        "orphaned helper {} or descendant {} survived its host",
+        running.group,
+        running.child
+    );
+}
+#[test]
+fn a_second_build_waits_then_takes_over_the_attention_source() {
+    use std::process::Stdio;
+    let home = tempfile::tempdir().unwrap();
+    let connection = connection(&server("singleton", &[]), "singleton", false);
+    let mut first = running_command(home.path(), &connection, "agent/watch");
+    let second_binary = home.path().join("other-build");
+    // A parallel test's fork can retain fs::copy's writable descriptor until exec,
+    // causing ETXTBSY here. Keep the writer in a separate process and wait for exit.
+    assert!(Command::new("cp")
+        .arg(env!("CARGO_BIN_EXE_buzz-agent-command"))
+        .arg(&second_binary)
+        .status()
+        .unwrap()
+        .success());
+    let marker = home.path().join("duplicate-executed");
+    let mut second = Command::new(&second_binary)
+        .args(["--launch", "/usr/bin/touch", marker.to_str().unwrap()])
+        .env("HOME", home.path())
+        .env("BUZZ_AGENT_CONNECTION", &connection)
+        .env("BUZZ_ATTENTION_COMMAND", "agent/watch")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut waiting = String::new();
+    BufReader::new(second.stderr.take().unwrap())
+        .read_line(&mut waiting)
+        .unwrap();
+    assert!(
+        waiting.contains("Waiting for another Buzz copy"),
+        "{waiting}"
+    );
+    assert!(
+        second.try_wait().unwrap().is_none(),
+        "takeover exited instead of waiting"
+    );
+    assert!(!marker.exists(), "both builds executed the source");
+    // A different saved source is independent while the takeover waits.
+    assert!(Command::new(&second_binary)
+        .args(["--launch", "/usr/bin/true"])
+        .env("HOME", home.path())
+        .env("BUZZ_AGENT_CONNECTION", &connection)
+        .env("BUZZ_ATTENTION_COMMAND", "agent/other-watch")
+        .process_group(0)
+        .status()
+        .unwrap()
+        .success());
+    first.host.kill().unwrap();
+    first.host.wait().unwrap();
+    assert!(wait_until(|| !alive(first.group) && !alive(first.child)));
+    assert!(wait_until(|| second.try_wait().unwrap().is_some()));
+    assert!(second.wait().unwrap().success());
+    assert!(marker.exists(), "waiting build did not take over");
+    // Dead owners leave a reusable lock file, never a permanently stale lease.
+    assert!(Command::new(&second_binary)
+        .args(["--launch", "/usr/bin/true"])
+        .env("HOME", home.path())
+        .env("BUZZ_AGENT_CONNECTION", &connection)
+        .env("BUZZ_ATTENTION_COMMAND", "agent/watch")
+        .process_group(0)
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[test]
+fn a_waiting_command_exits_when_its_host_dies() {
+    use std::process::Stdio;
+    let home = tempfile::tempdir().unwrap();
+    let connection = connection(&server("waiting", &[]), "waiting", false);
+    let first = running_command(home.path(), &connection, "agent/watch");
+    let marker = home.path().join("waiting-command-executed");
+    let mut host = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "set -m; \"$@\" & wait",
+            "buzz-host",
+            env!("CARGO_BIN_EXE_buzz-agent-command"),
+            "--launch",
+            "/usr/bin/touch",
+            marker.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env("BUZZ_AGENT_CONNECTION", &connection)
+        .env("BUZZ_ATTENTION_COMMAND", "agent/watch")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut waiting = String::new();
+    BufReader::new(host.stderr.take().unwrap())
+        .read_line(&mut waiting)
+        .unwrap();
+    assert!(
+        waiting.contains("Waiting for another Buzz copy"),
+        "{waiting}"
+    );
+    let output = Command::new("pgrep")
+        .args(["-P", &host.id().to_string()])
+        .output()
+        .unwrap();
+    let group: i32 = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    host.kill().unwrap();
+    host.wait().unwrap();
+    let stopped = wait_until(|| !alive(group));
+    if !stopped {
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    assert!(stopped, "waiting helper survived its host");
+    assert!(
+        alive(first.group),
+        "waiting copy stopped the existing owner"
+    );
+    assert!(!marker.exists(), "waiting command executed");
+}
+
+#[test]
+fn a_command_retains_the_lease_after_its_helper_is_terminated() {
+    use std::process::Stdio;
+    let home = tempfile::tempdir().unwrap();
+    let connection = connection(&server("terminating", &[]), "terminating", false);
+    let first = running_script(
+        home.path(),
+        &connection,
+        "agent/watch",
+        "trap '' TERM; sleep 600 & echo \"$$ $!\"; wait",
+    );
+    unsafe { libc::kill(-first.group, libc::SIGTERM) };
+    assert!(wait_until(|| !alive(first.group)));
+    assert!(alive(first.child), "command did not resist termination");
+    let marker = home.path().join("replacement-executed");
+    let mut second = Command::new(env!("CARGO_BIN_EXE_buzz-agent-command"))
+        .args(["--launch", "/usr/bin/touch", marker.to_str().unwrap()])
+        .env("HOME", home.path())
+        .env("BUZZ_AGENT_CONNECTION", &connection)
+        .env("BUZZ_ATTENTION_COMMAND", "agent/watch")
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut waiting = String::new();
+    BufReader::new(second.stderr.take().unwrap())
+        .read_line(&mut waiting)
+        .unwrap();
+    assert!(
+        waiting.contains("Waiting for another Buzz copy"),
+        "replacement started while the previous command was alive: {waiting}"
+    );
+    assert!(!marker.exists());
+    unsafe { libc::kill(-first.group, libc::SIGKILL) };
+    assert!(wait_until(|| second.try_wait().unwrap().is_some()));
+    assert!(second.wait().unwrap().success());
+    assert!(marker.exists());
 }

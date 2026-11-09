@@ -1,8 +1,12 @@
+import { OnboardingBack } from "./OnboardingBack";
 import { useId, useRef, useState } from "react";
 import { npubEncode } from "nostr-tools/nip19";
 import { useFileDrop } from "../messages/use-file-drop";
 import { Button } from "../../shared/design-system/ui/Button";
 import { Field } from "../../shared/design-system/ui/Field";
+import { EyeIcon, EyeSlashIcon } from "../../shared/design-system/icons";
+import { IconButton } from "../../shared/design-system/ui/IconButton";
+import { InputGroup } from "../../shared/design-system/ui/InputGroup";
 import { Input } from "../../shared/design-system/ui/Input";
 import styles from "./IdentitySetup.module.css";
 import { classifyKeyImport, readKeyFile } from "./key-import";
@@ -22,12 +26,17 @@ import { SetupProgress } from "./SetupProgress";
  */
 export function KeyImport({
   expectedPubkey,
+  automaticBackup = false,
   onBack,
+  onLost,
   onImport,
 }: {
   /** The hex key linked to the signed-in account, when the lane has one. */
   expectedPubkey?: string | undefined;
+  /** `kept`: the account holds the key's backup, so a saved opt-out stands. */
+  automaticBackup?: boolean | "kept";
   onBack: () => void;
+  onLost?: (() => void) | undefined;
   /** Rejects with the native refusal, shown under the field. */
   onImport: (nsec: string) => Promise<void>;
 }) {
@@ -47,8 +56,6 @@ export function KeyImport({
   const change = (next: string) => {
     setText(next);
     setFailure(undefined);
-    // Masked by default must re-assert for the next key pasted.
-    if (!next.trim()) setRevealed(false);
   };
   const fromFile = async (file: File | undefined) => {
     if (!file) return;
@@ -118,9 +125,19 @@ export function KeyImport({
                 Enter your private key
               </h1>
               <p className="text-body text-subtle">
-                Paste your private key to sign in to Buzz. You can also drop a
-                text file holding it here, or choose one.
+                Paste your private key to sign in to Buzz. You can also select
+                or drop a text file with your key.
               </p>
+              {automaticBackup && (
+                <p className="text-body-sm text-subtle">
+                  Buzz will automatically sync this key with your Builderlab
+                  account
+                  {automaticBackup === "kept" &&
+                    " unless you chose to manage it yourself"}
+                  . Block can use that copy to restore your identity, including
+                  anywhere else you use it.
+                </p>
+              )}
               <div className={styles.importForm}>
                 <Field
                   label="Private key (nsec)"
@@ -136,43 +153,59 @@ export function KeyImport({
                     )
                   }
                 >
-                  <Input
-                    type={revealed ? "text" : "password"}
-                    autoComplete="off"
-                    autoCorrect="off"
-                    autoCapitalize="off"
-                    spellCheck={false}
-                    placeholder="nsec1…"
-                    value={text}
-                    onValueChange={change}
-                    autoFocus
-                  />
-                </Field>
-                <div className="flex flex-col gap-2">
-                  <div className="flex flex-wrap gap-3">
-                    <Button
-                      type="button"
-                      size="sm"
-                      disabled={!text}
-                      onClick={() => setRevealed(!revealed)}
-                    >
-                      {revealed ? "Hide private key" : "Reveal private key"}
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      onClick={() => picker.current?.click()}
-                    >
-                      Choose a key file
-                    </Button>
+                  <div className="flex items-center gap-3">
+                    <div className="min-w-0 flex-1">
+                      <InputGroup
+                        trailing={
+                          <IconButton
+                            type="button"
+                            aria-label={
+                              revealed
+                                ? "Hide private key"
+                                : "Reveal private key"
+                            }
+                            icon={revealed ? <EyeSlashIcon /> : <EyeIcon />}
+                            onClick={() => setRevealed(!revealed)}
+                          />
+                        }
+                      >
+                        <Input
+                          type={revealed ? "text" : "password"}
+                          autoComplete="off"
+                          autoCorrect="off"
+                          autoCapitalize="off"
+                          spellCheck={false}
+                          placeholder="nsec1…"
+                          value={text}
+                          onValueChange={change}
+                          autoFocus
+                        />
+                      </InputGroup>
+                    </div>
+                    <div className="shrink-0">
+                      <Button
+                        type="button"
+                        size="md"
+                        onClick={() => picker.current?.click()}
+                      >
+                        Browse
+                      </Button>
+                    </div>
                   </div>
+                </Field>
+                {dragging && (
                   <p className="m-0 text-body-sm text-subtle">
-                    {dragging
-                      ? "Drop to use this file."
-                      : "A key file is a small text file whose first line is the nsec1 key."}
+                    Drop to use this file.
                   </p>
-                </div>
+                )}
               </div>
+              {onLost && (
+                <div className="flex justify-start">
+                  <Button variant="link" onClick={onLost}>
+                    I lost my key
+                  </Button>
+                </div>
+              )}
             </form>
             {/* Outside the form, so the key is its only field and Enter submits. */}
             <input
@@ -203,9 +236,7 @@ export function KeyImport({
           >
             Continue with this key
           </Button>
-          <Button type="button" size="lg" variant="ghost" onClick={onBack}>
-            Back
-          </Button>
+          <OnboardingBack type="button" onClick={onBack} />
         </>
       )}
     </OnboardingScreen>

@@ -1,0 +1,23 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "Buzz",
+        "dragDropEnabled": false,
+        "width": 1200,
+        "height": 800,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 16,
+          "y": 24
+        },
+        "minWidth": 480,
+        "minHeight": 400,
+        "backgroundThrottling": "disabled",
+        "transparent": true,
+        "visible": false
+      }
+    ]
+  }
+}

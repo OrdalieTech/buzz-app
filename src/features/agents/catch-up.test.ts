@@ -5,6 +5,11 @@ import {
   CATCH_UP_PAGE,
   CATCH_UP_PAGES,
   catchUpKey,
+  admitted,
+  delivered,
+  finished,
+  HEARD_LIMIT,
+  heardOf,
   readCheckpoints,
   readWindow,
   splitLegacyCheckpoints,
@@ -40,6 +45,7 @@ const relay = (events: readonly Stored[]) => {
 const all: Stream = {
   key: "k",
   slug: "watch/all",
+  kinds: [9],
   since: 1,
   enabled: true,
 };
@@ -193,6 +199,59 @@ it("keeps the progress each program saves for its own agents", async () => {
   );
 });
 
+it("writes the agents whose streams changed, and no other", async () => {
+  const storage = memoryStorage();
+  const set = vi.spyOn(storage, "set");
+  const c = streamKey(id(10), "watch/other");
+  const first = { through: 100 };
+  const saved = { [a]: first, [b]: { through: 100 } };
+  await writeCheckpoints(storage, saved, {});
+  set.mockClear();
+  // Nothing changed, even when the saved copy is equal but not the same.
+  await writeCheckpoints(storage, saved, structuredClone(saved));
+  expect(set).not.toHaveBeenCalled();
+  // A changed stream writes only its agent.
+  await writeCheckpoints(storage, { ...saved, [b]: { through: 200 } }, saved);
+  expect(set.mock.calls.map(([key]) => key)).toEqual([catchUpKey(id(11))]);
+  // A new stream of an agent writes it.
+  set.mockClear();
+  await writeCheckpoints(storage, { ...saved, [c]: { through: 100 } }, saved);
+  expect(set.mock.calls.map(([key]) => key)).toEqual([catchUpKey(id(10))]);
+  expect(Object.keys(readCheckpoints(storage))).toEqual(
+    expect.arrayContaining([a, b, c]),
+  );
+  // Removing an agent's last stream removes its key.
+  await writeCheckpoints(storage, { [a]: first }, saved);
+  expect(storage.get(catchUpKey(id(11)))).toBeNull();
+  expect(storage.get(catchUpKey(id(10)))).not.toBeNull();
+});
+
+it("serialises the same however many agents did not change", async () => {
+  const serialised = async (agents: number) => {
+    const saved = Object.fromEntries(
+      Array.from({ length: agents }, (_, n) => [
+        streamKey(id(100 + n), "watch/chat"),
+        { through: 100 },
+      ]),
+    );
+    const key = streamKey(id(100), "watch/chat");
+    const stringify = vi.spyOn(JSON, "stringify");
+    try {
+      await writeCheckpoints(
+        memoryStorage(),
+        { ...saved, [key]: { through: 200 } },
+        saved,
+      );
+      return stringify.mock.calls.length;
+    } finally {
+      stringify.mockRestore();
+    }
+  };
+  const few = await serialised(2);
+  expect(few).toBeGreaterThan(0);
+  expect(await serialised(20)).toBe(few);
+});
+
 it("moves the old shared progress into each agent's key, and a late move keeps newer progress", async () => {
   const { disk, open } = sharedFiles({
     [CATCH_UP_KEY]: JSON.stringify({
@@ -246,4 +305,184 @@ it("keeps the old shared progress when the move cannot be saved", async () => {
   error.mockRestore();
   expect(storage.get(CATCH_UP_KEY)).toBe(shared);
   expect(readCheckpoints(storage)).toEqual({ [a]: { through: 100 } });
+});
+
+it("keeps an overlap open and finds an event stored late, once", async () => {
+  const events: Stored[] = [{ id: id(1), created_at: 480, content: "a" }];
+  const { read } = relay(events);
+  const first = await readWindow(all, { through: 100 }, 490, read);
+  if (!first) throw new Error("no window");
+  expect(first.events.map(({ content }) => content)).toEqual(["a"]);
+  const checkpoint = finished(first, [], 60);
+  expect(checkpoint).toEqual({
+    through: 430,
+    read: 490,
+    heard: [{ created_at: 480, id: id(1) }],
+  });
+  // Read through its upper already: nothing to read again.
+  expect(await readWindow(all, checkpoint, 490, read)).toBeUndefined();
+  // The relay stores one late, with a time behind the last read.
+  events.push({ id: id(2), created_at: 470, content: "late" });
+  const second = await readWindow(all, checkpoint, 520, read);
+  if (!second) throw new Error("no window");
+  expect(second.events.map(({ content }) => content)).toEqual(["late"]);
+  const next = finished(second, checkpoint.heard, 60);
+  expect(next).toEqual({
+    through: 460,
+    read: 520,
+    heard: [
+      { created_at: 470, id: id(2) },
+      { created_at: 480, id: id(1) },
+    ],
+  });
+  const third = await readWindow(all, next, 550, read);
+  expect(third?.events).toEqual([]);
+});
+
+it("shrinks the overlap to keep the newest heard events", () => {
+  const read = Array.from({ length: HEARD_LIMIT + 2 }, (_, i) => ({
+    id: id(i + 1),
+    created_at: 1000 + i,
+  }));
+  const upper = 1000 + HEARD_LIMIT + 2;
+  const checkpoint = finished(
+    {
+      events: [],
+      read,
+      upper,
+      checkpoint: { through: 0, upper },
+      skipped: false,
+    },
+    [],
+    10_000,
+  );
+  expect(checkpoint.through).toBe(1001);
+  expect(checkpoint.heard).toHaveLength(HEARD_LIMIT);
+  expect(checkpoint.heard?.[0]).toEqual({ created_at: 1002, id: id(3) });
+  expect(
+    finished({
+      events: [],
+      read,
+      upper,
+      checkpoint: { through: 0 },
+      skipped: false,
+    }),
+  ).toEqual({ through: upper });
+});
+
+it("moves past the heard it drops, but not past what was read or a window's cursor", () => {
+  const heard = Array.from({ length: HEARD_LIMIT + 2 }, (_, i) => ({
+    id: id(i + 1),
+    created_at: 1000 + i,
+  }));
+  // Read through 1100: it moves past the two oldest, which were read.
+  expect(heardOf({ through: 0, read: 1100 }, heard)).toMatchObject({
+    through: 1001,
+    read: 1100,
+    heard: heard.slice(2),
+  });
+  // Read only through 1000: past that, one may not have been read yet, and
+  // it keeps every one past where it stays, so none is given again.
+  const unread = heardOf({ through: 0, read: 1000 }, heard);
+  expect(unread.through).toBe(1000);
+  expect(unread.read).toBeUndefined();
+  expect(unread.heard).toEqual(heard.slice(1));
+  // A window being given goes no further than before its cursor's second.
+  const after = { created_at: 1001, id: id(2) };
+  expect(heardOf({ through: 0, upper: 2000, after }, heard)).toMatchObject({
+    through: 1000,
+    upper: 2000,
+    after,
+  });
+  // Unread, with no window: it stays where it is and keeps them all.
+  expect(heardOf({ through: 0 }, heard)).toEqual({ through: 0, heard });
+});
+
+it("finds an event stored late below a window cut short twice, and gives none twice", async () => {
+  const at = (i: number, created_at: number, content = `e${i}`) => ({
+    id: id(i),
+    created_at,
+    content,
+  });
+  const events: Stored[] = [at(1, 110), at(2, 120), at(3, 130), at(4, 140)];
+  const { read } = relay(events);
+  const overlap = 1000;
+  const given: string[] = [];
+  const give = (window: { events: readonly Stored[] }, count: number) => {
+    const taken = window.events.slice(0, count);
+    given.push(...taken.map(({ content }) => content));
+    return taken;
+  };
+  const first = await readWindow(all, { through: 100 }, 200, read);
+  if (!first) throw new Error("no window");
+  const cut = admitted(first, give(first, 2), [], overlap);
+  // Stored late, below where the window goes on.
+  events.push(at(5, 115, "late"));
+  const second = await readWindow(all, cut, 200, read);
+  if (!second) throw new Error("no window");
+  const again = admitted(second, give(second, 1), cut.heard, overlap);
+  expect(again.through).toBe(100);
+  const third = await readWindow(all, again, 200, read);
+  if (!third) throw new Error("no window");
+  give(third, third.events.length);
+  const done = finished(third, again.heard, overlap);
+  const poll = await readWindow(all, done, 210, read);
+  if (!poll) throw new Error("no window");
+  give(poll, poll.events.length);
+  // Found as soon as the window goes on, in its place in order.
+  expect(given).toEqual(["e1", "e2", "late", "e3", "e4"]);
+});
+
+it("finds an event stored late in the second a cut-short read went on from, before it in order", async () => {
+  const at = (i: number, created_at: number, content = `e${i}`) => ({
+    id: id(i),
+    created_at,
+    content,
+  });
+  const events: Stored[] = [at(2, 120), at(3, 120), at(4, 130)];
+  const { read } = relay(events);
+  const overlap = 1000;
+  const given: string[] = [];
+  const give = (window: { events: readonly Stored[] }, count: number) => {
+    const taken = window.events.slice(0, count);
+    given.push(...taken.map(({ content }) => content));
+    return taken;
+  };
+  const first = await readWindow(all, { through: 100 }, 200, read);
+  if (!first) throw new Error("no window");
+  const cut = admitted(first, give(first, 2), [], overlap);
+  expect(cut.after).toBeUndefined();
+  // Same second as the last one given, and before it in order.
+  events.push(at(1, 120, "late"));
+  const rest = await readWindow(all, cut, 200, read);
+  if (!rest) throw new Error("no window");
+  give(rest, rest.events.length);
+  const done = finished(rest, cut.heard, overlap);
+  const poll = await readWindow(all, done, 210, read);
+  give(poll ?? { events: [] }, Number.MAX_SAFE_INTEGER);
+  expect(given.sort()).toEqual(["e2", "e3", "e4", "late"]);
+});
+
+it("lists what a cursor saved without an overlap passed, once a read with one goes on, and gives none again", async () => {
+  const at = (i: number, created_at: number) => ({
+    id: id(i),
+    created_at,
+    content: `e${i}`,
+  });
+  const events: Stored[] = [at(1, 120), at(2, 120), at(3, 130)];
+  const { read } = relay(events);
+  const overlap = 1000;
+  // e1 and e2 were given by a read with no overlap, which saved a cursor.
+  const plain = delivered(200, at(2, 120));
+  const resumed = await readWindow(all, plain, 200, read);
+  if (!resumed) throw new Error("no window");
+  expect(resumed.events.map(({ content }) => content)).toEqual(["e3"]);
+  const cut = admitted(resumed, resumed.events, [], overlap);
+  expect(cut.after).toBeUndefined();
+  expect(cut.heard?.map(({ id }) => id)).toEqual([id(1), id(2), id(3)]);
+  const again = await readWindow(all, cut, 200, read);
+  expect(again?.events).toEqual([]);
+  if (!again) throw new Error("no window");
+  const done = finished(again, cut.heard, overlap);
+  expect((await readWindow(all, done, 210, read))?.events ?? []).toEqual([]);
 });

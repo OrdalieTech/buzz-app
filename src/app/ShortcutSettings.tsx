@@ -2,8 +2,10 @@ import { SettingsGroup } from "../shared/design-system/ui/SettingsGroup";
 import { IconButton } from "../shared/design-system/ui/IconButton";
 import { PencilSimpleIcon, XIcon } from "../shared/design-system/icons";
 import { PreferenceRow } from "../shared/design-system/ui/PreferenceRow";
+import { SwitchPreferenceRow } from "../shared/design-system/ui/SwitchPreferenceRow";
 import { Header, InlineHeader } from "../shared/design-system/ui/Header";
 import {
+  Fragment,
   useEffect,
   useId,
   useRef,
@@ -18,6 +20,11 @@ import {
   type NormalizedShortcut,
 } from "../features/shortcuts/bindings";
 import { formatBinding, isApplePlatform } from "../features/shortcuts/format";
+import {
+  composerFormats,
+  formatBindings,
+  linkBindings,
+} from "../features/messages/composer-dom";
 import { KeyCombo } from "../features/shortcuts/KeyCombo";
 import {
   KeyCaptureControl,
@@ -25,7 +32,12 @@ import {
 } from "../features/shortcuts/KeyCaptureControl";
 import type { ShortcutBindings } from "../features/shortcuts/preferences";
 import type { ShortcutsService } from "../features/shortcuts/service";
+import {
+  sendKeyPreference,
+  useSendWithModEnterPreference,
+} from "../features/messages/send-key-preference";
 import type { PluginManager } from "../plugins/manager";
+import { editKeyPreference } from "../features/messages/edit-key-preference";
 
 type Row = Readonly<{
   key: string;
@@ -44,6 +56,8 @@ type Group = Readonly<{
   label: string;
   /** Stable owner identity for equal display labels. */
   sortKey: string;
+  /** Said once under the heading; its read-only rows then need no note each. */
+  description?: string;
   rows: readonly Row[];
 }>;
 type Notice = Readonly<{
@@ -51,6 +65,46 @@ type Notice = Readonly<{
   tone: "error" | "warning";
   message: string;
 }>;
+
+/** The message editor's own keys, shown read-only: it handles them before any shortcut. */
+const editorRows = (sendWithModEnter: boolean): readonly Row[] =>
+  [
+    ...composerFormats.map((format) => ({
+      title: format.label,
+      bindings: formatBindings(format),
+    })),
+    { title: "Add or edit link", bindings: linkBindings },
+    { title: "Undo", bindings: [{ key: "z", mod: true }] },
+    {
+      title: "Redo",
+      bindings: [
+        { key: "z", mod: true, shift: true },
+        { key: "y", mod: true },
+      ],
+    },
+    {
+      title: "Send message",
+      bindings: [
+        sendWithModEnter ? { key: "Enter", mod: true } : { key: "Enter" },
+      ],
+    },
+    {
+      title: "New line",
+      bindings: sendWithModEnter
+        ? [{ key: "Enter" }, { key: "Enter", shift: true }]
+        : [{ key: "Enter", shift: true }],
+    },
+  ].map(({ title, bindings }, order) => ({
+    key: `editor:${title}`,
+    title,
+    owner: "Message formatting",
+    order,
+    readOnly: true,
+    defaults: bindings,
+    override: undefined,
+    effective: bindings,
+  }));
+const EDITOR_FORMAT_CHORDS = editorRows(false).flatMap((row) => row.effective);
 
 /** Chords the message editor handles locally before the window dispatcher: undo/redo and line/document jumps. */
 const EDITOR_CHORDS: readonly KeyBinding[] = [
@@ -78,6 +132,37 @@ const DESKTOP_CHORDS: readonly KeyBinding[] = [
   { key: "Tab", mod: true },
   { key: "Tab", mod: true, shift: true },
 ];
+// Common shifted pairs. Aliases for one physical key (⌘= and ⌘+) exist so
+// the chord works on every layout; the row shows that key once.
+const SHIFTED: Readonly<Record<string, string>> = {
+  "=": "+",
+  "-": "_",
+  "\\": "|",
+  "/": "?",
+  ",": "<",
+  ".": ">",
+  ";": ":",
+  "'": '"',
+  "[": "{",
+  "]": "}",
+  "`": "~",
+};
+const physicalKey = (key: string) =>
+  Object.entries(SHIFTED).find((pair) => pair.includes(key))?.[0];
+const sameKeyOnLayout = (a: KeyBinding, b: KeyBinding) =>
+  !!a.mod === !!b.mod &&
+  !!a.ctrl === !!b.ctrl &&
+  !!a.alt === !!b.alt &&
+  physicalKey(a.key) !== undefined &&
+  physicalKey(a.key) === physicalKey(b.key);
+/** The distinct chords to show: each physical key once, in registration order. */
+const shownChords = (chords: readonly KeyBinding[]) =>
+  chords.filter(
+    (chord, index) =>
+      !chords
+        .slice(0, index)
+        .some((earlier) => sameKeyOnLayout(earlier, chord)),
+  );
 const includes = (chords: readonly KeyBinding[], binding: KeyBinding) =>
   chords.some((chord) => sameBinding(chord, binding));
 /** Every owner supplies order; identity and title make ties deterministic. */
@@ -87,23 +172,19 @@ const byPresentation = (a: Row, b: Row) =>
   a.title.localeCompare(b.title);
 
 /**
- * Lists every host binding and every active plugin contribution from the live
- * dispatcher registry, so the page cannot drift from what actually fires.
- * Overrides are keyed by the registry's own identity: host id or `pluginId/id`.
+ * Every listed shortcut, grouped as Settings shows them: host,
+ * then plugins by name, then the editor's read-only keys. `rows` are only the
+ * dispatcher's, which are the ones that can conflict or be rebound.
  */
-export function ShortcutSettings({
+function useShortcutGroups({
   shortcuts,
   bindings,
   plugins,
-  apple = isApplePlatform(navigator.platform),
   desktop = isTauri(),
 }: {
   shortcuts: ShortcutsService;
   bindings: ShortcutBindings;
-  /** Display names for plugin groups come from the catalog. */
   plugins: Pick<PluginManager, "subscribe" | "snapshot">;
-  apple?: boolean;
-  /** Packaged desktop build, where close/quit chords belong to the shell. */
   desktop?: boolean;
 }) {
   const host = useSyncExternalStore(
@@ -122,8 +203,7 @@ export function ShortcutSettings({
     plugins.subscribe,
     plugins.snapshot,
   );
-  const [editing, setEditing] = useState<string | null>(null);
-  const [notice, setNotice] = useState<Notice | null>(null);
+  const sendWithModEnter = useSendWithModEnterPreference();
 
   const pluginName = (id: string) =>
     (configuration.status === "ready"
@@ -191,6 +271,70 @@ export function ShortcutSettings({
     }))
     .filter((group) => group.rows.length);
   const rows = groups.flatMap((group) => group.rows);
+  // Listed after the rows that can conflict: the editor keeps these while typing.
+  const shownGroups: Group[] = [
+    ...groups,
+    {
+      id: "editor",
+      label: "Message formatting",
+      sortKey: "editor",
+      description:
+        "Built into the message editor. These work while you type and can't be changed.",
+      rows: editorRows(sendWithModEnter),
+    },
+  ];
+  return { overrides, error, rows, shownGroups };
+}
+
+/** A row's distinct chords, "⌘K or ⌘T". */
+function ShortcutChords({
+  chords,
+  apple,
+}: {
+  chords: readonly KeyBinding[];
+  apple: boolean;
+}) {
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1 text-body-sm text-subtle">
+      {shownChords(chords).map((binding, index) => (
+        <Fragment key={formatBinding(binding, apple).text}>
+          {index > 0 && <span>or</span>}
+          <KeyCombo binding={binding} apple={apple} />
+        </Fragment>
+      ))}
+    </span>
+  );
+}
+
+/**
+ * Lists every host binding and every active plugin contribution from the live
+ * dispatcher registry, so the page cannot drift from what actually fires.
+ * Overrides are keyed by the registry's own identity: host id or `pluginId/id`.
+ */
+export function ShortcutSettings({
+  shortcuts,
+  bindings,
+  plugins,
+  apple = isApplePlatform(navigator.platform),
+  desktop = isTauri(),
+}: {
+  shortcuts: ShortcutsService;
+  bindings: ShortcutBindings;
+  /** Display names for plugin groups come from the catalog. */
+  plugins: Pick<PluginManager, "subscribe" | "snapshot">;
+  apple?: boolean;
+  /** Packaged desktop build, where close/quit chords belong to the shell. */
+  desktop?: boolean;
+}) {
+  const { overrides, error, rows, shownGroups } = useShortcutGroups({
+    shortcuts,
+    bindings,
+    plugins,
+    desktop,
+  });
+  const [editing, setEditing] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const sendChord = apple ? "⌘ Enter" : "Ctrl+Enter";
   // A chord can become shared after capture (a plugin enabled later, a new
   // default in a release). The dispatcher then picks one silently, so each
   // affected row names the others.
@@ -265,7 +409,9 @@ export function ShortcutSettings({
     setEditing(null);
     // EditableInput handles Enter locally regardless of the held modifiers.
     setNotice(
-      binding.key === "Enter" || includes(EDITOR_CHORDS, binding)
+      binding.key === "Enter" ||
+        includes(EDITOR_CHORDS, binding) ||
+        includes(EDITOR_FORMAT_CHORDS, binding)
         ? {
             key: target.key,
             tone: "warning",
@@ -279,16 +425,32 @@ export function ShortcutSettings({
     <section aria-labelledby="shortcut-settings-title">
       <Header id="shortcut-settings-title" title="Shortcuts" />
       <div className="grid gap-5">
-        {groups.length ? (
+        <MessageKeyPreference
+          title="Sending messages"
+          label={`Send with ${sendChord}`}
+          description={`Enter adds a new line. ${sendChord} sends your message.`}
+          preference={sendKeyPreference}
+        />
+        <MessageKeyPreference
+          title="Editing messages"
+          label="Edit last message with Up Arrow"
+          description="When the composer is empty, Up Arrow edits your most recent editable message instead of selecting messages."
+          preference={editKeyPreference}
+        />
+        {rows.length ? (
           <div className="grid gap-section-gap">
-            {groups.map((group) => (
+            {shownGroups.map((group) => (
               <section key={group.id}>
-                <InlineHeader title={group.label} />
+                <InlineHeader
+                  title={group.label}
+                  subtitle={group.description}
+                />
                 <SettingsGroup>
                   {group.rows.map((row) => (
                     <ShortcutRow
                       key={row.key}
                       row={row}
+                      explained={!!group.description}
                       apple={apple}
                       sharedWith={sharedWith(row)}
                       listening={editing === row.key}
@@ -340,8 +502,48 @@ export function ShortcutSettings({
   );
 }
 
+function MessageKeyPreference({
+  title,
+  label,
+  description,
+  preference,
+}: {
+  title: string;
+  label: string;
+  description: string;
+  preference: typeof sendKeyPreference;
+}) {
+  const checked = preference.usePreference();
+  const [error, setError] = useState<string | null>(null);
+  const change = (enabled: boolean) => setError(preference.set(enabled));
+  return (
+    <section>
+      <InlineHeader title={title} />
+      <SettingsGroup>
+        <SwitchPreferenceRow
+          label={label}
+          description={description}
+          checked={checked}
+          onCheckedChange={change}
+        />
+      </SettingsGroup>
+      {error && (
+        <div role="alert" className="grid gap-3 text-body-sm text-standard">
+          <p className="m-0">{error}</p>
+          <div>
+            <Button type="button" onClick={() => change(checked)}>
+              Retry saving
+            </Button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ShortcutRow({
   row,
+  explained,
   apple,
   sharedWith,
   listening,
@@ -352,6 +554,8 @@ function ShortcutRow({
   onReset,
 }: {
   row: Row;
+  /** Its section already says why read-only rows can't change. */
+  explained: boolean;
   apple: boolean;
   /** Other listed shortcuts whose effective chord this row also answers to. */
   sharedWith: readonly Row[];
@@ -379,7 +583,6 @@ function ShortcutRow({
       change.current?.focus();
     resetting.current = false;
   }, [listening, row.override]);
-  const primary = row.effective[0];
   return (
     <article aria-labelledby={titleId}>
       <PreferenceRow
@@ -390,7 +593,9 @@ function ShortcutRow({
         }
         subtitle={
           row.readOnly ? (
-            "Reserved by Buzz"
+            explained ? undefined : (
+              "Reserved by Buzz"
+            )
           ) : row.override || sharedWith.length > 0 ? (
             <>
               {row.override && <span className="block">Modified</span>}
@@ -416,7 +621,7 @@ function ShortcutRow({
                 onCancel={onCancel}
               />
             ) : (
-              primary && <KeyCombo binding={primary} apple={apple} />
+              <ShortcutChords chords={row.effective} apple={apple} />
             )}
             {!row.readOnly && (
               <IconButton

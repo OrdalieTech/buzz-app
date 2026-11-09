@@ -16,7 +16,7 @@ export const AvatarArtworkContext = createContext<
   ((src: string) => ReactNode) | null
 >(null);
 
-type AvatarSize = "compact" | "small" | "default" | "large" | "fill";
+type AvatarSize = "tiny" | "compact" | "small" | "default" | "large" | "fill";
 type ImageStatus = "loading" | "loaded" | "failed";
 
 // WebKit re-requests cached custom-scheme images on lazy remounts. Remember a
@@ -127,6 +127,7 @@ export function Avatar({
   alt,
   fallback,
   fallbackContent,
+  fallbackSurface = "subtle",
   size = "default",
   shape = "circle",
   statusBadge,
@@ -136,6 +137,8 @@ export function Avatar({
   alt: string;
   fallback: string;
   fallbackContent?: ReactNode;
+  /** Panel-colored monogram for avatars displayed on an inset surface. */
+  fallbackSurface?: "subtle" | "panel";
   size?: AvatarSize;
   shape?: "circle" | "squircle";
   statusBadge?: "online" | "away" | "offline" | undefined;
@@ -158,6 +161,7 @@ export function Avatar({
         className="buzz-avatar"
         data-size={size}
         data-avatar-shape={shape}
+        data-fallback-surface={fallbackSurface}
         role={alt ? "img" : undefined}
         aria-label={
           alt ? `${alt}${statusBadge ? `, ${statusBadge}` : ""}` : undefined

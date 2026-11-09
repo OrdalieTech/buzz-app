@@ -84,8 +84,8 @@ checks, not that an OS banner was displayed or read.
   styling and offscreen cues without clearing unread evidence. Muted channel and
   DM sidebar rows show a crossed-out bell immediately after their names and hide
   unread dots, including thread dots. Manual unread can still emphasize
-  the name, and thread activity remains available. Muted DMs retain automatic
-  unread emphasis, offscreen unread counts and avatar previews. Solo chat labels
+  the name, and thread activity remains available. Muted DMs also suppress automatic
+  unread emphasis; offscreen unread counts and avatar previews remain. Solo chat labels
   retain unread emphasis. Unread thread cues are distinct from participating-thread alerts,
   which mute suppresses. Unknown or failed
   preference reads hold non-mention candidates until explicit retry; a confirmed
@@ -200,9 +200,12 @@ observed unread messages (including thread replies) or explicit channel-unread
 intent. It is not an exact message count or evidence of complete history. Unknown
 and observed-zero both omit the dot. Existing bounded evidence/read-state owns
 startup and updates; this projection adds no relay reads, network subscriptions,
-or storage. Channel mute does not remove retained unread evidence from this community-wide dot, so muted ordinary backlog can keep it on while the channel's ordinary sidebar cues are quiet. Personal space, account/session changes, access loss and host disposal
-clear or recompute the indicator. Disabling Channels does not stop host ownership.
-Desktop alert preferences do not alter this unread indicator.
+or storage. Confirmed channel mutes remove that channel from the projection without
+removing its retained unread evidence, so unmuting can restore the dot. The dot
+stays clear while mute preferences are unresolved. Personal space,
+account/session changes, access loss and host disposal clear or recompute the
+indicator. Disabling Channels does not stop host ownership. Desktop alert
+preferences do not alter this unread indicator.
 
 One ordered host writer calls a main-window-only command using Tauri's standard
 `set_badge_label` API. macOS draws the badge; no custom artwork is supplied.

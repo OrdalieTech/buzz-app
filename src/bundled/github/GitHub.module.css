@@ -386,6 +386,18 @@
 .description {
   margin-top: var(--space-4);
 }
+.views {
+  margin-top: var(--space-4);
+}
+.tabCounts {
+  margin-inline-start: var(--space-1);
+  font-variant-numeric: tabular-nums;
+}
+.files {
+  display: grid;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
 /* A Solo chat's linked pull request, in the sidebar's chat icon slot. */
 .soloPull {
   display: inline-flex;
@@ -395,10 +407,11 @@
   flex: 0 0 var(--space-5);
 }
 /* The sidebar's icon and a message link's icon take one colour per state, as
-   the panel's chip above does; a link's text stays a link. Open and merged
-   use the icon-tier roles: the chip's step-12 text inks are indistinguishable
-   from a bubble's own ink. Draft, closed and not yet read are quiet: closed is
-   not red here. Only the sidebar shows an open one's checks and conflicts.
+   the panel's chip above does; a link's text stays a link. Open, merged and
+   an issue completed use the icon-tier roles: the chip's step-12 text inks are
+   indistinguishable from a bubble's own ink. Draft, closed, an issue not
+   planned and not yet read are quiet: closed is not red here. Only the
+   sidebar shows an open one's checks and conflicts.
    The sidebar's quiet icon is the row's subtle ink, which a hovered or
    selected row rebinds; a message's icons take the pair the bubble hands
    them, if any. */
@@ -419,7 +432,8 @@
   color: var(--text-warning);
 }
 .soloPull[data-tone="merged"],
-.pullState[data-pr-state="merged"] {
+.pullState[data-pr-state="merged"],
+.pullState[data-pr-state="completed"] {
   color: var(--message-icon-categorical-purple, var(--icon-categorical-purple));
 }
 .soloLink {

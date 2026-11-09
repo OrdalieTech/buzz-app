@@ -1,0 +1,7 @@
+{
+  "id": "buzz.focus",
+  "name": "Focus",
+  "apiVersion": 1,
+  "description": "Quiet everything except your Solo chats for a while.",
+  "discovery": { "category": "productivity", "tags": ["tasks"] }
+}

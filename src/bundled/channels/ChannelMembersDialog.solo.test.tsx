@@ -4,6 +4,7 @@ import { SOLO_LABEL } from "../../features/solo/labels";
 import {
   act,
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -18,6 +19,11 @@ import {
   profile,
   signed,
 } from "../../features/relay/testing";
+import { Context } from "@deepseek-ai/cordis";
+import { ShortcutsService } from "../../features/shortcuts/service";
+import { createNavigationController } from "../../features/navigation/controller";
+import { createMemoryHistory } from "../../features/navigation/history";
+import { registerNavigationShortcuts } from "../../app/shortcuts";
 import { matchesEvent } from "../../features/relay/projection";
 import type { RelayEvent } from "../../features/relay/events";
 import { PublishRejected } from "../../features/relay/outbox";
@@ -98,7 +104,10 @@ afterEach(() => {
   localStorage.clear();
   for (const owner of owners.splice(0)) owner.dispose();
 });
-function fixture(direct = false) {
+function fixture(
+  direct = false,
+  access?: { visibility: "private" | "public"; joinRole: "member" | "guest" },
+) {
   const viewer = keypair(),
     relay = keypair(),
     aria = keypair(),
@@ -118,7 +127,8 @@ function fixture(direct = false) {
       metadata(relay, source, "Work", clock, [
         ["t", "stream"],
         ["t", SOLO_LABEL],
-        ["private"],
+        [access?.visibility ?? "private"],
+        ...(access ? [["join_role", access.joinRole]] : []),
         // The owner's own Solo chat, or one shared with them as a guest.
         ["P", direct ? viewer.pubkey : relay.pubkey],
       ]),
@@ -138,6 +148,8 @@ function fixture(direct = false) {
   let failDetails = false;
   let failRoster = false;
   let holdRoster: Promise<void> | undefined;
+  let holdRoles: Promise<void> | undefined;
+  const roles = new Map<string, string>();
   let loseDetailsResponse = false;
   const projects = (assignments: Record<string, string>) => ({
     status: "ready" as const,
@@ -171,6 +183,9 @@ function fixture(direct = false) {
       const previous = metadataEvents.get(source)?.tags ?? [];
       const ttl = value("ttl") ?? previous.find(([tag]) => tag === "ttl")?.[1];
       const visibility = value("visibility");
+      const joinRole =
+        value("join_role") ??
+        previous.find(([tag]) => tag === "join_role")?.[1];
       const written = event.tags.flatMap(([tag, label]) =>
         tag === "t" ? [label ?? ""] : [],
       );
@@ -201,6 +216,7 @@ function fixture(direct = false) {
               "",
           ],
           ...(ttl && ttl !== "0" ? [["ttl", ttl]] : []),
+          ...(joinRole ? [["join_role", joinRole]] : []),
         ]),
       );
       if (loseDetailsResponse) throw new Error("Lost settings response");
@@ -232,6 +248,13 @@ function fixture(direct = false) {
       scope: "https://community.test",
       media: () => undefined,
       query: async (filters) => {
+        if (filters.some((filter) => filter.consistency === "strong")) {
+          // Hold this explicit administration refresh, not independent signed
+          // access reads started while its member-role UI is still loading.
+          const held = holdRoles;
+          holdRoles = undefined;
+          await held;
+        }
         if (
           filters.some(
             (filter) => filter.kinds?.length === 1 && filter.kinds[0] === 39002,
@@ -270,15 +293,16 @@ function fixture(direct = false) {
                   "p",
                   key,
                   "",
-                  key === viewer.pubkey
-                    ? "owner"
-                    : profiles.some(
-                          (event) =>
-                            event.pubkey === key &&
-                            JSON.parse(event.content).is_agent,
-                        )
-                      ? "bot"
-                      : "member",
+                  roles.get(key) ??
+                    (key === viewer.pubkey
+                      ? "owner"
+                      : profiles.some(
+                            (event) =>
+                              event.pubkey === key &&
+                              JSON.parse(event.content).is_agent,
+                          )
+                        ? "bot"
+                        : "member"),
                 ]),
               ],
             }),
@@ -319,6 +343,7 @@ function fixture(direct = false) {
   const session = direct
     ? {
         ...owner.session,
+        messages: { ...owner.session.messages },
         soloPreferences: {
           ...owner.session.soloPreferences,
           snapshot: () => (filed ? filedProjects : unfiledProjects),
@@ -349,6 +374,10 @@ function fixture(direct = false) {
         profile(key, { name, ...(agent ? { is_agent: true } : {}) }),
       );
     },
+    holdRoles(value: Promise<void> | undefined) {
+      holdRoles = value;
+    },
+    roles,
     viewer,
     aria,
     dev,
@@ -393,6 +422,13 @@ function fixture(direct = false) {
       ]);
       clock++;
     },
+    addChannel(id: string, name: string) {
+      members.set(id, [viewer.pubkey]);
+      metadataEvents.set(
+        id,
+        metadata(relay, id, name, ++clock, [["t", "stream"], ["private"]]),
+      );
+    },
     async ready() {
       owner.session.channels.ensureList();
       await waitFor(() => expect(channel()?.channelType).toBe("solo"), {
@@ -409,17 +445,232 @@ function fixture(direct = false) {
   };
 }
 
+it("shows Public (existing) without offering Public and changes its admission to Guest", async () => {
+  const t = fixture(true, { visibility: "public", joinRole: "member" });
+  await t.ready();
+  t.mount();
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Access" }));
+  const audience = await screen.findByRole("combobox", {
+    name: "General access",
+  });
+  await waitFor(() => expect(audience).toBeEnabled());
+  expect(audience).toHaveTextContent("Public (existing)");
+  await user.click(audience);
+  expect(
+    (await screen.findAllByRole("option")).map((option) =>
+      option.getAttribute("aria-label"),
+    ),
+  ).toEqual(["View only", "Private"]);
+  await user.click(screen.getByRole("option", { name: "View only" }));
+  expect(screen.getByRole("alertdialog")).toHaveAccessibleDescription(
+    "Everyone in this community will be able to read this chat’s full history and Canvas, including its workspace folders and agent instructions. People already in the chat keep their access.",
+  );
+  expect(t.published).toEqual([]);
+  await user.click(screen.getByRole("button", { name: "Change access" }));
+  await waitFor(() => expect(audience).toBeEnabled());
+  expect(audience).toHaveTextContent("View only");
+  expect(t.published).toHaveLength(1);
+  expect(t.published[0]).toMatchObject({ kind: 9002 });
+  expect(t.published[0]?.tags).toContainEqual(["join_role", "guest"]);
+  expect(t.channel()).toMatchObject({
+    channelType: "solo",
+    visibility: "public",
+    joinRole: "guest",
+    labels: [SOLO_LABEL],
+  });
+  expect(t.members.get(source)).toEqual([t.viewer.pubkey]);
+  expect(t.placement).not.toHaveBeenCalled();
+});
+
+it("opens a Solo chat for view-only visitors and makes it private again without conversion or grants", async () => {
+  const t = fixture(true);
+  await t.ready();
+  t.mount();
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Access" }));
+  const audience = await screen.findByRole("combobox", {
+    name: "General access",
+  });
+  await waitFor(() => expect(audience).toBeEnabled());
+  expect(audience).toHaveTextContent("Private");
+  await user.click(audience);
+  expect(
+    (await screen.findAllByRole("option")).map((option) =>
+      option.getAttribute("aria-label"),
+    ),
+  ).toEqual(["View only", "Private"]);
+  await user.click(await screen.findByRole("option", { name: "View only" }));
+  const confirmation = screen.getByRole("alertdialog", {
+    name: "Change general access?",
+  });
+  expect(confirmation).toHaveAccessibleDescription(
+    "Everyone in this community will be able to read this chat’s full history and Canvas, including its workspace folders and agent instructions.",
+  );
+  expect(
+    screen.queryByRole("combobox", { name: "New people can" }),
+  ).not.toBeInTheDocument();
+  await user.keyboard("{Escape}");
+  await waitFor(() => expect(audience).toHaveFocus());
+  expect(t.published).toEqual([]);
+  await user.click(audience);
+  await user.click(await screen.findByRole("option", { name: "View only" }));
+  await user.click(screen.getByRole("button", { name: "Change access" }));
+  await waitFor(() => expect(audience).toBeEnabled());
+  expect(audience).toHaveTextContent("View only");
+  expect(t.published).toHaveLength(1);
+  expect(t.published[0]).toMatchObject({ kind: 9002 });
+  expect(t.published[0]?.tags).toContainEqual(["visibility", "open"]);
+  expect(t.published[0]?.tags).toContainEqual(["join_role", "guest"]);
+  expect(t.channel()).toMatchObject({
+    channelType: "solo",
+    visibility: "public",
+    joinRole: "guest",
+    labels: [SOLO_LABEL],
+  });
+  expect(
+    screen.queryByRole("combobox", { name: "New people can" }),
+  ).not.toBeInTheDocument();
+  expect(t.session.soloPreferences.snapshot().data?.assignments).toEqual({
+    [source]: "g",
+  });
+  expect(t.placement).not.toHaveBeenCalled();
+  expect(t.members.get(source)).toEqual([t.viewer.pubkey]);
+  await user.click(audience);
+  await user.click(await screen.findByRole("option", { name: "Private" }));
+  await user.click(screen.getByRole("button", { name: "Change access" }));
+  await waitFor(() => expect(audience).toBeEnabled());
+  expect(audience).toHaveTextContent("Private");
+  expect(t.channel()).toMatchObject({
+    channelType: "solo",
+    visibility: "private",
+    joinRole: "guest",
+    labels: [SOLO_LABEL],
+  });
+  expect(t.published.map(({ kind }) => kind)).toEqual([9002, 9002]);
+  expect(t.published[1]?.tags).toContainEqual(["visibility", "private"]);
+  expect(t.placement).not.toHaveBeenCalled();
+});
+
+it.each(["guest", "member"] as const)(
+  "warns about retained viewers only with a verified %s in a View-only chat",
+  async (role) => {
+    const t = fixture(true, { visibility: "public", joinRole: "guest" });
+    t.setSourceMembers([t.viewer.pubkey, t.aria.pubkey]);
+    t.roles.set(t.aria.pubkey, role);
+    await t.ready();
+    t.mount();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Access" }));
+    const audience = await screen.findByRole("combobox", {
+      name: "General access",
+    });
+    await waitFor(() => expect(audience).toBeEnabled());
+    await waitFor(() =>
+      expect(t.session.memberAdministration.snapshot(source).status).toBe(
+        "ready",
+      ),
+    );
+    await user.click(audience);
+    await user.click(await screen.findByRole("option", { name: "Private" }));
+    expect(screen.getByRole("alertdialog")).toHaveAccessibleDescription(
+      `Only chat members will have access.${role === "guest" ? " People who joined while it was View only are members and keep reading until you remove them in People." : ""}`,
+    );
+    expect(t.published).toEqual([]);
+    await user.click(screen.getByRole("button", { name: "Change access" }));
+    await waitFor(() => expect(audience).toBeEnabled());
+    expect(audience).toHaveTextContent("Private");
+    expect(t.published.map(({ kind }) => kind)).toEqual([9002]);
+    expect(t.members.get(source)).toEqual([t.viewer.pubkey, t.aria.pubkey]);
+    expect(
+      t.session.memberAdministration.snapshot(source).authority.roles[
+        t.aria.pubkey
+      ],
+    ).toBe(role);
+  },
+);
+
+it.each(["guest", "member"] as const)(
+  "keeps the retained-viewer warning while previous %s roles are loading or unavailable",
+  async (role) => {
+    const t = fixture(true, { visibility: "public", joinRole: "guest" });
+    t.setSourceMembers([t.viewer.pubkey, t.aria.pubkey]);
+    t.roles.set(t.aria.pubkey, role);
+    await t.ready();
+    t.mount();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Access" }));
+    const audience = await screen.findByRole("combobox", {
+      name: "General access",
+    });
+    await waitFor(() => expect(audience).toBeEnabled());
+    await waitFor(() =>
+      expect(t.session.memberAdministration.snapshot(source).status).toBe(
+        "ready",
+      ),
+    );
+    let release!: () => void;
+    let reject!: (reason: Error) => void;
+    t.holdRoles(
+      new Promise<void>((resolve, fail) => {
+        release = resolve;
+        reject = fail;
+      }),
+    );
+    let refreshing!: Promise<void>;
+    act(() => {
+      refreshing = t.session.memberAdministration.refresh(source);
+    });
+    try {
+      await waitFor(() =>
+        expect(t.session.memberAdministration.snapshot(source).status).toBe(
+          "loading",
+        ),
+      );
+      expect(
+        t.session.memberAdministration.snapshot(source).authority.roles[
+          t.aria.pubkey
+        ],
+      ).toBe(role);
+      await user.click(audience);
+      await user.click(await screen.findByRole("option", { name: "Private" }));
+      expect(
+        await screen.findByRole("alertdialog"),
+      ).toHaveAccessibleDescription(
+        "Only chat members will have access. People who joined while it was View only are members and keep reading until you remove them in People.",
+      );
+      await act(async () => {
+        reject(new Error("Roles unavailable"));
+        await refreshing;
+      });
+      expect(t.session.memberAdministration.snapshot(source).status).toBe(
+        "error",
+      );
+      expect(
+        await screen.findByRole("alertdialog"),
+      ).toHaveAccessibleDescription(
+        "Only chat members will have access. People who joined while it was View only are members and keep reading until you remove them in People.",
+      );
+      await user.keyboard("{Escape}");
+      expect(t.published).toEqual([]);
+    } finally {
+      release();
+      await act(async () => {
+        await refreshing;
+      });
+    }
+  },
+);
+
 const search = (dialog: HTMLElement) =>
   within(dialog).getByRole("searchbox", { name: "Search people and channels" });
-async function chooseDestination(
+async function findDestination(
   user: ReturnType<typeof userEvent.setup>,
   dialog: HTMLElement,
 ) {
   await user.clear(search(dialog));
   await user.type(search(dialog), "Plan");
-  await user.click(
-    await within(dialog).findByRole("button", { name: "Select Planning" }),
-  );
+  return within(dialog).findByRole("button", { name: "Share Planning" });
 }
 const waitForAccess = (dialog: HTMLElement) =>
   waitFor(() =>
@@ -471,7 +722,7 @@ it("Copy alone neither saves selections nor grants access", async () => {
   const clipboard = vi
     .spyOn(navigator.clipboard, "writeText")
     .mockResolvedValue();
-  await chooseDestination(user, dialog);
+  await findDestination(user, dialog);
   await user.click(within(dialog).getByRole("button", { name: "Copy link" }));
   expect(clipboard).toHaveBeenCalledWith(`buzz://channel/${source}`);
   const copied = within(dialog).getByRole("button", { name: "Link copied" });
@@ -502,34 +753,473 @@ it("Copy alone neither saves selections nor grants access", async () => {
   expect(t.publish).not.toHaveBeenCalled();
 });
 
-it("shares to a channel by giving its current members access, then posts one link; Retry adds whoever is still missing", async () => {
-  const t = fixture();
+it.each(["member", "guest"] as const)(
+  "shares a Private chat (%s) as View only after disclosure, without adding channel members",
+  async (joinRole) => {
+    const t = fixture(true, { visibility: "private", joinRole });
+    await t.ready();
+    t.addDestination(t.aria.pubkey);
+    const before = [...(t.members.get(source) ?? [])];
+    const user = userEvent.setup();
+    t.mount();
+    await user.click(screen.getByRole("button", { name: "Access" }));
+    const dialog = screen.getByRole("dialog", { name: "Share access" });
+    await findDestination(user, dialog);
+    const share = within(dialog).getByRole("button", {
+      name: "Share Planning",
+    });
+    await user.click(share);
+    let confirmation = await screen.findByRole("alertdialog");
+    expect(confirmation).toHaveAccessibleName("Share this chat?");
+    expect(confirmation).toHaveAccessibleDescription(
+      /^This changes the chat from Private to View only and posts its link in Planning\./,
+    );
+    expect(confirmation).toHaveTextContent(
+      "Everyone in this community can read its full history, Canvas, workspace folders, and agent instructions.",
+    );
+    expect(t.published).toHaveLength(0);
+    await user.click(
+      within(confirmation).getByRole("button", { name: "Cancel" }),
+    );
+    await waitFor(() => expect(share).toHaveFocus());
+    expect(dialog).toBeVisible();
+    expect(t.published).toHaveLength(0);
+    await user.click(share);
+    confirmation = await screen.findByRole("alertdialog");
+    await user.click(
+      within(confirmation).getByRole("button", {
+        name: "Share",
+      }),
+    );
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(t.published.map((event) => event.kind)).toEqual([9002, 9]),
+    );
+    expect(t.published[0]?.tags).toContainEqual(["visibility", "open"]);
+    if (joinRole === "member")
+      expect(t.published[0]?.tags).toContainEqual(["join_role", "guest"]);
+    expect(t.published[1]?.content).toContain(`buzz://channel/${source}`);
+    expect(t.published[1]?.tags).toContainEqual(["h", destination]);
+    expect(t.published[1]?.tags.some(([name]) => name === "p")).toBe(false);
+    expect(t.members.get(source)).toEqual(before);
+    expect(t.channel()).toMatchObject({
+      channelType: "solo",
+      visibility: "public",
+      joinRole: "guest",
+    });
+    expect(t.placement).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      "Chat changed to View only. Shared in Planning",
+      "success",
+      undefined,
+    );
+  },
+);
+
+it("shares to the current result after cancelling a different destination", async () => {
+  const t = fixture(true);
+  const other = "33333333-3333-4333-8333-333333333333";
+  t.addChannel(other, "Review");
   await t.ready();
-  t.addDestination(t.aria.pubkey);
-  t.failGrant(true);
   const user = userEvent.setup();
   t.mount();
   await user.click(screen.getByRole("button", { name: "Access" }));
   const dialog = screen.getByRole("dialog", { name: "Share access" });
-  await chooseDestination(user, dialog);
-  expect(within(dialog).getByRole("button", { name: "Share" })).toBeEnabled();
-  await user.click(within(dialog).getByRole("button", { name: "Share" }));
-  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-    "Chat invite refused",
+  await user.click(await findDestination(user, dialog));
+  const first = await screen.findByRole("alertdialog", {
+    name: "Share this chat?",
+  });
+  expect(first).toHaveTextContent("posts its link in Planning");
+  await user.click(within(first).getByRole("button", { name: "Cancel" }));
+  const search = within(dialog).getByRole("searchbox", {
+    name: "Search people and channels",
+  });
+  await user.clear(search);
+  await user.type(search, "Review");
+  await user.click(
+    await within(dialog).findByRole("button", { name: "Share Review" }),
   );
-  expect(within(dialog).getAllByRole("alert")).toHaveLength(1);
-  expect(t.published).toHaveLength(0);
-  // Retry reads the channel again, so a member who joined meanwhile is included.
-  t.addDestination(t.dev.pubkey);
-  t.failGrant(false);
-  await user.click(within(dialog).getByRole("button", { name: "Retry share" }));
+  const confirmation = await screen.findByRole("alertdialog", {
+    name: "Share this chat?",
+  });
+  expect(confirmation).toHaveTextContent("posts its link in Review");
+  await user.click(within(confirmation).getByRole("button", { name: "Share" }));
   await waitFor(() => expect(dialog).not.toBeInTheDocument());
-  expect(t.members.get(source)).toContain(t.aria.pubkey);
-  expect(t.members.get(source)).toContain(t.dev.pubkey);
   await waitFor(() =>
-    expect(t.published.map((event) => event.kind)).toEqual([9000, 9000, 9]),
+    expect(t.published.map((event) => event.kind)).toEqual([9002, 9]),
+  );
+  expect(t.published[1]?.tags).toContainEqual(["h", other]);
+});
+
+it.each(["member", "guest"] as const)(
+  "an already open chat (%s) preserves access and confirms View only delivery",
+  async (joinRole) => {
+    const t = fixture(true, { visibility: "public", joinRole });
+    await t.ready();
+    t.addDestination(t.aria.pubkey);
+    const user = userEvent.setup();
+    t.mount();
+    await user.click(screen.getByRole("button", { name: "Access" }));
+    const dialog = screen.getByRole("dialog", { name: "Share access" });
+    await findDestination(user, dialog);
+    await user.click(
+      within(dialog).getByRole("button", { name: "Share Planning" }),
+    );
+    if (joinRole === "guest") {
+      let confirmation = await screen.findByRole("alertdialog");
+      expect(confirmation).toHaveAccessibleDescription(
+        /^This chat is already View only\. Its link will be posted in Planning\./,
+      );
+      expect(t.published).toHaveLength(0);
+      await user.click(
+        within(confirmation).getByRole("button", { name: "Cancel" }),
+      );
+      const share = within(dialog).getByRole("button", {
+        name: "Share Planning",
+      });
+      await waitFor(() => expect(share).toHaveFocus());
+      expect(t.published).toHaveLength(0);
+      await user.click(share);
+      confirmation = await screen.findByRole("alertdialog");
+      await user.click(
+        within(confirmation).getByRole("button", { name: "Share" }),
+      );
+    }
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(t.published.map((event) => event.kind)).toEqual([9]),
+    );
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(t.channel()?.joinRole).toBe(joinRole);
+    expect(t.members.get(source)).toEqual([t.viewer.pubkey]);
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      "Shared in Planning",
+      "success",
+      undefined,
+    );
+  },
+);
+
+it("a refused access change posts nothing and retry asks for confirmation again", async () => {
+  const t = fixture(true);
+  await t.ready();
+  const user = userEvent.setup();
+  t.mount();
+  await user.click(screen.getByRole("button", { name: "Access" }));
+  const dialog = screen.getByRole("dialog", { name: "Share access" });
+  await findDestination(user, dialog);
+  await user.click(
+    within(dialog).getByRole("button", { name: "Share Planning" }),
+  );
+  t.failDetails(true);
+  await user.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Share",
+    }),
+  );
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "Settings refused",
+  );
+  expect(t.published).toHaveLength(0);
+  expect(notify).not.toHaveBeenCalled();
+  t.failDetails(false);
+  await user.click(
+    within(dialog).getByRole("button", { name: "Retry share Planning" }),
+  );
+  await user.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Share",
+    }),
+  );
+  await waitFor(() =>
+    expect(t.published.map((event) => event.kind)).toEqual([9002, 9]),
   );
 });
+
+it("checks an uncertain access save before posting, without resending the access change", async () => {
+  const t = fixture(true);
+  await t.ready();
+  const user = userEvent.setup();
+  t.mount();
+  await user.click(screen.getByRole("button", { name: "Access" }));
+  const dialog = screen.getByRole("dialog", { name: "Share access" });
+  await findDestination(user, dialog);
+  await user.click(
+    within(dialog).getByRole("button", { name: "Share Planning" }),
+  );
+  t.loseDetailsResponse(true);
+  await user.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Share",
+    }),
+  );
+  await within(dialog).findByRole("button", {
+    name: "Check access and share Planning",
+  });
+  expect(t.published.map((event) => event.kind)).toEqual([9002]);
+  t.loseDetailsResponse(false);
+  await user.click(
+    within(dialog).getByRole("button", {
+      name: "Check access and share Planning",
+    }),
+  );
+  await user.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Share",
+    }),
+  );
+  await waitFor(() => expect(dialog).not.toBeInTheDocument());
+  await waitFor(() =>
+    expect(t.published.map((event) => event.kind)).toEqual([9002, 9]),
+  );
+  expect(t.members.get(source)).toEqual([t.viewer.pubkey]);
+  expect(notify).toHaveBeenCalledExactlyOnceWith(
+    "Chat changed to View only. Shared in Planning",
+    "success",
+    undefined,
+  );
+});
+
+it("retains View only when link enqueue fails and retries just the link", async () => {
+  const t = fixture(true);
+  await t.ready();
+  const send = vi
+    .spyOn(t.session.messages, "send")
+    .mockImplementationOnce(() => {
+      throw new Error("Link unavailable");
+    });
+  const user = userEvent.setup();
+  t.mount();
+  await user.click(screen.getByRole("button", { name: "Access" }));
+  const dialog = screen.getByRole("dialog", { name: "Share access" });
+  await findDestination(user, dialog);
+  await user.click(
+    within(dialog).getByRole("button", { name: "Share Planning" }),
+  );
+  await user.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Share",
+    }),
+  );
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "Link unavailable",
+  );
+  expect(t.channel()?.joinRole).toBe("guest");
+  expect(t.published.map((event) => event.kind)).toEqual([9002]);
+  expect(notify).not.toHaveBeenCalled();
+  send.mockRestore();
+  await user.click(
+    within(dialog).getByRole("button", { name: "Retry share Planning" }),
+  );
+  await user.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Share",
+    }),
+  );
+  await waitFor(() =>
+    expect(t.published.map((event) => event.kind)).toEqual([9002, 9]),
+  );
+  expect(notify).toHaveBeenCalledExactlyOnceWith(
+    "Chat changed to View only. Shared in Planning",
+    "success",
+    undefined,
+  );
+});
+
+it.each([false, true])(
+  "cancelling a checked share ends its toast attempt before sharing again (different target: %s)",
+  async (differentTarget) => {
+    const t = fixture(true);
+    const other = "33333333-3333-4333-8333-333333333333";
+    if (differentTarget) t.addChannel(other, "Review");
+    await t.ready();
+    const user = userEvent.setup();
+    t.mount();
+    await user.click(screen.getByRole("button", { name: "Access" }));
+    const dialog = screen.getByRole("dialog", { name: "Share access" });
+    await user.click(await findDestination(user, dialog));
+    t.loseDetailsResponse(true);
+    await user.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Share",
+      }),
+    );
+    const check = await within(dialog).findByRole("button", {
+      name: "Check access and share Planning",
+    });
+    t.loseDetailsResponse(false);
+    await user.click(check);
+    await user.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Cancel",
+      }),
+    );
+    const name = differentTarget ? "Review" : "Planning";
+    if (differentTarget) {
+      await user.clear(search(dialog));
+      await user.type(search(dialog), name);
+    }
+    await user.click(
+      await within(dialog).findByRole("button", { name: `Share ${name}` }),
+    );
+    const confirmation = await screen.findByRole("alertdialog");
+    expect(confirmation).toHaveTextContent("This chat is already View only.");
+    await user.click(
+      within(confirmation).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(t.published.map((event) => event.kind)).toEqual([9002, 9]),
+    );
+    expect(t.published[1]?.tags).toContainEqual([
+      "h",
+      differentTarget ? other : destination,
+    ]);
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      `Shared in ${name}`,
+      "success",
+      undefined,
+    );
+  },
+);
+
+it("a different target after link enqueue rejection starts a new toast attempt", async () => {
+  const t = fixture(true);
+  const other = "33333333-3333-4333-8333-333333333333";
+  t.addChannel(other, "Review");
+  await t.ready();
+  vi.spyOn(t.session.messages, "send").mockImplementationOnce(() => {
+    throw new Error("Link unavailable");
+  });
+  const user = userEvent.setup();
+  t.mount();
+  await user.click(screen.getByRole("button", { name: "Access" }));
+  const dialog = screen.getByRole("dialog", { name: "Share access" });
+  await user.click(await findDestination(user, dialog));
+  await user.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Share",
+    }),
+  );
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "Link unavailable",
+  );
+  await user.clear(search(dialog));
+  await user.type(search(dialog), "Review");
+  await user.click(
+    await within(dialog).findByRole("button", { name: "Share Review" }),
+  );
+  await user.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Share",
+    }),
+  );
+  await waitFor(() => expect(dialog).not.toBeInTheDocument());
+  expect(notify).toHaveBeenCalledExactlyOnceWith(
+    "Shared in Review",
+    "success",
+    undefined,
+  );
+});
+
+it.each(["abort", "unmount"] as const)(
+  "stops before posting if the access dialog's visit ends during an access save (%s)",
+  async (mode) => {
+    const t = fixture(true);
+    await t.ready();
+    const controller = new AbortController();
+    let release!: () => void;
+    let started!: () => void;
+    const signingStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const original = t.detailsSign.getMockImplementation();
+    if (!original) throw new Error("Missing signer fixture");
+    t.detailsSign.mockImplementationOnce(async (...args) => {
+      started();
+      await gate;
+      return original(...args);
+    });
+    const user = userEvent.setup();
+    const mounted = t.mount(
+      mode === "abort" ? { signal: controller.signal } : {},
+    );
+    try {
+      await user.click(screen.getByRole("button", { name: "Access" }));
+      const dialog = screen.getByRole("dialog", { name: "Share access" });
+      await findDestination(user, dialog);
+      await user.click(
+        within(dialog).getByRole("button", { name: "Share Planning" }),
+      );
+      await user.click(
+        within(await screen.findByRole("alertdialog")).getByRole("button", {
+          name: "Share",
+        }),
+      );
+      await signingStarted;
+      if (mode === "abort") act(() => controller.abort());
+      mounted.unmount();
+      release();
+      await waitFor(() =>
+        expect(t.session.channelDetails.snapshot(source)).toBeUndefined(),
+      );
+      expect(t.published).toHaveLength(0);
+    } finally {
+      release();
+    }
+  },
+);
+
+it("rejects a destination that became read only before making the chat readable", async () => {
+  const t = fixture(true);
+  await t.ready();
+  const user = userEvent.setup();
+  t.mount();
+  await user.click(screen.getByRole("button", { name: "Access" }));
+  const dialog = screen.getByRole("dialog", { name: "Share access" });
+  await findDestination(user, dialog);
+  t.setDestinationMembers([t.aria.pubkey]);
+  await user.click(
+    within(dialog).getByRole("button", { name: "Share Planning" }),
+  );
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    "Destination membership could not be confirmed",
+  );
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  expect(t.published).toHaveLength(0);
+});
+
+it.each(["settings", "authority"] as const)(
+  "does not publish a share after %s changed during confirmation",
+  async (change) => {
+    const t = fixture(true);
+    await t.ready();
+    const user = userEvent.setup();
+    t.mount();
+    await user.click(screen.getByRole("button", { name: "Access" }));
+    const dialog = screen.getByRole("dialog", { name: "Share access" });
+    await findDestination(user, dialog);
+    await user.click(
+      within(dialog).getByRole("button", { name: "Share Planning" }),
+    );
+    const confirmation = await screen.findByRole("alertdialog");
+    if (change === "settings")
+      t.setArchived(false); // New signed metadata revision.
+    else t.setSourceMembers([t.aria.pubkey]);
+    await user.click(
+      within(confirmation).getByRole("button", {
+        name: "Share",
+      }),
+    );
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      change === "settings" ? "Channel details changed" : "access",
+    );
+    expect(t.published).toHaveLength(0);
+  },
+);
 
 it("Done never promotes or removes a Solo chat, and conversion stays in the chat menu", async () => {
   const t = fixture(true);
@@ -550,8 +1240,8 @@ it("Done never promotes or removes a Solo chat, and conversion stays in the chat
   expect(t.channel()?.channelType).toBe("solo");
 });
 
-it("leaves agents to mentions but includes channel bots without waking them", async () => {
-  const t = fixture();
+it("leaves agents to mentions and shares a view-only link without enrolling or waking channel bots", async () => {
+  const t = fixture(true, { visibility: "public", joinRole: "guest" });
   await t.ready();
   const bot = keypair();
   t.addProfile(bot, "Helper Bot", true);
@@ -568,8 +1258,15 @@ it("leaves agents to mentions but includes channel bots without waking them", as
   await within(results).findByText("To add an agent, mention it in the chat.");
   expect(results).toHaveTextContent("No other matching people.");
   expect(within(results).queryByRole("button", { name: /Helper/ })).toBeNull();
-  await chooseDestination(user, dialog);
-  await user.click(within(dialog).getByRole("button", { name: "Share" }));
+  await findDestination(user, dialog);
+  await user.click(
+    within(dialog).getByRole("button", { name: "Share Planning" }),
+  );
+  await user.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Share",
+    }),
+  );
   await waitFor(() => expect(dialog).not.toBeInTheDocument());
   // Planning is private, so the toast names it without a hash like the sidebar.
   expect(notify).toHaveBeenCalledExactlyOnceWith(
@@ -577,14 +1274,14 @@ it("leaves agents to mentions but includes channel bots without waking them", as
     "success",
     undefined,
   );
-  expect(t.published.map((event) => event.kind)).toEqual([9000, 9]);
-  expect(t.published[0]?.tags).toContainEqual(["role", "bot"]);
-  expect(t.published[1]?.tags.some(([name]) => name === "p")).toBe(false);
+  expect(t.published.map((event) => event.kind)).toEqual([9]);
+  expect(t.members.get(source)).not.toContain(bot.pubkey);
+  expect(t.published[0]?.tags.some(([name]) => name === "p")).toBe(false);
   expect(document.querySelector("[data-solo-shared]")).toBeNull();
 });
 
 it("shows loading and failed current access with refresh, never an empty roster", async () => {
-  const t = fixture();
+  const t = fixture(true);
   await t.ready();
   let release!: () => void;
   t.holdRoster(
@@ -618,29 +1315,33 @@ it("shows loading and failed current access with refresh, never an empty roster"
     );
     await user.click(refresh);
     await within(access).findByRole("region", { name: "People" });
-    expect(within(access).queryByRole("alert")).toBeNull();
+    // General access has its own failed metadata read and explicit recovery.
+    const recovery = within(access).getByRole("group", {
+      name: "General access recovery",
+    });
+    expect(within(recovery).getByRole("alert")).toHaveTextContent(
+      "Roster unavailable",
+    );
+    await user.click(
+      within(recovery).getByRole("button", { name: "Reload access" }),
+    );
+    await waitFor(() => expect(within(access).queryByRole("alert")).toBeNull());
     t.failRoster(true);
-    await chooseDestination(user, dialog);
-    const selectedChannel = within(dialog).getByRole("region", {
-      name: "Selected channel",
-    });
-    const unavailable = await within(selectedChannel).findByRole("button", {
-      name: /^Planning.*Participants unavailable/,
-    });
-    expect(selectedChannel).not.toHaveTextContent("0 members");
-    await user.click(unavailable);
-    expect(within(selectedChannel).getByRole("status")).toHaveTextContent(
-      "unavailable",
+    await findDestination(user, dialog);
+    await user.click(
+      within(dialog).getByRole("button", { name: "Share Planning" }),
+    );
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "Roster unavailable",
     );
     t.failRoster(false);
     await user.click(
-      within(selectedChannel).getByRole("button", {
-        name: "Retry participants",
-      }),
+      within(dialog).getByRole("button", { name: "Retry share Planning" }),
     );
-    await within(selectedChannel).findByRole("button", {
-      name: /^Planning.*1 member/,
-    });
+    const confirmation = await screen.findByRole("alertdialog");
+    await user.click(
+      within(confirmation).getByRole("button", { name: "Cancel" }),
+    );
     expect(t.publish).not.toHaveBeenCalled();
   } finally {
     release();
@@ -726,7 +1427,7 @@ it("shows Shared on cold render from verified members and cached human evidence 
 });
 
 it("offers matching people and channels as labelled results without public keys", async () => {
-  const t = fixture();
+  const t = fixture(true);
   const planningPerson = keypair();
   t.addProfile(planningPerson, "Planning Person");
   t.members.set(source, [t.viewer.pubkey, t.aria.pubkey]);
@@ -745,23 +1446,27 @@ it("offers matching people and channels as labelled results without public keys"
   await within(people).findByRole("button", { name: /^Add Planning Person/ });
   const channels = within(dialog).getByRole("region", { name: "Channels" });
   expect(
-    within(channels).getByRole("button", { name: "Select Planning" }),
-  ).toHaveTextContent("Select");
+    within(channels).getByRole("button", { name: "Share Planning" }),
+  ).toHaveTextContent("Share");
   expect(dialog).not.toHaveTextContent(formatPublicKey(t.aria.pubkey) ?? "");
   expect(dialog).not.toHaveTextContent(
     formatPublicKey(planningPerson.pubkey) ?? "",
   );
   await user.click(
-    within(channels).getByRole("button", { name: "Select Planning" }),
+    within(channels).getByRole("button", { name: "Share Planning" }),
   );
-  expect(search(dialog)).toHaveValue("");
-  expect(
-    within(dialog).getByRole("region", { name: "Selected channel" }),
-  ).toHaveTextContent("Planning");
-  expect(within(dialog).getByRole("button", { name: "Share" })).toBeEnabled();
+  const confirmation = await screen.findByRole("alertdialog");
+  expect(confirmation).toHaveTextContent("Planning");
   await user.click(
-    within(dialog).getByRole("button", { name: "Remove Planning" }),
+    within(confirmation).getByRole("button", { name: "Cancel" }),
   );
+  expect(search(dialog)).toHaveValue("Planning");
+  expect(
+    within(dialog).queryByRole("region", { name: "Selected channel" }),
+  ).toBeNull();
+  expect(
+    within(channels).getByRole("button", { name: "Share Planning" }),
+  ).toHaveFocus();
   expect(within(dialog).getByRole("button", { name: "Done" })).toBeEnabled();
   expect(t.publish).not.toHaveBeenCalled();
 });
@@ -830,4 +1535,69 @@ it("lets the chat owner remove someone with access from the row menu", async () 
     expect(t.published.map((event) => event.kind)).toEqual([9001]),
   );
   expect(t.members.get(source)).toEqual([t.viewer.pubkey]);
+});
+
+it("Back never walks history behind a pending Share, and the dialog still closes afterwards", async () => {
+  const t = fixture(true);
+  await t.ready();
+  t.addDestination(t.aria.pubkey);
+  t.failDetails(true);
+  const user = userEvent.setup();
+  t.mount();
+  await user.click(screen.getByRole("button", { name: "Access" }));
+  const dialog = screen.getByRole("dialog", { name: "Share access" });
+  await findDestination(user, dialog);
+  // Local Share access is not a navigation visit.
+  expect(dialog).not.toHaveAttribute("data-navigation-visit");
+  const ctx = new Context();
+  ctx.provide("pluginStatus", {
+    isActive: () => true,
+    subscribe: () => () => {},
+  });
+  const shortcuts = new ShortcutsService(ctx, window);
+  const controller = createNavigationController(createMemoryHistory());
+  const remove = registerNavigationShortcuts(shortcuts, controller.navigation);
+  let release!: () => void;
+  try {
+    const behind = { version: 1, kind: "settings" } as const;
+    void controller.navigation.open({ version: 1, kind: "home" });
+    void controller.navigation.open(behind);
+    await waitFor(() =>
+      expect(controller.navigation.snapshot().canGoBack).toBe(true),
+    );
+    // Share reads the destination's roster; hold it so Share stays pending.
+    t.holdRoster(new Promise<void>((resolve) => (release = resolve)));
+    await user.click(
+      within(dialog).getByRole("button", { name: "Share Planning" }),
+    );
+    fireEvent.keyDown(dialog, { key: "[", ctrlKey: true });
+    // The history-request.js route for mouse back.
+    window.dispatchEvent(new Event("buzz:history-back"));
+    await act(async () => {});
+    expect(controller.navigation.snapshot().attempt.entry.target).toEqual(
+      behind,
+    );
+    expect(dialog).toBeInTheDocument();
+    t.holdRoster(undefined);
+    release();
+    await user.click(await screen.findByRole("button", { name: "Share" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "Settings refused",
+    );
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: "Access" }));
+    const again = screen.getByRole("dialog", { name: "Share access" });
+    await user.click(within(again).getByRole("button", { name: "Done" }));
+    await waitFor(() => expect(again).not.toBeInTheDocument());
+    expect(controller.navigation.snapshot().attempt.entry.target).toEqual(
+      behind,
+    );
+  } finally {
+    release?.();
+    t.holdRoster(undefined);
+    remove();
+    controller.dispose();
+    await ctx.fiber.dispose();
+  }
 });

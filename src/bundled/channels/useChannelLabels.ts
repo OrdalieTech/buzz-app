@@ -40,7 +40,8 @@ export function useChannelLabels(
   // A name read can come back empty or fail (offline), and a full cache clear
   // empties the directory, without changing DM participants. Retry missing
   // names when channel membership changes, not for message previews/renders;
-  // keep enrichment in the background.
+  // keep enrichment in the background, which skips names a read on this
+  // connection found absent.
   const membership = useMemo(
     () =>
       roster

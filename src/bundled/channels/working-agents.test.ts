@@ -1,6 +1,7 @@
 import { expect, test } from "vitest";
 import type { RelaySession } from "../../features/relay/session";
 import {
+  activityTranscript,
   workingAgentDetails,
   workingAgentMessage,
   workingAgents,
@@ -139,4 +140,38 @@ test("links only a current turn to its single captured message", () => {
       agent,
     ),
   ).toEqual({ startedAt: 1000 });
+});
+
+test("View activity names a transcript only for a Solo chat, a DM or a loaded request", () => {
+  const top = "a".repeat(64);
+  const reply = "b".repeat(64);
+  const channels = {
+    list: () => ({
+      status: "ready",
+      channels: [
+        { id: "solo", name: "Planning", channelType: "solo" },
+        { id: "dm", name: "Ada", channelType: "dm" },
+        { id: "design", name: "design", channelType: "stream" },
+      ],
+    }),
+    window: (channelId: string) => ({
+      rows:
+        channelId === "design"
+          ? [{ id: top }, { id: reply, threadRootId: top }]
+          : [],
+    }),
+  } as unknown as Pick<RelaySession["channels"], "list" | "window">;
+  // One conversation, whichever message started the work.
+  expect(activityTranscript(channels, "solo", undefined)).toEqual({});
+  // A DM is one conversation too, loaded or not.
+  expect(activityTranscript(channels, "dm", "c".repeat(64))).toEqual({});
+  expect(activityTranscript(channels, "design", top)).toEqual({ rootId: top });
+  expect(activityTranscript(channels, "design", reply)).toEqual({
+    rootId: top,
+  });
+  // Unknown or unloaded work never guesses a thread.
+  expect(activityTranscript(channels, "design", undefined)).toBeUndefined();
+  expect(
+    activityTranscript(channels, "design", "c".repeat(64)),
+  ).toBeUndefined();
 });

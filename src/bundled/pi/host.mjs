@@ -763,15 +763,25 @@ export function serve({
       for (const extension of packages.extensions) install(extension);
       /** Conversations with a task Pi parked, which the next wait stops. */
       const parked = new Set();
+      const storage = await openNodeSqliteStorage(path);
       harness = await Harness.open(
-        await openNodeSqliteStorage(path),
+        storage,
         {
           models: protectedAgent
             ? protectModels(models, inspect, conversationFor)
             : models,
           registry,
           settings: SETTINGS,
-          env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? homedir() }),
+          // Its tools' commands, and only theirs, act as this agent.
+          env: ({ cwd }) => {
+            const credential = credentials.get(agent);
+            return new NodeExecutionEnv({
+              cwd: cwd ?? homedir(),
+              ...(credential && {
+                shellEnv: { BUZZ_CREDENTIAL_PROVIDER: credential },
+              }),
+            });
+          },
           onReport: (error, info) => {
             console.error(`Pi reported ${info.type}`, error);
             // Cut off by crashes too often, a task waits for a retry that
@@ -785,6 +795,7 @@ export function serve({
       const opened = {
         agent,
         harness,
+        storage,
         registry,
         install,
         conversations,
@@ -818,6 +829,10 @@ export function serve({
       throw error;
     }
   }
+
+  /** Each agent's credential for its tools' commands, never this host's own
+   * environment. */
+  const credentials = new Map();
 
   /** The agent's storage, opened once. */
   function opening(agent) {
@@ -1081,6 +1096,43 @@ export function serve({
     }
   }
 
+  /** The session `conversation` is in at entry `at`, or now: the id of the
+   * reset that began it, or 0 before any reset. Read from Pi's own head
+   * markers, so it always agrees with the history: a compaction's marker
+   * leads back to the one before it. Only markers are read, never the
+   * history between them. */
+  async function sessionOf(storage, conversation, at) {
+    let head = await storage.findLatestHeadMarker(conversation, at, context);
+    while (head && head.kind !== "pi.reset")
+      head = await storage.findLatestHeadMarker(
+        conversation,
+        head.head,
+        context,
+      );
+    return head?.id ?? 0;
+  }
+  /** Whether the next turn is its session's first: no compaction since the
+   * session began, no prompt in it, and none queued. A prompt follows its
+   * reset closely, so only the entries before the first one are read. */
+  async function firstTurn({ harness, storage }, conversation) {
+    const head = await storage.findLatestHeadMarker(
+      conversation,
+      undefined,
+      context,
+    );
+    if (head && head.kind !== "pi.reset") return false;
+    const query = { conversationId: conversation, order: "ascending" };
+    if (head) query.minEntryId = head.head;
+    let cursor;
+    do {
+      const page = await storage.scanEntries(query, 20, cursor, context);
+      if (page.items.some((entry) => entry.kind === "pi.user")) return false;
+      cursor = page.next;
+    } while (cursor);
+    const { submissions } = await harness.inspect(context);
+    return !submissions.some((s) => s.conversationId === conversation);
+  }
+
   /** Starts a request in a conversation configured for this turn. One that
    * steers a run working in it, `busy`, changes only what its owner picked,
    * as in Claude. The agent's `core` memory read for it is the
@@ -1269,7 +1321,8 @@ export function serve({
         : { ok: true, message: `Connected to ${model.modelId}` };
     },
     /** Opens the agent's storage, once, with its Buzz tools as they are now. */
-    async open({ agent, tools, hint }) {
+    async open({ agent, tools, hint, credential }) {
+      if (credential) credentials.set(agent, credential);
       const opened = await opening(agent);
       const listed = JSON.stringify([tools, hint]);
       if (opened.tools !== listed) {
@@ -1294,11 +1347,16 @@ export function serve({
     /** A page of a conversation's entries, newest first, as a transcript
      * shows them. */
     async entries({ agent, conversation, cursor }) {
-      const { harness } = await opening(agent);
+      const { harness, storage } = await opening(agent);
       const found = await harness.conversation(conversation, context);
       if (!found) return { entries: [] };
       const page = await found.entries({}, PAGE, cursor, context);
+      const oldest = page.items.at(-1);
       return {
+        // The session the page's oldest entry is in, however old its reset.
+        ...(oldest
+          ? { session: await sessionOf(storage, found.id, oldest.id) }
+          : {}),
         entries: page.items.map(({ id, kind, model, data }) => ({
           id,
           kind,
@@ -1370,6 +1428,11 @@ export function serve({
         opened.conversations.add(conversation.id);
         opened.contexts.set(conversation.id, tools);
         const { busy } = await watch(opened, conversation.id);
+        // Read before the turn is submitted: what Pi then holds decides it.
+        const session =
+          !busy && (await firstTurn(opened, conversation.id))
+            ? await sessionOf(opened.storage, conversation.id)
+            : undefined;
         if (reply)
           await harness.commit(async (tx) => {
             (await tx.doc(Replies))[turn.request] = reply;
@@ -1384,6 +1447,7 @@ export function serve({
             : undefined,
         );
         if (!submitted) return false;
+        if (session !== undefined) Object.assign(submitted, { session });
         // Recorded once Pi has the turn: one that could not start leaves the
         // messages it would have been shown for the next.
         await harness.commit(async (tx) => {

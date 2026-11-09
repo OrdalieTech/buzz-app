@@ -25,6 +25,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, expect, it } from "vitest";
 import script from "./claude.sh?raw";
+import { PROTECTED_CLAUDE_VERSION } from "./security";
 
 const execFileAsync = promisify(execFile);
 const homes: string[] = [];
@@ -131,6 +132,13 @@ it("prunes older releases but keeps a newer one another build may be testing", a
   );
   await step("use", "0.3.0");
   expect(await folders()).toEqual(["0.10.0", "0.2.0", "0.3.0"]);
+});
+
+it("keeps the release protected agents run when it switches past it", async () => {
+  const pinned = PROTECTED_CLAUDE_VERSION;
+  const { step, folders } = await disk([pinned, "99.0.0", "99.1.0"], "99.0.0");
+  await step("use", "99.1.0");
+  expect(await folders()).toEqual([pinned, "99.0.0", "99.1.0"]);
 });
 
 /** Holds the switch lock, as a build that is switching does, until killed. */
@@ -400,3 +408,57 @@ it("refuses a checksum that is not 64 hex digits before reusing or downloading",
     release("0.2.0"),
   );
 });
+
+/** claude.sh's review step in a new home. */
+async function reviewHome() {
+  const { home } = await disk([]);
+  const review = join(
+    home,
+    "Library/Application Support/Buzz/claude-code-review-home",
+  );
+  return {
+    home,
+    review,
+    reviewFolder: () => {
+      const running = run("bash", ["-c", script, "claude.sh", "review"], {
+        env: { PATH: process.env.PATH ?? "", HOME: home },
+      });
+      running.child.stdin?.end();
+      return running as Promise<{ stdout: string; stderr: string }>;
+    },
+  };
+}
+
+it.skipIf(process.platform !== "darwin")(
+  "makes reviews' own folder privately on first use and prints it",
+  async () => {
+    const { review, reviewFolder } = await reviewHome();
+    await expect(reviewFolder()).resolves.toEqual({
+      stdout: `${review}\n`,
+      stderr: "",
+    });
+    expect((await lstat(review)).mode & 0o777).toBe(0o700);
+    await expect(reviewFolder()).resolves.toEqual({
+      stdout: `${review}\n`,
+      stderr: "",
+    });
+  },
+);
+
+it.skipIf(process.platform !== "darwin")(
+  "refuses a review folder that is a link",
+  async () => {
+    const { home, review, reviewFolder } = await reviewHome();
+    const target = join(home, "elsewhere");
+    await mkdir(target);
+    await mkdir(dirname(review), { recursive: true });
+    await symlink(target, review);
+    const reading = reviewFolder();
+    await expect(reading).rejects.toThrow(
+      "The Claude review folder is not a folder",
+    );
+    await reading.catch((error: { stdout: string }) =>
+      expect(error.stdout).toBe(""),
+    );
+  },
+);

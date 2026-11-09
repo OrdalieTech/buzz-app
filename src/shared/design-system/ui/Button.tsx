@@ -14,6 +14,7 @@ type ButtonVariant =
   | "attention"
   | "glass"
   | "glass-ghost"
+  | "glass-clear"
   | "inverted"
   | "link"
   | "plain"
@@ -22,6 +23,7 @@ type ButtonVariant =
 type ButtonSize =
   | "caption"
   | "inline"
+  | "row"
   | "xs"
   | "sm"
   | "md"

@@ -4,6 +4,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtemp, access, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { nativeHookOutput } from "../hook-output";
 import { ClaudeProcess } from "./claude";
 import { expect, it } from "vitest";
 
@@ -13,6 +14,7 @@ it.skipIf(!process.env.CLAUDE_FACADE_BINARY).each(["deny", "throw"])(
     const home = await mkdtemp(join(tmpdir(), "buzz-claude-hooks-")),
       marker = join(home, "executed");
 
+    const modelInputs: unknown[] = [];
     let modelCalls = 0;
     let toolHooks = 0;
     const controlResponses: { subtype: string; error?: string }[] = [];
@@ -31,6 +33,7 @@ it.skipIf(!process.env.CLAUDE_FACADE_BINARY).each(["deny", "throw"])(
         return;
       }
       const data = JSON.parse(body);
+      modelInputs.push(data);
       const auxiliary = !data.tools?.length;
       if (!auxiliary) modelCalls++;
       let block:
@@ -203,15 +206,18 @@ it.skipIf(!process.env.CLAUDE_FACADE_BINARY).each(["deny", "throw"])(
             observed.push(name);
             if (name === "PreToolUse" && ++toolHooks === 1 && mode === "throw")
               throw new Error("Fixture callback failed");
-            return name === "PreToolUse"
-              ? {
-                  hookSpecificOutput: {
-                    hookEventName: "PreToolUse",
-                    permissionDecision: "deny",
-                    permissionDecisionReason: "Fixture blocks the command",
-                  },
-                }
-              : {};
+            return nativeHookOutput(
+              name === "PreToolUse"
+                ? {
+                    hookSpecificOutput: {
+                      hookEventName: "PreToolUse",
+                      permissionDecision: "deny",
+                      permissionDecisionReason: "Fixture blocks the command",
+                    },
+                  }
+                : {},
+              "fixture-policy",
+            ) as Record<string, unknown>;
           },
         },
       );
@@ -241,6 +247,9 @@ it.skipIf(!process.env.CLAUDE_FACADE_BINARY).each(["deny", "throw"])(
       }
       expect(outcome).toMatchObject({ ok: true });
       expect(observed).toContain("PreToolUse");
+      expect(JSON.stringify(modelInputs)).toContain(
+        "[Buzz plugin: fixture-policy] Fixture blocks the command",
+      );
     } finally {
       await claude?.kill();
       child?.kill();

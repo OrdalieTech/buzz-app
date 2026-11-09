@@ -216,6 +216,38 @@ it("keeps ordinary text unchanged and marks prepared image/video links as media"
   }
 });
 
+const image = {
+  ...descriptor,
+  url: `${origin}/media/${hash}.png`,
+  type: "image/png",
+};
+
+it("carries relay-measured image dimensions into imeta for receiver layout", () => {
+  const uploaded = validateUploadResult(
+    { ...image, dim: "1280x400" },
+    origin,
+    3,
+    "shot.png",
+  );
+  const result = attachmentMessage("", [uploaded], origin);
+  expect(result.tags[0]).toContain("dim 1280x400");
+  expect(
+    parseAttachments(
+      { id: "", pubkey: "", kind: 9, created_at: 1, ...result },
+      [],
+    )[0]?.dimensions,
+  ).toEqual({ width: 1280, height: 400 });
+});
+
+it.each(["1280 x 400", "1280x400x2", 1280, "-1x4"])(
+  "drops malformed relay dimensions %j without failing the upload",
+  (dim) => {
+    expect(
+      validateUploadResult({ ...image, dim }, origin, 3, "shot.png"),
+    ).not.toHaveProperty("dim");
+  },
+);
+
 it.each([
   [401, "denied"],
   [403, "denied"],

@@ -138,7 +138,14 @@ export async function uploadAttachment(req, relay, key, fetchUpstream, signal) {
       !new RegExp(`^/media/${sha256}(?:\\.[a-z0-9]{1,8})?$`).test(url.pathname)
     )
       throw new UploadError("invalid", 502);
-    return { url: url.href, type: v.type, size, sha256 };
+    // The app validates `dim` like the native path; the broker only forwards it.
+    return {
+      url: url.href,
+      type: v.type,
+      size,
+      sha256,
+      ...(typeof v.dim === "string" ? { dim: v.dim } : {}),
+    };
   } finally {
     await spool.cleanup();
   }

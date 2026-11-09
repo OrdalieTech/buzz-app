@@ -102,6 +102,14 @@
 .navigationPane {
   container-type: inline-size;
 }
+/* The host holds this pane to the scrollport's height for the plugin catalog,
+   so a longer section overflows past the scrollport's bottom padding. Carry
+   that padding with the content; the matching negative margin cancels it where
+   the pane is not held, so the end inset is never doubled. */
+.navigationPane:not([data-plugin-catalog]) {
+  padding-block-end: var(--dialog-padding);
+  margin-block-end: calc(-1 * var(--dialog-padding));
+}
 .navigationPane[data-plugin-catalog] {
   height: calc(100% + 2 * var(--dialog-padding));
   min-height: 0;
@@ -718,7 +726,9 @@
 }
 
 .pluginExtraActions {
-  display: contents;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
 }
 
 .pluginBadges > span:empty {

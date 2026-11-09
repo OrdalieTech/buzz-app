@@ -9,6 +9,11 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { SidebarUnread, type UnreadDmPreview } from "./SidebarUnread";
+import { UnreadBadge } from "./UnreadBadge";
+import {
+  createRelaySession,
+  type RelaySession,
+} from "../../features/relay/session";
 
 // Controlled geometry tests the production projection, not browser layout.
 // Real scrolling, clipping and collapsed-section geometry remain browser checks.
@@ -79,6 +84,30 @@ function row(id: string, top: number, onClick = vi.fn()) {
     </button>
   );
 }
+
+it.each([
+  ["above", 60],
+  ["below", 340],
+] as const)("remeasures the %s cue when a slide settles", async (edge, top) => {
+  render(
+    <SidebarUnread>
+      <div data-moving="">{row("moving", 180)}</div>
+    </SidebarUnread>,
+  );
+  await measure();
+  expect(
+    screen.queryByRole("button", { name: /unread conversation/ }),
+  ).toBeNull();
+  const moving = screen.getByRole("button", { name: "moving" });
+  await act(async () => {
+    moving.dataset.top = String(top);
+    moving.parentElement?.removeAttribute("data-moving");
+  });
+  await measure();
+  expect(
+    screen.getByRole("button", { name: `1 unread conversation ${edge}` }),
+  ).toBeVisible();
+});
 
 it.each([0, 1, 3, 5])(
   "previews at most three of %i eligible DMs without changing the conversation count",
@@ -251,3 +280,111 @@ it("removes both counts and previews when unread markers disappear", async () =>
   expect(surface).not.toHaveAttribute("inert");
   expect(surface).toHaveAttribute("data-visible", "true");
 });
+
+it.each([
+  { name: "channel mention", dm: false, solo: false, thread: false },
+  { name: "DM", dm: true, solo: false, thread: false },
+  { name: "Solo message", dm: false, solo: true, thread: false },
+  { name: "thread reply", dm: false, solo: false, thread: true },
+  { name: "Solo thread reply", dm: false, solo: true, thread: true },
+  { name: "manual unread", dm: false, solo: false, thread: false },
+])(
+  "excludes a muted $name from edge cues and restores it on unmute",
+  async ({ name, dm, solo, thread }) => {
+    const owner = createRelaySession(null);
+    const base = owner.session;
+    const target = { kind: "channel" as const, channelId: "muted" };
+    const snapshot = {
+      ...base.unread.snapshot(target),
+      manual:
+        name === "manual unread" ? ("local-only" as const) : ("none" as const),
+      observedCount: thread ? 0 : 2,
+      attentionCount: thread ? 0 : 1,
+    };
+    const activity = {
+      ...base.unread.activity("muted"),
+      items: thread
+        ? [
+            {
+              channelId: "muted",
+              rootId: "root",
+              latestMessageId: "reply",
+              authorId: "peer",
+              createdAt: 1,
+              preview: "Reply",
+              unreadCount: 1,
+            },
+          ]
+        : [],
+    };
+    let muted = false;
+    const listeners = new Set<() => void>();
+    const session: RelaySession = {
+      ...base,
+      unread: {
+        ...base.unread,
+        snapshot: () => snapshot,
+        activity: () => activity,
+      },
+      sidebarPreferences: {
+        ...base.sidebarPreferences,
+        snapshot: () => ({
+          status: "ready",
+          data: {
+            sections: [],
+            assignments: {},
+            starred: [],
+            muted: muted ? ["muted"] : [],
+          },
+        }),
+        subscribe: (listener: () => void) => {
+          listeners.add(listener);
+          return () => {
+            listeners.delete(listener);
+          };
+        },
+      },
+    };
+    try {
+      render(
+        <SidebarUnread>
+          {row("ordinary", 310)}
+          <button type="button" data-channel-id="muted" data-top="340">
+            Muted destination
+            <UnreadBadge
+              session={session}
+              channelId="muted"
+              dm={dm}
+              labelUnread={solo ? "all" : "ordinary"}
+            />
+          </button>
+        </SidebarUnread>,
+      );
+      await measure();
+      expect(
+        screen.getByRole("button", { name: "2 unread conversations below" }),
+      ).toBeInTheDocument();
+      await act(async () => {
+        muted = true;
+        for (const listener of listeners) listener();
+      });
+      await measure();
+      expect(
+        screen.getByRole("button", { name: "1 unread conversation below" }),
+      ).toBeInTheDocument();
+      expect(session.unread.snapshot(target)).toBe(snapshot);
+      expect(session.unread.activity("muted")).toBe(activity);
+      await act(async () => {
+        muted = false;
+        for (const listener of listeners) listener();
+      });
+      await measure();
+      expect(
+        screen.getByRole("button", { name: "2 unread conversations below" }),
+      ).toBeInTheDocument();
+    } finally {
+      cleanup();
+      owner.dispose();
+    }
+  },
+);

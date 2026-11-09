@@ -72,7 +72,7 @@ test("mention typing does not repeat cold reads or create phantom popup layout a
   } finally {
     await page.evaluate(() => window.mentionFixture.releaseProfiles());
   }
-  const choice = page.getByRole("option", { name: /^Mary Jane / });
+  const choice = page.getByRole("option", { name: "Mary Jane", exact: true });
   await expect(choice).toBeVisible();
   await expect.poll(async () => (await reads()).pending).toBe(0);
   await choice.click();

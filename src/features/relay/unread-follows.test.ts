@@ -70,6 +70,7 @@ async function setup(
     ),
   };
   const reads = createReadState({
+    floor: () => 0,
     viewer,
     reader,
     host: undefined,

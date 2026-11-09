@@ -361,7 +361,16 @@ only the selected recipient identities and names to both mention tools. Removing
 a selection updates both menus; an already-inserted mention still requires actual
 DM membership on Send. Mentioning never opens the DM early or adds recipients.
 The existing `MessageComposer` owns the draft and ordinary input behavior. Its placeholder is blank before selection and lists the selected names
-afterward. Disabled mention and emoji icons stay unfilled. No timeline is mounted before the first message is confirmed. DMs omit the date
+afterward. Disabled mention and emoji icons stay unfilled. When the recipients
+plus the viewer are exactly an existing DM's participants, in any order, that
+DM's history loads inline above the draft. This includes a DM removed with
+Close conversation or Hide conversation. A subset or superset of a group's
+participants shows the recipients' avatars instead. Each recipient change
+replaces the preview with the newly matched DM's timeline, or with the avatars.
+Previewing does not open, restore or mark the DM read, and it remains when
+this connection cannot start DMs. Send performs the confirmed
+open, which clears a local removal and asks the relay to unhide the DM. With no
+match, no timeline is mounted before the first message is confirmed. DMs omit the date
 pill at the beginning of their complete history, while retaining message times
 and date separators between days.
 
@@ -437,7 +446,7 @@ preview are omitted from Channel Settings; opening details does not read Canvas.
 
 Lifecycle actions extend the persistent sidebar’s existing context popup after
 Move channel and the mute/read group. Lifecycle items use shared leading icons and
-a separator only when they resolve and earlier actions exist. Right-click
+a separator only when there are lifecycle items and earlier actions exist. Right-click
 and keyboard access reuse the existing row trigger; no ⋮ control or second popup
 is added. Attention actions keep their existing owners. Solo chats in
 Messages use these same permission-checked
@@ -447,30 +456,37 @@ transcript layout, Share behavior and recipient rules do not change. Move/Star/g
 controls share this popup with independent eligibility; lifecycle actions do not
 change shared-menu styling.
 
-The row menu resolves fresh relay-authored metadata (`39000`), administrators
-(`39001`) and membership (`39002`) at exact channel coordinates before offering
-Archive/Unarchive/Delete/Leave or DM Hide. Archive and Unarchive require a direct
-owner/admin role or verified ownership evidence for an owner-role agent, matching
-the relay and desktop. Delete is offered to a direct owner or a member with that
-same evidence; the last direct owner cannot Leave. The menu omits Leave
-when it is forbidden, without an ownership-transfer explanation. Action labels
-have no trailing ellipsis. DMs offer Hide only.
+Every lifecycle surface (sidebar row, header, Solo chat menu and Settings)
+offers its actions as soon as it opens, from state the session already holds:
+the live relay-signed metadata (`39000`) and roster (`39002`). Opening a menu
+reads no channel permissions and waits on no relay read, so items do not shift. The roster's
+role fields (`["p", pubkey, relay_hint?, role?]`) agree with the administrator
+record (`39001`), as member administration requires, so they are a sound basis
+for what to offer. Archive and Unarchive are offered to a direct owner/admin or a
+verified owner-agent's human; Delete to a direct owner or that human; the last
+direct owner is not offered Leave, without an ownership-transfer explanation.
+Action labels have no trailing ellipsis. DMs offer Hide only. Channels whose id
+the lifecycle protocol rejects offer no lifecycle actions.
 
-Owner-agent eligibility follows the desktop's profile-based UX: read the channel
-owners' latest signed kind-0 profiles in bounded exact-author batches, then verify
-the unique NIP-OA tag, target binding, owner signature and conditions against the
-profile event. Display-only owner fields and agent hints never qualify. The
-existing shared verifier owns these checks; no new relay query or deployment is
-needed. Direct owners, DMs, Leave, and actions a direct role already grants do
-not require these optional profile reads. A failed five-second owner-profile lookup
-preserves independently established actions, omits the owner-agent actions and,
-on an active channel, exposes "Delete check unavailable" with explicit retry in
-both surfaces. Settings keeps
-its retry button focusable and busy during a fresh read, without retaining stale
-actions. Pending progress stays inside the button spinner, not a duplicate visible
-status sentence. If focus is still on recovery when the read finishes, it moves to the
-retry, an allowed action (Delete first), or a no-actions status. Moving focus
-elsewhere while waiting cancels that handoff.
+**What a surface offers is a hint; confirming authorizes.** Before signing and
+again before publishing, `run` reads fresh `39000`/`39001`/`39002` at exact
+channel coordinates and rejects a no-longer-permitted action in the
+confirmation result, and the relay enforces its own state. A stale roster can
+therefore offer an attempt that fails with an explanation, never a command the
+host would publish without a fresh check. Membership restored from the offline
+cache offers nothing until the relay confirms it, and membership the relay has
+revoked offers nothing.
+
+Owner-agent eligibility follows the desktop's profile-based UX: a channel owner's
+latest signed kind-0 profile must carry a unique NIP-OA tag whose target binding,
+owner signature and conditions verify against the profile event. Surfaces use
+the session profile cache's verified owner; if a roster owner's profile is not
+cached, they fetch it in the background and add Archive/Delete when it
+verifies, without holding back Leave. They ask again after a cache clear, an
+eviction or a failed read, at the directory's next change. `run` rereads the owner profiles in bounded
+exact-author batches with a five-second budget; failure there reports "Delete
+check unavailable. Try again." Display-only owner fields and agent hints never
+qualify.
 
 **Profile provenance is not the relay's persisted authorization mapping.** It is
 an eligibility hint for offering an attempt, not proof the command will succeed.
@@ -480,24 +496,16 @@ Profile replacement does not establish relay ownership transfer or revocation.
 The viewer signs the unchanged Delete command and the relay enforces its stored
 ownership and current channel state. A definitive rejection retains the channel
 and recoverable confirmation; uncertain delivery still blocks blind resubmission.
-Archive/Unarchive/Leave depend only on the viewer's own channel role. Existing
-membership requirements remain; nonmember access, owner-agent Archive/Unarchive authority and
-community-admin overrides are not added.
-Membership accepts NIP-29 `p` tags with optional relay and role fields
-(`["p", pubkey, relay_hint?, role?]`), including the relay's four-field roster.
-These fields never substitute for the separate administrator record. Invalid
-member keys and duplicate entries still fail closed. Failed menu permission reads
-show "Channel actions unavailable" with retry, not raw protocol errors. Pending
-permission reads show neither a loading row nor a lifecycle separator; the
-separator appears with the resolved actions or unavailable/retry section, and is
-omitted when there are no lifecycle items. Actions appear only after verification.
+Existing membership requirements remain; nonmember access and community-admin
+overrides are not added. Invalid member keys and duplicate entries still fail
+closed in the confirmation check.
 
 Channel Settings also offers **Leave channel**, **Archive channel** and **Delete
-channel** in its tools area, using one fresh lifecycle permission check. Each
-entry follows its own permission result: a last owner can Archive/Delete even
+channel** in its tools area, from the same live state. Each
+entry follows its own rule: a last owner can Archive/Delete even
 though Leave is forbidden, while an ordinary admin without owner-agent evidence can Archive but not Delete.
-Forbidden entries are omitted; failed checks offer retry and unsupported
-connections explain unavailability. DMs and read-only nonmember/cached views have no channel
+Forbidden entries are omitted and unsupported connections explain
+unavailability. DMs and read-only nonmember/cached views have no channel
 lifecycle entries. Archived channels cannot be deleted:
 the relay rejects Delete while archived. A direct owner/admin can restore it with
 **Unarchive channel**, which replaces Archive in the same Settings position, before
@@ -506,8 +514,8 @@ These controls hand off to the same persistent sidebar confirmation/navigation
 owner, so confirmed removal can unmount Settings without cancelling completion.
 Cancellation returns focus to the originating Settings button (or the sidebar
 fallback if that entry has gone away). Archive retains the current conversation,
-messages, membership and open Settings, replacing Archive with Unarchive after a
-fresh permission read. The conversation stays selected after reload; archived
+messages, membership and open Settings, replacing Archive with Unarchive once
+the confirmed metadata arrives. The conversation stays selected after reload; archived
 write restrictions still apply. Archived conversations and their threads replace the
 message composer with the lower archived-channel notice. If that composer owned
 focus, focus moves to the retained message history. Nonempty unsent text, including
@@ -531,6 +539,9 @@ membership, the channel joins the sidebar and the composer becomes available and
 focused. Guest-default previews omit Join and preserve reading without membership.
 Joining a channel is not available for DMs, private, archived or session
 conversations. See [relay queries](relay-queries.md#public-channel-name-search-and-join).
+Channel results end with their member count when the roster is known, such as
+**Public channel · not joined · 12 members**. A failed read leaves the row
+without one. See [relay queries](relay-queries.md#public-channel-name-search-and-join).
 Unarchive publishes the existing narrow `9002` command with `archived=false` and
 requires fresh relay metadata with a missing/false archive tag before updating
 shared discovery; a missing record is not success. Restoration returns the sidebar
@@ -559,10 +570,26 @@ the returned command, and confirms relay-owned state before removing a row. Arch
 confirmed Delete/Leave use the existing access-loss purge. Commands use narrow
 development-broker routes or the packaged native `relay_channel_sign` and
 `relay_channel_publish` commands, never the message outbox or automatic replay.
-Both hosts admit only the exact two-tag `9002` shape with `archived=true` (Archive)
-or `archived=false` (Unarchive); other values, extra tags, cross-route commands and
+The same route carries the **Starter channel for new members** switch as two commands
+without a confirmation dialog, `auto-join-on` and `auto-join-off`, each a `9002`
+with `auto_join=true|false`. The lifecycle owner requires fresh relay metadata for an
+active public stream channel before signing (channel roles cannot show community
+ownership; the relay accepts the flag only from community owners and admins) and
+confirms the result from the republished `39000`: the relay advertises the flag
+as a bare `auto_join` tag only while it is in effect, so success is that tag's
+presence or absence, not the written value.
+A published lifecycle command keeps its bounded, fresh, strong confirmation
+when access loss retires access-dependent work. Retired confirmation reads
+are reread; caller cancellation, session clear/disposal and the original deadline
+still abort its signal. A rejected publication or definitive confirmation-read
+failure still fails the command; an aborted read alone never confirms it. These signals
+do not forcibly interrupt an in-flight native publication IPC.
+Both hosts admit only the exact two-tag `9002` shape with `archived=true` (Archive),
+`archived=false` (Unarchive) or `auto_join=true|false` (the switch); other values,
+extra tags, cross-route commands and
 altered or foreign signatures are rejected. Hosts without this capability display
-an unavailable notice. Native Unarchive requires rebuilding/restarting the desktop
+an unavailable notice. Native Unarchive and the auto-join switch require
+rebuilding/restarting the desktop
 binary; updating the frontend alone does not update the Rust validator. Rust
 validator and production-IPC tests cover both values, but do not establish an
 installed desktop Archive → Unarchive round trip against a live relay; that
@@ -571,11 +598,13 @@ acceptance remains outstanding.
 Main’s DM × remains local removal, including restoration on new message evidence.
 The separate, confirmed Hide conversation action publishes `41012`, not Leave or Delete. The separate relay-authored `30622`
 visibility snapshot (`d=viewer`, `p=viewer`, hidden DM `h` tags) only filters sidebar
-rows; it does not deny access or prevent exact conversation navigation. Visibility
+rows; it does not deny access, prevent exact conversation navigation or stop
+New message from previewing the DM's history (see
+[Starting a direct message](#starting-a-direct-message)). Visibility
 refreshes with the channel roster, preserves the last good set on failure and
-rejects older snapshots. Live cross-device visibility updates and an in-app DM
-reopen/unhide flow are deferred; opening a DM through another supported client's
-`41010` flow and refreshing restores the row.
+rejects older snapshots. Live cross-device visibility updates are deferred; any
+confirmed `41010` open, including New message Send, unhides the DM, and its row
+returns when visibility next refreshes.
 
 A definitive rejection offers retry without optimistic removal. If publication or
 confirmation has an uncertain outcome, the dialog warns that the command may have
@@ -618,14 +647,16 @@ left-to-right fade on hover or keyboard focus (always visible on touch, no anima
 for reduced motion). The pencil follows the final text line;
 balanced side padding keeps the text centered and lets long titles wrap without clipping it.
 Description has a small pencil after its label,
-revealed with a short left-to-right fade on whole-row hover or keyboard focus
+revealed with a short left-to-right fade on row hover or keyboard focus
 (always visible on touch, no animation for reduced motion) without shifting layout;
-the whole row opens the shared Dialog with one Name/Description/Duration draft.
+only the label, a 24px target, opens the shared Dialog with one Name/Description/Duration draft.
+Every viewer sees the description rendered as message Markdown: its URLs, Buzz links
+and `#channel` references open their targets, so its value is not part of the Edit target.
 Opening Description focuses its textarea; the title focuses Name.
-Only authorized editors get the interactive rows; other viewers retain plain metadata.
+Only authorized editors get the edit actions; other viewers see the same linked description.
 Members has a right chevron and opens the existing member list. Channel ID has a
-small inline copy icon with the same hover/focus/touch behavior; selecting its row
-copies the exact ID. Only a successful copy opens a confirmation tooltip, without
+small inline copy icon revealed on whole-row hover or keyboard focus (always visible
+on touch, no animation for reduced motion); selecting its row copies the exact ID. Only a successful copy opens a confirmation tooltip, without
 growing the row; hovering or focusing does not open a hint or replay old feedback.
 Clipboard failure shows an inline error and leaves the row available to retry. The redundant standalone
 Edit details button, header-menu Edit details entry and informational Channel type
@@ -633,6 +664,23 @@ row are omitted.
 Duration uses Create's Ongoing/Temporary cards. Access controls live in the members
 dialog, separate from the text and lifespan draft. These details controls stage
 changes; none publishes immediately.
+**Starter channel for new members**, between Description and Members, is separate: an
+immediate switch that publishes its own narrow `9002` (see
+[Channel lifecycle](#channel-lifecycle)) and shows pending, the relay's refusal
+or, when the change is not confirmed, a prompt to try again beside itself. Once the
+channel's metadata shows the value that toggle wanted, the prompt clears, so trying
+again cannot undo a change that landed. It appears only to community owners and admins
+(the relay-signed kind `13534` roster) who are members of an active public stream
+channel, not previewing it or a guest in it, and only once the channel is loaded
+live rather than from cache. The relay checks the community role, not channel
+membership, so the gate is display-only and narrower: an owner or admin must join
+the channel to see the switch.
+Archiving a starter channel or making it private hides the switch and pauses the
+flag without clearing it: the relay stops advertising and applying it, refuses
+to change it on a private channel, and resumes adding new members on Unarchive
+or once the channel is public again. For a starter channel, the Archive and
+**Change general access?** (to Private) confirmations say so, so an owner or
+admin can turn the switch off first.
 **Save changes** submits the draft together and is enabled only for valid, changed values.
 **Cancel** explicitly discards edits and closes without confirmation. Close, Escape
 and backdrop clicks close untouched forms immediately; changed drafts first show
@@ -1032,7 +1080,12 @@ addition to the heading’s own top inset; invitation/recovery spacing is unchan
 The search composition reduces the shared header-to-body gap by `--space-2`
 (16px normally, 8px at the compact breakpoint) without affecting other dialogs.
 The member-list area flexes into the remaining dialog height and owns the only
-scrollbar, including search results and recovery messages. Current-member groups render at most 50 rows per page, with Previous/Next controls and whole-group counts. Search still filters the whole roster, and query or role-filter changes reset paging. Live roster changes retain the current page, clamped to the last available page. Subsequent growth retains that clamped page. Large-roster ordering and group membership stay stable while names update; live roster changes remove departed identities and append arrivals without re-sorting survivors. Reopening or refreshing takes a new ordering. Agents counts and the role filter reflect agent identities known at that point and can be partial when profiles have not loaded; newly learned agent badges can appear under People until reopen or refresh. Large rosters show the verified list without waiting for optional names; name enrichment requests only the displayed member pages through the existing profile directory, without warming the entire roster. Name search combines cached labels with paged relay name-search results for existing roster members, including when the viewer cannot add members; public-key search covers every member. Public-key labels remain available when a name is absent or evicted from that shared directory. The role groups and
+scrollbar, including search results and data recovery messages. Member
+administration errors, refused additions, Send message progress and errors, and
+Copy link failures sit above the list instead, so a long roster never hides them.
+Refused additions are grouped by reason: one alert names the people (up to three,
+then a count) and its one **Retry** resubmits all of them; Solo agents, which join
+directly, keep one alert each. Current-member groups render at most 50 rows per page, with Previous/Next controls and whole-group counts. Search still filters the whole roster, and query or role-filter changes reset paging. Live roster changes retain the current page, clamped to the last available page. Subsequent growth retains that clamped page. Large-roster ordering and group membership stay stable while names update; live roster changes remove departed identities and append arrivals without re-sorting survivors. Reopening or refreshing takes a new ordering. Agents counts and the role filter reflect agent identities known at that point and can be partial when profiles have not loaded; newly learned agent badges can appear under People until reopen or refresh. Large rosters show the verified list without waiting for optional names; name enrichment requests only the displayed member pages through the existing profile directory, without warming the entire roster. Name search combines cached labels with paged relay name-search results for existing roster members, including when the viewer cannot add members; public-key search covers every member. Public-key labels remain available when a name is absent or evicted from that shared directory. The role groups and
 Not in this channel flow naturally one after the other; empty groups are hidden. Only the bordered viewport fills spare
 height, never a group inside it. The shared Dialog's opt-in flex body
 keeps the outer body non-scrolling; other dialogs are unchanged.
@@ -1130,8 +1183,16 @@ member neither deletes their identity nor stops their agents.
 
 Role change and removal use deliberate confirmation steps in the same dialog,
 initially focused on Cancel. Removal shows only the avatar/name and actions;
-Cancel returns to the list. Errors appear below Search, outside the scrolling
-list; pending and success banners are omitted.
+Cancel returns to the list. Leaving either step keeps the list's scroll position
+and returns focus to that member's actions, including while a confirmed change
+is pending. When a confirmed removal takes the row away, focus moves to the
+actions of the member now in its place, the one before it, or Search when none
+is left, unless focus has moved elsewhere; a failed or uncertain removal leaves
+focus on the member. An addition's confirmation returns to Search. Errors appear
+below Search, outside the scrolling list. Only a confirmed change's own error
+scrolls the list, to keep that member's actions in view, and only while focus
+and the list are where the change left them. Pending and success banners are
+omitted.
 The service checks fresh actor/target state before signing and again
 before publication, rejects altered signer payloads, and confirms the requested
 role or roster absence with a fresh read. Relay acceptance alone is not success.
@@ -1183,7 +1244,20 @@ The port retains the prepared-store implementation and its behavior tests:
   retained-window live catch-up. Optional profile enrichment stays background.
   Selecting an already-queued catch-up promotes that existing read without adding
   a request or resetting its deadline.
-- 1,024 profile entries / 2 MiB signed-record budget, narrow row profile selectors,
+- 1,024 profile entries and an aggregate signed-record byte budget of the entry
+  limit × 2 KiB, evicting the least recently requested profile. While a channel is
+  open and active (not a retained background tab), it reserves room for its whole
+  roster on top of that base, up to 10,240 entries. Leaving gives the room back
+  after the current task, so a remount or a roster count change keeps the loaded
+  profiles; the shrink cancels background profile reads asked for before
+  leaving, not the next view's, and
+  stops the verified-name syncs it emptied. Verified-name syncs (128 people
+  each) have their own pool of 80, enough for the largest cache, apart from the
+  32 artifact syncs. A background profile read of many pages publishes once,
+  when its pages settle (a foreground read that joins it publishes at once), so
+  an open mention menu re-ranks a large roster once instead of per page. The
+  channel avatar preview reads at most the first 1,024 members; only the mention
+  menu reads a whole large roster. Narrow row profile selectors,
   and request-warmed avatars (fetched and decoded, nothing retained; disabled
   under the Save-Data preference). Signature verification yields in batches.
 - Account/relay-scoped IndexedDB: 64 records / 8 MiB global disk budget, 24-hour
@@ -1217,6 +1291,26 @@ The relay service restores a read-only session from the account/relay-scoped cac
 concurrently with the real connection handshake. Saved groups, stars and channel
 names are display data, not a confirmed preference mutation base. No cache means
 the ordinary cold connection flow; unavailable/corrupt storage never grants access.
+
+With no saved selection, Messages opens the first channel the relay flags
+`auto_join` (its starter channel for new members), then the first non-Solo
+channel; an explicit empty route bypasses both. The relay adds people to its
+`auto_join` channels itself, and the resulting membership hints populate the
+sidebar live:
+
+- A community that requires relay membership adds a member once, when they join
+  its roster: an invite claim that answers `joined`, or an admin's kind `9030`
+  add. A reclaim answering `already_member` adds nothing, and existing members
+  are not added to a channel flagged later.
+- An open community has no roster to join. After each human WebSocket AUTH
+  (agents are skipped) the relay adds the person to every `auto_join` channel
+  they have never been a member of, including channels flagged after they first
+  connected.
+
+Either way a later leave stands: the roster path does not run again for an
+existing member, and on the open path a leave or removal keeps a membership
+record, so the relay does not add the person back. The client only reads the
+flag; it never sends a join on a member's behalf.
 
 A cached roster can display previously downloaded, reverified history for up to
 24 hours. It cannot authorize head/history reads, unread evidence, typing or
@@ -1290,14 +1384,21 @@ channel-scoped payloads from the connected relay become activity rows; malformed
 unknown and other authors' summaries are not rendered as JSON. These events do not
 grant/revoke access: the existing signed roster remains authoritative.
 
-The timeline groups adjacent arrivals/departures into compact avatar-and-text rows.
-Messages, local-day changes and gaps over an hour break groups; removals by different
-actors stay separate. Same-adder additions use “added by you” for the viewer;
-mixed arrivals do not invent an adder. Grouping is presentation-only: signed event
-IDs and cursors remain per event, and live activity counts against the row budget.
-Profiles reuse the
-shared background directory/cache, and reading anchors can resolve a member of a
-group. Activity has no message actions, thread, unread evidence or chat preview.
+The timeline shows only explicit additions by another actor and removals; self-joins
+and voluntary leaves are hidden before grouping. Each uninterrupted run of visible
+membership activity becomes one centered avatar-and-text row. Messages and huddles
+break runs; local-day changes, elapsed time and different removal actors do not.
+Each person appears only under their latest visible action in the run, including
+in the hover detail: removal followed by re-addition is described as an addition.
+The group keeps its newest event's identity and its oldest event's date.
+
+Small same-adder additions use “added by you” for the viewer; mixed additions do not
+invent an adder. Large or mixed summaries keep one name per action and a count;
+hovering, clicking or keyboard-opening the count shows the full scrollable people
+list for that action. Grouping is presentation-only: all signed events remain in
+the group, IDs and cursors remain per event, and reading anchors can resolve any
+member event. Profiles reuse the shared background directory/cache. Activity has no
+message actions, thread, unread evidence or chat preview.
 A Solo chat omits its owner's additions and removals of agents before its first
 message once history reaches its start; later changes, people and agents added by others still
 show. Membership, access and pagination are unchanged.
@@ -1373,6 +1474,54 @@ not visible rows or complete history.
 The relay can filter rows after its limit, and summaries/EOSE are not proof of
 exhaustion. See [the thread owner and bounds](relay-queries.md#thread-views).
 
+### Scrolling long threads
+
+These are the requirements for scrolling a long thread; the targets below measure
+how close the panel is, and [performance runs](performance.md)
+report where it stands. A thread with hundreds of replies must scroll as smoothly
+as a short one, for every reply the panel has loaded, up to the bounded history
+above, whatever the mix of Markdown, mentions, links and authors. Reaching replies
+beyond those bounds belongs to the relay's thread retention, not to scrolling.
+
+- **Smooth and responsive:** wheel, trackpad and keyboard input move the pane from
+  the first event, at the display's frame rate, and a reversal follows at once.
+  The panel's own position corrections never stall input or cut a trackpad coast
+  short.
+- **Always available:** loaded replies are painted as they come into view, at any
+  scroll speed and through direction changes. The pane never blinks or shows empty
+  space where loaded replies belong, and replies already shown stay readable while
+  an older page loads.
+- **Final on arrival:** a reply appears at its final size and position. It does not
+  rewrap, resize or move after it is on screen; media occupy their reserved frame.
+- **Reading position holds:** older pages, resolved media and profiles, live
+  replies and panel resizes keep the message being read at the same offset. New
+  replies are followed only while the reader is at or near the bottom.
+- **Bounded work:** the cost of a scroll gesture depends on the replies near the
+  viewport, not on how many are loaded. If replies far from the viewport are not
+  rendered, scrolling, exact links, keyboard selection and Back/Forward still reach
+  every loaded reply, and focus, selection, editing, drafts and expanded branches
+  keep working for them.
+
+#### Targets
+
+These targets are measured on a fixed mock thread of 460 replies (the strict
+window's full history) in the macOS app, with every reply loaded and a 60 Hz
+display. A measured run is two upward trackpad flings with a reversal, then Jump to
+latest.
+They are advisory: the [performance suite](performance.md) reports them and does
+not fail CI on them.
+
+| While scrolling the loaded thread | Target | Ceiling |
+| --- | --- | --- |
+| 95th-percentile frame interval | 16.7 ms (60 fps) | 33 ms |
+| Frames longer than two 60 Hz frames, per run | 0 | 5 |
+| Captured frames with a blank band (35% of the pane or more), per run | 0 | 5 |
+
+The target is the goal; the ceiling is the line regressions must not cross while
+the target is out of reach. Browser engines show a different subset: Chromium's
+frame rate cannot see compositing stalls, so its runs report main-thread cost, and
+macOS WebKit reproduces the frame intervals but not momentum or painted pixels.
+
 ## Validation and limits
 
 `just scan` runs frontend checks/build, runtime/CLI tests, relay behavior tests,
@@ -1421,7 +1570,8 @@ the new block, and one undo restores the typed marker and its space. The typed
 `• ` alias sends as Markdown `- `. The channel placeholder appears only in an empty plain
 paragraph, not beside a list marker. Enter
 continues a list and exits an empty item; use the Send button to send while the caret is
-in a list (or Save changes when editing). Enter in ordinary prose still sends or saves. Inside a
+in a list (or Save changes when editing). Enter in ordinary prose still sends or saves;
+with **Send with ⌘ Enter** on, ⌘/Ctrl+Enter sends or saves instead, including in a list. Inside a
 quote the markers nest: `- ` opens a list and `> ` a second quote. Inside a list item only a
 marker of the item's own list kind, typed as the only text of an item after the first,
 converts, nesting that item as Tab does. A marker typed after prose on the same line, as
@@ -1549,6 +1699,41 @@ options exposes local-only manual unread, explicit mark-through and sync recover
 Older synchronized hints may expire under bounded retention. Synced manual-unread
 and OS notifications are not enabled by this feature.
 
+### Keyboard navigation and reading
+
+The Channels plugin registers Slack-style shortcuts through the shared dispatcher, so
+each is listed in Settings → Shortcuts and can be rebound. All run while typing in the
+message editor, except as noted below, and are ignored behind a dialog. None run in a
+terminal, which keeps Escape and Option+Arrow for the shell.
+
+- **Previous/next conversation** (Option+Up/Down) and **previous/next unread
+  conversation** (Option+Shift+Up/Down) step through the sidebar's rendered order,
+  Solo chats and team rows alike. As in Slack, plain Option+Up/Down steps from the
+  composer only while its draft is empty; with text it moves the caret by paragraph
+  instead. `conversation-rows.ts` scans the sidebar's `Subscribed channels` list, so sorting, sections, filters and the All/Solo/Team pane
+  are already applied; rows in a collapsed section or the inactive pane are skipped. A
+  row is unread when it shows the unread or thread-activity marker that
+  `SidebarUnread` also reads. The open conversation is the row marked `aria-current`.
+  Plain stepping does not wrap, and at either end it does nothing; unread stepping
+  wraps around to the nearest unread row from the other end. When the open
+  conversation is not among the rows, next starts from the top and previous from the
+  bottom. A conversation listed in two sections is stepped over once. The shortcuts
+  are unavailable, leaving the key alone, while the sidebar renders no rows (for
+  example behind another page's own sidebar). Stepping activates the row's own
+  button, so it takes the exact path of a click: the saved selection, navigation
+  intent, session staleness guard and Solo's immediate activation. The list scrolls
+  just far enough to show the row, and nothing above it moves.
+- **Mark conversation as read** (Escape) uses the open conversation's
+  `unread.markChannelRead`, as the row menu's Mark as read does, with no success toast.
+  A failure shows an error toast. The page publishes it only for a joined,
+  non-preview conversation (not the new message page), and it is available only while
+  the connection has `frontier-sync`, the conversation shows unread and focus is not a
+  text field outside the composer. It never consumes a dismissal: the dispatcher skips
+  events something already handled, panels, tabs, completions and message edits stop
+  Escape themselves, and the narrow navigation drawer now prevents it when it closes.
+- **Mark all as read** (Shift+Escape) is registered by the shell; see
+  [shell design](shell-design.md).
+
 
 ### Attachment layout and scrolling
 
@@ -1582,6 +1767,7 @@ Image attachments reserve loading geometry from valid `imeta dim` metadata,
 bounded to 360px wide and 320px tall without enlarging the frame beyond the
 original dimensions. Missing/invalid dimensions, including metadata that would
 reserve less than one CSS pixel on either axis, use a 360:320 loading frame.
+When sending media, the app copies `dim` from the relay's upload result.
 After the original decodes, its natural dimensions replace metadata and the
 loading frame. Loaded previews follow the image's aspect ratio with no grey
 backing or letterboxing, bounded to 360px wide and 320px tall. Exceptionally thin
@@ -1594,13 +1780,18 @@ Unavailable media keeps the same reserved frame and displays its status within i
 Exceptionally small frames can clip the visible label while retaining the complete
 accessible status.
 Valid message-carried `imeta blurhash` is decoded locally into a 32×32 canvas in
-that same frame when it intersects the viewport. No thumbnail is fetched. The
-preview is removed entirely (including behind transparency) only after the lazy
-original decodes; failure retains the preview. Missing/invalid hashes or canvas
+that same frame when it intersects the viewport. Relay-hosted images also lazily
+request the relay's small thumbnail and, once it loads, show it blurred above the
+blurhash. PNG, GIF, WebP and AVIF originals request the WebP variant, which keeps
+transparency; uploads that predate it fail and keep the blurhash. Third-party
+images and re-adopted decoded originals request none, and a failed thumbnail
+leaves the blurhash. These previews are removed entirely
+(including behind transparency) only after the lazy original decodes; failure
+retains them. Missing/invalid hashes or canvas
 failures keep the existing background. Syntax validation bounds hashes to 166
-base83 characters / 9×9 components; folding does no pixel work. Preview work is
+base83 characters / 9×9 components; folding does no pixel work. Blurhash work is
 per-mounted-image and uncached, visibility-gated even in nonvirtualized threads.
-Without IntersectionObserver, only the ordinary placeholder/original is used.
+Without IntersectionObserver, no blurhash is painted.
 This favors bounded visible work over instant offscreen previews on scrolling.
 `tests/browser/image-scroll.spec.mjs` covers delayed/failed loads, actual remounts,
 bottom following, reading anchors and narrow layout in Chromium and WebKit.
@@ -1613,6 +1804,13 @@ message opens as the root in the existing thread panel; a reply opens there with
 its actual root and bounded surrounding replies. No around-message channel query
 or separate detail screen is added. The presentation choice stays fixed for that
 navigation attempt; exact reads do not insert isolated old rows into channel history.
+Only **Open in channel** from a thread tab also shows the thread's root in the
+timeline: the list waits while older pages are read to find it, within the same
+bound as conversation tabs, then reveals and marks the root without taking the
+thread's focus. A root it cannot find leaves the timeline at its usual place.
+Back or Forward to that visit, or closing Members, seeks the root again; a list
+already shown stays in place while it does. Cached rows cannot place the root,
+so a cached session shows them as usual and seeks once it connects.
 
 Navigation completes only after the exact folded target is visible and focused.
 Reclick/Back reveals again; live/profile updates do not steal focus. The shared

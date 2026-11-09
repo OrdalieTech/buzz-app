@@ -72,7 +72,7 @@ it("measures coverage for the app's subscriber and for raw batch shapes", async 
   const packed = await run("filters:10", channels);
   const single = await run("multi-h:all", channels);
   // One live batch and two global routes. The client can also start replay.
-  expect([one.reqs, four.reqs, packed.reqs, single.reqs]).toEqual([4, 5, 2, 1]);
+  expect([one.reqs, four.reqs, packed.reqs, single.reqs]).toEqual([4, 4, 2, 1]);
   for (const result of [one, four, packed, single])
     expect(result).toMatchObject({
       channels: 20,
@@ -108,7 +108,7 @@ it("keeps live coverage when the separate replay sample fails", async () => {
     failed: 0,
     coverageMs: 40,
     canaryMs: 1000,
-    failures: { "error: replay unavailable": 2 },
+    failures: { "error: replay unavailable": 1 },
   });
 });
 

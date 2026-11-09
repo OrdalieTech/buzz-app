@@ -1,5 +1,5 @@
 import { test, expect } from "./fixture.mjs";
-import { open } from "./timeline.mjs";
+import { clickRow, open } from "./timeline.mjs";
 
 test.use({
   productionBroker: true,
@@ -27,10 +27,14 @@ test("a tab's Close other tabs keeps only that tab", async ({
   for (const [index, root] of roots.entries()) {
     // A main-pane thread covers the channel; return to it for the next one.
     if (index) await conversation.click();
-    await page
-      .locator(`[data-channel-timeline="alpha"] [data-message-id="${root.id}"]`)
-      .getByRole("button", { name: /^View thread:/ })
-      .click();
+    await clickRow(
+      page,
+      page
+        .locator(
+          `[data-channel-timeline="alpha"] [data-message-id="${root.id}"]`,
+        )
+        .getByRole("button", { name: /^View thread:/ }),
+    );
     await expect(threadTabs).toHaveCount(index + 1);
   }
   // The second thread is selected; keep the first, unselected one.

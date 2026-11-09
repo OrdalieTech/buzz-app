@@ -430,7 +430,7 @@ test.describe("crowded content tabs", () => {
     }));
     expect(geometry.scrollbar).toBeLessThanOrEqual(4);
     expect(geometry.nativeWidth).toBe("auto");
-    expect(geometry.trackHeight).toBe("4px");
+    expect(geometry.trackHeight).toBe("3px");
     await expect
       .poll(() => list.evaluate((el) => el.scrollWidth > el.clientWidth))
       .toBe(true);
@@ -515,7 +515,11 @@ test("Canvas opens once beside Thread and retains its channel draft", async ({
   await viewCanvas();
   const canvas = workspace.getByRole("tab", { name: "Canvas", exact: true });
   const text = workspace.getByRole("textbox", { name: "Canvas Markdown" });
+  const view = workspace.getByRole("article", { name: "Saved Canvas" });
+  const edit = workspace.getByRole("tab", { name: "Edit", exact: true });
   await expect(canvas).toHaveAttribute("aria-selected", "true");
+  await expect(view).toBeVisible();
+  await edit.click();
   await expect(text).toBeEnabled();
   await text.fill("Channel-scoped draft");
   await thread.click();
@@ -523,20 +527,35 @@ test("Canvas opens once beside Thread and retains its channel draft", async ({
   await viewCanvas();
   await expect(canvas).toHaveCount(1);
   await expect(canvas).toHaveAttribute("aria-selected", "true");
+  // Returning to an open Canvas tab keeps its selected Edit tab.
   await expect(text).toHaveValue("Channel-scoped draft");
+  // Pointer-returning to Canvas on Edit resumes the editor, not hidden View.
+  await text.evaluate((node) => node.setSelectionRange(2, 7));
+  await thread.click();
+  await expect(text).toBeHidden();
+  await canvas.click();
+  await expect(text).toBeFocused();
+  await expect(text).toHaveValue("Channel-scoped draft");
+  expect(
+    await text.evaluate((node) => [node.selectionStart, node.selectionEnd]),
+  ).toEqual([2, 7]);
   await workspace
     .getByRole("button", { name: "Close Canvas tab", exact: true })
     .click();
   await expect(thread).toHaveAttribute("aria-selected", "true");
   await viewCanvas();
+  await expect(view).toBeVisible();
+  await edit.click();
   await expect(text).toHaveValue("Channel-scoped draft");
-  // Leaving a channel retires its Canvas tab; reopening restores the draft.
+  // Leaving a channel keeps its Canvas tab open for the return.
   await page.locator('button[data-solo-channel-id="beta"]').click();
   await expect(workspace).toHaveCount(0);
   await page.locator('button[data-channel-id="alpha"]').click();
   await expect(thread).toBeVisible();
-  await expect(canvas).toHaveCount(0);
-  await viewCanvas();
+  await expect(canvas).toHaveCount(1);
+  await expect(canvas).toHaveAttribute("aria-selected", "true");
+  // Returning shows the open Canvas; Edit still holds the channel's draft.
+  await edit.click();
   await expect(text).toHaveValue("Channel-scoped draft");
 });
 
@@ -584,6 +603,10 @@ test.describe("archived Canvas", () => {
       name: "Channel Canvas",
       exact: true,
     });
+    await expect(
+      canvas.getByRole("article", { name: "Saved Canvas" }),
+    ).toHaveText("Archived plan");
+    await canvas.getByRole("tab", { name: "Edit", exact: true }).click();
     const editor = canvas.getByRole("textbox", { name: "Canvas Markdown" });
     await expect(editor).toHaveValue("Archived plan");
     await expect(editor).toHaveAttribute("readonly", "");
@@ -591,6 +614,8 @@ test.describe("archived Canvas", () => {
       canvas.getByRole("button", { name: "Save Canvas" }),
     ).toBeDisabled();
     await canvas.getByRole("tab", { name: "History", exact: true }).click();
+    await expect(canvas.getByText("Same as current version.")).toBeVisible();
+    await canvas.getByRole("checkbox", { name: "Show full content" }).click();
     await expect(
       canvas.getByRole("textbox", { name: "Revision Markdown" }),
     ).toHaveValue("Archived plan");

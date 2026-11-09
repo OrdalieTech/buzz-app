@@ -1,23 +1,28 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 import { createRelaySession } from "../relay/session";
-import { keypair, metadata, roster, signed } from "../relay/testing";
+import { keypair, metadata, signed } from "../relay/testing";
 import { matchesEvent } from "../relay/projection";
 import type { RelayEvent, ReadFilter } from "../relay/events";
 import { PublishRejected } from "../relay/outbox";
-import * as share from "../solo/share";
 import { MessageComposer } from "./MessageComposer";
 import { composerDOMFixture } from "./composer-testing";
 import { writeView } from "../../shared/view-state";
-import { bindNames } from "../identity-names/service";
-import { createAgentDirectory } from "../identity-names/testing";
 
 composerDOMFixture();
 const source = "11111111-1111-4111-8111-111111111111";
 const destination = "22222222-2222-4222-8222-222222222222";
+const second = "33333333-3333-4333-8333-333333333333";
 const root = "a".repeat(64);
 const owners: ReturnType<typeof createRelaySession>[] = [];
 afterEach(() => {
@@ -30,16 +35,18 @@ async function fixture(
   thread = false,
   options: {
     destinationType?: string;
-    alone?: boolean;
+    visibility?: "public" | "private";
+    joinRole?: "member" | "guest";
+    owned?: boolean;
     shared?: boolean;
-    /** The other people's profile name. */
-    named?: string;
+    alone?: boolean;
+    multiple?: boolean;
+    viewOnlySecond?: boolean;
   } = {},
 ) {
   const viewer = keypair(),
     relay = keypair(),
-    person = keypair(),
-    late = keypair();
+    person = keypair();
   let clock = Math.floor(Date.now() / 1000);
   const members = new Map([
     [source, options.shared ? [viewer.pubkey, person.pubkey] : [viewer.pubkey]],
@@ -47,63 +54,123 @@ async function fixture(
       destination,
       options.alone ? [viewer.pubkey] : [viewer.pubkey, person.pubkey],
     ],
+    ...(options.multiple
+      ? [[second, [viewer.pubkey]] as [string, string[]]]
+      : []),
   ]);
+  const metadataEvents = new Map(
+    [source, ...(options.multiple ? [second] : [])].map((id) => [
+      id,
+      metadata(relay, id, id === source ? "Work" : "Other work", clock, [
+        ["t", "stream"],
+        ["t", "buzz.solo"],
+        [
+          id === second && options.viewOnlySecond
+            ? "public"
+            : (options.visibility ?? "private"),
+        ],
+        [
+          "join_role",
+          id === second && options.viewOnlySecond
+            ? "guest"
+            : (options.joinRole ?? "member"),
+        ],
+        ["P", options.owned === false ? person.pubkey : viewer.pubkey],
+      ]),
+    ]),
+  );
   const published: RelayEvent[] = [];
-  let reject = false;
+  let reject = false,
+    loseResponse = false;
   let hold: Promise<void> | undefined;
   let onQuery: ((filters: readonly ReadFilter[]) => void) | undefined;
   const publish = vi.fn(async (event: RelayEvent) => {
-    if (event.kind === 9000) {
-      if (hold) await hold;
-      if (reject) throw new PublishRejected("Invite refused");
-      const channel = event.tags.find((tag) => tag[0] === "h")?.[1] ?? "";
-      const key = event.tags.find((tag) => tag[0] === "p")?.[1] ?? "";
-      members.set(channel, [
-        ...new Set([...(members.get(channel) ?? []), key]),
-      ]);
+    if (event.kind === 9002) {
+      await hold;
+      if (reject) throw new PublishRejected("Access refused");
+      const id = event.tags.find(([tag]) => tag === "h")?.[1] ?? "";
+      const previous = metadataEvents.get(id);
+      if (!previous) throw new Error("Unknown chat");
+      const tags = previous.tags.filter(
+        ([tag]) =>
+          tag !== "d" &&
+          tag !== "name" &&
+          tag !== "private" &&
+          tag !== "public" &&
+          tag !== "join_role",
+      );
+      metadataEvents.set(
+        id,
+        metadata(
+          relay,
+          id,
+          event.tags.find(([tag]) => tag === "name")?.[1] ??
+            (id === source ? "Work" : "Other work"),
+          ++clock,
+          [...tags, ["public"], ["join_role", "guest"]],
+        ),
+      );
     }
     published.push(event);
-    clock++;
+    if (event.kind === 9002 && loseResponse) throw new Error("Lost response");
   });
+  const sign = vi.fn(async (event: Parameters<typeof signed>[1]) =>
+    signed(viewer, event),
+  );
   const owner = createRelaySession(
     {
       viewer: viewer.pubkey,
       relayAuthor: relay.pubkey,
+      channelIdentity: true,
       scope: "https://test.example",
       media: () => undefined,
       query: async (filters: readonly ReadFilter[]) => {
         onQuery?.(filters);
         return [
-          metadata(relay, source, "Work", clock, [
-            ["t", "stream"],
-            ["t", "buzz.solo"],
-            ["private"],
-            ["P", viewer.pubkey],
-          ]),
+          ...metadataEvents.values(),
           metadata(relay, destination, "Team", clock, [
             ["t", options.destinationType ?? "stream"],
             ["private"],
           ]),
-          ...[source, destination].map((id) =>
-            roster(relay, id, members.get(id) ?? [], clock),
-          ),
-          ...(options.named
-            ? [person, late].map((key) =>
-                signed(key, {
-                  kind: 0,
-                  created_at: clock,
-                  tags: [],
-                  content: JSON.stringify({ name: options.named }),
-                }),
-              )
-            : []),
+          ...[...members].flatMap(([id, keys]) => [
+            signed(relay, {
+              kind: 39001,
+              created_at: clock,
+              content: "",
+              tags: [
+                ["d", id],
+                ...(options.owned !== false && id !== destination
+                  ? [["p", viewer.pubkey, "owner"]]
+                  : []),
+              ],
+            }),
+            signed(relay, {
+              kind: 39002,
+              created_at: clock,
+              content: "",
+              tags: [
+                ["d", id],
+                ...keys.map((key) => [
+                  "p",
+                  key,
+                  "",
+                  key === viewer.pubkey &&
+                  options.owned !== false &&
+                  id !== destination
+                    ? "owner"
+                    : "member",
+                ]),
+              ],
+            }),
+          ]),
           ...published,
         ].filter((event) =>
           filters.some((filter) => matchesEvent(event, filter)),
         );
       },
+      channelDetails: { sign, publish },
       writer: {
-        kinds: [9, 9000],
+        kinds: [9, 9000, 9002],
         sign: async (event) => signed(viewer, event),
         publish,
       },
@@ -113,23 +180,18 @@ async function fixture(
   owners.push(owner);
   owner.session.channels.ensureList();
   await vi.waitFor(() =>
-    expect(owner.session.channels.list().channels).toHaveLength(2),
+    expect(owner.session.channels.list().channels).toHaveLength(members.size),
   );
-  // The production naming policy, so namesakes are told apart.
-  const session = {
-    ...owner.session,
-    names: bindNames(owner.session, {
-      snapshot: () => [createAgentDirectory()],
-      subscribe: () => () => {},
-    }),
-  };
-  const link = `buzz://channel/${source}`;
   const key = `draft:${destination}${thread ? `:thread:${root}` : ""}`;
-  writeView(owner.session.scope, key, `${link}\n\nPlease look at this`);
+  writeView(
+    owner.session.scope,
+    key,
+    `${[source, ...(options.multiple ? [second] : [])].map((id) => `buzz://channel/${id}`).join("\n\n")}\n\nPlease look at this`,
+  );
   const view = render(
     <MessageComposer
-      session={session}
-      scope={session.scope}
+      session={owner.session}
+      scope={owner.session.scope}
       channelId={destination}
       channelName="Team"
       {...(thread ? { threadRootId: root } : {})}
@@ -137,15 +199,19 @@ async function fixture(
   );
   return {
     view,
-    session,
+    session: owner.session,
+    sign,
     published,
     publish,
     members,
-    person,
-    late,
     key,
+    viewer,
+    person,
     reject(value: boolean) {
       reject = value;
+    },
+    loseResponse(value: boolean) {
+      loseResponse = value;
     },
     hold(value: Promise<void>) {
       hold = value;
@@ -153,15 +219,39 @@ async function fixture(
     watchQueries(value: (filters: readonly ReadFilter[]) => void) {
       onQuery = value;
     },
-    addLate() {
-      members.get(destination)?.push(late.pubkey);
-      clock++;
+    makePublic(joinRole = "member") {
+      metadataEvents.set(
+        source,
+        metadata(relay, source, "Work", ++clock, [
+          ["t", "stream"],
+          ["t", "buzz.solo"],
+          ["public"],
+          ["join_role", joinRole],
+          ["P", viewer.pubkey],
+        ]),
+      );
+    },
+    changeDetails({ name = "Work", visibility = "private" } = {}) {
+      metadataEvents.set(
+        source,
+        metadata(relay, source, name, ++clock, [
+          ["t", "stream"],
+          ["t", "buzz.solo"],
+          [visibility],
+          ["join_role", options.joinRole ?? "member"],
+          ["P", viewer.pubkey],
+        ]),
+      );
     },
   };
 }
+const send = () =>
+  userEvent.click(screen.getByRole("button", { name: "Send message" }));
+const confirm = async () =>
+  userEvent.click(await screen.findByRole("button", { name: "Share" }));
 
 it.each([false, true])(
-  "consent grants access before posting exactly once in the selected conversation (thread=%s)",
+  "confirms community reading before posting exactly once, without grants (thread=%s)",
   async (thread) => {
     const f = await fixture(thread);
     let release!: () => void;
@@ -170,74 +260,133 @@ it.each([false, true])(
         release = resolve;
       }),
     );
-    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    expect(
-      await screen.findByRole("dialog", { name: "Share access to this chat?" }),
-    ).toBeVisible();
-    expect(f.publish).not.toHaveBeenCalled();
-    await userEvent.click(
-      screen.getByRole("button", { name: "Share and send" }),
+    await send();
+    const dialog = await screen.findByRole("alertdialog", {
+      name: "Share this chat?",
+    });
+    expect(dialog).toHaveAccessibleDescription(
+      /^This changes the chat from Private to View only and sends your message and chat link to #Team\./,
     );
+    expect(dialog).toHaveTextContent(
+      "full history, Canvas, workspace folders, and agent instructions",
+    );
+    expect(dialog).toHaveTextContent("#Team");
+    expect(screen.queryByRole("button", { name: "Send link only" })).toBeNull();
+    expect(f.publish).not.toHaveBeenCalled();
+    await confirm();
     try {
-      await waitFor(() => expect(f.publish).toHaveBeenCalled());
+      await waitFor(() => expect(f.publish).toHaveBeenCalledOnce());
       expect(f.published).toHaveLength(0);
-      expect(screen.getByRole("button", { name: "Sharing…" })).toBeDisabled();
     } finally {
       await act(async () => release());
     }
     await waitFor(() =>
-      expect(f.published.filter((event) => event.kind === 9)).toHaveLength(1),
+      expect(f.published.map((event) => event.kind)).toEqual([9002, 9]),
     );
-    expect(f.members.get(source)).toContain(f.person.pubkey);
-    expect(f.published.map((event) => event.kind)).toEqual([9000, 9]);
-    const message = f.published.find((event) => event.kind === 9);
+    expect(f.members.get(source)).toEqual([f.viewer.pubkey]);
+    expect(f.published[0]?.tags).toContainEqual(["visibility", "open"]);
+    expect(f.published[0]?.tags).toContainEqual(["join_role", "guest"]);
+    const message = f.published[1];
     expect(message?.content).toContain("Please look at this");
-    expect(message?.tags.some(([key]) => key === "s")).toBe(false);
     if (thread) expect(message?.tags).toContainEqual(["e", root, "", "reply"]);
-    else expect(message?.tags.some((tag) => tag[0] === "e")).toBe(false);
+    else expect(message?.tags.some(([tag]) => tag === "e")).toBe(false);
   },
 );
 
-it("link-only leaves access unchanged; cancelling preserves the draft", async () => {
+it("Cancel preserves access and the original draft", async () => {
   const f = await fixture(true);
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await screen.findByRole("dialog");
-  await userEvent.click(screen.getByRole("button", { name: "Close" }));
+  await send();
+  await screen.findByRole("alertdialog");
+  await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
   expect(f.publish).not.toHaveBeenCalled();
   expect(screen.getByRole("textbox")).toHaveTextContent("Please look at this");
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Send link only" }),
+  await send();
+  await confirm();
+  await waitFor(() =>
+    expect(f.published.map((event) => event.kind)).toEqual([9002, 9]),
   );
-  await waitFor(() => expect(f.published).toHaveLength(1));
-  expect(f.published[0]?.kind).toBe(9);
-  expect(f.members.get(source)).not.toContain(f.person.pubkey);
 });
 
-it("retains the captured audience on grant failure and retries the existing receipt before sending", async () => {
+it.each(["member", "guest"] as const)(
+  "an already open owned chat (%s) preserves access and confirms View only delivery",
+  async (joinRole) => {
+    const f = await fixture(false, { visibility: "public", joinRole });
+    await send();
+    if (joinRole === "guest") {
+      const dialog = await screen.findByRole("alertdialog", {
+        name: "Share this chat?",
+      });
+      expect(dialog).toHaveAccessibleDescription(
+        /^This chat is already View only\. Your message and chat link will be sent to #Team\./,
+      );
+      expect(f.publish).not.toHaveBeenCalled();
+      await userEvent.click(
+        within(dialog).getByRole("button", { name: "Cancel" }),
+      );
+      expect(screen.getByRole("textbox")).toHaveTextContent(
+        "Please look at this",
+      );
+      expect(f.publish).not.toHaveBeenCalled();
+      await send();
+      await confirm();
+    }
+    await waitFor(() =>
+      expect(f.published.map((event) => event.kind)).toEqual([9]),
+    );
+    expect(f.sign).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(
+      f.session.channels.list().channels.find((item) => item.id === source)
+        ?.joinRole,
+    ).toBe(joinRole);
+  },
+);
+
+it("a chat the viewer does not own sends as a link without granting access", async () => {
+  const f = await fixture(false, { owned: false });
+  await send();
+  await waitFor(() =>
+    expect(f.published.map((event) => event.kind)).toEqual([9]),
+  );
+  expect(f.sign).not.toHaveBeenCalled();
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  expect(f.members.get(source)).toEqual([f.viewer.pubkey]);
+});
+
+it("access rejection keeps the message unsent and allows explicit retry", async () => {
   const f = await fixture();
   f.reject(true);
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Share and send" }),
-  );
-  expect(await screen.findByRole("alert")).toHaveTextContent("Invite refused");
+  await send();
+  await confirm();
+  expect(await screen.findByRole("alert")).toHaveTextContent("Access refused");
   expect(f.published).toHaveLength(0);
-  const first = f.publish.mock.calls[0]?.[0].id;
-  f.addLate();
   f.reject(false);
   await userEvent.click(
     screen.getByRole("button", { name: "Retry share and send" }),
   );
   await waitFor(() =>
-    expect(f.published.filter((event) => event.kind === 9)).toHaveLength(1),
+    expect(f.published.map((event) => event.kind)).toEqual([9002, 9]),
   );
-  expect(f.published[0]?.id).toBe(first);
-  expect(f.members.get(source)).toContain(f.person.pubkey);
-  expect(f.members.get(source)).not.toContain(f.late.pubkey);
 });
 
-it("does not send the link after leaving while an already-dispatched grant finishes", async () => {
+it("checks an uncertain save without resending it before sending the message", async () => {
+  const f = await fixture();
+  f.loseResponse(true);
+  await send();
+  await confirm();
+  await screen.findByRole("button", { name: "Check access and send" });
+  expect(f.published.map((event) => event.kind)).toEqual([9002]);
+  f.loseResponse(false);
+  await userEvent.click(
+    screen.getByRole("button", { name: "Check access and send" }),
+  );
+  await waitFor(() =>
+    expect(f.published.map((event) => event.kind)).toEqual([9002, 9]),
+  );
+  expect(f.sign).toHaveBeenCalledOnce();
+});
+
+it("does not send after leaving while an already-dispatched access save finishes", async () => {
   const f = await fixture(true);
   let release!: () => void;
   f.hold(
@@ -245,195 +394,181 @@ it("does not send the link after leaving while an already-dispatched grant finis
       release = resolve;
     }),
   );
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Share and send" }),
-  );
+  await send();
+  await confirm();
   try {
     await waitFor(() => expect(f.publish).toHaveBeenCalledOnce());
     f.view.unmount();
   } finally {
     await act(async () => release());
   }
-  // Wait for the dispatched operation to settle; cancellation doesn't revoke it.
-  await waitFor(() => expect(f.published).toHaveLength(1));
+  await waitFor(() =>
+    expect(f.published.map((event) => event.kind)).toEqual([9002]),
+  );
   await act(async () => {
     await f.session.outbox?.ready();
   });
-  expect(f.published.map((event) => event.kind)).toEqual([9000]);
+  expect(f.published.map((event) => event.kind)).toEqual([9002]);
 });
 
-it("names the channel and how many members get access", async () => {
-  await fixture();
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  const dialog = await screen.findByRole("dialog", {
-    name: "Share access to this chat?",
-  });
+it("a private chat still needs community consent when destination members already have access or it is empty", async () => {
+  const f = await fixture(false, { shared: true, alone: true });
+  await send();
+  await screen.findByRole("alertdialog");
+  expect(f.publish).not.toHaveBeenCalled();
+  await confirm();
   await waitFor(() =>
-    expect(dialog).toHaveTextContent(
-      "Share gives the 1 other member of #Team, including agents, access",
-    ),
+    expect(f.published.map((event) => event.kind)).toEqual([9002, 9]),
   );
 });
 
-it("counts and grants only members who don't already have access", async () => {
-  const f = await fixture(false, { shared: true });
-  f.addLate();
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  const dialog = await screen.findByRole("dialog", {
-    name: "Share access to this chat?",
-  });
-  expect(dialog).toHaveTextContent("Share gives the 1 other member of #Team");
-  await userEvent.click(screen.getByRole("button", { name: "Share and send" }));
-  await waitFor(() =>
-    expect(f.published.filter((event) => event.kind === 9)).toHaveLength(1),
-  );
-  const grants = f.published.filter((event) => event.kind === 9000);
-  expect(grants).toHaveLength(1);
-  expect(grants[0]?.tags).toContainEqual(["p", f.late.pubkey]);
-});
-
-it("offers only link-only when the viewer can't share the chat", async () => {
-  const f = await fixture();
-  // Sharing's own rule is covered in share.test.ts; here only the dialog's response.
-  vi.spyOn(share, "shareBlocker").mockReturnValue(
-    "You can’t share access to this chat, so some people may not be able to open it. Send the link only, or ask its owner to share it.",
-  );
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  const dialog = await screen.findByRole("dialog");
-  expect(dialog).toHaveTextContent("You can’t share access to this chat");
-  expect(screen.queryByRole("button", { name: /share and send/i })).toBeNull();
-  await userEvent.click(screen.getByRole("button", { name: "Send link only" }));
-  await waitFor(() => expect(f.published).toHaveLength(1));
-  expect(f.published[0]?.kind).toBe(9);
-});
-
-it("asks before sending a chat link into a DM, then shares with its other person", async () => {
+it("sharing into a DM uses community consent without adding its participants", async () => {
   const f = await fixture(false, { destinationType: "dm" });
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  const dialog = await screen.findByRole("dialog", {
-    name: "Share access to this chat?",
-  });
-  expect(dialog).toHaveTextContent(
-    "Share gives the 1 other person in this DM access to the full chat history",
-  );
-  expect(f.publish).not.toHaveBeenCalled();
-  await userEvent.click(screen.getByRole("button", { name: "Share and send" }));
+  await send();
+  expect(await screen.findByRole("alertdialog")).toHaveTextContent("this DM");
+  await confirm();
   await waitFor(() =>
-    expect(f.published.filter((event) => event.kind === 9)).toHaveLength(1),
+    expect(f.published.map((event) => event.kind)).toEqual([9002, 9]),
   );
-  expect(f.members.get(source)).toContain(f.person.pubkey);
-  expect(f.published.map((event) => event.kind)).toEqual([9000, 9]);
+  expect(f.members.get(source)).toEqual([f.viewer.pubkey]);
 });
 
-it("names who in a DM gets access once their profile is known", async () => {
-  const f = await fixture(false, { destinationType: "dm", named: "Kenny" });
-  await f.session.profiles.ensure([f.person.pubkey]);
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  const dialog = await screen.findByRole("dialog", {
-    name: "Share access to this chat?",
-  });
-  expect(dialog).toHaveTextContent(
-    "Share gives Kenny access to the full chat history",
-  );
-});
-
-it("tells same-named DM members apart when only one gets access", async () => {
-  const f = await fixture(false, {
-    destinationType: "dm",
-    shared: true,
-    named: "Sam",
-  });
-  f.addLate();
-  await f.session.profiles.ensure([f.person.pubkey, f.late.pubkey]);
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  const dialog = await screen.findByRole("dialog", {
-    name: "Share access to this chat?",
-  });
-  const roster = f.members.get(destination);
-  const late = f.session.names.resolve(f.late.pubkey, undefined, roster);
-  expect(late).toMatch(/^Sam.+/);
-  expect(dialog).toHaveTextContent(`Share gives ${late} access`);
-});
-
-it("sends a chat link into a DM without asking when everyone has access", async () => {
-  const f = await fixture(false, { destinationType: "dm", shared: true });
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(f.published).toHaveLength(1));
-  expect(f.published[0]?.kind).toBe(9);
-  expect(screen.queryByRole("dialog")).toBeNull();
-});
-
-it("grants nothing and sends nothing when the draft changes while consent is open", async () => {
+it("a changed draft stops all access writes and sending while consent is open", async () => {
   const f = await fixture();
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await screen.findByRole("dialog");
+  await send();
+  await screen.findByRole("alertdialog");
   act(() => writeView(f.session.scope, f.key, "Something else"));
-  await userEvent.click(screen.getByRole("button", { name: "Share and send" }));
+  await confirm();
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "The draft changed.",
+    "The draft changed",
   );
   expect(f.publish).not.toHaveBeenCalled();
 });
 
-it("stops later grants when the draft changes while the first grant is in flight", async () => {
+it("stops before publication if the draft changes during signing", async () => {
   const f = await fixture();
-  f.addLate();
-  let release!: () => void;
-  f.hold(
-    new Promise<void>((resolve) => {
-      release = resolve;
-    }),
-  );
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await screen.findByRole("dialog", {
-    name: "Share access to this chat?",
-  });
-  await userEvent.click(screen.getByRole("button", { name: "Share and send" }));
-  try {
-    await waitFor(() => expect(f.publish).toHaveBeenCalledOnce());
+  const original = f.sign.getMockImplementation();
+  if (!original) throw new Error("Missing signer");
+  f.sign.mockImplementationOnce(async (event) => {
     act(() => writeView(f.session.scope, f.key, "Something else"));
-  } finally {
-    await act(async () => release());
-  }
-  expect(await screen.findByRole("alert")).toHaveTextContent(
-    "The draft changed.",
-  );
-  await act(async () => {
-    await f.session.outbox?.ready();
+    return original(event);
   });
-  expect(f.publish).toHaveBeenCalledOnce();
-  expect(f.published.map((event) => event.kind)).toEqual([9000]);
-});
-
-it("dispatches no grant when the draft changes while a grant is being prepared", async () => {
-  const f = await fixture();
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await screen.findByRole("dialog", { name: "Share access to this chat?" });
-  let reads = 0;
-  f.watchQueries((filters) => {
-    // The first source roster read is Share's own check; the second is inside the grant.
-    if (
-      filters.some((filter) => filter["#d"]?.includes(source)) &&
-      ++reads === 2
-    )
-      writeView(f.session.scope, f.key, "Something else");
-  });
-  await userEvent.click(screen.getByRole("button", { name: "Share and send" }));
+  await send();
+  await confirm();
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "The draft changed.",
+    "The draft changed",
   );
-  expect(reads).toBe(2);
   expect(f.publish).not.toHaveBeenCalled();
 });
 
-it.each([
-  ["no one else is in the channel", { alone: true }],
-  ["everyone in the channel already has access", { shared: true }],
-])("sends without asking when %s", async (_, options) => {
-  const f = await fixture(false, options);
-  await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(f.published).toHaveLength(1));
-  expect(f.published[0]?.kind).toBe(9);
-  expect(screen.queryByRole("dialog")).toBeNull();
+it("multiple private links are confirmed together and opened before one message, with safe partial retry", async () => {
+  const f = await fixture(false, { multiple: true });
+  f.publish.mockImplementationOnce(async (event) => {
+    // Use normal publication for the first chat, then reject the second.
+    const original = f.publish.getMockImplementation();
+    if (!original) throw new Error("Missing publisher");
+    await original(event);
+    f.reject(true);
+  });
+  await send();
+  expect(await screen.findByRole("alertdialog")).toHaveTextContent(
+    "Work, Other work",
+  );
+  await confirm();
+  expect(await screen.findByRole("alert")).toHaveTextContent("Access refused");
+  expect(f.published.map((event) => event.kind)).toEqual([9002]);
+  f.reject(false);
+  await userEvent.click(
+    screen.getByRole("button", { name: "Retry share and send" }),
+  );
+  await waitFor(() =>
+    expect(f.published.map((event) => event.kind)).toEqual([9002, 9002, 9]),
+  );
 });
+
+it("confirms mixed Private and View only links without rewriting the View only chat", async () => {
+  const f = await fixture(false, { multiple: true, viewOnlySecond: true });
+  await send();
+  const dialog = await screen.findByRole("alertdialog");
+  expect(dialog).toHaveAccessibleName("Share these chats?");
+  expect(dialog).toHaveTextContent(
+    "Private chats will change to View only; the other chats will stay View only.",
+  );
+  expect(dialog).toHaveTextContent(
+    "Everyone in this community can read each chat’s full history, Canvas, workspace folders, and agent instructions.",
+  );
+  expect(dialog).toHaveTextContent("Work, Other work");
+  expect(f.publish).not.toHaveBeenCalled();
+  await confirm();
+  await waitFor(() =>
+    expect(f.published.map((event) => event.kind)).toEqual([9002, 9]),
+  );
+  expect(f.published[0]?.tags).toContainEqual(["h", source]);
+  expect(f.published[1]?.content).toContain(`buzz://channel/${second}`);
+  expect(f.members.get(second)).toEqual([f.viewer.pubkey]);
+});
+
+it("a chat that becomes Public during consent keeps Public and only sends the message", async () => {
+  const f = await fixture();
+  await send();
+  await screen.findByRole("alertdialog");
+  f.makePublic();
+  await confirm();
+  await waitFor(() =>
+    expect(f.published.map((event) => event.kind)).toEqual([9]),
+  );
+  expect(f.sign).not.toHaveBeenCalled();
+});
+
+it("asks for fresh Private consent when a pasted View only chat narrows before Share", async () => {
+  const f = await fixture(false, { visibility: "public", joinRole: "guest" });
+  await send();
+  await screen.findByRole("alertdialog", { name: "Share this chat?" });
+  f.changeDetails();
+  await confirm();
+  const renewed = await screen.findByRole("alertdialog", {
+    name: "Share this chat?",
+    description: /from Private to View only/,
+  });
+  await waitFor(() =>
+    expect(
+      within(renewed).getByRole("button", { name: "Share" }),
+    ).toHaveFocus(),
+  );
+  expect(renewed).toHaveTextContent("from Private to View only");
+  expect(within(renewed).queryByRole("alert")).toBeNull();
+  expect(f.publish).not.toHaveBeenCalled();
+  await confirm();
+  await waitFor(() =>
+    expect(f.published.map((event) => event.kind)).toEqual([9002, 9]),
+  );
+});
+
+it.each(["before confirmation", "during signing"])(
+  "renews pasted-link consent after details change %s without writing until Share is confirmed again",
+  async (when) => {
+    const f = await fixture();
+    await send();
+    await screen.findByRole("alertdialog");
+    if (when === "during signing") {
+      const original = f.sign.getMockImplementation();
+      if (!original) throw new Error("Missing signer");
+      f.sign.mockImplementationOnce(async (event) => {
+        f.changeDetails({ name: "Updated work" });
+        return original(event);
+      });
+    } else f.changeDetails({ name: "Updated work" });
+    await confirm();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Share" })).toHaveFocus(),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("button", { name: "Share" })).toBeEnabled();
+    expect(f.publish).not.toHaveBeenCalled();
+    await confirm();
+    await waitFor(() =>
+      expect(f.published.map((event) => event.kind)).toEqual([9002, 9]),
+    );
+    expect(f.published[0]?.tags).toContainEqual(["name", "Updated work"]);
+  },
+);

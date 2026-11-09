@@ -1,3 +1,4 @@
+import { nativeHookOutput } from "../hook-output";
 import { CODEX_HOOK_EVENTS } from "./hook-bridge";
 import { repositoriesContext } from "../../features/communities/repositories";
 import { isTauri } from "@tauri-apps/api/core";
@@ -8,12 +9,14 @@ import { CodexLogoIcon } from "../../shared/design-system/icons";
 import { type Config, config, defaults, validWorkspace } from "./config";
 import { codexRun, TYPE_ID } from "./run";
 import { CodexRuntime } from "./runtime";
-import { CodexSetup, withScript } from "./setup";
+import { CodexSetup, reviewHome, withScript } from "./setup";
 import { CodexProvider, createTabs } from "./tabs";
 import { readUsage } from "./usage";
+import { reviewModel } from "./security-review";
+import { AppServer, listModels } from "./rpc";
 /** How often Buzz's copy of Codex looks for a new release. */
 const UPDATE_MS = 6 * 60 * 60_000;
-export const inject = ["agents", "host"];
+export const inject = ["agents", "host", "agentProtection"];
 export const apply: PluginModule["apply"] = (ctx) => {
   // Only the desktop app can start `codex`, and setup and file uploads run
   // `bash` and `base64`, which stock Windows lacks; no unusable type elsewhere.
@@ -37,7 +40,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
     (key) => ownerReads(ctx.agents.relay(key), pubkeyOf(key)),
     (key, signal) => ctx.agents.core(key, signal),
     ctx.agents.storage,
-    (raw) => providerController.resolve(raw),
+    (raw, remote) => providerController.resolve(raw, remote),
     () => ctx.agents.tools(),
     repositoriesContext,
     ctx.host.serveMcp
@@ -55,12 +58,38 @@ export const apply: PluginModule["apply"] = (ctx) => {
                   typeof output === "object" &&
                   Object.keys(output).length > 0,
                 milliseconds: event === "Interrupt" ? 2500 : 25000,
+                compose: nativeHookOutput,
               },
             )) ?? {}) as Record<string, unknown>;
           },
         }
       : undefined,
+    (key, session) => ctx.agents.execution(key, session),
+    undefined,
+    (key) => ctx.agents.inspectExecution(key),
+    undefined,
+    ctx.host,
+    (pubkey) => ctx.agents.handle(pubkey),
   );
+  ctx.agentProtection.registerModels({
+    label: "Codex",
+    models: async () => {
+      const rpc = new AppServer();
+      try {
+        await rpc.open(start);
+        return (await listModels(rpc)).map((model) => ({
+          id: model.model,
+          label: model.displayName,
+        }));
+      } finally {
+        await rpc.close();
+      }
+    },
+    complete: (model, prompt, signal, protectedSpawn) =>
+      reviewModel(protectedSpawn, model, prompt, signal, () =>
+        reviewHome(start),
+      ),
+  });
   /** A Codex agent is running, so Buzz's copy is needed; unknown until the
    * agents have loaded. */
   let needed: boolean | undefined;
@@ -74,7 +103,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
     // Once loaded, and when the first Codex agent runs, the copy is brought
     // up to date; that is also when a first copy is downloaded.
     const was = needed;
-    needed = running.length > 0;
+    needed = running.some((agent) => !ctx.agents.executionBinding(agent.key));
     if (spawn && (was === undefined || (needed && !was))) {
       const updated = setup.update(needed);
       // Then, after the check that follows it (two first starts of Codex
@@ -113,14 +142,31 @@ export const apply: PluginModule["apply"] = (ctx) => {
   const {
     Create,
     CreateModel,
+    CreateThinking,
     DefaultControl,
     ProviderDialogBody,
     SettingsTab,
     ActivityTab,
-  } = createTabs(providerController, runtime, start, setup);
+  } = createTabs(providerController, runtime, start, setup, (key) =>
+    ctx.agents.inspectExecution(key),
+  );
   ctx.agents.register<Config>({
     id: TYPE_ID,
+    voice: async (seat) => {
+      if (typeof RTCPeerConnection !== "function")
+        throw new Error("Voice is unsupported on this device");
+      // Protection is not known to review realtime input, so voice refuses it.
+      if (seat.agent.protection)
+        throw new Error("Voice is unavailable for protected agents");
+      await setup.installed(seat.signal);
+      const handle = ctx.agents.handle(seat.agent.key);
+      if (!handle) throw new Error("The Codex agent is not running");
+      return runtime.voice(seat, handle);
+    },
+    execution: true,
     hooks: { events: CODEX_HOOK_EVENTS },
+    retire: (pubkey) => runtime.retire(pubkey),
+    protection: true,
     title: "Codex",
     icon: CodexLogoIcon,
     description:
@@ -128,6 +174,8 @@ export const apply: PluginModule["apply"] = (ctx) => {
     defaults: () => ({ config: { ...defaults } }),
     Create,
     CreateModel,
+    createModelReportsReadiness: true,
+    CreateThinking,
     importShared: (source) =>
       source.runtime === "codex" &&
       (!source.provider || source.provider === "openai")
@@ -171,8 +219,11 @@ export const apply: PluginModule["apply"] = (ctx) => {
     summary: (agent) => config(agent.config).model || "Codex",
     ...(spawn &&
       readFile && {
-        usage: (agent, { since, signal }) =>
-          readUsage({ spawn, readFile }, agent, since, signal),
+        usage: async (agent, { since, signal }) => {
+          if (await ctx.agents.inspectExecution(agent.key))
+            throw new Error("Usage is unavailable for remote Codex agents.");
+          return readUsage({ spawn, readFile }, agent, since, signal);
+        },
       }),
     provider: {
       snapshot: providerController.snapshot,
@@ -216,7 +267,8 @@ export const apply: PluginModule["apply"] = (ctx) => {
       },
     ],
     // A mention during the first download waits for it, within its deadline.
-    ...codexRun(runtime, async (signal) => {
+    ...codexRun(runtime, async (signal, agent) => {
+      if (await ctx.agents.inspectExecution(agent)) return;
       await setup.installed(signal);
       if (providerController.snapshot().readiness === "checking")
         await providerController.check();

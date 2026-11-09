@@ -160,8 +160,13 @@ it.each([
         });
       }
       expect(labels.map((row) => row.id)).toEqual(["dm"]);
-      if (outcome) {
-        // The membership change retries the missing name exactly once.
+      if (outcome === "missing") {
+        // A read found no kind 0. Background enrichment does not reread it;
+        // the live profiles route delivers a later one.
+        expect(owner.session.profiles.snapshot().has(alice.pubkey)).toBe(false);
+        expect(labels[0]?.name).toBe(fallback);
+      } else if (outcome) {
+        // The membership change retries the failed name exactly once.
         expect(wire.pending).toHaveLength(1);
         expect(wire.pending[0]?.filters).toEqual([
           { kinds: [0], authors: [alice.pubkey], limit: 500 },

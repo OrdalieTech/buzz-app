@@ -10,10 +10,13 @@ import { Dialog } from "../../shared/design-system/ui/Dialog";
 export function ProviderDialog({
   type,
   finalFocus,
+  visit = false,
   onClose,
 }: {
   type: RegisteredAgentType | undefined;
-  finalFocus: RefObject<HTMLButtonElement | null>;
+  finalFocus: RefObject<HTMLElement | null>;
+  /** Opened as its own navigation visit, so Back closes it; local opens are not. */
+  visit?: boolean;
   onClose(): void;
 }) {
   const provider = type?.provider;
@@ -27,6 +30,7 @@ export function ProviderDialog({
           onOpenChange={(open) => !open && onClose()}
           title={type.title}
           dismissOnOutsideClick
+          visit={visit}
           finalFocus={() => finalFocus.current}
         >
           <p role="alert" className="m-0 text-body-sm text-danger">
@@ -39,6 +43,7 @@ export function ProviderDialog({
         type={type}
         provider={provider}
         finalFocus={finalFocus}
+        visit={visit}
         onClose={onClose}
       />
     </ContributionBoundary>
@@ -49,11 +54,13 @@ function ManagedProviderDialog({
   type,
   provider,
   finalFocus,
+  visit,
   onClose,
 }: {
   type: RegisteredAgentType;
   provider: NonNullable<RegisteredAgentType["provider"]>;
-  finalFocus: RefObject<HTMLButtonElement | null>;
+  finalFocus: RefObject<HTMLElement | null>;
+  visit: boolean;
   onClose(): void;
 }) {
   const state = useSyncExternalStore(
@@ -78,6 +85,7 @@ function ManagedProviderDialog({
       height="stable"
       headerGap="compact"
       dismissOnOutsideClick
+      visit={visit}
       preventClose={!!state.blocking}
       finalFocus={() => finalFocus.current}
     >

@@ -20,6 +20,7 @@ const nonIconDependencies = new Set([
   "@emoji-mart/data",
   "@fontsource-variable/inter",
   "@fontsource/jetbrains-mono",
+  "@hypothesi/tauri-mcp-server", // Native MCP client (docs/native-mcp.md).
   "@jsquash/webp", // Lossless media encoder, not an icon catalog.
   "@modelcontextprotocol/server", // The standalone Buzz MCP server.
   "@noble/curves",
@@ -45,6 +46,7 @@ const nonIconDependencies = new Set([
   "blurhash",
   "consola", // Runtime logging, not an icon catalog.
   "d3-scale", // Chart scales and ticks; marks are Buzz-rendered SVG.
+  "diff", // Text line diffs for Canvas history, not an icon library.
   "dockview-react",
   "emoji-mart",
   "flexlayout-react",
@@ -82,6 +84,7 @@ const nonIconDependencies = new Set([
   "virtua",
   "vite",
   "vitest",
+  "ws", // The native MCP client's loopback relay.
   "yaml",
 ]);
 const allowedDependencies = new Set([...approved, ...nonIconDependencies]);

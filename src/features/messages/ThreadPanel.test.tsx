@@ -11,13 +11,22 @@ import {
 } from "@testing-library/react";
 import { StrictMode } from "react";
 import { renderToString } from "react-dom/server";
-import { afterEach, expect, it, vi } from "vitest";
-import { useActivityLanePublisher } from "./activity-lane";
+import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import { ThreadPanel, type ThreadPanelProps } from "./ThreadPanel";
+import { selectNewestMessage } from "./message-selection";
 import type { MessageRowProps } from "./MessageRow";
 import type { MessageComposerProps } from "./MessageComposer";
 import { createAgentLibrary } from "../agents/library";
-import type { RelaySession } from "../relay/session";
+import { createRelaySession, type RelaySession } from "../relay/session";
+import type { RelayEvent } from "../relay/events";
+import type { ReadStateSigning } from "../relay/read-state-host";
+import { readJournal, type ReadJournal } from "../relay/read-state-storage";
+import { keypair, message, metadata, roster } from "../relay/testing";
+import {
+  decodeReadState,
+  signReadState,
+  // @ts-expect-error Test the production Node codec with disposable identities.
+} from "../../../browser-host/read-state.mjs";
 import type { PageNavigation } from "../navigation/service";
 import type { JsonValue } from "../navigation/targets";
 import { createNavigationController } from "../navigation/controller";
@@ -32,6 +41,11 @@ import { formatPublicKey } from "../../shared/identity/public-key";
 
 // Real React owns effects, refs and subscriptions. Only independent child UI is
 // reduced here; MessageRow/MessageComposer retain their own mounted suites.
+// Activity rendering/subscriptions have their own mounted integration suite.
+vi.mock("./TypingIndicator", () => ({
+  TypingIndicator: () => null,
+  useLiveConversationAgents: () => [],
+}));
 vi.mock("../relay/react", () => {
   const profiles = new Map();
   return { useProfileGeneration: () => 0, useRowProfiles: () => profiles };
@@ -86,7 +100,6 @@ vi.mock("./MessageComposer", () => ({
     scope,
     onSend,
     ownSoloConversation,
-    activityClickOpensPanel,
     disabled,
     placeholder,
     focusRequest,
@@ -99,7 +112,6 @@ vi.mock("./MessageComposer", () => ({
       data-channel={channelId}
       data-scope={scope}
       data-own-solo={ownSoloConversation}
-      data-direct-activity={activityClickOpensPanel}
       data-disabled={disabled}
       data-placeholder={placeholder}
       data-focus-request={focusRequest}
@@ -152,6 +164,7 @@ function ordinaryNavigation() {
     forSession: vi.fn<PageNavigation["forSession"]>(),
     position: vi.fn<PageNavigation["position"]>(),
     savePosition: vi.fn<PageNavigation["savePosition"]>(),
+    passThrough: () => () => {},
   } satisfies PageNavigation;
 }
 function messagesHarness(
@@ -200,10 +213,11 @@ function messagesHarness(
     .mockImplementationOnce(() => first)
     .mockImplementation(makeView);
   const ensure = vi.fn(async () => {});
+  const profiles = new Map();
   const session = {
     viewer,
     thread,
-    profiles: { ensure },
+    profiles: { ensure, snapshot: () => profiles, subscribe: () => () => {} },
     agentChoices: createAgentLibrary(undefined).queries,
     messages: { retry: vi.fn() },
     media: () => undefined,
@@ -346,6 +360,30 @@ it("allocates only after commit and disposes distinct owned views under StrictMo
     expect(view.dispose).toHaveBeenCalledOnce();
     expect(view.listeners.size).toBe(0);
   }
+});
+it("registers its messages for keyboard selection and leaves an Escape the selection handled open", () => {
+  const h = messagesHarness();
+  h.render();
+  const list = screen.getByRole("region", { name: "Thread messages" });
+  let selectedNewest = false;
+  act(() => {
+    selectedNewest = selectNewestMessage(list);
+  });
+  expect(selectedNewest).toBe(true);
+  const selected = document.activeElement;
+  expect(selected?.closest("[data-message-id]")).not.toBeNull();
+  // Shift+Escape is "Mark all as read", not a dismissal.
+  fireEvent.keyDown(selected as Element, { key: "Escape", shiftKey: true });
+  expect(h.close).not.toHaveBeenCalled();
+  // The mocked composer has no focus target; stand in for selection's handling.
+  const handled = (event: Event) => event.preventDefault();
+  selected?.addEventListener("keydown", handled);
+  fireEvent.keyDown(selected as Element, { key: "Escape" });
+  expect(h.close).not.toHaveBeenCalled();
+  selected?.removeEventListener("keydown", handled);
+  fireEvent.keyDown(selected as Element, { key: "Escape" });
+  expect(h.close).toHaveBeenCalledOnce();
+  h.unmount();
 });
 it("allocation failure exposes an effective retry rather than leaving a spinner", () => {
   const h = messagesHarness();
@@ -616,6 +654,157 @@ it.each([false, true])(
     expect(HTMLElement.prototype.scrollIntoView).not.toHaveBeenCalled();
   },
 );
+it("scopes its reading leases to its thread while the original is unavailable", () => {
+  const h = messagesHarness();
+  h.resize(600);
+  vi.mocked(document.hasFocus).mockReturnValue(true);
+  vi.spyOn(HTMLElement.prototype, "getClientRects").mockReturnValue([
+    new DOMRect(0, 0, 500, 500),
+  ] as unknown as DOMRectList);
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+    new DOMRect(0, 0, 500, 500),
+  );
+  const reading = vi.fn((_channelId: string, _rootId?: string) => ({
+    view: vi.fn(),
+    observe: vi.fn(async () => {}),
+    catchUp: vi.fn(async () => {}),
+    dispose: vi.fn(),
+  }));
+  Object.assign(h.session.unread, {
+    sync: () => ({ capability: "frontier-sync" }),
+    reading,
+  });
+  h.snapshot.root = undefined;
+  h.snapshot.replies = [{ ...row, id: "reply", content: "reply" }];
+  h.render();
+  expect(screen.getByText("Original message unavailable.")).toBeVisible();
+  h.element.focus();
+  // In a DM, the thread it opened bounds what its reads may cover.
+  expect(reading.mock.calls).not.toHaveLength(0);
+  for (const call of reading.mock.calls)
+    expect(call).toEqual(["channel", row.id]);
+});
+it("leaves a sibling reply it hides unread while a DM reply's original is unavailable", async () => {
+  // The real unread owner, so a dwell's DM read lands in its journal.
+  const self = keypair(),
+    relay = keypair(),
+    alice = keypair();
+  let journal: ReadJournal | undefined;
+  let incoming: (events: readonly RelayEvent[]) => void = () => {};
+  const owner = createRelaySession(
+    {
+      viewer: self.pubkey,
+      relayAuthor: relay.pubkey,
+      query: async () => [],
+      media: () => undefined,
+      readState: {
+        decode: async (events: readonly RelayEvent[]) =>
+          decodeReadState(events, self.secret),
+        sign: async (intent: ReadStateSigning) =>
+          signReadState(intent, self.secret),
+        publish: async () => {},
+      },
+      subscribe(callbacks) {
+        incoming = callbacks.receive;
+        return { update() {}, retry() {}, dispose() {} };
+      },
+    },
+    {
+      readStateFloor: () => 0,
+      readStateStorage: {
+        async update(change) {
+          journal = readJournal(change(journal), self.pubkey);
+          return journal;
+        },
+        close() {},
+      },
+      readPublisherLock: async (_signal, work) => work(),
+    },
+  );
+  onTestFinished(owner.dispose);
+  const h = messagesHarness();
+  const dm = h.props.channelId;
+  const unread = owner.session.unread;
+  // Neither the thread view nor the unread owner has the original.
+  const root = message(self, dm, "Original", 10);
+  const reply = (content: string, at: number) =>
+    message(alice, dm, content, at, [["e", root.id, "", "reply"]]);
+  const target = reply("Opened reply", 20);
+  const sibling = reply("Hidden sibling", 30);
+  incoming([
+    roster(relay, dm, [self.pubkey, alice.pubkey], 1),
+    metadata(relay, dm, "DM", 1, [["t", "dm"]]),
+    target,
+  ]);
+  await unread.ensure();
+  Object.assign(h.session, { viewer: self.pubkey, unread });
+  // What an exact view publishes when it cannot load the original: only its
+  // target, never the thread's other replies.
+  const shown = {
+    ...row,
+    id: target.id,
+    channelId: dm,
+    authorId: alice.pubkey,
+    content: target.content,
+    createdAt: target.created_at,
+    threadRootId: root.id,
+    replyParentId: root.id,
+    replyCount: 0,
+  };
+  h.snapshot.status = "error";
+  h.snapshot.error = "Error: The original thread message is unavailable.";
+  h.snapshot.root = undefined;
+  h.snapshot.replies = [shown];
+  h.snapshot.target = shown;
+  h.snapshot.targetStatus = "ready";
+  // Opened at the reply, as a conversation tab opens an exact message.
+  Object.assign(h.props as ThreadPanelProps, {
+    messageId: target.id,
+    retainThread: true,
+    revealSelected: true,
+    revealRequest: 1,
+  });
+  h.resize(600);
+  vi.spyOn(HTMLElement.prototype, "getClientRects").mockReturnValue([
+    new DOMRect(0, 0, 500, 500),
+  ] as unknown as DOMRectList);
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+    new DOMRect(0, 0, 500, 500),
+  );
+  // A controlled clock runs the reveal's frames and the dwell.
+  vi.useFakeTimers({
+    toFake: [
+      "setTimeout",
+      "clearTimeout",
+      "requestAnimationFrame",
+      "cancelAnimationFrame",
+    ],
+  });
+  try {
+    h.render();
+    expect(screen.getByText("Original message unavailable.")).toBeVisible();
+    // A sibling reply in the same thread arrives after opening, unread.
+    act(() => incoming([sibling]));
+    expect(unread.attention(dm, sibling.id).unread).toBe(true);
+    // The window gains focus: once revealed, the reader dwells on its reply.
+    vi.mocked(document.hasFocus).mockReturnValue(true);
+    await act(async () => h.element.focus());
+    for (
+      let elapsed = 0;
+      (journal?.state.frontiers[dm] ?? -1) < target.created_at;
+      elapsed += 50
+    ) {
+      if (elapsed >= 2000) throw new Error("The dwell never read the reply.");
+      await act(() => vi.advanceTimersByTimeAsync(50));
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+  // It reads the reply, but stops one second before the sibling it hides.
+  expect(journal?.state.frontiers[dm]).toBe(sibling.created_at - 1);
+  expect(unread.attention(dm, target.id).unread).toBe(false);
+  expect(unread.attention(dm, sibling.id).unread).toBe(true);
+});
 it("renders replies after the original without a reply-count divider", () => {
   const h = messagesHarness();
   h.snapshot.root = { ...row, replyCount: 0 };
@@ -862,55 +1051,6 @@ it("counts replies recovered after a completed traversal, not initial history pa
   ];
   h.render();
   expect(screen.getByRole("button", { name: "2 new messages" })).toBeVisible();
-});
-
-it("reserves the jump button's activity lane only for this thread's composer in a live channel", () => {
-  const h = messagesHarness();
-  const listeners = new Set<() => void>();
-  const subscribe = (listener: () => void) => {
-    listeners.add(listener);
-    return () => {
-      listeners.delete(listener);
-    };
-  };
-  let list: ChannelList = {
-    status: "ready",
-    channels: [{ id: "channel", name: "General" }],
-  };
-  Object.assign(h.session, {
-    channels: { list: () => list, subscribeList: subscribe },
-  });
-  // The composer is mocked here; publish what its TypingIndicator would.
-  function Shown({ threadRootId }: { threadRootId: string | undefined }) {
-    useActivityLanePublisher(h.session, "channel", threadRootId, true);
-    return null;
-  }
-  h.render();
-  h.scroll(500);
-  const lane = () =>
-    screen
-      .getByRole("button", { name: "Jump to latest" })
-      .closest("[data-visible]");
-  const live = lane();
-  expect(live).not.toHaveAttribute("data-activity-lane");
-  // Channel-level activity shows in the channel composer, not this thread's.
-  const channelLevel = render(<Shown threadRootId={undefined} />);
-  expect(live).not.toHaveAttribute("data-activity-lane");
-  channelLevel.unmount();
-  const thread = render(<Shown threadRootId={row.id} />);
-  expect(live).toHaveAttribute("data-activity-lane");
-  // A cached channel's composer mounts no TypingIndicator, so no lane; the
-  // gate flip keeps the same button mounted.
-  list = {
-    status: "ready",
-    channels: [{ id: "channel", name: "General", cached: true }],
-  };
-  act(() => {
-    for (const listener of listeners) listener();
-  });
-  expect(lane()).toBe(live);
-  expect(live).not.toHaveAttribute("data-activity-lane");
-  thread.unmount();
 });
 
 it("transfers keyboard focus to the thread history before removing the jump button", () => {
@@ -1418,8 +1558,13 @@ it("observes a visible reply before its root resolves, then enables thread catch
 
   h.snapshot.root = row;
   h.render();
+  // The rows measure in the next frame. That list mutation restarts dwell,
+  // which measures again in the frame after it.
   await act(() => vi.advanceTimersToNextFrame());
-  await act(() => vi.advanceTimersByTimeAsync(300));
+  await act(() => vi.advanceTimersToNextFrame());
+  await act(() => vi.advanceTimersByTimeAsync(299));
+  expect(catchUp).not.toHaveBeenCalled();
+  await act(() => vi.advanceTimersByTimeAsync(1));
   expect(catchUp).toHaveBeenCalledExactlyOnceWith(reply.id, row.id);
 });
 
@@ -1462,20 +1607,14 @@ it("names the conversation a thread lives in as a link, only when its host can o
   expect(within(thread).queryByText("#Alpha")).toBeNull();
 });
 
-it("passes readiness and direct Activity through to thread composition, and gives a Solo thread none", () => {
+it("passes readiness through to thread composition, and gives a Solo thread none", () => {
   const h = messagesHarness();
-  const view = render(
-    <ThreadPanel {...h.props} activityClickOpensPanel disabled />,
-  );
+  const view = render(<ThreadPanel {...h.props} disabled />);
   const composer = screen.getByRole("region", { name: "Composer" });
-  expect(composer).toHaveAttribute("data-direct-activity", "true");
   expect(composer).toHaveAttribute("data-disabled", "true");
-  view.rerender(
-    <ThreadPanel {...h.props} activityClickOpensPanel disabled={false} />,
-  );
+  view.rerender(<ThreadPanel {...h.props} disabled={false} />);
   expect(composer).toHaveAttribute("data-disabled", "false");
   view.rerender(<ThreadPanel {...h.props} />);
-  expect(composer).not.toHaveAttribute("data-direct-activity");
   // Solo agents answer at top level: its threads are read-only.
   view.rerender(<ThreadPanel {...h.props} soloConversation />);
   expect(
@@ -1492,13 +1631,19 @@ it.each([
   {
     channelType: "stream" as const,
     joinRole: "guest" as const,
-    joinable: false,
+    joinable: true,
   },
   { channelType: "stream" as const, archived: true as const, joinable: false },
   { channelType: "solo" as const, archived: true as const, joinable: false },
+  { channelType: "solo" as const, joinRole: "guest" as const, joinable: true },
+  {
+    channelType: "solo" as const,
+    joinRole: "member" as const,
+    joinable: false,
+  },
   { channelType: "solo" as const, joinable: false },
 ])(
-  "replaces the reply composer for a $channelType preview (joinable: $joinable)",
+  "replaces the reply composer for a $channelType preview (joinRole: $joinRole, joinable: $joinable)",
   ({ joinable, ...metadata }) => {
     const h = messagesHarness();
     Object.assign(h.props, {
@@ -1527,8 +1672,10 @@ it.each([
             ? "Archived chat"
             : "Archived channel"
           : metadata.joinRole === "guest"
-            ? "Read-only channel"
-            : "Channel preview",
+            ? `Read-only ${metadata.channelType === "solo" ? "chat" : "channel"}`
+            : metadata.channelType === "solo"
+              ? "Chat preview"
+              : "Channel preview",
       }),
     ).toBeVisible();
     if (metadata.archived) {
@@ -1893,6 +2040,45 @@ it("a retained reader reveals its exact selected message, again for each new req
   h.rerenderProps();
   await new Promise((resolve) => setTimeout(resolve, 50));
   expect(revealedReply()).toBe(false);
+});
+
+it("reopens collapsed activity for a new reveal of the same step", async () => {
+  const h = messagesHarness();
+  const replies = ["d", "e"].map((id, index) => ({
+    ...row,
+    id: id.repeat(64),
+    content: `Agent step ${index}`,
+    audience: "agents" as const,
+    threadRootId: row.id,
+    replyToId: row.id,
+    createdAt: 2 + index,
+  }));
+  const target = replies[1];
+  if (!target) throw new Error("Missing activity fixture target");
+  h.snapshot.replies = replies;
+  h.snapshot.target = target;
+  h.snapshot.targetStatus = "ready";
+  const props = h.props as ThreadPanelProps;
+  Object.assign(props, {
+    messageId: target.id,
+    retainThread: true,
+    revealSelected: true,
+    revealRequest: 1,
+  });
+  h.render();
+  fireEvent.click(
+    await screen.findByRole("button", { name: /Collapse activity history/ }),
+  );
+  expect(
+    screen.getByRole("button", { name: /Show activity history/ }),
+  ).toHaveAttribute("aria-expanded", "false");
+  props.revealRequest = 2;
+  h.rerenderProps();
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: /Collapse activity history/ }),
+    ).toHaveAttribute("aria-expanded", "true"),
+  );
 });
 
 it("a new reveal request reopens a branch the reader collapsed, and live updates leave it closed", async () => {
@@ -2298,4 +2484,41 @@ it("releases bottom following after a jump that included child-only resizing", (
   h.snapshot.replies = [{ ...row, id: "new", content: "new" }];
   h.render();
   expect(h.element.scrollTop).toBe(2000);
+});
+
+it("reveals a completed step selected by an exact thread link", async () => {
+  const h = messagesHarness();
+  const target = {
+    ...row,
+    id: "d".repeat(64),
+    content: "Completed tool result",
+    audience: "agents" as const,
+    threadRootId: row.id,
+    replyParentId: row.id,
+    createdAt: 2,
+  };
+  h.snapshot.replies = [
+    target,
+    {
+      ...row,
+      id: "e".repeat(64),
+      content: "Final response",
+      threadRootId: row.id,
+      replyParentId: row.id,
+      createdAt: 3,
+    },
+  ];
+  h.snapshot.target = target;
+  h.snapshot.targetStatus = "ready";
+  Object.assign(h.props, {
+    messageId: target.id,
+    retainThread: true,
+    revealSelected: true,
+    revealRequest: 1,
+  });
+  h.render();
+  expect(await screen.findByText("Completed tool result")).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: /Collapse activity history/ }),
+  ).toBeVisible();
 });

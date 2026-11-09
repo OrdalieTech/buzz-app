@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { AgentType } from "../../features/agents/service";
 import { ClaudeRuntime } from "./runtime";
 import { apply } from "./index";
+import { ClaudeSetup } from "./setup";
 
 vi.mock("@tauri-apps/api/core", () => ({ isTauri: () => true }));
 afterEach(() => vi.restoreAllMocks());
@@ -28,6 +29,7 @@ it("observes saved sessions with the live status of running ones", () => {
   ]);
   let type: AgentType | undefined;
   apply({
+    agentProtection: { registerModels: vi.fn() },
     pluginOwner: { id: "buzz.claude-code", revision: "r1" },
     host: { request: vi.fn() },
     agents: {
@@ -50,6 +52,7 @@ it("shares a Claude agent's model as the claude runtime and imports it back", ()
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
   let type: AgentType | undefined;
   apply({
+    agentProtection: { registerModels: vi.fn() },
     pluginOwner: { id: "buzz.claude-code", revision: "r1" },
     host: { request: vi.fn() },
     agents: {
@@ -69,4 +72,24 @@ it("shares a Claude agent's model as the claude runtime and imports it back", ()
   expect(
     type?.importShared?.({ runtime: "goose", model: "opus" }),
   ).toBeUndefined();
+});
+
+it("registers review models from the discovered catalog", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+  vi.spyOn(ClaudeSetup.prototype, "catalog").mockResolvedValue([
+    { value: "opus", displayName: "Opus" },
+    { value: "haiku" },
+  ] as never);
+  const registerModels = vi.fn();
+  apply({
+    agentProtection: { registerModels },
+    pluginOwner: { id: "buzz.claude-code", revision: "r1" },
+    host: { request: vi.fn() },
+    agents: { register: vi.fn(), relay: () => undefined },
+    effect: vi.fn(),
+  } as never);
+  await expect(registerModels.mock.calls[0]?.[0].models()).resolves.toEqual([
+    { id: "opus", label: "Opus" },
+    { id: "haiku", label: "haiku" },
+  ]);
 });

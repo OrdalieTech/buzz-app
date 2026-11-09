@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import type { EventData } from "../../features/relay/events";
 import { steerPrompt, turnPrompt } from "../claude-code/prompt";
 import { type FakeSession, fakeSpawn } from "./goose-testing";
-import { standalonePrompt } from "./runtime";
 import { GooseHistory, gooseTurns, startedFor } from "./transcript";
 
 const alice = "a".repeat(64);
@@ -29,9 +28,8 @@ const ask = (pubkey = agent, mention = root) =>
     scope: "thread",
     context: [],
     total: 1,
-    label: "@mention",
-    name: (key) => (key === alice ? "Alice" : undefined),
   });
+const name = (key: string) => (key === alice ? "Alice" : undefined);
 
 let created = 1_800_000_000;
 const user = (content: Record<string, unknown>[], metadata = {}) => ({
@@ -87,6 +85,7 @@ describe("gooseTurns", () => {
       conversation(),
       { sessionId: "s1", channelId: CHANNEL, root: root.id },
       false,
+      name,
     );
     expect(rest).toEqual([]);
     expect(turn).toMatchObject({
@@ -247,58 +246,100 @@ describe("GooseHistory", () => {
     new GooseHistory(fakeSpawn({ history: sessions, home: "/home/test" }));
   const signal = new AbortController().signal;
 
-  it("lists the sessions in its workspace that its first prompt names it in", async () => {
-    const rows = await history([
-      session("s1", "Gander · #general · 11111111", conversation()),
-      // Since renamed, it is still the agent's.
-      session("s2", "Old name · #general · 11111111", conversation()),
-      // Another agent of the same name, which mentions this one.
-      session("s3", "Gander · #general · 11111111", [
-        user([text(ask(other))]),
-        user([text(`Ask ${agent}`)]),
-      ]),
-      session("s4", "Gander · DM", conversation(), "/elsewhere"),
-      // A timer's turn, which names no channel.
-      session("s5", "Gander · timer/daily", [
-        user([text(standalonePrompt(agent, "Post the daily summary."))]),
-      ]),
-    ]).recent(agent, "~/.buzz", signal);
-    expect(rows.map((row) => [row.sessionId, row.title, row.at])).toEqual([
-      [
-        "s1",
-        "Gander · #general · 11111111",
-        Date.parse("2027-01-15T08:00:00Z"),
-      ],
-      [
-        "s2",
-        "Old name · #general · 11111111",
-        Date.parse("2027-01-15T08:00:00Z"),
-      ],
-      ["s5", "Gander · timer/daily", Date.parse("2027-01-15T08:00:00Z")],
-    ]);
-  });
+  const listed = (fake: ReturnType<typeof fakeSpawn>) =>
+    fake.geese
+      .flatMap((goose) => goose.received)
+      .filter((message) => message.method === "session/list");
 
-  it("finds a place's session, and reads every session the agent ran for it", async () => {
-    const goose = history([
-      session("theirs", "Goosey · #general", [user([text(ask(other))])]),
-      session("s1", "Gander · #general", conversation()),
-      session("s2", "Gander · #general", conversation()),
-    ]);
-    const place = { channelId: CHANNEL, root: root.id };
-    expect(await goose.find(agent, "~/.buzz", place, signal)).toMatchObject({
-      sessionId: "s1",
+  it("reads a place's saved sessions by id, without searching goose", async () => {
+    const fake = fakeSpawn({
+      home: "/home/test",
+      history: [
+        session("s1", "Gander · #general", conversation()),
+        session("s2", "Gander · #general", conversation()),
+        session("unsaved", "Gander · #general", conversation()),
+      ],
     });
-    const read = await goose.transcript(
-      { agent, workspace: "~/.buzz", place },
+    const place = { channelId: CHANNEL, root: root.id };
+    const read = await new GooseHistory(fake).transcript(
+      { agent, workspace: "~/.buzz", place, sessions: ["s2", "s1", "gone"] },
       signal,
     );
-    expect(read?.turns.map((turn) => turn.sessionId)).toEqual(["s1", "s2"]);
+    expect(read?.turns.map((turn) => turn.sessionId).sort()).toEqual([
+      "s1",
+      "s2",
+    ]);
+    expect(listed(fake)).toEqual([]);
     expect(
-      await goose.transcript(
-        { agent, workspace: "~/.buzz", place: { channelId: "elsewhere" } },
+      await new GooseHistory(fake).transcript(
+        { agent, workspace: "~/.buzz", place },
         signal,
       ),
     ).toBeUndefined();
+    expect(listed(fake)).toEqual([]);
+  });
+
+  it("searches goose for every session the agent ran for a place only when asked", async () => {
+    const fake = fakeSpawn({
+      home: "/home/test",
+      history: [
+        session("theirs", "Goosey · #general", [user([text(ask(other))])]),
+        session("s1", "Gander · #general", conversation()),
+        session("s2", "Gander · #general", conversation()),
+      ],
+    });
+    const goose = new GooseHistory(fake);
+    const place = { channelId: CHANNEL, root: root.id };
+    const read = await goose.transcript(
+      { agent, workspace: "~/.buzz", place, search: true },
+      signal,
+    );
+    expect(read?.turns.map((turn) => turn.sessionId)).toEqual(["s1", "s2"]);
+    expect(listed(fake)).toHaveLength(1);
+    expect(
+      await goose.transcript(
+        {
+          agent,
+          workspace: "~/.buzz",
+          place: { channelId: "elsewhere" },
+          search: true,
+        },
+        signal,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("reuses another session's export only on automatic reads, so a full read shows its final messages", async () => {
+    const a = [...conversation()];
+    const sessions = [
+      session("a", "Gander · DM", a),
+      session("b", "Gander · DM", conversation()),
+    ];
+    const goose = history(sessions);
+    const lookup = { agent, workspace: "~/.buzz", sessions: ["a", "b"] };
+    await goose.transcript(
+      { ...lookup, working: "a" },
+      signal,
+      undefined,
+      true,
+    );
+    // Session a ends with a last reply, and b starts working.
+    a.push(assistant([text("a's final reply")]));
+    const shows = (read: unknown) =>
+      JSON.stringify(read).includes("a's final reply");
+    expect(
+      shows(
+        await goose.transcript(
+          { ...lookup, working: "b" },
+          signal,
+          undefined,
+          true,
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      shows(await goose.transcript({ ...lookup, working: "b" }, signal)),
+    ).toBe(true);
   });
 
   it("reads one session by its id, and none that goose deleted", async () => {

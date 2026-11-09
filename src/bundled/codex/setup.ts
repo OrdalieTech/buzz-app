@@ -37,9 +37,14 @@ const STEPS: Readonly<Record<string, readonly string[]>> = {
   install: ["install"],
   use: ["use"],
   adopt: ["adopt"],
+  home: ["home"],
+  "read-from": ["read-from"],
+  login: ["login"],
+  review: ["review"],
 };
-/** Starts `codex`, `app-server`, `install`, `use` and `adopt` as steps of `codex.sh`,
- * which the manifest grants as `bash -c`; other processes start as declared. */
+/** Starts `codex`, `app-server`, `install`, `use`, `adopt`, `home`,
+ * `read-from`, `login` and `review` as steps of `codex.sh`, which the manifest grants as `bash -c`; other
+ * processes start as declared. */
 export const withScript =
   (spawn: Spawn): Spawn =>
   (id, options) => {
@@ -73,6 +78,37 @@ async function collect(spawn: Spawn, id: string, args: readonly string[]) {
 
 const message = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
+
+/** The `count` lines a `codex.sh` step prints, which must succeed. */
+async function printed(spawn: Spawn, id: string, count: number) {
+  const { code, stdout, stderr } = await collect(spawn, id, []);
+  const lines = stdout.trim().split("\n");
+  if (code !== 0 || lines.length < count || lines.some((line) => !line))
+    throw new Error(stderr.trim() || `Buzz's Codex ${id} is unavailable`);
+  return lines;
+}
+
+const homes = new WeakMap<Spawn, Promise<string>>();
+/** Buzz's Codex home, where protected agents run as `codex.sh run` does. Only
+ * a success is kept: a failure is looked up again. */
+export function buzzHome(spawn: Spawn) {
+  const known = homes.get(spawn);
+  if (known) return known;
+  const found = printed(spawn, "home", 1).then(([home = ""]) => home);
+  homes.set(spawn, found);
+  found.catch(() => {
+    if (homes.get(spawn) === found) homes.delete(spawn);
+  });
+  return found;
+}
+
+/** Makes Buzz's review home again, which holds only the sign-in and links to
+ * the state folder, and returns both with the ChatGPT workspace a Buzz sign-in
+ * recorded, while the sign-in still names it. Each review starts with it. */
+export async function reviewHome(spawn: Spawn) {
+  const [home = "", state = "", workspace] = await printed(spawn, "review", 2);
+  return { home, state, workspace };
+}
 
 export async function checkCodex(spawn: Spawn): Promise<CodexStatus> {
   let version: string;
@@ -304,7 +340,7 @@ export class CodexSetup {
     this.set({ running: step, ...(asked ? { output: "" } : {}) });
     try {
       if (step === "install") await this.install(spawn);
-      else await this.step(spawn, "codex", ["login"], "Sign-in");
+      else await this.step(spawn, "login", [], "Sign-in");
     } catch (error) {
       this.log(`\n${message(error)}`);
     } finally {

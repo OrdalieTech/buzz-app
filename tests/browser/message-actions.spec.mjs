@@ -37,6 +37,7 @@ test("coordination keeps its first line visible throughout expansion and collaps
     undefined,
     [["audience", "agents"]],
   );
+  await thread.getByRole("button", { name: /^Show activity history:/ }).click();
   const row = thread.locator(`[data-message-id="${event.id}"]`);
   const toggle = row.getByRole("button", { name: /Three café names:/ });
   await expect(toggle).toBeVisible();
@@ -50,6 +51,16 @@ test("coordination keeps its first line visible throughout expansion and collaps
       preview.getBoundingClientRect().left - row.getBoundingClientRect().left;
     const failures = [];
     let animated = false;
+    // A busy frame can miss the entire transition. Observe its start before
+    // clicking; frame samples still check clipping and settlement below.
+    const onTransitionStart = (event) => {
+      if (
+        event.target.matches('[class*="audiencePanel"]') &&
+        event.propertyName === "height"
+      )
+        animated = true;
+    };
+    row.addEventListener("transitionstart", onTransitionStart);
     const sample = (opening) => {
       const panel = row.querySelector('[class*="audiencePanel"]');
       const preview = row.querySelector('[class*="audiencePreview"]');
@@ -77,30 +88,35 @@ test("coordination keeps its first line visible throughout expansion and collaps
       const running = panel
         ?.getAnimations()
         .some((animation) => animation.playState === "running");
-      animated ||= !!running;
       return { panel, running };
     };
-    for (const opening of [true, false]) {
-      const start = performance.now();
-      button.click();
-      await new Promise((resolve, reject) => {
-        let settled = 0;
-        const tick = () => {
-          const { panel, running } = sample(opening);
-          settled = (
-            opening
-              ? panel && !panel.hasAttribute("data-starting-style") && !running
-              : !panel
-          )
-            ? settled + 1
-            : 0;
-          if (settled >= 2) resolve();
-          else if (performance.now() - start > 5000)
-            reject(new Error("Coordination transition did not settle"));
-          else requestAnimationFrame(tick);
-        };
-        requestAnimationFrame(tick);
-      });
+    try {
+      for (const opening of [true, false]) {
+        const start = performance.now();
+        button.click();
+        await new Promise((resolve, reject) => {
+          let settled = 0;
+          const tick = () => {
+            const { panel, running } = sample(opening);
+            settled = (
+              opening
+                ? panel &&
+                  !panel.hasAttribute("data-starting-style") &&
+                  !running
+                : !panel
+            )
+              ? settled + 1
+              : 0;
+            if (settled >= 2) resolve();
+            else if (performance.now() - start > 5000)
+              reject(new Error("Coordination transition did not settle"));
+            else requestAnimationFrame(tick);
+          };
+          requestAnimationFrame(tick);
+        });
+      }
+    } finally {
+      row.removeEventListener("transitionstart", onTransitionStart);
     }
     return { failures, animated };
   });
@@ -188,8 +204,7 @@ for (const direction of ["forward", "backward"]) {
     await page.keyboard.press(direction === "forward" ? "Tab" : "Shift+Tab");
     await expect(
       actions.getByRole("button", {
-        name:
-          direction === "forward" ? "React with 👍" : "More message actions",
+        name: direction === "forward" ? "Add reaction" : "More message actions",
         exact: true,
       }),
     ).toBeFocused();
@@ -197,7 +212,7 @@ for (const direction of ["forward", "backward"]) {
     await page.keyboard.press(direction === "forward" ? "Tab" : "Shift+Tab");
     await expect(
       actions.getByRole("button", {
-        name: direction === "forward" ? "React with ❤️" : "Copy link",
+        name: direction === "forward" ? "Reply" : "Forward message",
         exact: true,
       }),
     ).toBeFocused();
@@ -262,6 +277,7 @@ test("message actions reveal, copy, restore focus and reply across responsive la
   ).toBeVisible();
   const copiedLink = await page.evaluate(() => window.copiedMessages.at(-1));
   expect(copiedLink).toBe(`buzz://message?channel=alpha&id=${event.id}`);
+  await hoverMessage(row);
   await row.getByRole("button", { name: "Reply", exact: true }).click();
   const panel = page.getByRole("complementary", {
     name: "Thread",
@@ -270,7 +286,10 @@ test("message actions reveal, copy, restore focus and reply across responsive la
   const root = panel.locator(`[data-message-id="${event.id}"]`);
   await expect(root).toBeVisible();
   // A pointer click leaves focus on the control; the bar still follows hover.
-  const copyLink = row.getByRole("button", { name: "Copy link", exact: true });
+  const copyLink = row.getByRole("button", {
+    name: "Copy link",
+    exact: true,
+  });
   await hoverMessage(row);
   await copyLink.click();
   await root.hover();
@@ -327,8 +346,11 @@ test("message actions reveal, copy, restore focus and reply across responsive la
   await page.mouse.move(0, 0);
   await expect(actions).toHaveCSS("opacity", "0");
   await hoverMessage(root);
-  await root
-    .getByRole("button", { name: "React with 👍", exact: true })
+  await root.getByRole("button", { name: "Add reaction", exact: true }).click();
+  await page.locator('em-emoji-picker input[type="search"]').fill("thumbsup");
+  await page
+    .locator("em-emoji-picker")
+    .getByRole("button", { name: "👍", exact: true })
     .click();
   await expect(
     root.getByRole("button", {
@@ -372,6 +394,7 @@ test("message actions reveal, copy, restore focus and reply across responsive la
   });
   await expect(replyBox).toBeFocused();
   await replyBox.fill("Keep this reply draft");
+  await hoverMessage(row);
   await hoverMessage(row);
   await row.getByRole("button", { name: "Reply", exact: true }).click();
   await expect(replyBox).toBeFocused();
@@ -510,7 +533,12 @@ test("DM actions open the correct reply thread", async ({ page, app }) => {
   const event = app.append("primary", channel, "DM menu check");
   const row = timeline.locator(`[data-message-id="${event.id}"]`);
   await hoverMessage(row);
-  await row.getByRole("button", { name: "React with 👍", exact: true }).click();
+  await row.getByRole("button", { name: "Add reaction", exact: true }).click();
+  await page.locator('em-emoji-picker input[type="search"]').fill("thumbsup");
+  await page
+    .locator("em-emoji-picker")
+    .getByRole("button", { name: "👍", exact: true })
+    .click();
   await expect(
     row.getByRole("button", {
       name: "👍: You",
@@ -542,6 +570,7 @@ test("DM actions open the correct reply thread", async ({ page, app }) => {
     page.getByRole("menuitem", { name: "Copy message", exact: true }),
   ).toBeVisible();
   await page.keyboard.press("Escape");
+  await hoverMessage(row);
   await row.getByRole("button", { name: "Reply", exact: true }).click();
   await expect(
     page
@@ -553,6 +582,7 @@ test("DM actions open the correct reply thread", async ({ page, app }) => {
     exact: true,
   });
   await expect(replyBox).toBeFocused();
+  await hoverMessage(row);
   await hoverMessage(row);
   await row.getByRole("button", { name: "Reply", exact: true }).click();
   await expect(replyBox).toBeFocused();
@@ -633,7 +663,9 @@ test("narrow timeline continuation actions never cover prose or move adjacent ro
     const toolbar = await actions.boundingBox();
     expect(
       toolbar.y + toolbar.height <= prose.y ||
-        toolbar.x + toolbar.width <= prose.x,
+        toolbar.x + toolbar.width <= prose.x ||
+        toolbar.y >= prose.y + prose.height ||
+        toolbar.x >= prose.x + prose.width,
     ).toBe(true);
     await expect(actions).toHaveCSS("position", "fixed");
     expect((await following.boundingBox()).y).toBe(baseline.y);
@@ -641,9 +673,16 @@ test("narrow timeline continuation actions never cover prose or move adjacent ro
     await expect
       .poll(() =>
         link.evaluate((node) => {
-          const rect = node.getBoundingClientRect();
-          return node.contains(
-            document.elementFromPoint(rect.x + rect.width / 2, rect.y + 1),
+          // Wrapped inline links have separate hit regions; the union box
+          // includes empty space beside shorter lines.
+          const fragments = Array.from(node.getClientRects());
+          return (
+            fragments.length > 0 &&
+            fragments.every((rect) =>
+              node.contains(
+                document.elementFromPoint(rect.x + rect.width / 2, rect.y + 1),
+              ),
+            )
           );
         }),
       )
@@ -660,13 +699,22 @@ test("narrow timeline continuation actions never cover prose or move adjacent ro
       const { x, y, width, height } = range.getBoundingClientRect();
       return { x, y, width, height };
     });
-  const text = await link.boundingBox();
+  // Aim at one of the link's line fragments: when it wraps, its union box
+  // includes prose before the first line and gaps between lines.
+  const fragmentPoint = (which) =>
+    link.evaluate((node, which) => {
+      const fragments = Array.from(node.getClientRects());
+      const rect = fragments[which === "first" ? 0 : fragments.length - 1];
+      return {
+        x: which === "first" ? rect.left + rect.width / 2 : rect.right - 1,
+        y: rect.top + rect.height / 2,
+      };
+    }, which);
+  const end = await fragmentPoint("last");
   await page.mouse.move(prose.x + 1, prose.y + 1);
   await expect(actions).toHaveCSS("opacity", "1");
   await page.mouse.down();
-  await page.mouse.move(text.x + text.width - 1, text.y + text.height / 2, {
-    steps: 10,
-  });
+  await page.mouse.move(end.x, end.y, { steps: 10 });
   await page.mouse.up();
   await expect
     .poll(() => page.evaluate(() => getSelection()?.toString()))
@@ -684,7 +732,18 @@ test("narrow timeline continuation actions never cover prose or move adjacent ro
       { once: true },
     );
   });
-  await link.click({ position: { x: 10, y: 1 } });
+  const first = await fragmentPoint("first");
+  await page.mouse.move(first.x, first.y);
+  await expect
+    .poll(() =>
+      link.evaluate(
+        (node, { x, y }) => node.contains(document.elementFromPoint(x, y)),
+        first,
+      ),
+    )
+    .toBe(true);
+  await page.mouse.down();
+  await page.mouse.up();
   await expect(link).toHaveAttribute("data-clicked", "true");
   // Chromium retains focus on the clicked link. Return to the composer.
   await page
@@ -808,7 +867,7 @@ test("live grouped appends preserve avatar focus in channel and thread", async (
     await expect(preview).toBeHidden();
     await page.keyboard.press("Tab");
     await expect(
-      row.getByRole("button", { name: "React with 👍", exact: true }),
+      row.getByRole("button", { name: "Add reaction", exact: true }),
     ).toBeFocused();
     await expect(avatar).toHaveCount(0);
     await composer.focus();

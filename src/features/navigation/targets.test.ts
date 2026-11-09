@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { parseOpenTarget, targetKey, type OpenTarget } from "./targets";
+import {
+  parseGitPluginSource,
+  parseOpenTarget,
+  targetKey,
+  type OpenTarget,
+} from "./targets";
 const viewer = "a".repeat(64);
 const conversation = {
   version: 1,
@@ -10,6 +15,20 @@ const conversation = {
 } as const;
 
 describe("open target boundary", () => {
+  it("bounds a scoped forwarding presentation independently of its underlying message", () => {
+    const target = parseOpenTarget({
+      ...conversation,
+      forward: "D".repeat(64),
+    });
+    expect(target).toEqual({
+      ...parseOpenTarget(conversation),
+      forward: "d".repeat(64),
+    });
+    expect(targetKey(target)).not.toBe(targetKey(conversation));
+    expect(() =>
+      parseOpenTarget({ ...conversation, forward: "invalid" }),
+    ).toThrow();
+  });
   it("bounds nested provider addresses to Agent setup and keeps their scope", () => {
     const target = {
       version: 1,
@@ -61,6 +80,12 @@ describe("open target boundary", () => {
     expect(targetKey(target)).not.toBe(targetKey(conversation));
     expect(Object.isFrozen(target)).toBe(true);
     expect(() => parseOpenTarget({ ...target, scope: undefined })).toThrow();
+  });
+  it("keeps Open in channel's thread context as its own visit", () => {
+    const thread = { ...conversation, threadRootId: "C".repeat(64) };
+    const target = parseOpenTarget({ ...thread, context: "channel" });
+    expect(target).toEqual({ ...parseOpenTarget(thread), context: "channel" });
+    expect(targetKey(target)).not.toBe(targetKey(thread));
   });
   it("opens a saved Shared sessions target as its conversation", () => {
     const target = parseOpenTarget({
@@ -133,6 +158,9 @@ describe("open target boundary", () => {
     { ...conversation, panel: { kind: "members", remove: "someone" } },
     { ...conversation, panel: null },
     { ...conversation, messageId: undefined, threadRootId: "b".repeat(64) },
+    // Context names where a thread's root shows; it needs that root.
+    { ...conversation, context: "channel" },
+    { ...conversation, threadRootId: "b".repeat(64), context: "timeline" },
     { ...conversation, channelId: "../../other" },
     { version: 1, kind: "page", pluginId: "a/b", pageId: "board" },
     {
@@ -259,6 +287,27 @@ it("keeps explicit Personal space distinct from an unspecified page scope", () =
   expect(() => parseOpenTarget({ ...conversation, scope: null })).toThrow();
 });
 
+it("addresses one installed plugin only within Plugins settings", () => {
+  const target = {
+    version: 1,
+    kind: "settings",
+    section: "plugins",
+    pluginId: "example.notes",
+  };
+  expect(parseOpenTarget(target)).toEqual(target);
+  expect(() => parseOpenTarget({ ...target, section: "profile" })).toThrow();
+  expect(() => parseOpenTarget({ ...target, pluginId: "../bad" })).toThrow();
+  expect(() =>
+    parseOpenTarget({
+      ...target,
+      pluginImport: {
+        repository: "https://example.com/repo",
+        reference: "main",
+      },
+    }),
+  ).toThrow();
+});
+
 it("retains copied Git source fields only on the Plugins settings destination", () => {
   const source = {
     repository: "https://github.com/example/plugin",
@@ -276,6 +325,71 @@ it("retains copied Git source fields only on the Plugins settings destination", 
   expect(() =>
     parseOpenTarget({ ...target, pluginImport: { ...source, enable: true } }),
   ).toThrow();
+  const pinned = {
+    ...source,
+    path: "plugins/one",
+    commit: "a".repeat(40),
+  };
+  expect(parseOpenTarget({ ...target, pluginImport: pinned })).toMatchObject({
+    pluginImport: pinned,
+  });
+  expect(() =>
+    parseOpenTarget({ ...target, pluginImport: { ...pinned, path: "../x" } }),
+  ).toThrow();
+});
+
+const gitSource = {
+  repository: "https://github.com/example/plugin",
+  reference: "release",
+};
+it("keeps an optional plugin folder and lowercased commit on a Git source", () => {
+  const commit = "A".repeat(40);
+  expect(
+    parseGitPluginSource({ ...gitSource, path: "plugins/one", commit }),
+  ).toEqual({ ...gitSource, path: "plugins/one", commit: "a".repeat(40) });
+  expect(
+    parseGitPluginSource({ ...gitSource, commit: "b".repeat(64) }),
+  ).toEqual({ ...gitSource, commit: "b".repeat(64) });
+  expect(parseGitPluginSource(gitSource)).toEqual(gitSource);
+  expect(
+    Object.isFrozen(parseGitPluginSource({ ...gitSource, path: "x" })),
+  ).toBe(true);
+  expect(parseGitPluginSource({ ...gitSource, path: "" }).path).toBe(".");
+  expect(parseGitPluginSource({ ...gitSource, path: "." }).path).toBe(".");
+});
+
+it.each([
+  "/abs",
+  "../up",
+  "a/../b",
+  "a/..",
+  "a/./b",
+  "a//b",
+  "a/",
+  "a\\b",
+  "a\u0000b",
+  "a\nb",
+  "x".repeat(513),
+])("rejects the plugin folder %j", (path) => {
+  expect(() => parseGitPluginSource({ ...gitSource, path })).toThrow();
+});
+
+it.each([
+  "",
+  "abc123",
+  "a".repeat(39),
+  "a".repeat(41),
+  "a".repeat(63),
+  "g".repeat(40),
+  ` ${"a".repeat(40)}`,
+])("rejects the pinned commit %j", (commit) => {
+  expect(() => parseGitPluginSource({ ...gitSource, commit })).toThrow();
+});
+
+it("rejects non-string plugin folders and commits", () => {
+  expect(() => parseGitPluginSource({ ...gitSource, path: 1 })).toThrow();
+  expect(() => parseGitPluginSource({ ...gitSource, commit: 1 })).toThrow();
+  expect(() => parseGitPluginSource({ ...gitSource, path: null })).toThrow();
 });
 
 it("bounds plugin link targets to plain string params", () => {

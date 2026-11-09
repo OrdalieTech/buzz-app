@@ -13,6 +13,7 @@ export const SOUND_NAMES = [
   "flutter",
   "oh-no",
   "ping",
+  "soft",
   "unison",
 ] as const;
 export type SoundName = (typeof SOUND_NAMES)[number] | "silent";

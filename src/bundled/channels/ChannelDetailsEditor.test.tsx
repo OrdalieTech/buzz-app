@@ -18,6 +18,7 @@ import type {
   DetailsAttempt,
 } from "../../features/relay/channel-details";
 import type { ChannelDetails } from "../../features/relay/channel-details-protocol";
+import { createRelaySession } from "../../features/relay/session";
 
 afterEach(() => {
   cleanup();
@@ -438,6 +439,79 @@ it("orders metadata before actions and dismisses each edit layer with Escape", a
   await user.keyboard("{Escape}");
   expect(close).toHaveBeenCalledOnce();
 });
+it.each([
+  ["an editor", true],
+  ["a member", false],
+])(
+  "links the description for %s without the editor taking its clicks",
+  async (_, canEdit) => {
+    const h = harness();
+    h.load.mockResolvedValue({ ...base, canEdit });
+    const user = userEvent.setup();
+    const owned = createRelaySession(null);
+    const ops = { id: "ops", name: "ops", channelType: "stream" as const };
+    const session = {
+      ...owned.session,
+      channels: {
+        ...owned.session.channels,
+        list: () => ({ status: "ready" as const, channels: [channel, ops] }),
+      },
+    };
+    const open = vi.fn(() => true);
+    const panel = (description: string | undefined) => (
+      <ChannelSettingsPanel
+        scope="community:viewer"
+        channel={{ ...channel, description }}
+        details={h.capability}
+        session={session}
+        onOpenLink={open}
+        close={() => {}}
+      >
+        Diagnostics
+      </ChannelSettingsPanel>
+    );
+    const { rerender } = render(
+      panel("R2 runbook: https://example.com/r2-runbook · see #ops"),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("complementary", { name: "Channel settings" }),
+      ).toHaveAttribute("aria-busy", "false"),
+    );
+    const edit = screen.queryByRole("button", { name: "Edit description" });
+    expect(!!edit).toBe(canEdit);
+    const description = screen.getAllByRole("definition")[0];
+    if (!description) throw new Error("Missing description");
+    await user.click(
+      within(description).getByRole("link", {
+        name: "https://example.com/r2-runbook",
+      }),
+    );
+    expect(open).toHaveBeenLastCalledWith("https://example.com/r2-runbook");
+    await user.click(within(description).getByRole("link", { name: "#ops" }));
+    expect(open).toHaveBeenLastCalledWith("buzz://channel/ops");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    if (edit) {
+      // The rendered value follows; its Markdown source would read twice.
+      expect(edit).not.toHaveAccessibleDescription();
+      await user.click(edit);
+      await waitFor(() =>
+        expect(
+          screen.getByRole("textbox", { name: "Description" }),
+        ).toHaveFocus(),
+      );
+      await user.keyboard("{Escape}");
+    }
+    for (const [value, shown] of [
+      ["", "No description"],
+      [undefined, "Not available"],
+    ] as const) {
+      rerender(panel(value));
+      expect(screen.getAllByRole("definition")[0]).toHaveTextContent(shown);
+      expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    }
+  },
+);
 it("only enables Save for normalized, changed, valid fields with connected errors", async () => {
   const h = harness();
   const user = userEvent.setup();

@@ -129,3 +129,22 @@ export function workingAgentMessage(
 ): string | undefined {
   return workingAgentDetails(snapshot, channelId, agent)?.messageId;
 }
+
+/** The one conversation whose transcript the sidebar's View activity opens:
+ * a Solo chat or DM is one conversation, as agent runtimes key them, and
+ * elsewhere a loaded request message names its thread. Anything else opens the Activity overview. */
+export function activityTranscript(
+  channels: Pick<RelaySession["channels"], "list" | "window">,
+  channelId: string,
+  messageId: string | undefined,
+): { rootId?: string } | undefined {
+  const channel = channels
+    .list()
+    .channels.find((item) => item.id === channelId);
+  if (channel?.channelType === "solo" || channel?.channelType === "dm")
+    return {};
+  const row =
+    messageId &&
+    channels.window(channelId).rows.find((item) => item.id === messageId);
+  return row ? { rootId: row.threadRootId ?? row.id } : undefined;
+}

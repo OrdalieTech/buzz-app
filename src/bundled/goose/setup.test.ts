@@ -1,7 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Spawn } from "./goose";
-import { fakeSpawn } from "./goose-testing";
+import { fakeSpawn, flush } from "./goose-testing";
 import { GooseSetup, keyLabel, modelFilter } from "./setup";
+import manifest from "./manifest.json";
+
+it("declares protected file reads through the bundled helper with a positional path", () => {
+  expect(
+    manifest.host.processes.find((process) => process.id === "read-protected"),
+  ).toEqual({
+    id: "read-protected",
+    program: "buzz-agent-command",
+    bundled: true,
+    args: [
+      "--shell",
+      `case "$1" in "~/"*) set -- "$HOME/\${1:2}";; esac; exec /usr/bin/base64 -i "$1"`,
+      "buzz-read",
+    ],
+  });
+});
 
 const ANTHROPIC = {
   providerId: "anthropic",
@@ -76,6 +92,247 @@ const setup = (options: Parameters<typeof fakeSpawn>[0] = {}) => {
 };
 
 describe("GooseSetup", () => {
+  it.each([false, true])(
+    "waits for the protected review worker to exit after completion (failure: %s)",
+    async (fails) => {
+      const { fake, setup: goose } = setup();
+      let killed!: () => void;
+      const killing = new Promise<void>((resolve) => {
+        killed = resolve;
+      });
+      const kill = vi.fn(async () => killed());
+      const spawn = async (options: Parameters<typeof fake.spawn>[1]) => {
+        const process = await fake.spawn("goose", options);
+        return {
+          ...process,
+          kill,
+          write: async (data: string) => {
+            const request = JSON.parse(data);
+            if (request.method !== "_buzz/security/review")
+              return process.write(data);
+            expect(request.params).toEqual({
+              provider: "ollama",
+              id: "qwen3",
+              prompt: {
+                system: `Review\n\nReply with only JSON that matches this JSON Schema, and no other text:\n${JSON.stringify({ type: "object", required: ["decision"] })}`,
+                input: "Evidence",
+              },
+            });
+            options?.onStdout?.(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id: request.id,
+                ...(fails
+                  ? { error: { code: -32603, message: "Review failed" } }
+                  : { result: { text: "Approved", model: { id: "qwen3" } } }),
+              })}\n`,
+            );
+          },
+        };
+      };
+      let settled = false;
+      const model = { runtime: "buzz.goose", provider: "ollama", id: "qwen3" };
+      const result = goose
+        .review(
+          model,
+          {
+            system: "Review",
+            input: "Evidence",
+            outputSchema: { type: "object", required: ["decision"] },
+          },
+          new AbortController().signal,
+          spawn,
+        )
+        .then(
+          (value) => {
+            settled = true;
+            return value;
+          },
+          (error: unknown) => {
+            settled = true;
+            throw error;
+          },
+        );
+      const outcome = fails
+        ? expect(result).rejects.toThrow("Review failed")
+        : expect(result).resolves.toMatchObject({ text: "Approved" });
+      try {
+        await killing;
+        await flush();
+        expect(kill).toHaveBeenCalledOnce();
+        expect(settled).toBe(false);
+      } finally {
+        fake.geese[0]?.exit(null);
+        await outcome;
+      }
+      expect(settled).toBe(true);
+    },
+  );
+
+  it("refuses model review without a protection-plugin worker", async () => {
+    const { fake, setup: goose } = setup();
+    expect(() =>
+      goose.review(
+        { provider: "ollama", id: "qwen3" },
+        { system: "Review", input: "Evidence" },
+        new AbortController().signal,
+      ),
+    ).toThrow("Protected Goose review worker is unavailable");
+    expect(fake.geese).toHaveLength(0);
+  });
+
+  /** A protected spawn whose goose answers `_buzz/security/review`, with what
+   * each review asked. */
+  const reviewing = (fake: ReturnType<typeof fakeSpawn>) => {
+    const asked: unknown[] = [];
+    const spawn = async (options: Parameters<typeof fake.spawn>[1]) => {
+      const process = await fake.spawn("goose", options);
+      return {
+        ...process,
+        write: async (data: string) => {
+          const request = JSON.parse(data);
+          if (request.method !== "_buzz/security/review")
+            return process.write(data);
+          asked.push(request.params);
+          options?.onStdout?.(
+            `${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { text: "Approved", model: {} } })}\n`,
+          );
+        },
+      };
+    };
+    return { asked, spawn };
+  };
+  const PROMPT = { system: "Review", input: "Evidence" };
+
+  it.each(["github_copilot", "codex", "cursor-agent"])(
+    "refuses a review on %s before starting a worker",
+    (provider) => {
+      const { fake, setup: goose } = setup();
+      expect(() =>
+        goose.review(
+          { provider, id: "model" },
+          PROMPT,
+          new AbortController().signal,
+          reviewing(fake).spawn,
+        ),
+      ).toThrow(`Goose reviews cannot use ${provider}`);
+      expect(fake.geese).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["", { providerId: "ollama", modelId: "qwen3" }, "qwen3"],
+    ["chosen", { providerId: "ollama", modelId: "qwen3" }, "chosen"],
+  ])(
+    "reviews an unnamed provider on goose's default, read in the review worker (model %j)",
+    async (id, defaults, sent) => {
+      const { fake, setup: goose } = setup({ defaults });
+      const { asked, spawn } = reviewing(fake);
+      await expect(
+        goose.review({ id }, PROMPT, new AbortController().signal, spawn),
+      ).resolves.toMatchObject({ text: "Approved" });
+      expect(asked).toEqual([
+        expect.objectContaining({ provider: "ollama", id: sent }),
+      ]);
+      expect(fake.geese).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    [
+      { providerId: "github_copilot", modelId: "gpt-5" },
+      "cannot use github_copilot",
+    ],
+    [{ providerId: "ollama" }, "no default provider and model"],
+    [{}, "no default provider and model"],
+  ])(
+    "refuses an unnamed provider when goose's default is %j",
+    async (defaults, message) => {
+      const { fake, setup: goose } = setup({ defaults });
+      const { asked, spawn } = reviewing(fake);
+      await expect(
+        goose.review({ id: "" }, PROMPT, new AbortController().signal, spawn),
+      ).rejects.toThrow(message);
+      expect(asked).toEqual([]);
+      expect(fake.geese[0]?.killed).toBe(true);
+    },
+  );
+
+  it("cancels a protected review: kills the worker, waits for its exit, then rejects", async () => {
+    const { fake, setup: goose } = setup({ silent: ["_buzz/security/review"] });
+    const kill = vi.fn(async () => undefined);
+    const spawn = async (options: Parameters<typeof fake.spawn>[1]) => ({
+      ...(await fake.spawn("goose", options)),
+      kill,
+    });
+    const controller = new AbortController();
+    let settled = false;
+    const result = goose
+      .review(
+        { provider: "ollama", id: "qwen3" },
+        PROMPT,
+        controller.signal,
+        spawn,
+      )
+      .finally(() => {
+        settled = true;
+      });
+    const outcome = expect(result).rejects.toThrow("goose exited");
+    await vi.waitFor(() =>
+      expect(
+        fake.geese[0]?.received.some(
+          (message) => message.method === "_buzz/security/review",
+        ),
+      ).toBe(true),
+    );
+    try {
+      controller.abort();
+      expect(kill).toHaveBeenCalled();
+      await flush();
+      expect(settled).toBe(false);
+    } finally {
+      fake.geese[0]?.exit(null);
+      await outcome;
+    }
+    expect(settled).toBe(true);
+  });
+
+  it("stops a protected review that passes its deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const { fake, setup: goose } = setup({
+        silent: ["_buzz/security/review"],
+      });
+      let settled = false;
+      const result = goose
+        .review(
+          { provider: "ollama", id: "qwen3" },
+          PROMPT,
+          new AbortController().signal,
+          (options) => fake.spawn("goose", options),
+        )
+        .finally(() => {
+          settled = true;
+        });
+      const outcome = expect(result).rejects.toThrow(
+        "goose did not answer _buzz/security/review",
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(
+        fake.geese[0]?.received.some(
+          (message) => message.method === "_buzz/security/review",
+        ),
+      ).toBe(true);
+      await vi.advanceTimersByTimeAsync(64_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await outcome;
+      expect(fake.geese[0]?.killed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("lists the providers set up here, by name, with goose's defaults", async () => {
     const { fake, setup: goose } = setup();
     const listed = await goose.providers();
@@ -541,6 +798,18 @@ describe("GooseSetup", () => {
     expect(read?.turns).toEqual([]);
     expect(read?.deleted).toEqual(["session-1"]);
     expect(read?.killed).toBe(true);
+  });
+
+  it("reads thinking levels goose lists inside an option group", async () => {
+    const { setup: goose } = setup({
+      thinking: {
+        "": { current: "high", levels: ["low", "high"], grouped: true },
+      },
+    });
+    expect(await goose.efforts({ provider: "anthropic", model: " " })).toEqual({
+      current: "high",
+      levels: ["low", "high"],
+    });
   });
 
   it("offers each model's thinking levels, read in one goose, on the agent's level", async () => {

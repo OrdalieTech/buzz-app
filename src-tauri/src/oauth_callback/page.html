@@ -1,29 +1,19 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-provider="{{provider}}">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Builderlab sign-in</title>
+    <title>{{provider}} sign-in</title>
     <!-- {{style}} -->
   </head>
   <body data-complete="{{complete}}" data-close-delay="{{closeDelay}}">
     <div class="page">
-      <div class="brand" role="img" aria-label="Builderlab">{{brand}}</div>
-      <div class="artwork" aria-hidden="true">
-        <img src="data:image/webp;base64,{{artwork}}" alt="">
-      </div>
+      <!-- {{pageBrand}} -->
+      <!-- {{artwork}} -->
       <main aria-labelledby="heading">
         <h1 id="heading">{{heading}}</h1>
         <p>{{message}}</p>
-        <p class="hint" role="status">
-          <svg id="close-spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-            <path d="M12 3a9 9 0 1 0 9 9" />
-          </svg>
-          <span class="hint-copy">
-            <span id="closing-hint">Closing this window automatically</span>
-            <span id="close-hint">You can close this window.</span>
-          </span>
-        </p>
+        <!-- {{closeHint}} -->
       </main>
     </div>
     <!-- {{script}} -->

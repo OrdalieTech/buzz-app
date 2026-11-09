@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
 import host from "./host.mjs?raw";
+import { piHookOutput } from "../hook-output";
 
 const DEPS = process.env.PI_DEPS;
 const run = promisify(execFile);
@@ -33,6 +34,7 @@ import lockfile from "proper-lockfile";
 import { AuthFile, serve } from "./host.mjs";
 import { Harness } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 const originalOpen = Harness.open;
 let openedHarness, report;
 Harness.open = async (...args) => { report = args[1].onReport; openedHarness = await originalOpen(...args); return openedHarness; };
@@ -46,7 +48,7 @@ const tools = [
   { name: "watch_add", description: "Watch for events", inputSchema: { type: "object" }, load: "search" },
 ];
 const out = {};
-let blockTools = false, rewriteTools = false;
+let blockTools = false, rewriteTools = false, blockedMessages = [];
 function start(prompt = async () => undefined) {
   const input = new PassThrough(), output = new PassThrough();
   const events = [], tools = [], pending = new Map();
@@ -56,9 +58,9 @@ function start(prompt = async () => undefined) {
     if (message.method === "event") events.push(message.params);
     else if (message.method === "hook") {
       const { event, input: call } = message.params;
-      const result = blockTools && event === "beforeTool" ? { block: "Fixture blocks the command" }
+      const result = blockTools && event === "beforeTool" ? ${JSON.stringify(piHookOutput({ block: "Fixture blocks the command" }, "fixture-policy"))}
         : rewriteTools && event === "beforeTool" ? { arguments: { ...call.arguments, text: "Rewritten arguments" } }
-        : rewriteTools && event === "afterTool" ? { output: [{ type: "text", text: "Replaced result" }] }
+        : rewriteTools && event === "afterTool" ? ${JSON.stringify(piHookOutput({ output: [{ type: "text", text: "Replaced result" }] }, "fixture-policy"))}
         : null;
       input.write(JSON.stringify({ id: message.id, result }) + "\\n");
     }
@@ -122,10 +124,10 @@ out.entries = (await pi.rpc("entries", { agent, conversation: a.conversation }))
 blockTools = true;
 faux.setResponses([
   fauxAssistantMessage(fauxToolCall("buzz_send", { text: "blocked", final: true }), { stopReason: "toolUse" }),
-  fauxAssistantMessage("Blocked by policy"),
+  (context) => { blockedMessages = context.messages; return fauxAssistantMessage("Blocked by policy"); },
 ]);
 const blocked = await pi.rpc("deliver", turn("HOOK", "blocked tool"));
-out.blocked = { ...(await pi.rpc("wait", { agent, submission: blocked.submission })), tools: pi.tools.splice(0), conversation: blocked.conversation };
+out.blocked = { ...(await pi.rpc("wait", { agent, submission: blocked.submission })), messages: blockedMessages, tools: pi.tools.splice(0), conversation: blocked.conversation };
 blockTools = false;
 // A request while the run works steers it.
 rewriteTools = true;
@@ -206,6 +208,47 @@ await pi.rpc("session", { agent, key: "chan/root", action: "compact" });
 await pi.rpc("session", { agent, key: "chan/root", action: "new" });
 out.renewed = { place: await pi.rpc("place", { agent, key: "chan/root" }), kinds: (await pi.rpc("entries", { agent, conversation: s1.conversation })).entries.map((entry) => entry.kind).slice(0, 2) };
 out.unplaced = await pi.rpc("session", { agent, key: "chan/none", action: "compact" });
+// Which turn starts a session, and the session it starts, come from Pi's own
+// history: a reset's entry id, or 0 before any.
+const own = (request, text) => ({ ...turn(request, text), key: "chan/sessions" });
+const answer = async (request, text) => {
+  faux.setResponses([fauxAssistantMessage("ok")]);
+  const delivered = await pi.rpc("deliver", own(request, text));
+  await pi.rpc("wait", { agent, submission: delivered.submission });
+  return delivered;
+};
+const n0 = await answer("N0", "opens");
+const n1 = await answer("N1", "continues");
+await pi.rpc("session", { agent, key: "chan/sessions", action: "new" });
+const reset = (await pi.rpc("entries", { agent, conversation: n0.conversation })).entries.find((entry) => entry.kind === "pi.reset")?.id;
+const n2 = await answer("N2", "after new");
+// A host that stops after the session's first turn, before the app saved its
+// prompt, never offers a later turn as the first.
+await pi.stop();
+pi = start();
+await pi.rpc("open", { agent, tools });
+const n3 = await answer("N3", "after restart");
+// Enough turns that the reset is older than the first page of entries.
+for (let index = 0; index < 110; index++) await answer("M" + index, "more");
+// Count the entries Pi's storage reads, to see that naming a session reads
+// only its markers, not the history before them.
+const probe = await openNodeSqliteStorage(data + "/probe.sqlite");
+const storage = Object.getPrototypeOf(probe);
+await probe.close();
+const scan = storage.scanEntries;
+let read = 0;
+storage.scanEntries = async function (...args) {
+  const page = await scan.apply(this, args);
+  read += page.items.length;
+  return page;
+};
+const page = await pi.rpc("entries", { agent, conversation: n0.conversation });
+const pageRead = read;
+read = 0;
+const last = await answer("M110", "more");
+const deliverRead = read;
+storage.scanEntries = scan;
+out.sessions = { n0: n0.session, n1: n1.session, n2: n2.session, n3: n3.session, last: last.session, reset, page: page.session, more: !!page.next, oldest: page.entries.at(-1)?.id, shown: page.entries.length, pageRead, deliverRead };
 // A tool loaded on search is offered once tool_search finds it.
 const offered = [];
 /** The tools a request offers: its own, and those its system messages add. */
@@ -574,6 +617,9 @@ describe.skipIf(!DEPS)("the Pi host on Pi durable", () => {
       tools: [],
       conversation: out.a.conversation,
     });
+    expect(JSON.stringify(out.blocked.messages)).toContain(
+      "[Buzz plugin: fixture-policy] Fixture blocks the command",
+    );
     expect(out.cleanupFailure).toMatchObject({
       status: "done",
       text: "Plain answer",
@@ -626,6 +672,7 @@ describe.skipIf(!DEPS)("the Pi host on Pi durable", () => {
     // What a Buzz tool answered is what the model reads.
     expect(out.c.rewritten).toMatchObject({ text: "Rewritten arguments" });
     expect(out.c.results.at(-1)).toEqual([
+      { type: "text", text: "[Buzz plugin: fixture-policy]" },
       { type: "text", text: "Replaced result" },
     ]);
     expect(out.stopped).toEqual({ status: "closed" });
@@ -671,6 +718,22 @@ describe.skipIf(!DEPS)("the Pi host on Pi durable", () => {
       aborted: true,
     });
     // A new session is shown the whole conversation at its next turn.
+    // The first turn of a conversation and of each reset names its session.
+    expect(out.sessions).toMatchObject({
+      n0: 0,
+      n2: out.sessions.reset,
+      more: true,
+    });
+    expect(out.sessions.n1).toBeUndefined();
+    expect(out.sessions.n3).toBeUndefined();
+    expect(out.sessions.oldest).toBeGreaterThan(out.sessions.reset);
+    expect(out.sessions.page).toBe(out.sessions.reset);
+    expect(out.sessions.last).toBeUndefined();
+    // Naming the page's session reads no entry beyond the page itself.
+    expect(out.sessions.pageRead).toBe(out.sessions.shown);
+    // A later turn's first-turn check stops at the session's first prompt,
+    // well short of the hundreds of entries since the reset.
+    expect(out.sessions.deliverRead).toBeLessThan(50);
     expect(out.renewed).toEqual({
       place: { seen: 0 },
       kinds: ["pi.reset", "pi.compaction"],

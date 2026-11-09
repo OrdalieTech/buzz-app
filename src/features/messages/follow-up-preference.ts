@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import type { DeviceSetting } from "../../shared/device-settings";
 
 export type FollowUpBehavior = "immediate" | "queue";
 const preferenceKey = "buzz-follow-up-behavior.v1";
@@ -48,3 +49,19 @@ export function setFollowUpBehaviorPreference(value: FollowUpBehavior): void {
   }
   window.dispatchEvent(new Event(changedEvent));
 }
+
+/** Solo follow-up behavior as a device setting. */
+export const followUpBehaviorSetting: DeviceSetting = {
+  key: "conversations.follow_up_behavior",
+  description:
+    "In Solo, send follow-ups immediately or queue them until the agent finishes its previous response.",
+  schema: { type: "string", enum: ["immediate", "queue"] },
+  read: () => ({
+    value: followUpBehaviorPreference(),
+    unsaved:
+      unsavedPreference === undefined
+        ? null
+        : "This behavior is active, but could not be saved on this device.",
+  }),
+  write: (value) => setFollowUpBehaviorPreference(value as FollowUpBehavior),
+};

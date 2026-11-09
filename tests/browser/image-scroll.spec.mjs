@@ -26,9 +26,30 @@ async function navigate(page, direction) {
   while (true) {
     const before = await remaining();
     if (before < 4) break;
+    // Virtual measurements change the estimated extent. Compare the reader's
+    // position in these numbered fixture messages instead of scrollTop.
+    const position = () =>
+      feed.evaluate((element) => {
+        const top = element.getBoundingClientRect().top;
+        const row = [...element.querySelectorAll("[data-message-id]")].find(
+          (row) => row.getBoundingClientRect().bottom > top,
+        );
+        if (!row) return { index: 0, offset: element.scrollTop };
+        const number = row.textContent.match(/Message (\d+)\./);
+        if (!number) throw new Error("Missing numbered image fixture message");
+        return {
+          index: Number(number[1]),
+          offset: top - row.getBoundingClientRect().top,
+        };
+      });
+    const start = await position();
     await wheel(page, direction * Math.min(2000, before));
+    const end = await position();
     expect(
-      before - (await remaining()),
+      direction *
+        (end.index === start.index
+          ? end.offset - start.offset
+          : end.index - start.index),
       "image navigation retains progress after settling",
     ).toBeGreaterThan(0);
   }
@@ -604,29 +625,28 @@ test("decoded image resizing preserves reading and bottom following across remou
         .toBeLessThan(1);
       expect(await bottomDistance()).toBeGreaterThan(400);
 
-      await navigate(page, 1);
-      await waiting(page, "58");
-      expect(
-        await latestImage.evaluate(
-          (node, previous) => node !== previous,
-          originalNode,
-        ),
-      ).toBe(true);
-      await expect(latestImage).toHaveCSS("visibility", "hidden");
-      // A loaded image must retain its learned frame while the new DOM node's
-      // decode is pending. Otherwise eviction restores the 320px placeholder
-      // and feeds another geometry correction back into the virtualizer.
-      await expect(latestImage).toHaveCSS("height", "10px");
-      await settle(page, feed);
       const completed = await page.evaluate(() =>
         window.imageTest.completed("58"),
       );
-      await releaseDecode(page, "58");
-      await expect
-        .poll(() => page.evaluate(() => window.imageTest.completed("58")))
-        .toBeGreaterThan(completed);
+      await navigate(page, 1);
+      await expect(latestImage).toHaveCount(1);
+      // The remount re-adopts the decoded original instead of hiding a new
+      // node until it decodes, which flashed an empty frame on every return.
+      expect(
+        await latestImage.evaluate(
+          (node, previous) => node === previous,
+          originalNode,
+        ),
+      ).toBe(true);
       await expect(latestImage).toHaveCSS("visibility", "visible");
+      await expect(latestImage).toHaveCSS("height", "10px");
       await settle(page, feed);
+      expect(
+        await page.evaluate(() => [
+          window.imageTest.waiting("58"),
+          window.imageTest.completed("58"),
+        ]),
+      ).toEqual([false, completed]);
       expect(await bottomDistance()).toBeLessThan(4);
     } finally {
       await originalNode.dispose();

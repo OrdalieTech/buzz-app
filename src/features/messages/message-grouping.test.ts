@@ -1,6 +1,9 @@
 import { expect, it } from "vitest";
 import type { ChannelMessage } from "../relay/contracts";
-import { continuesMessageGroup } from "./message-grouping";
+import {
+  continuesMessageGroup,
+  publicMessageNeighbor,
+} from "./message-grouping";
 
 const first: ChannelMessage = {
   id: "first",
@@ -72,3 +75,29 @@ it("keeps automation bylines on every row, even for a common signer and owner", 
     false,
   );
 });
+
+it("continues a reply into activity but starts the next public reply separately", () => {
+  const activity = { ...first, id: "activity", audience: "agents" as const };
+  expect(continuesMessageGroup(first, activity)).toBe(true);
+  expect(continuesMessageGroup(activity, { ...activity, id: "next" })).toBe(
+    true,
+  );
+  expect(continuesMessageGroup(activity, first)).toBe(false);
+});
+
+it.each([-1, 1] as const)(
+  "does not bridge another author's visible activity in direction %s",
+  (direction) => {
+    const rows = [
+      first,
+      { ...first, id: "work", authorId: "agent", audience: "agents" as const },
+      { ...first, id: "followup" },
+    ];
+    const index = direction === 1 ? 0 : 2;
+    expect(publicMessageNeighbor(rows, index, direction)).toBeUndefined();
+    rows[1] = { ...first, id: "work", audience: "agents" };
+    expect(publicMessageNeighbor(rows, index, direction)?.id).toBe(
+      direction === 1 ? "followup" : "first",
+    );
+  },
+);

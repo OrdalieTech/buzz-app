@@ -129,7 +129,8 @@ test("playground distinguishes same-name people and agents in the real composer"
       // lands on two different rows and reaches neither.
       await expect(dialog.getByText("Searching community…")).toHaveCount(0);
       await dialog
-        .getByRole("button", { name: `${label} ${key}`, exact: true })
+        .getByRole("button")
+        .and(page.locator(`[data-mention-choice="${key}"]`))
         .click();
       labels.push(`@${label}`);
       await expect(chips).toHaveText(labels);

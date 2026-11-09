@@ -1,10 +1,18 @@
+.progress p {
+  margin: 0;
+}
+.flow h1 {
+  margin: 0;
+}
 /* Branded first-launch surface, matching mobile's onboarding artwork. */
 .landing {
   min-height: 100dvh;
+  position: relative;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
   color: var(--text-primary);
-  background: #e7f0ef url("/shell-gradient.png") center / 100% 100% no-repeat;
+  background: var(--surface-panel);
 }
 
 .titlebar {
@@ -49,7 +57,7 @@
 }
 
 .tagline {
-  margin: 0;
+  margin: var(--space-4) 0 0;
   font-family: var(--font-sans);
   font-size: var(--text-body-lg);
   font-weight: var(--text-body-lg--font-weight);
@@ -103,16 +111,6 @@
   visibility: hidden;
 }
 
-[data-color-mode="dark"] .landing {
-  background:
-    radial-gradient(ellipse at 15% 0%, #203d53, transparent 65%),
-    radial-gradient(ellipse at 90% 100%, #39304b, transparent 70%), #11181d;
-}
-
-[data-color-mode="dark"] .wordmark img {
-  filter: invert(1);
-}
-
 @media (forced-colors: active) {
   .landing {
     background: Canvas;
@@ -153,4 +151,289 @@
   width: 100%;
   max-width: 27.5rem;
   margin-inline: auto;
+}
+
+/* Mobile welcome is always the light brand palette, independent of app theme. */
+.welcome {
+  background: #d7d72e;
+  color: var(--text-standard);
+}
+.welcome .wordmark {
+  width: min(100%, 40rem);
+}
+.welcome .content {
+  max-width: 43rem;
+  position: relative;
+}
+.welcome .titlebar {
+  position: relative;
+}
+.bees {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: -1;
+}
+.bee {
+  position: absolute;
+  width: 2.15625rem;
+  height: 1.453125rem;
+}
+.bee > span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #d7e7f5;
+  mask: url("/welcome-bee.svg") center / contain no-repeat;
+}
+.bee:nth-child(2n) > span {
+  background: #dbfa52;
+}
+/* Builderlab/Auth0 card composition, using the same shared controls and Panel. */
+.step {
+  background: var(--surface-onboarding);
+  --text-heading: var(--text-title);
+  --text-heading--line-height: var(--text-title--line-height);
+  --text-heading--font-weight: var(--text-title--font-weight);
+  --text-heading--letter-spacing: var(--text-title--letter-spacing);
+  --text-body: var(--text-body-sm);
+  --text-body--line-height: var(--text-body-sm--line-height);
+  --text-body--font-weight: var(--text-body-sm--font-weight);
+  --text-body--letter-spacing: var(--text-body-sm--letter-spacing);
+}
+.step .content {
+  max-width: calc(490px + 3rem);
+  justify-content: center;
+  padding-bottom: var(--space-16);
+}
+.cardContent {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  padding: var(--space-8);
+}
+.step .brand {
+  flex: initial;
+  align-items: stretch;
+  justify-content: flex-start;
+  padding-block: 0;
+  gap: var(--space-2);
+}
+.step .actions {
+  max-width: none;
+  text-align: left;
+}
+.step .actions:empty {
+  display: none;
+}
+.step .importContent {
+  max-width: none;
+  justify-content: flex-start;
+  padding-block: 0;
+}
+.step .importContent > h1,
+.step .importContent > p,
+.step .setupContent > h1,
+.step .setupContent > p {
+  text-align: left;
+}
+.flow {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-6);
+  min-width: 0;
+}
+.step [data-onboarding-actions] {
+  display: flex;
+  flex-direction: row;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  padding-top: var(--space-6);
+}
+.progress {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  text-align: center;
+  padding-block: var(--space-8);
+}
+.loadingBee {
+  display: block;
+  width: 5rem;
+  height: 3.3125rem;
+  background: currentColor;
+  mask: url("/welcome-bee.svg") center / contain no-repeat;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .loadingBee {
+    animation: bee-breathe 1.8s ease-in-out infinite alternate;
+  }
+}
+@keyframes bee-breathe {
+  from {
+    transform: translateY(0.15rem) scale(0.96);
+  }
+  to {
+    transform: translateY(-0.15rem) scale(1);
+  }
+}
+@media (max-width: 35rem) {
+  .content {
+    padding-inline: var(--space-4);
+  }
+  .bees .bee:nth-child(n + 9) {
+    display: none;
+  }
+}
+@media (forced-colors: active) {
+  .welcome {
+    background: Canvas;
+    color: CanvasText;
+  }
+  .bees {
+    display: none;
+  }
+  .loadingBee {
+    background: CanvasText;
+  }
+}
+
+/* One-time Mac introduction. Opacity and transforms keep the reveal composited. */
+.welcome[data-intro="waiting"],
+.welcome[data-intro="running"] {
+  background: transparent;
+}
+.welcome::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: #d7d72e;
+  z-index: -2;
+  pointer-events: none;
+}
+.welcome[data-intro="waiting"]::before,
+.welcome[data-intro="waiting"] .brand,
+.welcome[data-intro="waiting"] .actions,
+.welcome[data-intro="waiting"] .bees {
+  opacity: 0;
+}
+.welcome[data-intro="running"]::before {
+  animation: welcome-reveal 1100ms 4000ms both;
+}
+.welcome[data-intro="running"] .wordmark {
+  animation: welcome-logo-enter 700ms 5000ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.welcome[data-intro="running"] .tagline {
+  animation: welcome-reveal 500ms 6800ms both;
+}
+.welcome[data-intro="running"] .actions {
+  animation: welcome-reveal 500ms 7800ms both;
+}
+.welcome[data-intro="running"] .beeArrival {
+  animation: bee-arrive 1800ms both;
+}
+.bee:nth-child(2n) .beeArrival {
+  animation-delay: 200ms;
+}
+.bee:nth-child(3n) .beeArrival {
+  animation-delay: 450ms;
+}
+.bee:nth-child(4n) .beeArrival {
+  animation-delay: 700ms;
+}
+.bee:nth-child(5n) .beeArrival {
+  animation-delay: 950ms;
+}
+/* buzz.xyz hero: 94% → 100%, 700ms, its shared entrance easing. */
+@keyframes welcome-logo-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes welcome-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes bee-arrive {
+  from {
+    translate: -110vw 0;
+  }
+  to {
+    translate: 0 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .welcome[data-intro]::before,
+  .welcome[data-intro] .wordmark,
+  .welcome[data-intro] .tagline,
+  .welcome[data-intro] .actions,
+  .welcome[data-intro] .beeArrival {
+    animation: none;
+  }
+}
+
+.step .actions:has(> [data-onboarding-back]) {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-end;
+}
+.step [data-onboarding-back] {
+  order: -1;
+  margin-right: auto;
+  flex-shrink: 0;
+}
+.step [data-onboarding-actions] {
+  align-items: center;
+}
+
+/* Match Builderlab's compact heading group and form/action rhythm. */
+.step .brand > h1,
+.step .brand > p,
+.step .brand h1,
+.step .brand h1 + p {
+  margin: 0;
+}
+.step .brand h1 + p {
+  margin-top: var(--space-2);
+}
+.step .brand > h1 + p {
+  margin-top: 0;
+}
+.step .actions:has(> [data-onboarding-back]) {
+  padding-top: var(--space-6);
+}
+
+.step .importContent {
+  gap: var(--space-2);
+}
+.step .importContent > h1 + p {
+  margin-top: 0;
+}
+.step .setupContent > h1 + p {
+  margin-top: 0;
+}
+
+.cornerMark {
+  position: absolute;
+  top: var(--space-6);
+  left: var(--space-6);
+  width: calc(var(--space-6) + var(--space-8));
+  height: calc(var(--space-6) + var(--space-8));
+  object-fit: contain;
 }

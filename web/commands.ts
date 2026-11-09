@@ -91,6 +91,9 @@ export const commands: Record<string, Handler> = {
   sign_out_wipe_refusal: () => null,
   // Block's key backup service is not configured for this host.
   nsec_backup_available: () => false,
+  nsec_backup_confirmed: () => false,
+  federated_identity_servers: () => [],
+  credential_pairings_list: () => [],
   relay_sign: key,
   relay_http: key,
   relay_http_cancel: key,

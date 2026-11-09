@@ -459,6 +459,49 @@ it("keeps every DM scope of a sidebar pass for the next pass", () => {
   expect(resolve).toHaveBeenCalledTimes(dms.length);
 });
 
+it("labels a frozen member list like an equal unfrozen one, across interleaved scopes", () => {
+  const [a, b, d] = ["a", "b", "d"].map((key) => key.repeat(64));
+  if (!a || !b || !d) throw new Error("Missing fixture keys");
+  const profiles = new Map([
+    [a, { name: "Alex" }],
+    [b, { name: "Alex" }],
+    [d, { name: "Dana" }],
+  ]);
+  const library = {
+    status: "ready",
+    definitions: [],
+    identities: [],
+  } as const;
+  const source: NameSource = {
+    profiles: {
+      snapshot: () => profiles,
+      subscribe: () => () => {},
+      ensure: async () => {},
+    },
+    agentLibrary: {
+      snapshot: () => library,
+      subscribe: () => () => {},
+      refresh: async () => {},
+      retain: () => () => {},
+    },
+  };
+  const resolve = vi.fn(defaultNamingPolicy.resolve);
+  const names = bindNames(source, {
+    snapshot: () => [createNameProvider({ id: "spy", resolve })],
+    subscribe: () => () => {},
+  });
+  const members = Object.freeze([b.toUpperCase(), a]);
+  const suffixed = (key: string) => `Alex · ${npubEncode(key).slice(-4)}`;
+  for (let pass = 0; pass < 2; pass++) {
+    expect(names.resolve(a, "", members)).toBe(suffixed(a));
+    expect(names.resolve(d, "", [d])).toBe("Dana");
+    expect(names.resolve(b, "", members)).toBe(suffixed(b));
+    expect(names.resolve(a, "", [a, b])).toBe(suffixed(a));
+  }
+  // The frozen list and its equal unfrozen copy share one policy run.
+  expect(resolve).toHaveBeenCalledTimes(2);
+});
+
 it.each(
   [
     '{"about":"Artwork-only agent"}',
@@ -556,3 +599,53 @@ it.each([false, true])(
     }
   },
 );
+
+it("labels a scope from its own keys and their owners, not the whole profile cache", () => {
+  const me = "1".repeat(64),
+    owner = "2".repeat(64),
+    a = "a".repeat(64),
+    b = "b".repeat(64);
+  const crowd = Array.from(
+    { length: 500 },
+    (_, index) =>
+      [index.toString(16).padStart(64, "c"), { name: "Honey" }] as const,
+  );
+  const profiles = new Map<
+    string,
+    { name: string; isAgent?: true; ownerPubkey?: string }
+  >([
+    ...crowd,
+    [owner, { name: "Wes" }],
+    [a, { name: "Honey", isAgent: true, ownerPubkey: owner }],
+    [b, { name: "Honey", isAgent: true, ownerPubkey: me }],
+  ]);
+  const library = { status: "ready" as const, definitions: [], identities: [] };
+  const source: NameSource = {
+    viewer: me,
+    profiles: {
+      snapshot: () => profiles,
+      ensure: async () => {},
+      subscribe: () => () => {},
+    },
+    agentLibrary: {
+      snapshot: () => library,
+      subscribe: () => () => {},
+      refresh: async () => {},
+      retain: () => () => {},
+    },
+  };
+  const resolve = vi.fn(defaultNamingPolicy.resolve);
+  const provider = createNameProvider({ ...defaultNamingPolicy, resolve });
+  const scoped = provider.scope(source, [a, b]);
+  // The owner outside the scope still qualifies its agent's name.
+  expect(scoped(a)?.name).toBe("Wes’s Honey");
+  expect(scoped(b)?.name).toBe("Honey");
+  const rows = resolve.mock.calls[0]?.[0] ?? [];
+  expect(new Set(rows.map((row) => row.pubkey))).toEqual(
+    new Set([a, b, owner]),
+  );
+  // Unscoped lookups still see every cached namesake.
+  expect(provider.scope(source)(crowd[0]?.[0] as string)?.name).not.toBe(
+    "Honey",
+  );
+});

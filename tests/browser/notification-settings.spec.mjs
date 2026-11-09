@@ -5,7 +5,10 @@ import {
 } from "./navigation.mjs";
 import { test, expect } from "./fixture.mjs";
 
-test.use({ historyCounts: { alpha: 0, beta: 0 } });
+test.use({
+  enabledPlugins: ["buzz.reminders"],
+  historyCounts: { alpha: 0, beta: 0 },
+});
 
 async function settings(page) {
   await openSettings(page);

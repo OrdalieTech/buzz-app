@@ -386,6 +386,7 @@ test("adds custom emoji through the production broker, then uses, replaces, retr
     // Reaction with it.
     await hoverMessage(row);
     await row
+      .getByRole("group", { name: "Message actions", includeHidden: true })
       .getByRole("button", { name: "Add reaction", exact: true })
       .click();
     await page
@@ -453,11 +454,19 @@ test("adds custom emoji through the production broker, then uses, replaces, retr
         .getByRole("button", { name: ":party_parrot:: You", exact: true })
         .locator("img"),
     ).toHaveAttribute("src", media(first));
+    await hoverMessage(row);
+    await row
+      .getByRole("group", { name: "Message actions", includeHidden: true })
+      .getByRole("button", { name: "Add reaction", exact: true })
+      .click();
+    const reactionPicker = page.locator("em-emoji-picker");
+    await reactionPicker.locator('input[type="search"]').fill("party_parrot");
     await expect(
-      row
-        .getByRole("button", { name: "React with :party_parrot:" })
+      reactionPicker
+        .getByRole("button", { name: ":party_parrot:", exact: true })
         .locator("img"),
     ).toHaveAttribute("src", media(second));
+    await page.keyboard.press("Escape");
     await page.screenshot({
       path: testInfo.outputPath("primary-after-replace.png"),
       fullPage: true,

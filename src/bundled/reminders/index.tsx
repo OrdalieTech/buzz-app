@@ -149,9 +149,12 @@ export const apply: PluginModule["apply"] = (ctx) => {
                   ? `Reminder due · #${channel.name}`
                   : "Reminder due",
               body:
-                [reminder.target?.preview, reminder.note].find(
-                  (text) => text && plainText(text),
-                ) ?? "A reminder is waiting",
+                [
+                  plainText(reminder.target?.preview ?? "", {
+                    storedPreview: true,
+                  }),
+                  plainText(reminder.note ?? ""),
+                ].find(Boolean) || "A reminder is waiting",
             })
             .catch(() => {});
         }

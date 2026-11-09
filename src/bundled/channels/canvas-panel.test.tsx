@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { Context } from "@deepseek-ai/cordis";
 import { afterEach, assert, expect, it, vi } from "vitest";
 import { PanelsService } from "../../features/panels/service";
@@ -94,6 +101,11 @@ it("lets a joined Guest read the canvas and reacts to promotion and demotion", a
         }}
       />,
     );
+    // A Guest opens on the rendered saved Canvas and can still open Edit.
+    expect(
+      await screen.findByRole("article", { name: "Saved Canvas" }),
+    ).toHaveTextContent("Saved canvas");
+    fireEvent.click(screen.getByRole("tab", { name: "Edit" }));
     const editor = await screen.findByRole("textbox", {
       name: "Canvas Markdown",
     });

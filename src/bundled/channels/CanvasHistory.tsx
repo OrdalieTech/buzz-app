@@ -1,4 +1,5 @@
 import {
+  type Ref,
   useCallback,
   useEffect,
   useMemo,
@@ -11,17 +12,23 @@ import type {
   CanvasHistoryPage,
   ChannelCanvas,
 } from "../../features/channel-templates/capability";
-import { CANVAS_BYTES } from "../../features/channel-templates/model";
+import {
+  LIVE_CANVAS_BYTES,
+  LIVE_CANVAS_LIMIT,
+} from "../../features/channel-templates/model";
 import type { RelayEvent } from "../../features/relay/events";
 import type { ProfileQueries } from "../../features/relay/profile-directory";
 import { useProfileGeneration } from "../../features/relay/react";
 import { selectProfiles } from "../../features/relay/profile-selection";
 import { publicKeyLabels } from "../../shared/identity/public-key";
+import { Checkbox } from "../../shared/design-system/ui/Checkbox";
 import { Button } from "../../shared/design-system/ui/Button";
 import { Dialog } from "../../shared/design-system/ui/Dialog";
+import { LoadingRegion } from "../../shared/design-system/ui/LoadingRegion";
 import { Field } from "../../shared/design-system/ui/Field";
 import { Radio, RadioGroup } from "../../shared/design-system/ui/RadioGroup";
 import { Textarea } from "../../shared/design-system/ui/Textarea";
+import { CanvasDiff } from "./CanvasDiff";
 import styles from "./ChannelTemplates.module.css";
 
 export function CanvasHistory({
@@ -33,6 +40,9 @@ export function CanvasHistory({
   loaded,
   dirty,
   refreshHead,
+  retryHead,
+  comparisonRef,
+  retryRef,
   restore,
   readOnly = false,
 }: {
@@ -41,19 +51,25 @@ export function CanvasHistory({
   profiles: ProfileQueries;
   head: RelayEvent | undefined;
   busy: boolean;
+  /** `head` is loaded and the latest read of it succeeded. */
   loaded: boolean;
   dirty: boolean;
   readOnly?: boolean;
   refreshHead(): Promise<void>;
+  /** Retries a failed head read from `retryRef`, which keeps focus. */
+  retryHead(): void;
+  comparisonRef?: Ref<HTMLDivElement>;
+  retryRef?: Ref<HTMLButtonElement>;
   restore(revision: RelayEvent): Promise<void>;
 }) {
   const [page, setPage] = useState<CanvasHistoryPage>();
   const [selected, setSelected] = useState<RelayEvent>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [full, setFull] = useState(false);
   const [notice, setNotice] = useState("");
   const [confirm, setConfirm] = useState(false);
-  const cancel = useRef<HTMLButtonElement>(null);
+  const proceed = useRef<HTMLButtonElement>(null);
   const restoreButton = useRef<HTMLButtonElement>(null);
   const generation = useRef(0);
   const refreshButton = useRef<HTMLButtonElement>(null);
@@ -138,9 +154,26 @@ export function CanvasHistory({
     };
     // This panel is keyed by the owning channel/session and mounted lazily.
   }, [load]);
+  // A head read that has failed stays failed through its retry, so Retry
+  // keeps its place and focus until a read lands.
+  const [headFailed, setHeadFailed] = useState(false);
+  if (loaded ? headFailed : !busy && !headFailed) setHeadFailed(!loaded);
+  const headContent = head?.content ?? "";
+  const fullContent = (note?: string) => (
+    <>
+      {note && <p>{note}</p>}
+      <Textarea
+        aria-label="Revision Markdown"
+        variant="code"
+        rows={10}
+        readOnly
+        value={selected?.content ?? ""}
+      />
+    </>
+  );
   const tooLarge =
     selected &&
-    new TextEncoder().encode(selected.content).length > CANVAS_BYTES;
+    new TextEncoder().encode(selected.content).length > LIVE_CANVAS_BYTES;
   const apply = async () => {
     if (!selected || readOnly) return;
     const current = ++generation.current;
@@ -244,18 +277,49 @@ export function CanvasHistory({
       )}
       {selected && (
         <>
-          <Textarea
-            aria-label="Revision Markdown"
-            variant="code"
-            rows={10}
-            readOnly
-            value={selected.content}
+          <Checkbox
+            label="Show full content"
+            checked={full}
+            onCheckedChange={setFull}
           />
+          <div ref={comparisonRef} tabIndex={-1}>
+            {!loaded ? (
+              <LoadingRegion
+                pending={busy}
+                label="Reading the current Canvas…"
+                feedback={
+                  headFailed ? (
+                    <div className={styles.actions}>
+                      <p role="alert">
+                        The current Canvas could not be read, so this version
+                        cannot be compared with it.
+                      </p>
+                      <Button ref={retryRef} loading={busy} onClick={retryHead}>
+                        Retry
+                      </Button>
+                    </div>
+                  ) : undefined
+                }
+              >
+                {fullContent()}
+              </LoadingRegion>
+            ) : full ? (
+              fullContent()
+            ) : selected.id === head?.id || selected.content === headContent ? (
+              <p>Same as current version.</p>
+            ) : (
+              <CanvasDiff
+                current={headContent}
+                revision={selected.content}
+                fallback={fullContent}
+              />
+            )}
+          </div>
           {!selected.content && <p>This version is empty.</p>}
           {tooLarge && (
             <p>
-              This version exceeds the 24 KiB Canvas limit and cannot be
-              restored here.
+              This version exceeds the {LIVE_CANVAS_LIMIT} Canvas limit and
+              cannot be restored here.
             </p>
           )}
           <div className={styles.actions}>
@@ -288,7 +352,7 @@ export function CanvasHistory({
         onOpenChange={setConfirm}
         title="Restore this version?"
         description="This publishes the selected version as a new Canvas revision. Existing history is kept."
-        initialFocus={cancel}
+        initialFocus={proceed}
         finalFocus={() =>
           attempted.current ? refreshButton.current : restoreButton.current
         }
@@ -296,14 +360,11 @@ export function CanvasHistory({
         dismissOnOutsideClick
         actions={
           <>
-            <Button
-              ref={cancel}
-              disabled={busy}
-              onClick={() => setConfirm(false)}
-            >
+            <Button disabled={busy} onClick={() => setConfirm(false)}>
               Cancel
             </Button>
             <Button
+              ref={proceed}
               variant="prominent"
               loading={busy}
               disabled={readOnly}

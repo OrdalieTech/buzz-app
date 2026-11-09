@@ -1,6 +1,10 @@
 // Agent and team config channels (NIP-AP "Config channels"): the relay
 // support check, labels, and the only calls this app makes into the NIP-CL
 // system-channel API.
+import {
+  administerMember,
+  type MemberResult,
+} from "../channel-members/administration";
 import type {
   MemberChange,
   MemberRole,
@@ -103,12 +107,7 @@ const isConfig = (
   !!channel.labels?.includes(family) &&
   !!channel.labels.includes(subject);
 
-/** A member change's outcome. `uncertain`: published, but readback could not
- * confirm it; it is not sent again. */
-export type MemberResult = Readonly<{
-  status: "confirmed" | "failed" | "uncertain";
-  error?: string;
-}>;
+export type { MemberResult };
 
 export function createConfigChannels(
   session: RelaySession,
@@ -199,32 +198,12 @@ export function createConfigChannels(
       role: MemberRole | undefined,
     ) => Omit<MemberChange, "pubkey"> | undefined,
   ): Promise<MemberResult> {
-    const admin = session.memberAdministration;
-    await admin.refresh(channel);
-    const read = admin.snapshot(channel);
-    if (read.status !== "ready")
-      return { status: "failed", error: read.error ?? "Roles unavailable" };
-    const intent = decide(read.authority.roles[pubkey]);
-    if (!intent) return { status: "confirmed" };
-    const change = { pubkey, ...intent };
-    try {
-      await admin.run(channel, change);
-    } catch (error) {
-      return {
-        status: "failed",
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-    const { operation, error } = admin.snapshot(channel);
-    if (
-      operation?.change.pubkey !== pubkey ||
-      operation.change.role !== change.role ||
-      operation.status === "pending"
-    )
-      return { status: "uncertain" };
-    return operation.status === "confirmed"
-      ? { status: "confirmed" }
-      : { status: operation.status, ...(error ? { error } : {}) };
+    return administerMember(
+      session.memberAdministration,
+      channel,
+      pubkey,
+      decide,
+    );
   }
 
   async function owns(pubkey: string, signal?: AbortSignal) {

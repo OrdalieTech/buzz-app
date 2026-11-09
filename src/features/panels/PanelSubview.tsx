@@ -108,7 +108,7 @@ function InlinePanelSubview({
       className={host ? styles.subview : styles.inlineSubview}
       aria-label={title}
       onKeyDown={(event) => {
-        if (event.key === "Escape") {
+        if (event.key === "Escape" && !event.shiftKey) {
           event.stopPropagation();
           onBack();
         }

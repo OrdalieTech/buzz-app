@@ -8,6 +8,7 @@ import { composerDOMFixture } from "../../features/messages/composer-testing";
 import { createAgentChoices } from "../../features/agents/choices";
 import { createAgentLibrary } from "../../features/agents/library";
 import { localAgentsFixture } from "../../features/agents/local-testing";
+import type { Agents } from "../../features/agents/service";
 import type { ConversationHostServices } from "../../features/conversation/ConversationHost";
 import {
   createNavigationController,
@@ -68,6 +69,7 @@ afterEach(() => {
   localStorage.clear();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
 });
 const pollen = "b".repeat(64),
   fizz = "c".repeat(64),
@@ -94,6 +96,8 @@ async function fixture({
   archived = false,
   withReply = false,
 } = {}) {
+  // jsdom has no native scrolling; thread reveals still use this DOM boundary.
+  HTMLElement.prototype.scrollIntoView = vi.fn();
   // The timeline waits for a measurable host before mounting its virtualizer.
   vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(800);
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(600);
@@ -267,10 +271,16 @@ async function fixture({
     disconnect() {},
     async clearCache() {},
   };
-  const navigator = {
-    open: vi.fn(async () => ({ status: "opened" as const })),
-    dismiss: vi.fn(),
-  } as unknown as Navigation;
+  const controller = createNavigationController(
+    createMemoryHistory({
+      version: 1,
+      kind: "page",
+      pluginId: "buzz.bestie",
+      pageId: "bestie",
+    }),
+  );
+  disposals.push(controller.dispose);
+  const navigator = controller.navigation;
   const host = {
     relay,
     panels: {
@@ -280,6 +290,12 @@ async function fixture({
     },
     navigation: { open: vi.fn() },
   } as unknown as ConversationHostServices;
+  const agents = {
+    subscribe: () => () => {},
+    snapshot: () => undefined,
+    types: () => empty,
+    find: () => undefined,
+  } as unknown as Agents;
   return {
     viewer: viewer.pubkey,
     scope,
@@ -322,6 +338,7 @@ async function fixture({
           host={host}
           extensions={extensions}
           navigator={renderedNavigator}
+          agents={agents}
           navigation={navigation}
         />
       </ToastProvider>
@@ -335,6 +352,7 @@ async function fixture({
             host={host}
             extensions={extensions}
             navigator={navigator}
+            agents={agents}
           />
         </ToastProvider>,
         { reactStrictMode: true },
@@ -564,6 +582,7 @@ async function threadHistoryFixture() {
       ...(attempt.focus ? { focus: attempt.focus } : {}),
       position: () => undefined,
       savePosition() {},
+      passThrough: () => () => {},
       forSession: () => request,
       resolve: () => false,
       complete: () => true,
@@ -624,7 +643,9 @@ it("restores Bestie threads with Back and Forward and retires every explicitly c
   rerender();
   expect(await screen.findByLabelText("Thread")).toBeVisible();
 
-  await userEvent.click(screen.getByRole("button", { name: "Close thread" }));
+  await userEvent.click(
+    screen.getByRole("button", { name: "Close Are you there? tab" }),
+  );
   rerender();
   expect(navigator.snapshot().entry.target).toEqual(bestie);
   act(() => navigator.back());
@@ -743,6 +764,27 @@ it("recovers a saved agent missing from a partial inventory through refresh", as
   expect(f.session.agentChoices.snapshot()).not.toHaveProperty("error");
 });
 
+it("replaces a missing saved Bestie from the chooser in place", async () => {
+  const f = await fixture();
+  f.choose(pollen);
+  f.makePollenIneligible();
+  f.mount();
+  expect(
+    await screen.findByRole("heading", { name: "Pollen is no longer here" }),
+  ).toBeVisible();
+  const user = userEvent.setup();
+  await user.click(
+    screen.getByRole("combobox", {
+      name: "Choose an eligible agent or create a new one:",
+    }),
+  );
+  await user.click(await screen.findByRole("option", { name: /^Fizz / }));
+  expect(
+    await screen.findByRole("textbox", { name: "Message Fizz" }),
+  ).toBeVisible();
+  expect(f.open).toHaveBeenCalledWith([fizz], expect.any(AbortSignal));
+});
+
 it("does not use a known-archived identity's DM during partial discovery", async () => {
   const f = await fixture({
     existing: true,
@@ -778,4 +820,37 @@ it("rechecks eligibility before retrying a failed DM open", async () => {
     ),
   ).toBeVisible();
   expect(f.open).toHaveBeenCalledTimes(attempts);
+});
+
+it("keeps the DM and draft mounted beside a thread and retains the reply draft while collapsing its pane", async () => {
+  const f = await fixture({ existing: true, withReply: true });
+  f.choose(pollen);
+  f.mount();
+  const user = userEvent.setup();
+  const composer = await screen.findByRole("textbox", {
+    name: "Message Pollen",
+  });
+  await user.type(composer, "Main draft");
+  await user.click(
+    await screen.findByRole("button", { name: "View thread: 1 reply" }),
+  );
+  expect(await screen.findByLabelText("Thread")).toBeVisible();
+  expect(screen.getByRole("textbox", { name: "Message Pollen" })).toBe(
+    composer,
+  );
+  expect(composer).toHaveTextContent("Main draft");
+  const reply = screen.getByRole("textbox", { name: "Reply to thread" });
+  await user.type(reply, "Reply draft");
+  await user.click(screen.getByRole("button", { name: "Toggle tab pane" }));
+  expect(composer).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Toggle tab pane" }));
+  expect(await screen.findByRole("textbox", { name: "Reply to thread" })).toBe(
+    reply,
+  );
+  expect(reply).toHaveTextContent("Reply draft");
+  await user.click(
+    screen.getByRole("button", { name: "Close Are you there? tab" }),
+  );
+  expect(composer).toHaveTextContent("Main draft");
+  expect(screen.queryByLabelText("Thread")).not.toBeInTheDocument();
 });

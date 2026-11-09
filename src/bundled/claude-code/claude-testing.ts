@@ -30,6 +30,8 @@ export type FakeClaude = {
   interruptError?: string;
   /** When false, a kill is only a request; the test calls `exit()`. */
   exitOnKill: boolean;
+  /** The agents its Buzz credential was asked to act as, in order. */
+  actedAs: Readonly<{ pubkey: string; relay: string }>[];
   emit(message: Record<string, unknown>): void;
   finish(result?: Readonly<{ error?: string }>): void;
   exit(code: number | null, stderr?: string): void;
@@ -55,11 +57,28 @@ export const MODELS = [
 const resolved = (model: string) =>
   MODELS.find((item) => item.value === model)?.resolvedModel ?? model;
 
-/** A spawn whose `claude` processes answer like Claude. Sessions named in
- * `known` (or created by a process) can be resumed; others fail to load. */
+/** The processes that run Claude: Buzz's copy, and the pinned protected
+ * release on the Mac `platform` reports. */
+export const CLAUDES: ReadonlySet<string> = new Set([
+  "claude",
+  "claude-protected-arm64",
+]);
+
+/** A spawn whose Claude processes answer like Claude, on an Apple silicon
+ * Mac. Sessions named in `known` (or created by a process) can be resumed;
+ * others fail to load. */
 export function fakeSpawn(known = new Set<string>()) {
   const processes: FakeClaude[] = [];
   const spawn = async (id: string, options: HostProcessOptions = {}) => {
+    if (id === "platform") {
+      options.onStdout?.("Darwin arm64\n");
+      return {
+        write: async () => {},
+        end: async () => {},
+        kill: async () => {},
+        exited: Promise.resolve(0),
+      };
+    }
     let resolveExit!: (code: number | null) => void;
     const exited = new Promise<number | null>((resolve) => {
       resolveExit = resolve;
@@ -86,6 +105,7 @@ export function fakeSpawn(known = new Set<string>()) {
       hold: false,
       killed: false,
       exitOnKill: true,
+      actedAs: [],
       emit(message) {
         if (alive) options.onStdout?.(`${JSON.stringify(message)}\n`);
       },
@@ -207,10 +227,17 @@ export function fakeSpawn(known = new Set<string>()) {
         fake.killed = true;
         if (fake.exitOnKill) fake.exit(null);
       },
+      ...(options.agentCredential && {
+        actAs: async (agent: Readonly<{ pubkey: string; relay: string }>) => {
+          fake.actedAs.push(agent);
+        },
+      }),
       exited,
     };
     // Output that arrives before spawn returns is buffered by the caller.
-    if (id !== "claude") queueMicrotask(() => fake.exit(0));
+    // Claude answers `--version` and exits, as other processes do.
+    if (!CLAUDES.has(id) || args[0] === "--version")
+      queueMicrotask(() => fake.exit(0));
     return process;
   };
   return { spawn, processes, known };

@@ -1,13 +1,16 @@
 import {
   createContext,
+  useCallback,
   useId,
   useContext,
   useLayoutEffect,
   useRef,
+  useState,
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { motion, useReducedMotion } from "motion/react";
+import { AlertDialog } from "../../shared/design-system/ui/AlertDialog";
 import { Button } from "../../shared/design-system/ui/Button";
 import { ScrollEdgeMaterial } from "../../shared/design-system/ui/ScrollEdgeMaterial";
 import styles from "./AgentSaveButton.module.css";
@@ -101,6 +104,52 @@ export function useAgentSaveState(
     report?.({ dirty, saving }, id);
     return () => report?.(null, id);
   }, [report, id, dirty, saving, active]);
+}
+
+/** Combines the reports of everything below one AgentSaveState provider. */
+export function useAgentSaveReports() {
+  const [draft, setDraft] = useState({ dirty: false, saving: false });
+  const drafts = useRef(new Map<string, { dirty: boolean; saving: boolean }>());
+  const report = useCallback(
+    (state: { dirty: boolean; saving: boolean } | null, id: string) => {
+      if (state) drafts.current.set(id, state);
+      else drafts.current.delete(id);
+      const states = [...drafts.current.values()];
+      setDraft({
+        dirty: states.some((state) => state.dirty),
+        saving: states.some((state) => state.saving),
+      });
+    },
+    [],
+  );
+  return [draft, report] as const;
+}
+
+/** Asks before leaving would unmount reported unsaved edits. */
+export function DiscardChanges({
+  description,
+  onKeep,
+  onDiscard,
+}: {
+  description: string;
+  onKeep(): void;
+  onDiscard(): void;
+}) {
+  return (
+    <AlertDialog
+      title="Discard changes?"
+      description={description}
+      onClose={onKeep}
+      actions={
+        <>
+          <Button onClick={onKeep}>Keep editing</Button>
+          <Button variant="destructive" onClick={onDiscard}>
+            Discard changes
+          </Button>
+        </>
+      }
+    />
+  );
 }
 
 export function AgentSaveButton({

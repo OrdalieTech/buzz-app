@@ -1,24 +1,13 @@
+@reference "../../shared/styles/globals.css";
+
 .typing {
-  position: absolute;
-  inset-block-end: calc(100% + var(--space-half));
-  inset-inline: var(--space-4);
-  inline-size: min(calc(100% - 2 * var(--space-4)), 52rem);
-  margin-inline: auto;
-  z-index: 1;
-  flex-direction: row-reverse;
-  justify-content: space-between;
-  pointer-events: none;
   display: flex;
-  align-items: center;
-  gap: var(--space-1h);
-  flex-shrink: 0;
+  flex-direction: column;
+  gap: var(--space-half);
+  padding: 0 var(--space-4) var(--space-2);
   min-width: 0;
-  max-width: 100%;
+  flex-shrink: 0;
   color: var(--text-subtle);
-  font-size: var(--text-caption);
-  line-height: var(--text-caption--line-height);
-  letter-spacing: var(--text-caption--letter-spacing);
-  font-weight: var(--text-caption--font-weight);
 }
 
 .label {
@@ -28,6 +17,20 @@
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+.stopAction {
+  align-self: center;
+  flex-shrink: 0;
+  padding: var(--space-1);
+}
+
+.stopIcon {
+  transform: rotate(22.5deg);
+}
+
+.typing > [data-agent-response-preview] {
+  width: min(100%, var(--timeline-measure, var(--buzz-message-width, 52rem)));
 }
 
 .dots {
@@ -64,34 +67,8 @@
   }
 }
 
-.avatars {
-  display: inline-flex;
-  align-items: center;
-  padding-inline-end: var(--space-1);
-}
-
-.avatar {
-  display: inline-flex;
-  flex-shrink: 0;
-  width: 1.5rem;
-  height: 1.5rem;
-}
-
-.avatars .avatar {
-  padding: var(--space-half);
-  margin-inline-end: calc(-1 * var(--space-1));
-  background: var(--surface-panel);
-  border-radius: var(--radius-control);
-  box-shadow: var(--shadow-sm);
-}
-
-.typing [data-agent-activity-trigger] {
-  pointer-events: auto;
-  padding: var(--space-1);
-  min-height: var(--size-control-sm);
-}
-
 .humans {
+  @apply text-caption;
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -103,13 +80,27 @@
   border-radius: var(--radius-control);
 }
 
-.overflow {
-  padding-inline-start: var(--space-2);
+.typing[data-in-flow] {
+  width: min(100%, var(--timeline-measure, var(--buzz-message-width, 52rem)));
+  margin-inline: auto;
+  padding: 0;
 }
 
-@media (max-width: 40.625rem) {
-  .typing {
-    inset-inline: var(--space-3);
-    inline-size: min(calc(100% - 2 * var(--space-3)), 52rem);
-  }
+/* Human presence stays anchored above the composer, outside the scrolling feed. */
+.typing[data-audience="humans"] {
+  position: absolute;
+  inset-block-end: calc(100% + var(--space-half));
+  inset-inline: var(--space-4);
+  inline-size: min(
+    calc(100% - 2 * var(--space-4)),
+    var(--buzz-message-width, 52rem)
+  );
+  margin-inline: auto;
+  z-index: 1;
+  padding: 0;
+  pointer-events: none;
+}
+/* Matches the composer, which spans a compact list's full width. */
+:where(html[data-message-density="compact"]) .typing[data-audience="humans"] {
+  inline-size: calc(100% - 2 * var(--space-4));
 }

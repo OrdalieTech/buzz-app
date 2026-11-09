@@ -162,14 +162,78 @@ impl AppAgentHost {
         .await
     }
     /// The agent, its key and its organization evidence, for one request.
-    async fn signer(
+    pub(crate) async fn signer(
         &self,
         pubkey: String,
         relay: String,
     ) -> Result<(AppAgent, Arc<Secret>, Admission), String> {
+        self.signer_for(pubkey, relay, Duration::ZERO).await
+    }
+    /// As [`Self::signer`], with evidence valid for at least `valid_for`.
+    async fn signer_for(
+        &self,
+        pubkey: String,
+        relay: String,
+        valid_for: Duration,
+    ) -> Result<(AppAgent, Arc<Secret>, Admission), String> {
         let incarnation = self.tokens.stamp(&pubkey, &relay)?;
+        self.signer_at(pubkey, relay, incarnation, valid_for).await
+    }
+    /// The owner's retirements so far, for a local caller's token issued now.
+    pub(crate) fn caller_retirements(&self) -> u64 {
+        self.tokens.retirements()
+    }
+    /// Whether the owner's identity was closed for good, so no local caller
+    /// may be issued, bound or act again.
+    pub(crate) fn caller_closed(&self) -> bool {
+        self.tokens.identity_closed()
+    }
+    /// The agent and its current incarnation, for a local caller's token that
+    /// acts as it from now on.
+    pub(crate) async fn caller_stamp(
+        &self,
+        pubkey: String,
+        relay: String,
+    ) -> Result<(AppAgent, Stamp), String> {
+        let incarnation = self.tokens.stamp(&pubkey, &relay)?;
+        Ok((self.agent(pubkey, relay).await?, incarnation))
+    }
+    /// Whether a token issued at [`Self::caller_retirements`] and bound at
+    /// [`Self::caller_stamp`] still acts: the agent was not deleted and the
+    /// owner did not sign out or change account since.
+    pub(crate) fn caller_live(
+        &self,
+        pubkey: &str,
+        relay: &str,
+        incarnation: Stamp,
+        retirements: u64,
+    ) -> bool {
+        !self.tokens.identity_closed()
+            && self.tokens.retirements() == retirements
+            && self.tokens.admits(pubkey, relay, incarnation)
+    }
+    /// The agent and its key, for a local caller's operation that sends nothing.
+    pub(crate) async fn caller_key(
+        &self,
+        pubkey: String,
+        relay: String,
+    ) -> Result<(AppAgent, Arc<Secret>), String> {
+        self.key(self.agent(pubkey, relay).await?).await
+    }
+    /// As [`Self::signer_for`], for work stamped earlier with `incarnation`:
+    /// deleting the agent since then refuses it.
+    pub(crate) async fn signer_at(
+        &self,
+        pubkey: String,
+        relay: String,
+        incarnation: Stamp,
+        valid_for: Duration,
+    ) -> Result<(AppAgent, Arc<Secret>, Admission), String> {
         let (agent, key) = self.key(self.agent(pubkey, relay).await?).await?;
-        let evidence = self.tokens.authorize(&agent, &key, incarnation).await?;
+        let evidence = self
+            .tokens
+            .authorize_for(&agent, &key, incarnation, valid_for)
+            .await?;
         Ok((agent, key, evidence))
     }
     /// Saves an imported identity with its key, opening the agent's next
@@ -305,6 +369,46 @@ impl AppAgentHost {
             agent
         })
         .await
+    }
+}
+
+#[cfg(test)]
+impl AppAgentHost {
+    /// A host whose only agent is `agent`, saved at `path`, its key already read.
+    pub(crate) fn holding(
+        path: PathBuf,
+        agent: &AppAgent,
+        key: Secret,
+        tokens: AgentTokens,
+    ) -> Self {
+        std::fs::write(&path, serde_json::to_vec(&[agent]).unwrap()).unwrap();
+        let host = Self::new(Ok(path), Err("unused".into()), true, tokens);
+        host.keys().insert(agent.pubkey.clone(), Arc::new(key));
+        host
+    }
+    /// Saves `agents` in place of the held ones and holds `key` too.
+    pub(crate) fn also_holding_for_test(&self, path: PathBuf, agents: &[&AppAgent], key: Secret) {
+        std::fs::write(path, serde_json::to_vec(agents).unwrap()).unwrap();
+        self.keys().insert(key.pubkey().into(), Arc::new(key));
+    }
+    /// This host reading keys from `credentials`, its key cache emptied.
+    #[cfg(test)]
+    pub(crate) fn with_credentials_for_test(mut self, credentials: Arc<dyn Credentials>) -> Self {
+        self.credentials = credentials;
+        self.keys().clear();
+        self
+    }
+    pub(crate) fn forget_row_for_test(&self, pubkey: &str, relay: &str) {
+        self.tokens.forget_row(pubkey, relay).unwrap();
+    }
+    pub(crate) fn reopen_row_for_test(&self, pubkey: &str, relay: &str) {
+        self.tokens.reopen_row(pubkey, relay).unwrap();
+    }
+    /// Holds every key read until dropped, pausing work that needs a key.
+    pub(crate) fn hold_keys_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Secret>>> {
+        self.keys()
     }
 }
 
@@ -609,10 +713,34 @@ pub(crate) async fn app_agent_portable(
     blocking(move || Ok(old.list())).await
 }
 
+#[derive(Deserialize)]
+pub(crate) struct ConvertedPicture {
+    source: String,
+    png: String,
+}
+
+fn port_picture(
+    original: &str,
+    converted: Option<&ConvertedPicture>,
+) -> Option<(&'static str, Vec<u8>)> {
+    // Bind the WebView's rendering to the picture actually read for this import.
+    if original.starts_with("data:image/svg+xml,") {
+        if let Some(converted) = converted.filter(|picture| picture.source == original) {
+            if let Some(("image/png", bytes)) = inline_picture(&converted.png) {
+                if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                    return Some(("image/png", bytes));
+                }
+            }
+        }
+    }
+    inline_picture(original)
+}
+
 /// Takes over an earlier identity with its key, name, picture and description,
 /// as `app_agent_create` does for a new one, and reports its carried settings.
 /// Its old store keeps it.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri passes each IPC field as an argument.
 pub(crate) async fn app_agent_port(
     state: tauri::State<'_, AppAgentHost>,
     identity: tauri::State<'_, crate::identity::IdentityHost>,
@@ -621,6 +749,7 @@ pub(crate) async fn app_agent_port(
     destination: String,
     owner: String,
     agent_type: String,
+    converted_picture: Option<ConvertedPicture>,
 ) -> Result<Ported, String> {
     // Unavailable storage refuses before the old store gives up its key.
     state.agents.clone()?;
@@ -661,13 +790,14 @@ pub(crate) async fn app_agent_port(
         .picture
         .as_deref()
         .filter(|url| url.starts_with("data:"));
-    if inline.is_some_and(|url| inline_picture(url).is_none()) {
+    let prepared_picture = inline.and_then(|url| port_picture(url, converted_picture.as_ref()));
+    if inline.is_some() && prepared_picture.is_none() {
         notes.push(format!(
             "{} came over without its picture, which isn't a PNG, JPEG, GIF or WebP image under 6 MB.",
             agent.name
         ));
     }
-    if let Some((mime, bytes)) = inline.and_then(inline_picture) {
+    if let Some((mime, bytes)) = prepared_picture {
         match state
             .imported_picture(&agent, &key, incarnation, mime, bytes)
             .await
@@ -995,7 +1125,7 @@ async fn signed_read(
         .await
         .map_err(|_| "Agent read failed")?;
     let status = response.status();
-    Ok((status, bounded(response, 8 * 1024 * 1024).await?))
+    Ok((status, bounded(response, READ_LIMIT).await?))
 }
 
 /// Searches the agent's community for profiles whose `name` or `display_name`
@@ -1131,8 +1261,12 @@ async fn upload(
 }
 
 /// The URL of repository `repo` of `owner` in the agent's community, and the
-/// `Authorization` header Git sends there as the agent for the next minute.
-/// The key stays native; the header grants only that repository.
+/// headers Git sends there as the agent for the next minute, one per line:
+/// `Authorization`, then the agent's sign-in evidence when the community
+/// requires it. The key stays native. These are the only assertion headers
+/// that leave native code: the NIP-98 proof grants only that repository for 60
+/// seconds; the assertion is scoped to the relay for its issuer's lifetime and
+/// is bound to the agent's key (NIP-FI, Assertion–key binding).
 #[tauri::command]
 pub(crate) async fn app_agent_git_auth(
     state: tauri::State<'_, AppAgentHost>,
@@ -1141,17 +1275,28 @@ pub(crate) async fn app_agent_git_auth(
     owner: String,
     repo: String,
 ) -> Result<Value, String> {
-    use base64::Engine;
-    let (agent, key) = state.key(state.agent(pubkey, relay).await?).await?;
+    let (agent, key, evidence) = state.signer_for(pubkey, relay, GIT_EVIDENCE).await?;
     let (url, auth) = agent.git_auth(&key, &owner, &repo)?;
     let auth = serde_json::to_vec(&auth).map_err(|_| "Could not authorize Git")?;
-    Ok(serde_json::json!({
-        "url": url,
-        "header": format!(
-            "Authorization: Nostr {}",
-            base64::engine::general_purpose::STANDARD.encode(auth)
-        ),
-    }))
+    evidence.dispatch()?;
+    Ok(serde_json::json!({ "url": url, "header": git_headers(&auth, evidence.header()) }))
+}
+
+/// How long the Git headers must stay valid: the minute the `repo` tool
+/// promises, and a margin for a command that starts at its end.
+const GIT_EVIDENCE: Duration = Duration::from_secs(70);
+
+/// Git's header lines for a signed `auth` and the agent's sign-in `evidence`.
+fn git_headers(auth: &[u8], evidence: Option<&str>) -> String {
+    use base64::Engine;
+    let auth = format!(
+        "Authorization: Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(auth)
+    );
+    match evidence {
+        Some(evidence) => format!("{auth}\n{}: {evidence}", assertion::HEADER),
+        None => auth,
+    }
 }
 
 /// The largest image an agent is shown. Claude takes 5 MiB of base64 on its
@@ -1344,6 +1489,10 @@ fn client() -> Result<&'static reqwest::Client, String> {
         .map_err(|_| "Agent client unavailable".into())
 }
 
+/// The most an agent read returns. Mirrors `CANVAS_READ_BYTES` in
+/// `canvas-limits.ts`, which sizes Canvas history pages to fit it.
+const READ_LIMIT: usize = 8 * 1024 * 1024;
+
 async fn bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| "Agent request failed")? {
@@ -1417,6 +1566,45 @@ async fn post(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn imported_emoji_png_is_bound_to_the_current_source() {
+        let original = "data:image/svg+xml,legacy";
+        let mut converted = ConvertedPicture {
+            source: original.into(),
+            png: "data:image/png;base64,iVBORw0KGgo=".into(),
+        };
+        assert_eq!(
+            port_picture(original, Some(&converted)),
+            Some(("image/png", b"\x89PNG\r\n\x1a\n".to_vec()))
+        );
+        assert!(port_picture(original, None).is_none());
+        assert!(port_picture("data:image/svg+xml,changed", Some(&converted)).is_none());
+        for refused in [
+            "data:image/svg+xml;base64,PHN2Zz4=",
+            "data:image/png;base64,!!",
+            "data:image/png;base64,iVBO",
+            "data:image/jpeg;base64,iVBORw0KGgo=",
+        ] {
+            converted.png = refused.into();
+            assert!(port_picture(original, Some(&converted)).is_none());
+        }
+        converted.png = format!("data:image/png;base64,{}", "A".repeat(8 * 1024 * 1024 + 1));
+        assert!(port_picture(original, Some(&converted)).is_none());
+        assert_eq!(
+            port_picture("data:image/png;base64,iVBO", Some(&converted)),
+            Some(("image/png", vec![0x89, 0x50, 0x4e]))
+        );
+    }
+
+    #[test]
+    fn git_headers_add_sign_in_evidence_only_when_present() {
+        assert_eq!(git_headers(b"{}", None), "Authorization: Nostr e30=");
+        assert_eq!(
+            git_headers(b"{}", Some("Bearer token")),
+            "Authorization: Nostr e30=\nNostr-Federated-Identity: Bearer token"
+        );
+    }
 
     #[test]
     fn declining_storage_upgrade_leaves_files_unchanged() {
@@ -2286,7 +2474,7 @@ mod tests {
                     .await
                     .unwrap(),
                 "sign-out" => {
-                    f.tokens.sign_out().await.unwrap();
+                    f.tokens.sign_out(None).await.unwrap();
                 }
                 _ => {
                     tokio::time::pause();
@@ -2498,11 +2686,39 @@ mod tests {
         let query = admission.run(false, read(&agent, &f.key, admission.header(), &filters));
         let retire = async {
             reached.await.unwrap();
-            f.tokens.sign_out().await.unwrap();
+            f.tokens.sign_out(None).await.unwrap();
             release.send(()).unwrap();
         };
         let (result, ()) = tokio::join!(query, retire);
         assert!(result.is_err(), "a retired query returned its parsed body");
         assert!(server.await.unwrap().contains("nostr-federated-identity:"));
+    }
+    #[test]
+    fn read_limit_mirrors_the_canvas_read_budget() {
+        let policy = include_str!("../../src/features/channel-templates/canvas-limits.ts");
+        assert_eq!(READ_LIMIT, 8 * 1024 * 1024);
+        assert!(policy.contains("export const CANVAS_READ_BYTES = 8 * 1024 * 1024;"));
+    }
+    #[tokio::test]
+    async fn bounded_admits_the_limit_and_refuses_one_byte_over() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (size, admitted) in [(READ_LIMIT, true), (READ_LIMIT + 1, false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n\r\n");
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&vec![b'x'; size]).await;
+            });
+            let response = reqwest::get(&url).await.unwrap();
+            let body = bounded(response, READ_LIMIT).await;
+            assert_eq!(body.map(|b| b.len()).ok(), admitted.then_some(size));
+            server.abort();
+        }
     }
 }

@@ -28,6 +28,7 @@ import { LinkThreadTabContext } from "./LinkLabelContext";
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 const entry: Contribution<LinkRenderer> = {
@@ -286,6 +287,76 @@ it("preserves ordinary pane interception and modified or middle-click fallback",
     anchor,
     new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
   );
+  expect(onOpenLink).not.toHaveBeenCalled();
+});
+
+function desktopOpener() {
+  const invoke = vi.fn().mockResolvedValue(undefined);
+  vi.stubGlobal("isTauri", true);
+  vi.stubGlobal("__TAURI_INTERNALS__", { invoke });
+  return invoke;
+}
+
+it.each([
+  "https://github.com/block/buzz-app/pull/1?view=all#discussion_r1",
+  "http://example.com/path?query=yes#section",
+])(
+  "opens desktop Command-click in the browser with the exact URL: %s",
+  (target) => {
+    const invoke = desktopOpener();
+    const { anchor, onOpenLink } = mount(target);
+    const event = new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      metaKey: true,
+    });
+    fireEvent(anchor, event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(invoke).toHaveBeenCalledExactlyOnceWith(
+      "plugin:opener|open_url",
+      {
+        url: target,
+      },
+      undefined,
+    );
+    expect(onOpenLink).not.toHaveBeenCalled();
+  },
+);
+
+it("keeps ordinary desktop clicks in the pane", () => {
+  const invoke = desktopOpener();
+  const { anchor, onOpenLink } = mount();
+  fireEvent.click(anchor);
+  expect(onOpenLink).toHaveBeenCalledExactlyOnceWith(url);
+  expect(invoke).not.toHaveBeenCalled();
+});
+
+it("reports a failed desktop browser open and clears the error on retry", async () => {
+  const invoke = desktopOpener();
+  invoke.mockRejectedValueOnce("Browser unavailable");
+  const { anchor, onOpenLink } = mount();
+  fireEvent.click(anchor, { metaKey: true });
+  expect(
+    await screen.findByText("Couldn’t open the link in your browser."),
+  ).toBeInTheDocument();
+  fireEvent.click(anchor, { metaKey: true });
+  expect(
+    screen.queryByText("Couldn’t open the link in your browser."),
+  ).not.toBeInTheDocument();
+  expect(invoke).toHaveBeenCalledTimes(2);
+  expect(onOpenLink).not.toHaveBeenCalled();
+});
+
+it("does not open a desktop browser from an inactive conversation", () => {
+  const invoke = desktopOpener();
+  const onOpenLink = vi.fn(() => true);
+  render(
+    <ConversationPresentation value={false}>
+      <MessageLink url={url} registry={undefined} onOpenLink={onOpenLink} />
+    </ConversationPresentation>,
+  );
+  fireEvent.click(screen.getByRole("link"), { metaKey: true });
+  expect(invoke).not.toHaveBeenCalled();
   expect(onOpenLink).not.toHaveBeenCalled();
 });
 

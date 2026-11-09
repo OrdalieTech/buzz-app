@@ -257,6 +257,7 @@ export async function threadSample(
         },
       },
       {
+        readStateFloor: () => 0,
         // Match service.ts production options; no production defaults are changed.
         prepared: true,
         warm: true,

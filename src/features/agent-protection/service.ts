@@ -32,10 +32,15 @@ export type ProtectionRequest = ProtectionAction &
     runtime: string;
     policy: unknown;
   }>;
+/** A denial its provider explained, for Buzz to show people. */
+export type ProtectionDenial = Readonly<{ allowed: false; reason: string }>;
 export type ProtectionProvider = Readonly<{
   phases?(policy: unknown): ProtectionPhases;
   /** Checks one immutable action. Failure, removal and cancellation deny it. */
-  check(request: ProtectionRequest, signal: AbortSignal): Promise<boolean>;
+  check(
+    request: ProtectionRequest,
+    signal: AbortSignal,
+  ): Promise<boolean | ProtectionDenial>;
   processProtection: ProcessProtection;
   /** Runtime owner to a process declared by this protection plugin. */
   runtimeProcesses?: Readonly<Record<string, string>>;
@@ -52,6 +57,29 @@ export type AgentProtection = Readonly<{
   assertAvailable(): void;
   check(action: ProtectionAction, signal: AbortSignal): Promise<void>;
 }>;
+/** Its message is all the agent sees; `reason` is the provider's explanation,
+ * for people. */
+export class ProtectionDenied extends Error {
+  readonly reason: string | undefined;
+  constructor(reason?: string) {
+    super("Agent action denied by its protection policy");
+    this.reason = reason;
+  }
+}
+// One bounded line of a provider's explanation, or none.
+const explanation = (value: unknown) => {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Object.keys(value).sort().join() !== "allowed,reason"
+  )
+    return undefined;
+  const { allowed, reason } = value as Record<string, unknown>;
+  if (allowed !== false || typeof reason !== "string") return undefined;
+  const line = [...reason.replace(/[\p{C}\p{Z}\s]+/gu, " ").trim()];
+  if (!line.length) return undefined;
+  return line.length > 300 ? `${line.slice(0, 299).join("")}…` : line.join("");
+};
 export type ProtectionDefaults = {
   revision: number;
   defaults: ProtectionBinding | null;
@@ -81,6 +109,8 @@ export class AgentProtectionService extends Service {
       abort: AbortController;
       epoch: number;
       spawn: Host["spawn"];
+      /** Its review spawn for each model runtime, kept for its lifetime. */
+      reviewers: Map<string, ProtectedSpawn>;
     }
   >();
   private epoch = 0;
@@ -192,9 +222,13 @@ export class AgentProtectionService extends Service {
     if (new TextEncoder().encode(JSON.stringify(prompt)).length > 768 * 1024)
       throw new Error("Model completion context is too large");
     const protection = this.providers.get(caller);
-    const spawn = protection?.value.runtimeProcesses?.[model.runtime]
-      ? this.runtimeSpawn(caller, protection, model.runtime, signal)
-      : undefined;
+    // The same spawn for every review, so the runtime can keep its worker;
+    // revoking the provider kills it.
+    let spawn = protection?.reviewers.get(model.runtime);
+    if (protection?.value.runtimeProcesses?.[model.runtime] && !spawn) {
+      spawn = this.runtimeSpawn(caller, protection, model.runtime);
+      protection.reviewers.set(model.runtime, spawn);
+    }
     const result = await provider.complete(
       {
         id: model.id,
@@ -274,6 +308,7 @@ export class AgentProtectionService extends Service {
       spawn: host?.spawn?.bind(host),
       abort: new AbortController(),
       epoch: ++this.epoch,
+      reviewers: new Map<string, ProtectedSpawn>(),
     };
     this.providers.get(id)?.abort.abort();
     this.providers.set(id, next);
@@ -288,12 +323,11 @@ export class AgentProtectionService extends Service {
     id: string,
     provider: NonNullable<ReturnType<typeof this.providers.get>>,
     runtime: string,
-    signal?: AbortSignal,
+    agent?: Readonly<{ pubkey: string; relay: string }>,
   ): ProtectedSpawn {
     const processId = provider.value.runtimeProcesses?.[runtime];
     const spawn = provider.spawn;
     const assertAvailable = () => {
-      signal?.throwIfAborted();
       if (provider.abort.signal.aborted || this.providers.get(id) !== provider)
         throw new Error("The required protection plugin is unavailable");
     };
@@ -305,14 +339,13 @@ export class AgentProtectionService extends Service {
         );
       let process: HostProcess | undefined;
       const stop = () => void process?.kill();
-      const stopped = signal
-        ? AbortSignal.any([signal, provider.abort.signal])
-        : provider.abort.signal;
+      const stopped = provider.abort.signal;
       stopped.addEventListener("abort", stop, { once: true });
       try {
         process = await spawn(processId, {
           ...options,
           protection: copy(provider.value.processProtection),
+          ...(agent && { protectedAgent: agent }),
         });
         assertAvailable();
       } catch (error) {
@@ -387,6 +420,7 @@ export class AgentProtectionService extends Service {
             binding.provider,
             provider,
             agent.type.split("/")[0] ?? "",
+            { pubkey: agent.pubkey, relay: agent.relay },
           )
         : async () => {
             throw new Error("The required protection plugin is unavailable");
@@ -427,7 +461,8 @@ export class AgentProtectionService extends Service {
           signal.addEventListener("abort", stop, { once: true });
           if (signal.aborted) stop();
         });
-        let allowed = false;
+        let allowed: unknown = false;
+        let reason: string | undefined;
         const timeout = setTimeout(
           () =>
             deadline.abort(
@@ -443,6 +478,7 @@ export class AgentProtectionService extends Service {
             provider.value.check(request, signal),
             cancelled,
           ]);
+          reason = explanation(allowed);
         } catch {
           /* A failed checker denies. */
         } finally {
@@ -450,8 +486,7 @@ export class AgentProtectionService extends Service {
           signal.removeEventListener("abort", stop);
         }
         signal.throwIfAborted();
-        if (allowed !== true)
-          throw new Error("Agent action denied by its protection policy");
+        if (allowed !== true) throw new ProtectionDenied(reason);
       },
     });
   }

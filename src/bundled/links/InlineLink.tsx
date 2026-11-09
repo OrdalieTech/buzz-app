@@ -28,6 +28,7 @@ import {
 } from "../../features/conversation/LinkLabelContext";
 import { buzzLinkKind } from "../../features/navigation/buzz-links";
 import styles from "../../shared/InlineReference.module.css";
+import { channelIconClass } from "../../shared/inline-reference";
 
 // Match actual host boundaries, never a service name found in a path or query.
 const serviceHosts = {
@@ -153,7 +154,12 @@ export function LinkLabel({
     label === href ||
     (linkKind(label) !== null && new URL(label).href === new URL(href).href);
   const Icon = kind === "channel" && privateChannel ? LockIcon : icons[kind];
-  icon ??= <Icon aria-hidden="true" className={styles.icon} />;
+  icon ??= (
+    <Icon
+      aria-hidden="true"
+      className={kind === "channel" ? channelIconClass(Icon) : styles.icon}
+    />
+  );
   if (content !== undefined && !rawDestination)
     return (
       <span data-link-kind={kind}>

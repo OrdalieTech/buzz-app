@@ -1,7 +1,9 @@
 // How a pull request's state looks and reads, the same in the sidebar, the
-// panel and links in messages.
+// panel and links in messages, and an issue's in links.
 import {
+  CheckCircleIcon,
   CircleDashedIcon,
+  GitHubIssueIcon,
   GitMergeIcon,
   GitPullRequestIcon,
   XCircleIcon,
@@ -13,6 +15,14 @@ export const stateIcons = {
   draft: CircleDashedIcon,
   closed: XCircleIcon,
   merged: GitMergeIcon,
+};
+
+/** An issue's: one completed is checked off, as on GitHub, and one not
+ * planned is crossed out, as a closed pull request is here. */
+export const issueIcons = {
+  open: GitHubIssueIcon,
+  completed: CheckCircleIcon,
+  "not planned": XCircleIcon,
 };
 
 type Read = Readonly<{
@@ -41,4 +51,16 @@ export function pullTone({ state }: Read) {
   if (state.state !== "open") return state.state;
   if (state.checks === "failure" || state.conflicts) return "failure";
   return state.checks === "pending" ? "pending" : "open";
+}
+
+/** What an issue's icon shows: open, or why it was closed. */
+export const issueState = (state: PullState) =>
+  state.state === "closed" ? (state.reason ?? "completed") : "open";
+
+/** The words for what an issue's icon shows. */
+export function describeIssue({ state, failed }: Read) {
+  if (failed) return "Issue, unavailable";
+  if (!state) return "Issue";
+  const shown = issueState(state);
+  return shown === "open" ? "Issue, open" : `Issue, closed as ${shown}`;
 }

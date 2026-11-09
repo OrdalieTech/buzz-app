@@ -1,13 +1,23 @@
+import { LIVE_CANVAS_BYTES } from "../features/channel-templates/model";
+import {
+  CANVAS_HISTORY_PAGE,
+  CANVAS_MAX_EVENT_BYTES,
+  CANVAS_READ_BYTES,
+} from "../features/channel-templates/canvas-limits";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { npubEncode } from "nostr-tools/nip19";
 import { bytesToHex } from "nostr-tools/utils";
 import { expect, it, vi } from "vitest";
+import { eventDto } from "../features/relay/events";
+import { keypair, signed } from "../features/relay/testing";
 import type { BuzzClient, BuzzEvent, Filter, Memory, Template } from "./client";
 import { respond } from "./rpc";
 import { ATTENTION_TOOLS } from "./attention";
 import { createHash } from "node:crypto";
 import { callTool, memoryVersion, TOOLS } from "./tools";
 import { callSessionTool, sessionTools } from "./session-tools";
+import { PLUGIN_TOOLS } from "./plugins";
+import { SETTINGS_TOOLS } from "./settings";
 import { SOLO_WORKER_TOOLS } from "./solo-worker";
 import { Context } from "@deepseek-ai/cordis";
 import { AgentProtectionService } from "../features/agent-protection/service";
@@ -138,9 +148,14 @@ it.each([false, true])(
     const protect = vi.fn<NonNullable<BuzzClient["protect"]>>(async () => {});
     const client = new Proxy({} as BuzzClient, {
       get(_target, property) {
-        // The shared session gate checks this optional hook before dispatch.
+        // The shared session gate checks these optional hooks before dispatch.
         if (property === "protect")
           return protectedSession ? protect : undefined;
+        if (property === "nativeToolGate") return undefined;
+        // The tool list checks whether settings can change and owner tools
+        // apply here.
+        if (property === "settings" || property === "ownerAccess")
+          return undefined;
         throw new Error(`Help must not access the host: ${String(property)}`);
       },
     });
@@ -332,6 +347,28 @@ it.each(["send", "reply_in_subthread"])(
   },
 );
 
+it.each(["agent_create", "agent_update"])(
+  "refuses protected %s pictures before reads or uploads",
+  async (tool) => {
+    const { client } = fake([]);
+    client.protect = vi.fn(async () => {});
+    client.createAgent = vi.fn();
+    client.updateAgent = vi.fn();
+    await expect(
+      callSessionTool(client, {}, tool, {
+        agent: "Child",
+        type: "codex/codex",
+        name: "Kid",
+        picture: "me.png",
+      }),
+    ).rejects.toThrow("Protected picture uploads are not supported");
+    expect(client.read).not.toHaveBeenCalled();
+    expect(client.upload).not.toHaveBeenCalled();
+    expect(client.createAgent).not.toHaveBeenCalled();
+    expect(client.updateAgent).not.toHaveBeenCalled();
+  },
+);
+
 it("refuses an oversized captured file before review or publication", async () => {
   const { client, published } = fake(community);
   const ctx = new Context();
@@ -438,6 +475,106 @@ it("refuses to post a name it cannot resolve unless told who it means", async ()
     mentions: [bob],
   });
   expect(published[0]?.tags).toContainEqual(["p", bob]);
+});
+
+it("tags a member by the names the relay verified, ahead of names people gave themselves", async () => {
+  const relay = keypair();
+  // Signed and admitted, as a connection's query returns them.
+  const verified = (
+    subject: string,
+    names: readonly string[][],
+    { by = relay, at = 100, active = true } = {},
+  ): BuzzEvent =>
+    eventDto(
+      signed(by, {
+        kind: 30382,
+        content: "",
+        created_at: at,
+        tags: [
+          ["d", subject],
+          ["p", subject],
+          ["active", String(active)],
+          ...(active
+            ? [
+                ["issuer_label", "Example"],
+                ["verified_at", String(at)],
+              ]
+            : []),
+          ...names,
+        ],
+      }),
+    );
+  const { client, published } = fake([
+    ...community,
+    verified(alice, [
+      ["display_name", "Alice S"],
+      ["username", "asmith"],
+      ["full_name", "Alice Smith-Jones"],
+    ]),
+    // Bob's own profile claims Alice's verified name, and her username.
+    profile(bob, "Alice S"),
+    event({
+      kind: 0,
+      pubkey: bob,
+      created_at: 101,
+      content: JSON.stringify({ display_name: "Alice S", name: "asmith" }),
+    }),
+    // A name another key signed, one the relay retracted, and one the app
+    // would reject give nobody.
+    verified(
+      bob,
+      [
+        ["display_name", "Forged"],
+        ["username", "forged"],
+      ],
+      {
+        by: keypair(),
+      },
+    ),
+    verified(
+      bob,
+      [
+        ["display_name", "Bobby"],
+        ["username", "bobby"],
+      ],
+      {
+        at: 90,
+      },
+    ),
+    verified(bob, [], { at: 95, active: false }),
+    verified(me, [
+      ["display_name", "Bad"],
+      ["username", "Not A Handle"],
+    ]),
+  ]);
+  const tagged = { ...client, relayAuthor: relay.pubkey };
+  const context = { channel: "chan", root };
+  for (const text of [
+    "@Alice S see this",
+    "@asmith see this",
+    "@alice smith-jones see this",
+  ]) {
+    await callTool(tagged, context, "send", { audience: "everyone", text });
+    expect(published.at(-1)?.tags).toEqual([
+      ["h", "chan"],
+      ["e", root, "", "reply"],
+      ["p", alice],
+    ]);
+  }
+  for (const name of ["forged", "bobby", "bad"])
+    await expect(
+      callTool(tagged, context, "send", {
+        audience: "everyone",
+        text: `@${name} hi`,
+      }),
+    ).rejects.toThrow(`No single channel member is @${name}`);
+  // Without the relay's key, verified names are not read at all, so only
+  // the names people gave themselves are left.
+  await callTool(client, context, "send", {
+    audience: "everyone",
+    text: "@asmith hi",
+  });
+  expect(published.at(-1)?.tags).toContainEqual(["p", bob]);
 });
 
 it("replies to a message inside a thread at the thread's root, and posts a file's text and attachments", async () => {
@@ -598,6 +735,18 @@ it("reads the current thread with each message's latest edit", async () => {
         ["e", nested],
       ],
     }),
+    // Newer, but not the author's, so it must not hide the author's edit.
+    event({
+      id: "e".repeat(64),
+      kind: 40003,
+      pubkey: bob,
+      created_at: 130,
+      content: "not theirs",
+      tags: [
+        ["h", "chan"],
+        ["e", nested],
+      ],
+    }),
   ]);
   const text = (await callTool(
     client,
@@ -618,6 +767,11 @@ it.each([
   ["search", { q: "hello" }],
   ["current thread", {}],
   ["explicit thread", { thread: nested }],
+  ["message link", { message_url: `buzz://message?channel=chan&id=${nested}` }],
+  [
+    "message search",
+    { message_url: `buzz://message?channel=chan&id=${nested}`, q: "hello" },
+  ],
 ] as const)(
   "keeps agent ownership and nested reply context in a %s read",
   async (_, args) => {
@@ -1172,9 +1326,14 @@ it("lists its tools before it can call them", async () => {
       method: "tools/list",
     },
   )) as { result: { tools: unknown[] } };
-  // Every app session lists the same tools: the Buzz, attention and Solo worker tools.
+  // Every app session lists the same tools: the Buzz, attention, Solo worker,
+  // plugin and settings tools.
   expect(list.result.tools).toHaveLength(
-    TOOLS.length + ATTENTION_TOOLS.length + SOLO_WORKER_TOOLS.length,
+    TOOLS.length +
+      ATTENTION_TOOLS.length +
+      SOLO_WORKER_TOOLS.length +
+      PLUGIN_TOOLS.length +
+      SETTINGS_TOOLS.length,
   );
   await expect(
     respond(
@@ -2032,7 +2191,7 @@ it("publishes the first canvas only after finding visible channel metadata", asy
 });
 
 it("lists canvas revisions newest first, a page at a time", async () => {
-  const rows = Array.from({ length: 26 }, (_, i) =>
+  const rows = Array.from({ length: CANVAS_HISTORY_PAGE + 1 }, (_, i) =>
     event({
       kind: 40100,
       id: `${i}`.padStart(64, "0"),
@@ -2048,12 +2207,12 @@ it("lists canvas revisions newest first, a page at a time", async () => {
     {},
   );
   const lines = (page as string).split("\n");
-  expect(lines).toHaveLength(28);
-  expect(lines[0]).toBe(`version: ${rows[25]?.id}`);
+  expect(lines).toHaveLength(CANVAS_HISTORY_PAGE + 3);
+  expect(lines[0]).toBe(`version: ${rows[CANVAS_HISTORY_PAGE]?.id}`);
   expect(lines[2]).toBe(
-    `${rows[25]?.id} 1970-01-01T00:02Z ${alice} 14B # Plan 25`,
+    `${rows[CANVAS_HISTORY_PAGE]?.id} 1970-01-01T00:01Z ${alice} 14B # Plan ${CANVAS_HISTORY_PAGE}`,
   );
-  expect(lines[27]).toBe(
+  expect(lines[CANVAS_HISTORY_PAGE + 2]).toBe(
     `Older revisions may remain; continue with ${JSON.stringify({ channel: "chan", before: 101, before_id: rows[1]?.id })}`,
   );
   await expect(
@@ -2079,7 +2238,7 @@ it("lists canvas revisions newest first, a page at a time", async () => {
   expect(filters[0]).toEqual({
     kinds: [40100],
     "#h": ["chan"],
-    limit: 25,
+    limit: CANVAS_HISTORY_PAGE,
     consistency: "strong",
   });
   expect(filters[1]).not.toHaveProperty("consistency");
@@ -2105,10 +2264,61 @@ it("pages canvas revisions that share a timestamp without gaps", async () => {
     "canvas_history",
     cursor,
   )) as string;
-  const ids = [...first.split("\n").slice(2, 27), ...second.split("\n")].map(
-    (line) => line.split(" ")[0],
-  );
+  const ids = [
+    ...first.split("\n").slice(2, 2 + CANVAS_HISTORY_PAGE),
+    ...second.split("\n"),
+  ].map((line) => line.split(" ")[0]);
   expect(ids).toEqual(rows.map((row) => row.id));
+});
+
+it("reads a full canvas_history page of the largest escaped revisions within the agent read cap", async () => {
+  const size = (row: BuzzEvent) =>
+    new TextEncoder().encode(JSON.stringify(row)).length;
+  const largest = (i: number) => {
+    const base = event({
+      kind: 40100,
+      id: `${i}`.padStart(64, "0"),
+      pubkey: alice,
+      created_at: 1700000000 - i,
+      sig: "e".repeat(128),
+    });
+    // Each quote serializes as two bytes.
+    const quotes = Math.floor((CANVAS_MAX_EVENT_BYTES - size(base)) / 2);
+    return { ...base, content: '"'.repeat(quotes) };
+  };
+  const rows = Array.from({ length: CANVAS_HISTORY_PAGE + 1 }, (_, i) =>
+    largest(i),
+  );
+  const [biggest] = rows;
+  if (!biggest) throw new Error("no rows");
+  expect(size(biggest)).toBeGreaterThan(CANVAS_MAX_EVENT_BYTES - 2);
+  expect(size(biggest)).toBeLessThanOrEqual(CANVAS_MAX_EVENT_BYTES);
+  const { client } = fake(rows);
+  const query = client.query;
+  client.query = vi.fn(async (filters: Filter[]) => {
+    const page = await query(filters);
+    // The bare event array app_agents.rs bounds.
+    expect(
+      new TextEncoder().encode(JSON.stringify(page)).length,
+    ).toBeLessThanOrEqual(CANVAS_READ_BYTES);
+    return page;
+  });
+  const first = (await callTool(client, {}, "canvas_history", {
+    channel: "chan",
+  })) as string;
+  const page = rows.slice(0, CANVAS_HISTORY_PAGE);
+  expect(
+    first
+      .split("\n")
+      .slice(2, -1)
+      .map((line) => line.split(" ")[0]),
+  ).toEqual(page.map((row) => row.id));
+  const last = page.at(-1);
+  expect(JSON.parse(first.split("continue with ")[1] ?? "")).toEqual({
+    channel: "chan",
+    before: last?.created_at,
+    before_id: last?.id,
+  });
 });
 
 it("restores a canvas revision guarded by the head it read", async () => {
@@ -2194,8 +2404,8 @@ it("restores only revisions within the canvas size limit", async () => {
     const head = event({ kind: 40100, id: nested, created_at: 200 });
     for (const [content, ok] of [
       ["", true],
-      ["x".repeat(24 * 1024), true],
-      ["x".repeat(24 * 1024 + 1), false],
+      ["x".repeat(LIVE_CANVAS_BYTES), true],
+      ["x".repeat(LIVE_CANVAS_BYTES + 1), false],
     ] as const) {
       const old = event({ kind: 40100, id: root, content });
       const { client, published } = fake([old, head], { keep: true });
@@ -3484,10 +3694,10 @@ const repo = (
     id: d.padEnd(64, "0"),
     tags: [["d", d], ...channels.map((c) => ["buzz-channel", c]), ...extra],
   });
-const git = (client: BuzzClient) => {
+const git = (client: BuzzClient, header = "Authorization: Nostr abc") => {
   const gitAuth = vi.fn(async (owner: string, name: string) => ({
     url: `https://relay/git/${owner}/${name}.git`,
-    header: "Authorization: Nostr abc",
+    header,
   }));
   client.gitAuth = gitAuth;
   return gitAuth;
@@ -3526,9 +3736,22 @@ it("gives the channel's repository and a Git header signed for it", async () => 
   expect(answer).toBe(
     [
       `hive: ${url}`,
-      "For the next 60 seconds, pass this header to each git command (call again for a new one; never save it):",
+      "For the next 60 seconds, pass these headers to each git command (call again for a new one; never save it):",
       `git -c http.${url}.extraHeader='Authorization: Nostr abc' clone ${url}`,
     ].join("\n"),
+  );
+});
+
+it("passes each Git header line, sign-in evidence included", async () => {
+  const { client } = fake([
+    hive({ [bob]: "admin" }),
+    repo(bob, "hive", ["chan"]),
+  ]);
+  git(client, "Authorization: Nostr abc\nNostr-Federated-Identity: Bearer xyz");
+  const answer = await callTool(client, { channel: "chan" }, "repo", {});
+  const url = `https://relay/git/${bob}/hive.git`;
+  expect(answer).toContain(
+    `git -c http.${url}.extraHeader='Authorization: Nostr abc' -c http.${url}.extraHeader='Nostr-Federated-Identity: Bearer xyz' clone ${url}`,
   );
 });
 
@@ -3753,6 +3976,21 @@ it("validates creation inputs and reports hosts without agent creation", async (
       "required",
     );
   expect(client.createAgent).not.toHaveBeenCalled();
+  await callTool(client, {}, "agent_create", { type: "x", name: "Child" });
+  await callTool(client, {}, "agent_create", {
+    type: "x",
+    name: "Child",
+    instructions: "Review PRs.",
+  });
+  expect(client.createAgent).toHaveBeenNthCalledWith(1, {
+    type: "x",
+    name: "Child",
+  });
+  expect(client.createAgent).toHaveBeenNthCalledWith(2, {
+    type: "x",
+    name: "Child",
+    instructions: "Review PRs.",
+  });
 });
 
 it("hands off to the agent in another of its conversations it can see", async () => {
@@ -3835,6 +4073,45 @@ it("hands off to the agent in another of its conversations it can see", async ()
     [{ channel: "chan", root, text: "carry on", from: {} }],
   ]);
 });
+it("reads agents and teams and drafts team changes without members", async () => {
+  const { client } = fake([]);
+  for (const name of ["agent_read", "team_read"])
+    await expect(callTool(client, {}, name, {})).rejects.toThrow("unavailable");
+  client.readAgents = vi.fn(async () => []);
+  client.readTeams = vi.fn(async () => ({
+    id: "t",
+    name: "Crew",
+    instructions: "",
+    members: [],
+    synced: true,
+    revision: "r",
+  }));
+  client.updateTeam = vi.fn(async () => ({
+    requestId: "draft",
+    saved: false as const,
+  }));
+  expect(await callTool(client, {}, "agent_read", {})).toBe("[]");
+  expect(client.readAgents).toHaveBeenCalledWith(undefined);
+  expect(
+    JSON.parse(
+      (await callTool(client, {}, "team_read", { team: "Crew" })) as string,
+    ),
+  ).toMatchObject({ id: "t", revision: "r" });
+  expect(client.readTeams).toHaveBeenCalledWith("Crew");
+  await expect(callTool(client, {}, "team_update", {})).rejects.toThrow(
+    "required",
+  );
+  await callTool(client, {}, "team_update", {
+    team: "Crew",
+    name: " ",
+    instructions: "",
+    members: ["x"],
+  });
+  expect(client.updateTeam).toHaveBeenCalledWith({
+    team: "Crew",
+    instructions: "",
+  });
+});
 it("validates change drafts and passes only the proposed fields", async () => {
   const { client } = fake([]);
   await expect(
@@ -3867,6 +4144,68 @@ it("validates change drafts and passes only the proposed fields", async () => {
   expect(client.updateAgent).toHaveBeenLastCalledWith({
     agent: "Child",
     instructions: "",
+  });
+});
+
+it("uploads a proposed picture as the agent once its draft is valid", async () => {
+  const { client } = fake([]);
+  const image = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10, 0]);
+  const read = client.read;
+  client.read = vi.fn(async (path: string) =>
+    path === "/tmp/me.png" || path === "kid.png" ? image : read(path),
+  );
+  const pictures: string[] = [];
+  const saved = async (input: { picture?: () => Promise<string> }) => {
+    if (input.picture) pictures.push(await input.picture());
+    return { requestId: "draft", saved: false as const };
+  };
+  client.updateAgent = vi.fn(saved);
+  client.createAgent = vi.fn(saved);
+  await expect(
+    callTool(client, {}, "agent_update", { agent: "Child", picture: "me.png" }),
+  ).rejects.toThrow("Picture proposals are unavailable");
+  expect(client.updateAgent).not.toHaveBeenCalled();
+  client.uploadPicture = vi.fn(async (_data: Uint8Array, type: string) => ({
+    url: "https://relay/media/x.png",
+    sha256: "ab",
+    size: 7,
+    type,
+  }));
+  // A text file, and a PNG signature cut short that the preparer would
+  // pass through unchanged.
+  for (const picture of ["notes.md", "short.png"])
+    for (const [name, args] of [
+      ["agent_update", { agent: "Child" }],
+      ["agent_create", { type: "codex/codex", name: "Child" }],
+    ] as const)
+      await expect(
+        callTool(client, {}, name, { ...args, picture }),
+      ).rejects.toThrow("PNG, JPEG, GIF or WebP");
+  expect(client.uploadPicture).not.toHaveBeenCalled();
+  expect(pictures).toEqual([]);
+  await callTool(client, {}, "agent_update", {
+    agent: "Child",
+    picture: "/tmp/me.png",
+  });
+  await callTool(client, {}, "agent_create", {
+    type: "codex/codex",
+    name: "Kid",
+    picture: "kid.png",
+  });
+  expect(client.uploadPicture).toHaveBeenCalledWith(image, "image/png");
+  expect(client.upload).not.toHaveBeenCalled();
+  expect(pictures).toEqual([
+    "https://relay/media/x.png",
+    "https://relay/media/x.png",
+  ]);
+  expect(client.updateAgent).toHaveBeenLastCalledWith({
+    agent: "Child",
+    picture: expect.any(Function),
+  });
+  expect(client.createAgent).toHaveBeenLastCalledWith({
+    type: "codex/codex",
+    name: "Kid",
+    picture: expect.any(Function),
   });
 });
 
@@ -4122,4 +4461,40 @@ it("refuses to delete another author's message", async () => {
     callTool(client, { channel: "chan" }, "delete", { id: root }),
   ).rejects.toThrow("Only your own messages can be deleted.");
   expect(published).toEqual([]);
+});
+
+it("saves a canvas of exactly the live limit in UTF-8 bytes, and refuses one byte over", async () => {
+  const { client, published } = fake([
+    event({ kind: 39000, tags: [["d", "chan"]] }),
+  ]);
+  const exact = "é".repeat(LIVE_CANVAS_BYTES / 2);
+  await expect(
+    callTool(client, { channel: "chan" }, "canvas_set", { content: exact }),
+  ).resolves.toBe("saved");
+  expect(published).toHaveLength(1);
+  await expect(
+    callTool(client, { channel: "chan" }, "canvas_set", {
+      content: `${exact.slice(1)}xyz`,
+    }),
+  ).rejects.toThrow(`over its limit of ${LIVE_CANVAS_BYTES} bytes`);
+  expect(published).toHaveLength(1);
+});
+
+it("addresses a new reaction to the actual message author and fails before publishing if the target is unavailable", async () => {
+  const { client, published } = fake([event({ id: root, pubkey: alice })]);
+  await callTool(client, {}, "react", { id: root, emoji: "❤️" });
+  expect(published).toEqual([
+    {
+      kind: 7,
+      content: "❤️",
+      tags: [
+        ["e", root],
+        ["p", alice],
+      ],
+    },
+  ]);
+  await expect(
+    callTool(client, {}, "react", { id: nested, emoji: "❤️" }),
+  ).rejects.toThrow("No message");
+  expect(published).toHaveLength(1);
 });

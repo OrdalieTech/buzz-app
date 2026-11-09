@@ -1,16 +1,44 @@
 // @vitest-environment node
 import { expect, it, vi } from "vitest";
+import { turnPrompt } from "../claude-code/prompt";
 import type { PiEntry } from "./transcript";
 import { conversationUsage, readUsage } from "./usage";
 
 const PLACE = { conversation: 2, channelId: "chan", root: "root" };
-const ask = (id: number, text: string): PiEntry => ({
+const ask = (id: number, text: string, json = false): PiEntry => ({
   id,
   kind: "pi.user",
   model: [
     {
       role: "user",
-      content: `<context>\nChannel: general (#chan)\n</context>\n\n<buzz-event type="@mention">\nFrom: Sal (npub1x)\nContent: ${text}\nTags: []\n</buzz-event>`,
+      content: json
+        ? `<context>\nChannel: general (#chan)\n</context>\n\n<buzz-event type="@mention">\n${JSON.stringify({ id: "e".repeat(64), pubkey: "a".repeat(64), author: "Sal", content: text, tags: [] })}\n</buzz-event>`
+        : `<context>\nChannel: general (#chan)\n</context>\n\n<buzz-event type="@mention">\nFrom: Sal (npub1x)\nContent: ${text}\nTags: []\n</buzz-event>`,
+      timestamp: id * 1000,
+    },
+  ],
+});
+const record = (id: number, text: string): PiEntry => ({
+  id,
+  kind: "pi.user",
+  model: [
+    {
+      role: "user",
+      content: turnPrompt({
+        agent: "c".repeat(64),
+        event: {
+          id: "1".repeat(64),
+          pubkey: "a".repeat(64),
+          kind: 9,
+          created_at: id,
+          content: text,
+          tags: [["h", "chan"]],
+        },
+        channel: { id: "chan", name: "general" },
+        scope: "thread",
+        context: [],
+        total: 1,
+      }),
       timestamp: id * 1000,
     },
   ],
@@ -40,51 +68,60 @@ const usage = (cost: number, more = {}) => ({
   ...more,
 });
 
-it("reports each answer's tokens and cost, where and what was asked", () => {
-  expect(
-    conversationUsage(
-      [
-        ask(1, "fix the build"),
-        answer(2, usage(0.25, { cacheWrite1h: 5 })),
+it.each([false, true])(
+  "reports each answer's tokens and cost, where and what was asked (json=%s)",
+  (json) => {
+    expect(
+      conversationUsage(
+        [
+          ask(1, "fix the build\nwith more detail", json),
+          answer(2, usage(0.25, { cacheWrite1h: 5 })),
+          {
+            id: 3,
+            kind: "pi.tool-result",
+            model: [{ role: "toolResult", timestamp: 3000 }],
+          },
+          // A model pi-ai has no rates for is priced at 0: the cost is unknown.
+          answer(4, usage(0), { model: "local-y", responseId: undefined }),
+        ],
+        PLACE,
+      ),
+    ).toEqual({
+      id: "2",
+      channelId: "chan",
+      root: "root",
+      title: "fix the build",
+      startedAt: 1000,
+      lastAt: 4000,
+      gaps: [],
+      observations: [
         {
-          id: 3,
-          kind: "pi.tool-result",
-          model: [{ role: "toolResult", timestamp: 3000 }],
+          requestId: "resp-2",
+          at: 2000,
+          model: "claude-x",
+          tokens: {
+            input: 100,
+            output: 10,
+            cacheRead: 50,
+            cacheWrite: 5,
+            cacheWrite1h: 5,
+          },
+          cost: { usd: 0.25, source: "pi" },
         },
-        // A model pi-ai has no rates for is priced at 0: the cost is unknown.
-        answer(4, usage(0), { model: "local-y", responseId: undefined }),
+        {
+          at: 4000,
+          model: "local-y",
+          tokens: { input: 100, output: 10, cacheRead: 50, cacheWrite: 5 },
+        },
       ],
-      PLACE,
-    ),
-  ).toEqual({
-    id: "2",
-    channelId: "chan",
-    root: "root",
-    title: "fix the build",
-    startedAt: 1000,
-    lastAt: 4000,
-    gaps: [],
-    observations: [
-      {
-        requestId: "resp-2",
-        at: 2000,
-        model: "claude-x",
-        tokens: {
-          input: 100,
-          output: 10,
-          cacheRead: 50,
-          cacheWrite: 5,
-          cacheWrite1h: 5,
-        },
-        cost: { usd: 0.25, source: "pi" },
-      },
-      {
-        at: 4000,
-        model: "local-y",
-        tokens: { input: 100, output: 10, cacheRead: 50, cacheWrite: 5 },
-      },
-    ],
-  });
+    });
+  },
+);
+
+it("titles a conversation whose prompt is sent as exact records", () => {
+  expect(
+    conversationUsage([record(1, "fix the build\nand lint")], PLACE)?.title,
+  ).toBe("fix the build");
 });
 
 it("leaves out counts pi-ai did not record, and a conversation with no messages", () => {

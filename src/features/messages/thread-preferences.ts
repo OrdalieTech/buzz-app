@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import type { DeviceSetting } from "../../shared/device-settings";
 
 export type ThreadPlacement = "main" | "side";
 const preferenceKey = "buzz-thread-placement.v1";
@@ -46,3 +47,20 @@ export function setThreadPlacementPreference(value: ThreadPlacement): void {
   }
   window.dispatchEvent(new Event(changedEvent));
 }
+
+/** Thread placement as a device setting. */
+export const threadPlacementSetting: DeviceSetting = {
+  key: "conversations.thread_placement",
+  description: "Where new thread tabs open: the side pane or the main pane.",
+  schema: { type: "string", enum: ["side", "main"] },
+  applies:
+    "New thread tabs only; open threads stay where they are, and Solo threads always open in the side pane.",
+  read: () => ({
+    value: threadPlacementPreference(),
+    unsaved:
+      unsavedPreference === undefined
+        ? null
+        : "This placement is active, but could not be saved on this device.",
+  }),
+  write: (value) => setThreadPlacementPreference(value as ThreadPlacement),
+};

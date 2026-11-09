@@ -22,6 +22,9 @@ export function useNonmemberMentions(
 ) {
   const [pending, setPending] = useState<Pending>();
   const adding = useRef(false);
+  // Mentioning someone outside the channel usually means you want them here,
+  // so Enter right after Send invites. Escape and Close keep the draft unsent.
+  const inviteAction = useRef<HTMLButtonElement>(null);
   const channel = session.channels
     .list()
     .channels.find((item) => item.id === channelId);
@@ -37,10 +40,16 @@ export function useNonmemberMentions(
     };
     setPending({ ...request, busy: true });
     try {
-      for (const person of request.people) {
-        check();
-        await session.memberAdditions.add(channelId, person.pubkey);
-      }
+      check();
+      // Requested together, so they go to the relay together.
+      const failed = (
+        await Promise.allSettled(
+          request.people.map((person) =>
+            session.memberAdditions.add(channelId, person.pubkey),
+          ),
+        )
+      ).find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
       check();
       request.finish([]);
     } catch (reason) {
@@ -82,6 +91,7 @@ export function useNonmemberMentions(
         title="Mention people outside this channel?"
         description={pending && describe(pending.people, canAdd)}
         preventClose={!!pending?.busy}
+        initialFocus={canAdd ? inviteAction : undefined}
         finalFocus={() => {
           restoreFocus();
           return false;
@@ -99,6 +109,7 @@ export function useNonmemberMentions(
             </Button>
             {canAdd && (
               <Button
+                ref={inviteAction}
                 type="button"
                 variant="prominent"
                 disabled={pending?.busy}

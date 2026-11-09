@@ -3,7 +3,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, expect, it } from "vitest";
 import { BrowserIcon } from "../../shared/design-system/icons/index";
-import { PageIcon } from "./PageIcon";
+import { PageIcon, paintsCurrentColor } from "./PageIcon";
 
 afterEach(() => {
   cleanup();
@@ -75,4 +75,50 @@ it("renders the component icon at the given size when no image is declared", () 
   expect(icon).toHaveAttribute("width", "1.0625rem");
   expect(icon).toHaveAttribute("aria-hidden", "true");
   expect(container.querySelector("img")).toBeNull();
+});
+
+const bag = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" stroke="currentColor"><path d="M1 1"/></svg>')}`;
+const bag64 = `data:image/svg+xml;charset=utf-8;base64,${btoa('<svg fill="currentcolor"/>')}`;
+
+it("tells SVGs that paint with currentColor from other images", () => {
+  expect(paintsCurrentColor(bag)).toBe(true);
+  expect(paintsCurrentColor(bag64)).toBe(true);
+  expect(paintsCurrentColor(owl)).toBe(false);
+  expect(paintsCurrentColor(fox)).toBe(false);
+  const styled =
+    '<svg><style>path{stroke: currentColor}</style><path d="M1 1"/></svg>';
+  expect(
+    paintsCurrentColor(`data:image/svg+xml,${encodeURIComponent(styled)}`),
+  ).toBe(true);
+  const named =
+    '<svg><title>currentColor example</title><!-- fill="currentColor" --><path fill="red"/><path fill="blue"/></svg>';
+  expect(
+    paintsCurrentColor(`data:image/svg+xml,${encodeURIComponent(named)}`),
+  ).toBe(false);
+  expect(paintsCurrentColor("data:image/svg+xml,%E0%A4%A")).toBe(false);
+  expect(paintsCurrentColor("data:image/svg+xml;base64,@@@")).toBe(false);
+});
+
+it("draws a currentColor SVG as a mask in the text colour", () => {
+  const { container } = render(
+    <PageIcon icon={BrowserIcon} image={bag} size={16} />,
+  );
+  const mask = container.firstElementChild as HTMLElement;
+  expect(mask.tagName).toBe("SPAN");
+  expect(mask).toHaveClass("bg-current");
+  expect(mask).toHaveAttribute("aria-hidden", "true");
+  expect(mask.getAttribute("style")).toContain(`url("${bag}")`);
+  expect(mask.style.width).toBe("1rem");
+  const probe = mask.querySelector("img");
+  expect(probe).toHaveAttribute("src", bag);
+  expect(probe).not.toBeVisible();
+});
+
+it("swaps in the component icon when a masked SVG fails to load", () => {
+  const { container } = render(
+    <PageIcon icon={BrowserIcon} image={bag64} size={16} />,
+  );
+  fireEvent.error(container.querySelector("img") as Element);
+  expect(container.querySelector("span")).toBeNull();
+  expect(container.querySelector("svg")).toBeInstanceOf(SVGSVGElement);
 });

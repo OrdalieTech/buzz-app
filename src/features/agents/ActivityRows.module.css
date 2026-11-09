@@ -121,15 +121,11 @@
 .activityStatic > .activityItemBody {
   flex: 1;
 }
-.activityScope {
-  display: block;
-  color: var(--text-subtle);
-  font-size: var(--text-caption);
+.activityItemMeta {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-.activityItemWithAction .activityItemMeta,
-.activityItemWithAction .activityScope {
+.activityItemWithAction .activityItemMeta {
   padding-inline-end: var(--size-control-sm);
 }

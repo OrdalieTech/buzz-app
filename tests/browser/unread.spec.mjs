@@ -7,6 +7,7 @@ import {
   holdReadingFocus,
   releaseReadingFocus,
 } from "./reading.mjs";
+import { channelUnread } from "./unread-state.mjs";
 
 const alphaId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 test.use({
@@ -137,10 +138,11 @@ test("built sidebar → visible dwell → durable journal → encrypted broker p
     )
     .toBe(true);
   // Wait for the bounded roster-wide repair, not merely the first 20-row head.
-  await expect(alpha(page).getByRole("img")).toHaveAttribute(
-    "aria-label",
-    /^500 observed unread messages/,
-  );
+  // The open channel's row is quiet; the engine keeps the unread.
+  await expect
+    .poll(async () => (await channelUnread(page, alphaId)).observedCount)
+    .toBe(500);
+  await expect(alpha(page).getByRole("img")).toHaveCount(0);
   await park(page);
   await releaseReadingFocus(page);
   // Install after startup and focus cancellation have settled on the real
@@ -427,10 +429,12 @@ test.describe("explicit mark-through with membership activity", () => {
           history(page).locator("[data-membership-row]"),
         ).toHaveCount(1);
         if (!activityOnly) {
-          await expect(alpha(page).getByRole("img")).toHaveAttribute(
-            "aria-label",
-            /^2 observed unread messages/,
-          );
+          // The open channel's row is quiet; the engine keeps the unread.
+          await expect
+            .poll(
+              async () => (await channelUnread(page, alphaId)).observedCount,
+            )
+            .toBe(2);
         }
         await options(page);
         await page
@@ -503,7 +507,7 @@ test.describe("automatic catch-up after membership rows", () => {
   });
 });
 
-// AIDA-2318: a burst of joins filled the first history page, so the messages
+// A burst of joins filled the first history page, so the messages
 // unread counted never loaded and opening the channel could not read them.
 test.describe("a join burst longer than a history page", () => {
   test.use({ membershipBurst: 40, historyCounts: { [alphaId]: 20, beta: 1 } });
@@ -514,7 +518,10 @@ test.describe("a join burst longer than a history page", () => {
     // Startup focus would read Alpha before the unread baseline is observed.
     await holdReadingFocus(page);
     await open(page, app);
-    await expect(alpha(page).locator("[data-channel-unread]")).toHaveCount(1);
+    // The open channel's row is quiet; the engine keeps the unread.
+    await expect
+      .poll(async () => (await channelUnread(page, alphaId)).observedCount)
+      .toBeGreaterThan(0);
     await releaseReadingFocus(page);
     await composer(page).focus();
     const latest = app.histories
@@ -526,7 +533,9 @@ test.describe("a join burst longer than a history page", () => {
           (await journal(page))?.state.frontiers[`activity:${alphaId}`],
       )
       .toBe(latest.created_at);
-    await expect(alpha(page).locator("[data-channel-unread]")).toHaveCount(0);
+    await expect
+      .poll(async () => (await channelUnread(page, alphaId)).observedCount)
+      .toBe(0);
   });
 });
 
@@ -538,6 +547,8 @@ test.describe("local receipt reserve", () => {
     page,
     app,
   }) => {
+    // Startup and reload must not earn bottom catch-up before the isolated read.
+    await holdReadingFocus(page);
     await open(page, app);
     const ids = await visible(page);
     expect(ids.length).toBeGreaterThan(0);
@@ -564,7 +575,6 @@ test.describe("local receipt reserve", () => {
       (await journal(page)).state.frontiers[`activity:${alphaId}`],
     ).toBeUndefined();
     await park(page);
-    await holdReadingFocus(page); // Applied on reload, so it cannot silently reread Alpha.
     await page.evaluate(() =>
       window.fixtureRelay.snapshot().session.channels.ensure("beta"),
     );
@@ -611,8 +621,10 @@ test.describe("local receipt reserve", () => {
       })
       .toBe(stored.revision);
     expect(
-      app.report.readPublications.at(-1).blob.contexts[key],
-    ).toBeUndefined();
+      app.report.readPublications.some(({ blob }) =>
+        Object.hasOwn(blob.contexts, key),
+      ),
+    ).toBe(false);
     await page.reload();
     await openPage(page, "Messages");
     await composer(page).waitFor();

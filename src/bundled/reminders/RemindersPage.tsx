@@ -512,7 +512,7 @@ function ReminderRow({
   const overdue =
     pending && reminder.notBefore !== undefined && reminder.notBefore <= now;
   const preview = reminder.target?.preview
-    ? messagePreview(reminder.target.preview)
+    ? messagePreview(reminder.target.preview, { storedPreview: true })
     : reminder.note;
   const note = reminder.target?.preview ? reminder.note : undefined;
   const fullDue =

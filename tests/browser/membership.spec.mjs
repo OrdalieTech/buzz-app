@@ -111,23 +111,33 @@ test("Channels renders grouped history and live membership without turning activ
   });
   // The real stream subscriber/filter/session must deliver additions and departures.
   await expect.poll(() => app.relay.hasRoute("primary", "alpha")).toBe(true);
+  app.membership("member_joined", 0, 0);
   app.membership("member_left", 0, 0);
   app.membership("member_left", 1, 1);
-  await expect(groups).toHaveCount(2);
+  await expect(groups).toHaveCount(1);
   await expect(groups.last()).toContainText(
-    "Pinky, along with Brain, left the channel",
+    "Pinky added by you, along with Brain",
   );
   app.membership("member_removed", 0);
-  await expect(groups).toHaveCount(3);
-  await expect(groups.last()).toContainText("Pinky was removed by you");
+  await expect(groups).toHaveCount(1);
+  await expect(groups.last()).toContainText(
+    "Brain was added · Pinky was removed",
+  );
+  await expect(groups.last().locator("p")).toHaveAttribute(
+    "title",
+    /Pinky was removed by you/,
+  );
+  await groups.last().screenshot({
+    path: testInfo.outputPath("latest-membership-change.png"),
+  });
   app.membership("member_joined", 0, -1, true);
   // Place a genuine message after the forgery: seeing it proves the batch was processed.
   const after = app.append("primary", "alpha", "After membership activity");
   await expect(feed.locator(`[data-message-id="${after.id}"]`)).toBeVisible();
-  await expect(groups).toHaveCount(3);
+  await expect(groups).toHaveCount(1);
   // A normal message is a grouping barrier, never swallowed by an activity cohort.
   app.membership("member_joined", 0);
-  await expect(groups).toHaveCount(4);
+  await expect(groups).toHaveCount(2);
   await expect(groups.last()).toContainText("Pinky added by you");
   await expect(groups.last()).toBeVisible();
   // Wait for the scheduled bottom-follow before leaving; an overscan count is
@@ -139,7 +149,7 @@ test("Channels renders grouped history and live membership without turning activ
     .toBeLessThan(2);
   await page.getByRole("button", { name: "Beta", exact: true }).click();
   await page.getByRole("button", { name: "Alpha", exact: true }).click();
-  await expect(groups).toHaveCount(4);
+  await expect(groups).toHaveCount(2);
   await expect(groups.last()).toBeVisible();
 });
 
@@ -150,11 +160,10 @@ keyboardTest(
   "one keyboard scroll leaves bottom follow and live membership preserves the reader",
   async ({ page, app }) => {
     await openMessages(page, app);
-    // Unread evidence contributes to the accessible name; channel identity does not change.
+    // The open channel's row is quiet, and its identity locates it.
     const alpha = page.locator('button[data-channel-id="alpha"]');
-    await expect(alpha.getByRole("img")).toHaveAccessibleName(
-      /observed unread messages/,
-    );
+    await expect(alpha).toHaveAttribute("aria-current", "page");
+    await expect(alpha.getByRole("img")).toHaveCount(0);
     await alpha.click();
     const feed = page.getByRole("region", { name: "Channel message history" });
     const distance = () =>
@@ -303,17 +312,79 @@ burstTest(
       feed.getByText("primary alpha message 625", { exact: false }),
     ).toBeVisible();
     await expect(groups).toHaveCount(1);
-    await expect(groups).toContainText("497 others");
+    await expect(groups).toContainText("and 499 others were added");
     // The second notice read pages below the first by the composite cursor.
     await expect.poll(() => app.pending.length).toBe(1);
     const notices = app.pending.shift();
     expect(notices.filter).toMatchObject({ kinds: [40099], "#h": ["alpha"] });
     expect(notices.filter.until).toEqual(expect.any(Number));
     notices.release();
-    await expect(groups).toContainText("599 others");
+    await expect(groups).toContainText("Pinky and 601 others were added");
     await expect(groups).toHaveCount(1);
     await settle(page);
     expect(app.pending).toHaveLength(0);
+    // A real hover surface must remain reachable and expose every member,
+    // including those beyond the scroll viewport; keyboard activation works too.
+    const others = groups.getByRole("button", {
+      name: "601 others",
+      exact: true,
+    });
+    await others.hover();
+    const popup = page.getByRole("dialog", {
+      name: "People who were added (602)",
+    });
+    await expect(popup).toBeVisible();
+    const people = popup.getByRole("region", {
+      name: "People who were added",
+      exact: true,
+    });
+    await expect(people.getByRole("listitem")).toHaveCount(602);
+    await expect(people.getByRole("listitem").first()).toHaveText("Pinky");
+    await expect(people.getByRole("listitem").nth(1)).toHaveText("Brain");
+    await people.hover();
+    await page.screenshot({
+      path: testInfo.outputPath("membership-people.png"),
+    });
+    await page.mouse.wheel(0, 100000);
+    await expect(people.getByRole("listitem").last()).toBeInViewport();
+    await page.keyboard.press("Escape");
+    await expect(popup).toHaveCount(0);
+    await page.mouse.move(0, 0);
+    await others.focus();
+    await others.press("Enter");
+    await expect(popup).toBeVisible();
+    await expect(people).toBeFocused();
+    await people.press("End");
+    await expect(people.getByRole("listitem").last()).toBeInViewport();
+    await page.keyboard.press("Escape");
+    await expect(popup).toHaveCount(0);
+    await expect(others).toBeFocused();
+    await page.setViewportSize({ width: 390, height: 900 });
+    await page.locator("html").evaluate((root) => {
+      root.dataset.colorMode = "dark";
+      root.style.setProperty("--buzz-text-scale", "1.5");
+    });
+    await others.hover();
+    await expect(popup).toBeVisible();
+    await expect
+      .poll(() =>
+        popup.evaluate((node) => {
+          const rect = node.getBoundingClientRect();
+          return (
+            rect.left >= 0 &&
+            rect.right <= innerWidth &&
+            rect.top >= 0 &&
+            rect.bottom <= innerHeight
+          );
+        }),
+      )
+      .toBe(true);
+    await page.screenshot({
+      path: testInfo.outputPath("membership-people-narrow-dark.png"),
+    });
+    await page.keyboard.press("Escape");
+    await expect(popup).toHaveCount(0);
+
     await page.screenshot({ path: testInfo.outputPath("join-burst.png") });
     await testInfo.attach("join-burst", {
       path: testInfo.outputPath("join-burst.png"),

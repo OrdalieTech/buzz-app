@@ -1,3 +1,4 @@
+import { nativeHookOutput } from "../hook-output";
 import { CLAUDE_HOOK_EVENTS } from "./hooks";
 import { repositoriesContext } from "../../features/communities/repositories";
 // Claude agents: an agent type whose agents are Claude sessions on
@@ -19,7 +20,7 @@ export { TYPE_ID };
 /** How often Buzz's copy of Claude looks for a new release. */
 const UPDATE_MS = 6 * 60 * 60_000;
 
-export const inject = ["agents", "host"];
+export const inject = ["agents", "host", "agentProtection", "navigation"];
 export const apply: PluginModule["apply"] = (ctx) => {
   // Only the desktop app can start `claude`, and setup and file uploads run
   // `bash` and `base64`, which stock Windows lacks; no unusable type elsewhere.
@@ -29,13 +30,23 @@ export const apply: PluginModule["apply"] = (ctx) => {
   const spawn = host.spawn && withScript(host.spawn.bind(host));
   const readFile = host.readFile?.bind(host);
   const setup = new ClaudeSetup(spawn, (input) => host.request(input));
+  ctx.agentProtection.registerModels({
+    label: "Claude",
+    models: async () =>
+      (await setup.catalog()).map((model) => ({
+        id: model.value,
+        label: model.displayName ?? model.value,
+      })),
+    complete: (model, prompt, signal) => setup.review(model, prompt, signal),
+  });
   const providerDefaults = new ClaudeDefaults(agents.storage);
+  // No turn starts without credentials.
   const runtime = new ClaudeRuntime(
-    spawn ? { spawn } : {},
+    spawn ? { spawn: setup.auth.authorize(spawn, true) } : {},
     (key) => ownerReads(agents.relay(key), pubkeyOf(key)),
     (key, signal) => agents.core(key, signal),
     agents.storage,
-    (raw) => providerDefaults.resolve(raw),
+    (raw, remote) => (remote ? config(raw) : providerDefaults.resolve(raw)),
     () => agents.tools(),
     repositoriesContext,
     async (agent, session, event, input) => {
@@ -50,9 +61,13 @@ export const apply: PluginModule["apply"] = (ctx) => {
             typeof output === "object" &&
             Object.keys(output).length > 0,
           milliseconds: 25000,
+          compose: nativeHookOutput,
         },
       )) ?? {}) as Record<string, unknown>;
     },
+    (key, session) => agents.execution(key, session),
+    (key) => agents.inspectExecution(key),
+    (key) => !!agents.executionBinding(key),
   );
   /** A Claude agent is running, so Buzz's copy is needed; unknown until the
    * agents have loaded. */
@@ -67,13 +82,14 @@ export const apply: PluginModule["apply"] = (ctx) => {
     // Once loaded, and when the first Claude agent runs, the copy is brought
     // up to date; that is also when a first copy is downloaded.
     const was = needed;
-    needed = running.length > 0;
+    needed = running.some((agent) => !agents.executionBinding(agent.key));
     if (was === undefined || (needed && !was)) void setup.update(needed);
   };
   // One spare session waits for whichever running agent needs it next.
   if (spawn) {
     const unsubscribe = agents.subscribe(sync);
     const unsubscribeDefaults = providerDefaults.subscribe(sync);
+    const unsubscribeAuth = setup.auth.subscribe(() => runtime.restart());
     sync();
     const timer = setInterval(
       () => void setup.update(needed ?? false),
@@ -83,14 +99,31 @@ export const apply: PluginModule["apply"] = (ctx) => {
       clearInterval(timer);
       unsubscribe();
       unsubscribeDefaults();
+      unsubscribeAuth();
       runtime.dispose();
       setup.dispose();
     });
   }
 
+  const openSetup = () =>
+    void ctx.navigation.open({
+      version: 1,
+      kind: "settings",
+      section: "agents",
+      provider: typeKey,
+    });
+  // Failed turns' reports link to the same place.
+  runtime.explain = (error) =>
+    setup.auth.explainTurn(
+      error,
+      `buzz://settings?section=agents&provider=${encodeURIComponent(typeKey)}`,
+    );
   const {
     Create,
+    CreateAction,
+    CreateConfiguration,
     CreateModel,
+    CreateThinking,
     DefaultControl,
     ProviderDialogBody,
     SettingsTab,
@@ -99,17 +132,25 @@ export const apply: PluginModule["apply"] = (ctx) => {
     setup,
     defaults: providerDefaults,
     runtime,
+    openSetup,
   });
   agents.register<Config>({
     id: TYPE_ID,
+    execution: true,
     hooks: { events: CLAUDE_HOOK_EVENTS },
+    retire: (pubkey) => runtime.retire(pubkey),
+    protection: true,
     title: "Claude",
     icon: ClaudeLogoIcon,
     description:
       "Claude on this computer. Each thread it is mentioned in is one continuing session.",
     defaults: () => ({ config: DEFAULT_CONFIG }),
     Create,
+    CreateAction,
+    CreateConfiguration,
     CreateModel,
+    createModelReportsReadiness: true,
+    CreateThinking,
     importShared: (source) =>
       source.runtime === "claude" &&
       (!source.provider || source.provider === "anthropic")
@@ -147,15 +188,18 @@ export const apply: PluginModule["apply"] = (ctx) => {
     summary: (agent) => config(agent.config).model || "Claude",
     ...(spawn &&
       readFile && {
-        usage: (agent, { since, signal }) =>
-          readUsage(
+        usage: async (agent, { since, signal }) => {
+          if (await agents.inspectExecution(agent.key))
+            throw new Error("Usage is unavailable for remote Claude agents.");
+          return readUsage(
             { spawn, readFile },
             config(agent.config).workspace,
             agent.key,
             runtime.conversations(agent.key).map((saved) => saved.sessionId),
             since,
             signal,
-          ),
+          );
+        },
       }),
     provider: {
       snapshot: setup.providerSnapshot,
@@ -167,8 +211,8 @@ export const apply: PluginModule["apply"] = (ctx) => {
         return state.status?.state === "missing" ||
           state.status?.state === "outdated"
           ? () => void setup.run("install")
-          : state.status?.state === "signed-out"
-            ? () => void setup.run("login")
+          : state.status?.state === "signed-out" && setup.auth.signIn
+            ? () => void setup.run("sign-in")
             : undefined;
       },
       DialogBody: ProviderDialogBody,
@@ -201,6 +245,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
         title: "Settings",
         role: "settings",
         splitSettings: true,
+        reconcilesConfig: true,
         component: SettingsTab,
       },
       {
@@ -211,6 +256,11 @@ export const apply: PluginModule["apply"] = (ctx) => {
       },
     ],
     // A mention during the first download waits for it, within its deadline.
-    ...claudeRun(runtime, (signal) => setup.installed(signal)),
+    ...claudeRun(runtime, async (signal, agent) => {
+      if (agent && (await agents.inspectExecution(agent.key))) return;
+      return agent?.protection
+        ? setup.protectedInstalled(signal)
+        : setup.installed(signal);
+    }),
   });
 };

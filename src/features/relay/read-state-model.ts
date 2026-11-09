@@ -1,10 +1,15 @@
 import type { RelayEvent } from "./events.ts";
+import { READ_SNAPSHOT_BYTES } from "./read-state-host.ts";
 
 /** NIP-RS timestamps/counters are uint32, not timeline event-ID cursors. */
 export const READ_STATE_MAX = 0xffff_ffff;
 export const READ_STATE_KEYS = 10_000;
 export const READ_STATE_EVENT_BYTES = 64 * 1024;
 export const READ_STATE_PLAINTEXT_BYTES = 40 * 1024;
+/** Frontiers older than this are pruned and every older message counts as read. */
+export const READ_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+/** Maximum-size events one installation may own before it alone fills a snapshot. */
+export const READ_STATE_SLOTS = READ_SNAPSHOT_BYTES / READ_STATE_EVENT_BYTES;
 const encoder = new TextEncoder();
 const bytes = (value: string) => encoder.encode(value).byteLength;
 export const uint32 = (value: unknown): value is number =>
@@ -15,7 +20,10 @@ export const uint32 = (value: unknown): value is number =>
 export const record = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 export const contextId = (value: unknown): value is string =>
-  typeof value === "string" && value.length > 0 && bytes(value) <= 256;
+  typeof value === "string" &&
+  value.length > 0 &&
+  // UTF-8 takes at most 3 bytes per UTF-16 unit: short strings need no encoding.
+  (value.length <= 85 || bytes(value) <= 256);
 export const slotId = (value: unknown): value is string =>
   typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
 
@@ -221,6 +229,8 @@ export function changeOverride(
     },
   });
 }
+/** Code-unit order, so every client sorts keys identically. */
+const byKey = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 /** Canonical floors are permanent. Never call on a partial snapshot for publication. */
 export function readBlob(
   clientId: string,
@@ -229,11 +239,11 @@ export function readBlob(
 ): ReadBlob {
   const contexts: Record<string, number> = Object.fromEntries(
     Object.entries(state.frontiers)
-      .sort(([a], [b]) => a.localeCompare(b))
+      .sort(([a], [b]) => byKey(a, b))
       .map(([key, value]) => [escapeContext(key), value]),
   );
   for (const [key, value] of Object.entries(state.overrides).sort(([a], [b]) =>
-    a.localeCompare(b),
+    byKey(a, b),
   )) {
     if (!contextId(`ov_s:${key}`))
       throw new Error("Read override key exceeds capacity");
@@ -255,6 +265,61 @@ export function readBlob(
       "Read-state publication capacity reached; saved intent retained",
     );
   return blob;
+}
+export type ReadSlotPlan = Readonly<{
+  slot: string;
+  frontiers: Readonly<Record<string, number>>;
+}>;
+/**
+ * Places frontiers into an installation's slots without ever dropping one.
+ * A key keeps the slot whose observed blob already carries it, so a new key
+ * can never move a sole carrier between coordinates mid-publication. Other
+ * keys fill the first slot with room in key order, then new slots.
+ */
+export function packReadState(
+  clientId: string,
+  frontiers: Readonly<Record<string, number>>,
+  slots: readonly Readonly<{ slot: string; carried: readonly string[] }>[],
+  newSlot: () => string,
+  maxBytes = READ_STATE_PLAINTEXT_BYTES,
+): ReadSlotPlan[] {
+  const base = bytes(
+    JSON.stringify({ v: 1, client_id: clientId, contexts: {} }),
+  );
+  const bins = slots.map(({ slot }) => ({
+    slot,
+    frontiers: {} as Record<string, number>,
+    used: base,
+  }));
+  const home = new Map<string, number>();
+  slots.forEach(({ carried }, index) => {
+    for (const key of carried) if (!home.has(key)) home.set(key, index);
+  });
+  const add = (bin: (typeof bins)[number], key: string, value: number) => {
+    const size =
+      bytes(JSON.stringify(escapeContext(key))) +
+      1 +
+      String(value).length +
+      (bin.used > base ? 1 : 0);
+    if (bin.used + size > maxBytes) return false;
+    bin.frontiers[key] = value;
+    bin.used += size;
+    return true;
+  };
+  const keys = Object.keys(frontiers).sort(byKey);
+  const rest = keys.filter((key) => {
+    const bin = bins[home.get(key) ?? -1];
+    return !bin || !add(bin, key, frontiers[key] as number);
+  });
+  for (const key of rest) {
+    const value = frontiers[key] as number;
+    if (bins.some((bin) => add(bin, key, value))) continue;
+    const bin = { slot: newSlot(), frontiers: {}, used: base };
+    if (!add(bin, key, value))
+      throw new Error("Read frontier exceeds publication capacity");
+    bins.push(bin);
+  }
+  return bins.map(({ slot, frontiers }) => ({ slot, frontiers }));
 }
 /** Wait rather than manufacture unbounded future timestamps on rapid/backward clocks. */
 export function readVersion(now: number, previous: number): number {

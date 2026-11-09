@@ -8,10 +8,15 @@ import {
 import { useRelayConnection } from "../../../features/relay/react";
 import type { RelayData } from "../../../features/relay/service";
 import type { RelaySession } from "../../../features/relay/session";
-import { activityTranscript } from "../../../features/agents/activity-transcript";
+import {
+  activityTranscript,
+  type TranscriptTurn,
+} from "../../../features/agents/activity-transcript";
 import { ActivityTranscript } from "../../../features/agents/ActivityTranscript";
 import type { Agent, AgentViewProps } from "../../../features/agents/service";
 import { SettingsSectionLink } from "../../../features/navigation/SettingsSectionLink";
+import type { IdentityNameView } from "../../../features/identity-names/service";
+import { useIdentityNames } from "../../../features/identity-names/react";
 
 export type AgentActivity = RelaySession["agentActivity"];
 
@@ -33,6 +38,9 @@ export function createActivityTab(
             : undefined
         }
         openSettings={openSettings}
+        names={
+          connection.status === "ready" ? connection.session.names : undefined
+        }
       />
     );
   };
@@ -43,20 +51,24 @@ export function ActivityPanel({
   activity,
   openSettings,
   openConversation,
+  names,
 }: {
   agent: Agent;
   /** Absent while the owner's session connects. */
   activity: AgentActivity | undefined;
   openSettings?: ((section: string) => void) | undefined;
   openConversation?: AgentViewProps["openConversation"];
+  /** Names the people whose messages prompted the turns. */
+  names?: IdentityNameView | undefined;
 }) {
   if (!activity) return <Note>Activity shows once Buzz is connected.</Note>;
   return (
     <ActivityFeed
       agent={agent}
+      openConversation={openConversation}
       activity={activity}
       openSettings={openSettings}
-      openConversation={openConversation}
+      names={names}
     />
   );
 }
@@ -68,26 +80,38 @@ function ActivityFeed({
   activity,
   openSettings,
   openConversation,
+  names,
 }: {
   agent: Agent;
   activity: AgentActivity;
   openSettings: ((section: string) => void) | undefined;
   openConversation: AgentViewProps["openConversation"];
+  names: IdentityNameView | undefined;
 }) {
+  const resolve = useIdentityNames(names);
   // The Agent Activity plugin owns the feed's lease; this only reads it.
   const snapshot = useSyncExternalStore(
     activity.subscribe,
     activity.snapshot,
     activity.snapshot,
   );
-  const transcript = useMemo(
-    () =>
-      activityTranscript(
-        snapshot.records.filter((record) => record.agent === agent.pubkey),
-        { agent: agent.pubkey },
-      ),
-    [snapshot.records, agent.pubkey],
-  );
+  const transcript = useMemo(() => {
+    const transcript = activityTranscript(
+      snapshot.records.filter((record) => record.agent === agent.pubkey),
+      { agent: agent.pubkey },
+      (pubkey) => resolve(pubkey, "") || undefined,
+    );
+    return {
+      turns: transcript.turns.map((turn): TranscriptTurn => {
+        const retained = snapshot.turns.find(
+          (row) => row.agent === agent.pubkey && row.turnId === turn.turnId,
+        );
+        return retained?.outcome
+          ? { ...turn, outcome: retained.outcome }
+          : turn;
+      }),
+    };
+  }, [snapshot.records, snapshot.turns, agent.pubkey, resolve]);
   if (snapshot.status === "unavailable") return <Note>{UNAVAILABLE}</Note>;
   if (snapshot.status === "disabled")
     return (
@@ -110,6 +134,9 @@ function ActivityFeed({
     <ActivityTranscript
       transcript={transcript}
       agentName={agent.name}
+      agentKey={agent.key}
+      agentPicture={agent.picture}
+      community={agent.relay}
       state={(turnId) => state.get(turnId)}
       follow={false}
       openConversation={openConversation}

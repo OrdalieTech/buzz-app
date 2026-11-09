@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useState } from "react";
 import { Button } from "../../shared/design-system/ui/Button";
 import { Field } from "../../shared/design-system/ui/Field";
 import { Input } from "../../shared/design-system/ui/Input";
@@ -23,7 +23,6 @@ export function InviteCodeField({
 }) {
   const [code, setCode] = useState("");
   const [edited, setEdited] = useState(false);
-  const errorId = useId();
   const shown = edited ? undefined : error;
   const value = code.trim();
   const submit = () => {
@@ -31,13 +30,11 @@ export function InviteCodeField({
     setEdited(false);
     onSubmit(value);
   };
-  // `CommunityUrlField`'s recipe: the error sits below the row, so Join stays
-  // aligned with the input.
   return (
     <div className="flex flex-col gap-1">
-      <div className="flex items-end gap-3">
+      <div className="flex flex-col gap-12">
         <div className="min-w-0 flex-1">
-          <Field label="Invite code" invalid={!!shown} disabled={busy}>
+          <Field label="Invite code" error={shown} disabled={busy}>
             <Input
               autoComplete="off"
               autoCapitalize="none"
@@ -45,7 +42,6 @@ export function InviteCodeField({
               maxLength={256}
               value={code}
               disabled={busy}
-              aria-describedby={shown ? errorId : undefined}
               onChange={(event) => {
                 setCode(event.target.value);
                 setEdited(true);
@@ -59,15 +55,15 @@ export function InviteCodeField({
             />
           </Field>
         </div>
-        <Button disabled={busy || !value} onClick={submit}>
+        <Button
+          size="lg"
+          variant="prominent"
+          disabled={busy || !value}
+          onClick={submit}
+        >
           {pending ? "Joining…" : "Join"}
         </Button>
       </div>
-      {shown && (
-        <p id={errorId} role="alert" className="m-0 text-body-sm text-danger">
-          {shown}
-        </p>
-      )}
     </div>
   );
 }

@@ -1,5 +1,10 @@
+import meshManifest from "./mesh-compute/manifest.json";
+import * as mesh from "./mesh-compute";
 import voiceNotesManifest from "./voice-notes/manifest.json";
 import * as voiceNotes from "./voice-notes";
+
+import draftsSentManifest from "./drafts-sent/manifest.json";
+import * as draftsSent from "./drafts-sent";
 import pairingManifest from "./pairing/manifest.json";
 import * as pairing from "./pairing";
 import todosManifest from "./todos/manifest.json";
@@ -28,6 +33,7 @@ import watchingManifest from "./watching/manifest.json";
 import * as watching from "./watching";
 import claudeCodeManifest from "./claude-code/manifest.json";
 import * as claudeCode from "./claude-code";
+import { leadsHarnesses as claudeLeadsHarnesses } from "./claude-code/auth";
 import codexManifest from "./codex/manifest.json";
 import * as codex from "./codex";
 import gooseManifest from "./goose/manifest.json";
@@ -44,6 +50,8 @@ import usageManifest from "./usage/manifest.json";
 import * as usage from "./usage";
 import inboxManifest from "./inbox/manifest.json";
 import * as inbox from "./inbox";
+import focusManifest from "./focus/manifest.json";
+import * as focus from "./focus";
 import remindersManifest from "./reminders/manifest.json";
 import * as reminders from "./reminders";
 import reposManifest from "./repos/manifest.json";
@@ -59,11 +67,30 @@ import relayStaffManifest from "./relay-staff/manifest.json";
 import * as relayStaff from "./relay-staff";
 import typesafeManifest from "./typesafe/manifest.json";
 import * as typesafe from "./typesafe";
+import pluginDevelopmentManifest from "./plugin-development/manifest.json";
+import * as pluginDevelopment from "./plugin-development";
 
 import relayNotesManifest from "./relay-notes/manifest.json";
 import * as relayNotes from "./relay-notes";
 
+const codexHarness: BundledPlugin = {
+  manifest: { ...codexManifest, apiVersion: 1 },
+  module: codex,
+  enabledByDefault: true,
+};
+const claudeHarness: BundledPlugin = {
+  manifest: { ...claudeCodeManifest, apiVersion: 1 },
+  module: claudeCode,
+  enabledByDefault: true,
+};
+
 export const bundledPlugins: readonly BundledPlugin[] = [
+  {
+    manifest: { ...meshManifest, apiVersion: 1 },
+    module: mesh,
+    // Opt-in: it reads community membership in the background once enabled.
+    enabledByDefault: false,
+  },
   {
     manifest: { ...relayNotesManifest, apiVersion: 1 },
     module: relayNotes,
@@ -83,6 +110,12 @@ export const bundledPlugins: readonly BundledPlugin[] = [
     manifest: { ...builderlabManifest, apiVersion: 1 },
     module: builderlab,
     enabledByDefault: true,
+  },
+  {
+    manifest: { ...draftsSentManifest, apiVersion: 1 },
+    module: draftsSent,
+    // Opt-in until it is ready for everyone.
+    enabledByDefault: false,
   },
   {
     manifest: { ...pairingManifest, apiVersion: 1 },
@@ -162,7 +195,12 @@ export const bundledPlugins: readonly BundledPlugin[] = [
   {
     manifest: { ...remindersManifest, apiVersion: 1 },
     module: reminders,
-    enabledByDefault: true,
+    enabledByDefault: false,
+  },
+  {
+    manifest: { ...focusManifest, apiVersion: 1 },
+    module: focus,
+    enabledByDefault: false,
   },
   {
     manifest: { ...reposManifest, apiVersion: 1 },
@@ -179,16 +217,11 @@ export const bundledPlugins: readonly BundledPlugin[] = [
     module: watching,
     enabledByDefault: true,
   },
-  {
-    manifest: { ...claudeCodeManifest, apiVersion: 1 },
-    module: claudeCode,
-    enabledByDefault: true,
-  },
-  {
-    manifest: { ...codexManifest, apiVersion: 1 },
-    module: codex,
-    enabledByDefault: true,
-  },
+  // The first of Codex and Claude leads the Harness list and is new agents'
+  // default: Codex, unless Claude's auth seam says Claude may.
+  ...(claudeLeadsHarnesses
+    ? [claudeHarness, codexHarness]
+    : [codexHarness, claudeHarness]),
   {
     manifest: { ...gooseManifest, apiVersion: 1 },
     module: goose,
@@ -202,7 +235,7 @@ export const bundledPlugins: readonly BundledPlugin[] = [
   {
     manifest: { ...workflowsManifest, apiVersion: 1 },
     module: workflows,
-    enabledByDefault: true,
+    enabledByDefault: false,
   },
   {
     manifest: { ...moderationManifest, apiVersion: 1 },
@@ -217,6 +250,11 @@ export const bundledPlugins: readonly BundledPlugin[] = [
   {
     manifest: { ...typesafeManifest, apiVersion: 1 },
     module: typesafe,
+    enabledByDefault: true,
+  },
+  {
+    manifest: { ...pluginDevelopmentManifest, apiVersion: 1 },
+    module: pluginDevelopment,
     enabledByDefault: true,
   },
 ];

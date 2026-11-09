@@ -6,7 +6,7 @@ import { matchesEvent } from "./projection";
 import type { RelayEvent } from "./events";
 import { SOLO_LABEL } from "../solo/labels";
 
-function setup() {
+function setup(visibility: "private" | "public" = "private") {
   const viewer = keypair(),
     relay = keypair(),
     agent = keypair();
@@ -102,7 +102,11 @@ function setup() {
             tags: [["-"], ...archived.map((key) => ["p", key])],
           }),
           meta(parent, "stream"),
-          meta(child, "stream", [["private"], ["t", SOLO_LABEL]]),
+          meta(child, "stream", [
+            [visibility],
+            ["t", SOLO_LABEL],
+            ["join_role", "guest"],
+          ]),
           roster(relay, parent, members, clock),
           roster(relay, child, childMembers, clock),
         ];
@@ -174,36 +178,83 @@ function setup() {
   };
 }
 
-it("adds an outside agent once and confirms its membership", async () => {
-  const test = setup();
-  try {
-    await test.ready();
-    await test.owner.session.channelWrites.addAgents(test.child, [
-      test.agent,
-      test.agent,
-    ]);
-    expect(test.publish).toHaveBeenCalledOnce();
-    expect(test.publish.mock.calls[0]?.[0]).toMatchObject({
-      kind: 9000,
-      tags: expect.arrayContaining([
-        ["h", test.child],
-        ["p", test.agent],
-      ]),
-    });
-    expect(
-      test.publish.mock.calls[0]?.[0].tags.some(([name]) => name === "role"),
-    ).toBe(false);
-    expect(
-      test.owner.session.channels
-        .list()
-        .channels.find((item) => item.id === test.child)?.members,
-    ).toContain(test.agent);
-    await test.owner.session.channelWrites.addAgents(test.child, [test.agent]);
-    expect(test.publish).toHaveBeenCalledOnce();
-  } finally {
-    test.owner.dispose();
-  }
-});
+it.each(["private", "public"] as const)(
+  "adds an outside agent as Bot with a Guest default in a %s Solo chat",
+  async (visibility) => {
+    const test = setup(visibility);
+    try {
+      await test.ready();
+      await test.owner.session.channelWrites.addAgents(test.child, [
+        test.agent,
+        test.agent,
+      ]);
+      expect(test.publish).toHaveBeenCalledOnce();
+      expect(test.publish.mock.calls[0]?.[0]).toMatchObject({
+        kind: 9000,
+        tags: expect.arrayContaining([
+          ["h", test.child],
+          ["p", test.agent],
+          ["role", "bot"],
+        ]),
+      });
+      expect(
+        test.owner.session.channels
+          .list()
+          .channels.find((item) => item.id === test.child)?.members,
+      ).toContain(test.agent);
+      await test.owner.session.channelWrites.addAgents(test.child, [
+        test.agent,
+      ]);
+      expect(test.publish).toHaveBeenCalledOnce();
+    } finally {
+      test.owner.dispose();
+    }
+  },
+);
+it.each([
+  { roleTags: [] },
+  { roleTags: [["role", "guest"]] },
+  { roleTags: [["role", "member"]] },
+  {
+    roleTags: [
+      ["role", "bot"],
+      ["role", "bot"],
+    ],
+  },
+])(
+  "does not reuse a Solo agent receipt with incompatible role tags $roleTags",
+  async ({ roleTags }) => {
+    const test = setup();
+    try {
+      await test.ready();
+      test.setDenied(true);
+      const outbox = test.owner.session.outbox;
+      if (!outbox) throw new Error("Missing fixture outbox");
+      const previous = outbox.send({
+        kind: 9000,
+        content: "",
+        tags: [["h", test.child], ["p", test.agent], ...roleTags],
+      });
+      await vi.waitFor(() =>
+        expect(
+          outbox.snapshot().find((item) => item.event.id === previous)
+            ?.delivery,
+        ).toBe("failed"),
+      );
+      test.setDenied(false);
+      await test.owner.session.channelWrites.addAgents(test.child, [
+        test.agent,
+      ]);
+      expect(test.publish.mock.lastCall?.[0].id).not.toBe(previous);
+      expect(test.publish.mock.lastCall?.[0].tags).toContainEqual([
+        "role",
+        "bot",
+      ]);
+    } finally {
+      test.owner.dispose();
+    }
+  },
+);
 it("reports channel-specific uncertainty when an accepted addition lacks roster confirmation", async () => {
   const test = setup();
   try {

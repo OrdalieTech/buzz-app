@@ -22,9 +22,17 @@ import type { RelayData } from "../../src/features/relay/service";
 import { AgentInstructions } from "../../src/features/agents/AgentInstructions";
 import { CreateModelChoices } from "../../src/features/agents/CreateModelChoices";
 import { ModelPicker } from "../../src/features/agents/ModelPicker";
+import { createTabs as createClaudeTabs } from "../../src/bundled/claude-code/tabs";
+import { DEFAULT_CONFIG as claudeDefaults } from "../../src/bundled/claude-code/runtime";
+import { createTabs as createCodexTabs } from "../../src/bundled/codex/tabs";
+import { defaults as codexDefaults } from "../../src/bundled/codex/config";
 import "../../src/shared/styles/globals.css";
 
 const harness = new URLSearchParams(location.search).get("harness");
+const settingsSync = new URLSearchParams(location.search).has("settingsSync");
+const thinkingHarness = settingsSync
+  ? "claude"
+  : new URLSearchParams(location.search).get("thinking");
 const importing = new URLSearchParams(location.search).has("import");
 const teamImport = new URLSearchParams(location.search).has("teamImport");
 if (importing || teamImport) createAppearance();
@@ -128,7 +136,116 @@ const type: RegisteredAgentType = {
       />
     ),
 };
-const snapshot = {
+const staticStore = <T,>(state: T) => ({
+  snapshot: () => state,
+  subscribe: () => () => {},
+});
+const thinkingTypes: Record<string, RegisteredAgentType> = {};
+if (thinkingHarness === "claude") {
+  const setup = staticStore({
+    status: { state: "ready", version: "fixture" },
+    running: undefined,
+    checking: false,
+    models: [
+      ...(settingsSync
+        ? [
+            {
+              value: "claude-fixture-other",
+              displayName: "Other Claude model",
+              supportedEffortLevels: ["low", "high"],
+            },
+          ]
+        : []),
+      {
+        value: "default",
+        resolvedModel: "claude-fixture-model",
+        displayName: "Fictional Claude model",
+        supportedEffortLevels: ["low", "high"],
+      },
+      {
+        value: "claude-fixture-model",
+        displayName: "Fictional Claude model",
+        supportedEffortLevels: ["low", "high"],
+      },
+    ],
+    modelsChecking: false,
+    modelsError: "",
+  });
+  const defaults = staticStore({ model: "", effort: "" });
+  const tabs = createClaudeTabs({
+    setup: setup as never,
+    defaults: defaults as never,
+    runtime: { isRemote: async () => false } as never,
+  });
+  thinkingTypes.claude = {
+    ...type,
+    key: "fixture/claude",
+    id: "claude",
+    title: "Claude",
+    defaults: () => ({ config: { ...claudeDefaults } }),
+    CreateModel: tabs.CreateModel,
+    CreateThinking: tabs.CreateThinking,
+    ...(settingsSync
+      ? {
+          tabs: [
+            {
+              id: "settings",
+              title: "Settings",
+              role: "settings" as const,
+              splitSettings: true,
+              component: tabs.SettingsTab,
+            },
+          ],
+        }
+      : {}),
+  };
+} else if (thinkingHarness === "codex") {
+  const model = {
+    model: "codex-fixture-model",
+    displayName: "Fictional Codex model",
+    description: "Synthetic browser fixture",
+    isDefault: true,
+    defaultReasoningEffort: "low",
+    supportedReasoningEfforts: [
+      { reasoningEffort: "low", description: "" },
+      { reasoningEffort: "high", description: "" },
+    ],
+  };
+  const providerState = {
+    readiness: "ready",
+    checking: false,
+    data: { models: [model] },
+    error: "",
+    defaults: { model: "", effort: "" },
+  };
+  const provider = {
+    ...staticStore(providerState),
+    resolve: (value: unknown) => ({
+      ...codexDefaults,
+      ...(value as Partial<typeof codexDefaults>),
+    }),
+  };
+  const setup = staticStore({
+    status: { state: "ready", version: "fixture" },
+    running: undefined,
+  });
+  const tabs = createCodexTabs(
+    provider as never,
+    {} as never,
+    (() => Promise.resolve(undefined)) as never,
+    setup as never,
+  );
+  thinkingTypes.codex = {
+    ...type,
+    key: "fixture/codex",
+    id: "codex",
+    title: "Codex",
+    defaults: () => ({ config: { ...codexDefaults } }),
+    CreateModel: tabs.CreateModel,
+    CreateThinking: tabs.CreateThinking,
+  };
+}
+let snapshot = {
   status: "ready" as const,
   running: [] as Agent[],
   teams: teamImport
@@ -160,6 +277,22 @@ const snapshot = {
       }) as Agent,
   ),
 };
+const fixtureThinkingType = thinkingTypes[thinkingHarness ?? ""];
+if (fixtureThinkingType) {
+  snapshot.agents = snapshot.agents.map((agent) => ({
+    ...agent,
+    type: fixtureThinkingType.key,
+  }));
+}
+if (settingsSync) {
+  const saved = JSON.parse(
+    localStorage.getItem("fixture-agent-settings") ?? "{}",
+  );
+  snapshot.agents = snapshot.agents.map((agent) => ({
+    ...agent,
+    config: saved[agent.key] ?? agent.config,
+  }));
+}
 const joining = [4, 5].map(
   (n) =>
     ({
@@ -207,16 +340,18 @@ if (harness === "hosted") {
 }
 const reviewing = new URLSearchParams(location.search).has("review");
 const changing = new URLSearchParams(location.search).has("change");
-const types = harness
-  ? [type, other, hosted]
-  : importing
-    ? [
-        { ...type, title: "Alternative" },
-        { ...other, title: "Claude Code", icon: ClaudeLogoIcon },
-      ]
-    : changing
-      ? [type, other]
-      : [type];
+const types = thinkingTypes[thinkingHarness ?? ""]
+  ? [thinkingTypes[thinkingHarness ?? ""]]
+  : harness
+    ? [type, other, hosted]
+    : importing
+      ? [
+          { ...type, title: "Alternative" },
+          { ...other, title: "Claude Code", icon: ClaudeLogoIcon },
+        ]
+      : changing
+        ? [type, other]
+        : [type];
 if (changing) snapshot.running = snapshot.agents;
 let updates: readonly AgentUpdateRequest[] = changing
   ? [
@@ -307,6 +442,8 @@ const agents = {
         ]
       : [],
   configHistory: () => undefined,
+  agentSync: () => undefined,
+  teamSync: () => ({ local: undefined }),
   addedTabs: () => [],
   registerTab: () => {},
   controlAttention: () => {},
@@ -334,19 +471,44 @@ const agents = {
   },
   relay: () => undefined,
   save: async (key: string, change: { config?: unknown }) => {
-    if (!saveFooter) return;
+    if (!saveFooter && !settingsSync) return;
     snapshot.agents = snapshot.agents.map((agent) =>
       agent.key === key
         ? { ...agent, config: change.config ?? agent.config }
         : agent,
     );
+    if (settingsSync) {
+      snapshot = { ...snapshot };
+      localStorage.setItem(
+        "fixture-agent-settings",
+        JSON.stringify(
+          Object.fromEntries(
+            snapshot.agents.map((agent) => [agent.key, agent.config]),
+          ),
+        ),
+      );
+    }
     for (const listener of listeners) listener();
   },
   classifier: () => "unavailable",
 } as unknown as Agents;
+if (settingsSync) {
+  Object.assign(window, {
+    updateFixtureInstructions: (instructions: string) => {
+      const agent = snapshot.agents[0];
+      if (!agent) throw new Error("Missing fixture agent");
+      return agents.save(agent.key, {
+        config: { ...(agent.config as Record<string, unknown>), instructions },
+      });
+    },
+  });
+}
 const disconnected = {
   status: "disconnected",
   generation: 0,
+  ...(new URLSearchParams(location.search).has("reorder")
+    ? { scope: "https://relay.example:fixture-owner" }
+    : {}),
   ...(teamImport
     ? {
         viewer: "owner",

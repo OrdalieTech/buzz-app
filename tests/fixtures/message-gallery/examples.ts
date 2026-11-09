@@ -16,11 +16,29 @@ export const agent = "c".repeat(64);
 const workflowRelay = keypair();
 const workflowOwner = keypair();
 const missingWorkflowOwner = keypair();
+const reviewers = [
+  "Jordan Lee",
+  "Priya Shah",
+  "Chen Wei",
+  "Maya Ortiz",
+  "Noah Kim",
+  "Ines Duarte",
+  "Tariq Haddad",
+  "Lena Fischer",
+  "Omar Farouk",
+  "Ruth Okafor",
+  "Diego Alvarez",
+  "Hana Sato",
+].map((name, index) => ({
+  name,
+  pubkey: "123456789def".charAt(index).repeat(64),
+}));
 export const profiles = new Map<string, Profile>([
   [workflowOwner.pubkey, { name: "Wes" }],
   [reader, { name: "Alex Morgan", picture: "https://fixture.test/avatar" }],
   [teammate, { name: "Sam Rivera" }],
   [agent, { name: "Studio assistant", isAgent: true }],
+  ...reviewers.map(({ name, pubkey }) => [pubkey, { name }] as const),
 ]);
 export const artwork = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><rect width="640" height="360" fill="#e9e8e4"/><circle cx="460" cy="100" r="48" fill="#cda97c"/><path d="M0 360L180 120L390 360M210 360L425 180L640 360" fill="#859e89"/></svg>')}`;
 export const media = (url: string) => {
@@ -83,21 +101,27 @@ export const groups: Group[] = [
   {
     id: "agent-coordination",
     title: "Agent coordination",
-    description: "Every compact entry keeps its author's avatar visible.",
+    description:
+      "Compact activity rows use author avatars, inline mentions, and expandable text.",
     examples: [
       {
         id: "repeated-agent",
         title: "Consecutive agent updates",
         description:
-          "Author icons remain visible before and after expanding a row.",
+          "Individual rows keep previews within the message width. Timeline group folding is exercised separately.",
         rows: [
+          message(
+            "coordination-intro",
+            "I’ll investigate the missing icons and check the rendered result.",
+            { authorId: agent },
+          ),
           message("coordination-first", "Investigating the missing icons.", {
             authorId: agent,
             audience: "agents",
           }),
           message(
             "coordination-next",
-            "Found the cause.\n\nThe fix is ready to try.",
+            "Found the cause. The activity rows were rendering their own avatars rather than using the conversation’s message grouping. I’m updating the shared grouping and matching the width of these previews to the surrounding messages.\n\nThe fix is ready to try.",
             {
               authorId: agent,
               audience: "agents",
@@ -187,6 +211,16 @@ export const groups: Group[] = [
         "Colored bubbles preserve contrast for links, mentions, and revealed spoilers.",
         references,
         { mentions: [teammate, agent] },
+      ),
+      single(
+        "wrapped-mentions",
+        "Wrapped mentions",
+        "Mentions that start a line, wrap or follow a line break all meet the prose edge.",
+        `Tagging everyone who reviews message styling. Please check the narrow layout before Friday.\n@Studio assistant can collect the notes.\n\n${reviewers.map(({ name }) => `@${name}`).join(" ")}`,
+        {
+          authorId: teammate,
+          mentions: [agent, ...reviewers.map(({ pubkey }) => pubkey)],
+        },
       ),
       single(
         "long-links",
@@ -332,7 +366,7 @@ export const groups: Group[] = [
         id: "workflow-owner",
         title: "Automated message",
         description:
-          "Automation leads; owner navigation is labelled. Open the information icon to inspect the separate owner and relay keys.",
+          "Automation leads; owner navigation is labelled. Rest on or open the information icon to read that the owner didn’t send it personally.",
         rows: foldMessages(
           "studio",
           workflowRelay.pubkey,

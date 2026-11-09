@@ -608,7 +608,7 @@ test("stale guest requests and guest shortcuts under a modal leave both panes al
   render(<NativePanes close={close} select={select} />);
   screen.getByRole("textbox", { name: "side one draft" }).focus();
   act(() => {
-    expect(requestClose("buzz:close-active-tab", "retired")).toBe("unhandled");
+    expect(requestClose("buzz:close-active-tab", "retired")).toBe("handled");
     switchTab("buzz:next-tab", "retired");
   });
   const dialog = document.createElement("dialog");
@@ -675,6 +675,39 @@ test("tab switching does nothing behind a modal or with a single tab", () => {
     window.dispatchEvent(request);
   });
   expect(request.defaultPrevented).toBe(false);
+});
+
+test("a modal with its own tabs takes the request at its focused control, not the tabs behind it", () => {
+  visibleWorkspace();
+  const received: string[] = [];
+  render(
+    <>
+      <div role="dialog" aria-modal="true">
+        <div
+          data-modal-tab-switch=""
+          ref={(element) => {
+            element?.addEventListener("buzz:previous-tab", (event) => {
+              event.preventDefault();
+              received.push(event.type);
+            });
+          }}
+        >
+          <input aria-label="Search" />
+        </div>
+        <input aria-label="Other field" />
+      </div>
+      <Fixture />
+    </>,
+  );
+  screen.getByRole("textbox", { name: "Search" }).focus();
+  act(() => switchTab("buzz:previous-tab"));
+  expect(received).toEqual(["buzz:previous-tab"]);
+  expect(tab("Thread")).toHaveAttribute("aria-selected", "true");
+  // Outside the tabbed region, the modal still keeps the request.
+  screen.getByRole("textbox", { name: "Other field" }).focus();
+  act(() => switchTab("buzz:previous-tab"));
+  expect(received).toHaveLength(1);
+  expect(tab("Thread")).toHaveAttribute("aria-selected", "true");
 });
 
 test("a consumed tab switch request cannot switch another workspace", () => {
@@ -904,6 +937,39 @@ test("a menu opened in the previous channel cannot close the new channel's tabs"
   expect(screen.getAllByRole("tab")).toHaveLength(2);
 });
 
+test("an identity menu opened in the previous channel cannot close the new channel's tabs", async () => {
+  const closeAll = vi.fn(() => false);
+  const workspace = (scope: string) => (
+    <PanelWorkspace
+      main
+      identity={<button type="button">Channel identity</button>}
+      tabMenu={{ key: scope, closeAll }}
+      value="conversation"
+      select={() => {}}
+      items={[
+        {
+          id: "conversation",
+          label: "Channel",
+          content: <input aria-label="Channel draft" />,
+        },
+      ]}
+    />
+  );
+  const view = render(workspace("alpha"));
+  fireEvent.contextMenu(
+    screen.getByRole("button", { name: "Channel identity" }),
+  );
+  const oldAction = await screen.findByRole("menuitem", {
+    name: "Close all tabs",
+  });
+  view.rerender(workspace("beta"));
+  expect(
+    screen.queryByRole("menuitem", { name: "Close all tabs" }),
+  ).not.toBeInTheDocument();
+  fireEvent.click(oldAction);
+  expect(closeAll).not.toHaveBeenCalled();
+});
+
 // Close uses focus first, then the visible side pane when the main selection
 // is the permanent conversation. Listener registration order must not decide.
 test.each([false, true])(
@@ -985,3 +1051,133 @@ test.each([false, true])(
     expect(closeSide).toHaveBeenCalledTimes(1);
   },
 );
+
+test("conversation identity preserves content and focus when the last detail tab closes", async () => {
+  const manage = vi.fn();
+  function IdentityWorkspace() {
+    const [detail, setDetail] = useState(false);
+    const [selected, select] = useState("conversation");
+    return (
+      <PanelWorkspace
+        main
+        focusOnMount={false}
+        identity={
+          <button type="button" onClick={manage}>
+            Manage Nightriders members
+          </button>
+        }
+        value={selected}
+        select={select}
+        items={[
+          {
+            id: "conversation",
+            label: "Nightriders",
+            content: (
+              <>
+                <input aria-label="Conversation draft" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDetail(true);
+                    select("detail");
+                  }}
+                >
+                  Open detail
+                </button>
+              </>
+            ),
+          },
+          ...(detail
+            ? [
+                {
+                  id: "detail",
+                  label: "Detail",
+                  content: <p>Detail content</p>,
+                  close: () => {
+                    setDetail(false);
+                    select("conversation");
+                  },
+                },
+              ]
+            : []),
+        ]}
+      />
+    );
+  }
+  render(<IdentityWorkspace />);
+  expect(screen.getByRole("region", { name: "Nightriders" })).toBeVisible();
+  expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+  await userEvent.click(
+    screen.getByRole("button", { name: "Manage Nightriders members" }),
+  );
+  expect(manage).toHaveBeenCalledOnce();
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "Conversation draft" }),
+    "Keep this draft",
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Open detail" }));
+  expect(
+    screen.getByRole("tab", { name: "Detail", selected: true }),
+  ).toBeVisible();
+  await userEvent.click(
+    screen.getByRole("button", { name: "Close Detail tab" }),
+  );
+  expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("textbox", { name: "Conversation draft" }),
+  ).toHaveValue("Keep this draft");
+  expect(
+    screen.getByRole("button", { name: "Manage Nightriders members" }),
+  ).toHaveFocus();
+});
+
+test("native Close from the main conversation leaves focus to a side tab that asks first", () => {
+  visibleWorkspace();
+  // A close that keeps its tab may be asking, and its prompt takes focus.
+  let answer: false | undefined = false;
+  const close = vi.fn(() => {
+    screen.getByRole("button", { name: "Keep editing" }).focus();
+    return answer;
+  });
+  render(
+    <>
+      <button type="button">Keep editing</button>
+      <PanelWorkspace
+        main
+        label="Main tabs"
+        value="conversation"
+        select={() => {}}
+        items={[
+          {
+            id: "conversation",
+            label: "Channel",
+            content: <input aria-label="Channel composer" />,
+          },
+        ]}
+      />
+      <PanelWorkspace
+        label="Side tabs"
+        value="side-thread"
+        select={() => {}}
+        items={[
+          {
+            id: "side-thread",
+            label: "Side thread",
+            content: <input aria-label="Side reply" />,
+            close,
+          },
+        ]}
+      />
+    </>,
+  );
+  const composer = screen.getByRole("textbox", { name: "Channel composer" });
+  composer.focus();
+  act(() => expect(requestClose()).toBe("handled"));
+  expect(close).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("button", { name: "Keep editing" })).toHaveFocus();
+  answer = undefined;
+  composer.focus();
+  act(() => expect(requestClose()).toBe("handled"));
+  expect(close).toHaveBeenCalledTimes(2);
+  expect(composer).toHaveFocus();
+});

@@ -33,7 +33,7 @@ test("generated author package in a path with spaces exposes shared message fact
       join(dir, "consumer.ts"),
       `
 import { createElement } from "react";
-import type { Context, DecisionResult, Host, HostRequestOnceOptions, HostByteRequest, HostByteResponse, HostSavedBytes, PluginManifest, NamingPolicy, PageSidebarProps, SidebarSectionContribution, SidebarSections, UnreadCapability } from "@buzz/author";
+import type { Context, Delivery, HarnessConversation, McpHandler, StandaloneTurn, TurnResult, DecisionResult, Host, HostRequestOnceOptions, AddedTool, AddedToolContext, AddedToolReply, BuzzClient, Media, HostByteUpload, HostByteRequest, HostByteResponse, HostSavedBytes, PluginManifest, NamingPolicy, PagePreviewProps, PageSidebarProps, SidebarSectionContribution, SidebarSections, SidebarRowContribution, SidebarRows, UnreadCapability, Backdrops } from "@buzz/author";
 export const manifest: PluginManifest = {
   id: "example.plugin", name: "Example", apiVersion: 1,
   host: {
@@ -46,6 +46,8 @@ const ExampleSidebar = ({ target, children }: PageSidebarProps) => {
   void target.kind;
   return children;
 };
+const ExamplePreview = ({ close }: PagePreviewProps) =>
+  createElement("button", { type: "button", onClick: close }, "Open");
 export const inject = ["agents", "decisions", "host", "identityNames", "pages", "relay"];
 export function apply(ctx: Context) {
   const unread: UnreadCapability = ctx.relay.snapshot().session.unread;
@@ -71,6 +73,42 @@ export function apply(ctx: Context) {
   };
   ctx.identityNames.register(policy);
   const host: Host = ctx.host;
+  const upload: HostByteUpload = { url: "https://api.example.com/upload", field: "image", name: "image.png", contentType: "image/png" };
+  void host.uploadBytesOnce?.(new Uint8Array([1]), upload, { callId: crypto.randomUUID() });
+  const tool: AddedTool = { name: "example_image", description: "Read an image", inputSchema: {},
+    async call(client: BuzzClient, context: AddedToolContext): Promise<AddedToolReply> {
+      void [context.channel, context.root, context.topLevel, context.wholeChannel];
+      const media: Media = await client.media("abc.png");
+      return media.data ?? "No inline image";
+    },
+  };
+  ctx.agents.addTool(tool);
+  const { harness } = ctx.agents;
+  ctx.agents.register({
+    id: "example",
+    title: "Example",
+    defaults: () => ({ config: {} }),
+    async run(delivery: Delivery) {
+      const conversation: HarnessConversation | undefined = await harness.conversation(delivery, "thread");
+      if (!conversation) return delivery.ignored?.();
+      void [conversation.key, conversation.channel, conversation.root, conversation.topLevel, conversation.where];
+      const system: string = await harness.systemPrompt(delivery, { scope: "thread", cwd: "~", instructions: "", tools: false });
+      const first = await harness.turnPrompt(delivery, conversation);
+      const prompt = await harness.turnPrompt(delivery, conversation, { cursor: first.cursor });
+      const next: string = prompt.cursor;
+      const tools: McpHandler = harness.tools(delivery.agent, conversation, { read: async () => new Uint8Array() });
+      void host.serveMcp?.(tools);
+      void [system, prompt.text, next];
+      prompt.restore();
+      await harness.reply(delivery.agent, conversation, "Done", { notifyOwner: true });
+    },
+    async runOnce(turn: StandaloneTurn): Promise<TurnResult> {
+      const text = await turn.prompt();
+      if (text !== undefined) void harness.standalonePrompt(turn.delivery.agent, text);
+      void harness.tools(turn.delivery.agent);
+      return { ok: true };
+    },
+  });
   void host.runCommand("status").then((output: string | null) => void output);
   void host.request({
     url: "https://api.example.com/graphql",
@@ -108,6 +146,14 @@ export function apply(ctx: Context) {
     primary: true,
     placement: "toolbar",
     sidebar: ExampleSidebar,
+    preview: ExamplePreview,
+  });
+  ctx.pages.register({
+    id: "bad-preview",
+    title: "Bad preview",
+    component: () => null,
+    // @ts-expect-error A page preview must be a React component.
+    preview: "card",
   });
   ctx.pages.register({
     id: "bad-sidebar",
@@ -128,6 +174,10 @@ export function apply(ctx: Context) {
     select: () => ({ version: 1, kind: "home" }),
     actions: [{ id: "new", label: "New", icon: createElement("span"), onSelect: () => {} }],
   };
+  const backdrops: Backdrops | undefined = ctx.reflect.get("backdrops");
+  backdrops?.register({ id: "glow", component: () => null });
+  // @ts-expect-error A backdrop must be a React component.
+  backdrops?.register({ id: "bad-glow", component: "div" });
   const sidebar: SidebarSections | undefined = ctx.reflect.get("sidebarSections");
   sidebar?.register(section);
   // @ts-expect-error Sidebar contribution versions are explicit.
@@ -135,6 +185,17 @@ export function apply(ctx: Context) {
   // @ts-expect-error Row counts are numeric, not display text.
   const badCount: SidebarSectionContribution = { ...section, rows: { snapshot: () => [{ id: "bad", label: "Bad", count: "two" }], subscribe: () => () => {} } };
   void badCount;
+  const hostRows: SidebarRows | undefined = ctx.reflect.get("sidebarRows");
+  const decoration: SidebarRowContribution = {
+    version: 1, id: "details",
+    render: (row, Default) => row.kind === "dm" ? createElement("div", { title: row.label }, Default) : Default,
+    sortModes: [{ id: "reverse", label: "Reverse", compare: (a, b) => b.label.localeCompare(a.label) }],
+  };
+  hostRows?.register(decoration);
+  // @ts-expect-error Host row contribution versions are explicit.
+  hostRows?.register({ ...decoration, version: 2 });
+  // @ts-expect-error Render results must be elements or an intentional null.
+  hostRows?.register({ version: 1, id: "invalid", render: () => "text" });
   ctx.pages.register({
     id: "other",
     title: "Other",
@@ -142,7 +203,7 @@ export function apply(ctx: Context) {
     // @ts-expect-error A page icon is a data URL string.
     icon: 1,
   });
-  for (const placement of ["sidebar", "topbar", "toolbar"] as const)
+  for (const placement of ["sidebar", "dock", "topbar", "toolbar"] as const)
     ctx.pages.register({ id: placement, title: placement, component: () => null, primary: true, placement });
   ctx.pages.register({
     id: "bad-placement", title: "Bad placement", component: () => null,
@@ -181,6 +242,38 @@ import type { createServices } from "@buzz/author";
 `,
     );
     await writeFile(
+      join(dir, "plugin-status-consumer.ts"),
+      `
+import type { Context } from "@buzz/author";
+export function observePlugin(ctx: Context) {
+  const owner = ctx.pluginOwner;
+  if (!owner) return;
+  const id: string = owner.id;
+  const revision: string = owner.revision;
+  const active: boolean = ctx.pluginStatus.isActive(id, revision);
+  const stop: () => void = ctx.pluginStatus.subscribe(() => {
+    const current: boolean = ctx.pluginStatus.isActive(id, revision);
+    void current;
+  });
+  stop();
+  const settled: boolean | undefined = ctx.pluginStatus.settled?.();
+  const withoutReadiness: Context["pluginStatus"] = {
+    isActive: () => true,
+    subscribe: () => () => {},
+  };
+  void [active, settled, withoutReadiness];
+  // @ts-expect-error A revision is a string, not a generation number.
+  ctx.pluginStatus.isActive(id, 1);
+  // @ts-expect-error Subscription requires a callback.
+  ctx.pluginStatus.subscribe("changed");
+  // @ts-expect-error Readiness is optional and must be checked.
+  ctx.pluginStatus.settled();
+  // @ts-expect-error Installed ownership is readonly.
+  owner.revision = "replacement";
+}
+`,
+    );
+    await writeFile(
       join(dir, "tsconfig.json"),
       JSON.stringify({
         compilerOptions: {
@@ -195,7 +288,7 @@ import type { createServices } from "@buzz/author";
             "@buzz/author": ["./author package/types/plugins/author.d.ts"],
           },
         },
-        files: ["consumer.ts"],
+        files: ["consumer.ts", "plugin-status-consumer.ts"],
       }),
     );
     // Only generated declarations and the external consumer, never host source.

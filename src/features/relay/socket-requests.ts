@@ -5,13 +5,17 @@ import {
   isCatalogKind,
   MAX_EVENT_BYTES as CATALOG_EVENT_BYTES,
 } from "../agents/catalog-envelope.ts";
+import { CANVAS_FRAME_BYTES } from "../channel-templates/canvas-limits.ts";
 
-/** False means proven non-delivery, not merely a negative or missing OK. */
+/** False means proven non-delivery, not merely a negative or missing OK.
+ * `refusal` is the log-safe summary; `reason` is the relay's own bounded text
+ * for a proven refusal, for the client only and never for logs. */
 export class SocketRequestError extends Error {
   constructor(
     message: string,
     readonly sent: boolean,
     readonly refusal?: string,
+    readonly reason?: string,
   ) {
     super(message);
   }
@@ -34,9 +38,13 @@ export function createSocketPublications(wake: () => void) {
         throw new SocketRequestError("Publication already in flight", false);
       if (pending.size >= 32)
         throw new SocketRequestError("Publication capacity reached", false);
-      // NIP-AP catalog events may exceed the ordinary frame; the relay's
-      // default frame limit is far above their envelope bound.
-      const frame = isCatalogKind(event.kind) ? CATALOG_EVENT_BYTES : 65536;
+      // NIP-AP catalog and Canvas events may exceed the ordinary frame, up
+      // to their own bounds within the relay's default frame limit.
+      const frame = isCatalogKind(event.kind)
+        ? CATALOG_EVENT_BYTES
+        : event.kind === 40100
+          ? CANVAS_FRAME_BYTES
+          : 65536;
       if (
         new TextEncoder().encode(JSON.stringify(["EVENT", event])).length >
         frame
@@ -126,6 +134,7 @@ export function createSocketPublications(wake: () => void) {
             "Relay publication not confirmed",
             !rejected,
             publicationRefusal(data[3]),
+            rejected ? data[3] : undefined,
           ),
         );
       }

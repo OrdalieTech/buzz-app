@@ -1,8 +1,8 @@
 //! Agent identities an earlier agent system saved on this machine, which Agents
 //! can take over: the harness controller's library and old Buzz's. The identity
 //! and its public name, picture and description move, with its instructions
-//! and workspace as a `Carry` for the new type to adopt; other harness settings
-//! and memberships stay behind. Old Buzz's teams are listed apart, each with its
+//! and workspace as a `Carry` for the new type to adopt. Public connection
+//! selectors can seed a reviewed import; credentials and memberships stay behind. Old Buzz's teams are listed apart, each with its
 //! members, for the app to rebuild. Neither store is ever written.
 use crate::config::{agent_id, canonical_key, canonical_relay, MAX_AGENTS};
 use crate::import::read_json;
@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+
+mod connection;
+pub use connection::SavedConnection;
 
 const KEY_GONE: &str = "That agent's key is no longer saved";
 
@@ -46,6 +49,8 @@ pub struct Portable {
     pub about: Option<String>,
     /// The community it was saved for there; the new identity uses the open one.
     pub relay: String,
+    /// Public saved runtime choices, not credentials or proof of readiness.
+    pub connection: SavedConnection,
     /// Settings any type may adopt. Only taking the agent over reports them.
     #[serde(skip)]
     pub carry: Carry,
@@ -370,6 +375,7 @@ fn portable(source: PortSource, record: &Value, records: &[Value]) -> Option<(Po
             picture,
             about: description(source, record, records),
             relay,
+            connection: connection::saved(source, record, records),
             carry: Carry {
                 // Old Buzz ran an instance's own prompt, never its definition's.
                 instructions: present(text(if harness {

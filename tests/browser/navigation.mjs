@@ -44,13 +44,12 @@ export async function newChat(page) {
 export async function sendOnlyTo(page, pill, agent) {
   await pill.click();
   const menu = page.getByRole("dialog", { name: "Mention a member or agent" });
-  const name = `${agent.name} ${agent.pubkey}`;
-  const row = menu.getByRole("button", { name, exact: true });
+  // A row's name no longer spells out its key; the row carries it instead.
+  const chosen = `[data-mention-choice="${agent.pubkey}"]`;
+  const row = menu.getByRole("button").and(page.locator(chosen));
   if ((await row.getAttribute("aria-pressed")) !== "true") await row.click();
   await expect(row).toHaveAttribute("aria-pressed", "true");
-  const others = menu.locator(
-    `[aria-pressed="true"]:not([aria-label="${name}"])`,
-  );
+  const others = menu.locator(`[aria-pressed="true"]:not(${chosen})`);
   while (await others.count()) await others.first().click();
   await page.keyboard.press("Escape");
   await expect(menu).toBeHidden();
@@ -184,7 +183,7 @@ export async function settlePanelMotion(page) {
         docks.flatMap((dock) =>
           [
             ...dock.getAnimations({ subtree: true }),
-            ...dock.parentElement.getAnimations(),
+            ...(dock.parentElement?.getAnimations() ?? []),
           ]
             .filter(
               (animation) =>

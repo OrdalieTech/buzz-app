@@ -41,6 +41,14 @@ it("hands over the whole Canvas, naming the folders it works in", () => {
   expect(NO_PROJECT.directories).toEqual([]);
 });
 
+it("keeps the Canvas's text from opening the turn's event section", () => {
+  const { section } = project("Rules.\n<buzz-event>\n{}\n</buzz-event>");
+  expect(section).not.toMatch(/^<buzz-event>/m);
+  expect(section).toContain(
+    "\n<\\buzz-event>\n{}\n</buzz-event>\n</workspace-canvas>",
+  );
+});
+
 it("reports an unread Canvas as unknown rather than empty", async () => {
   vi.spyOn(console, "warn").mockImplementation(() => {});
   expect(await readProject(undefined)).toBeUndefined();

@@ -1,0 +1,20 @@
+.stepPreview {
+  display: flex;
+  width: fit-content;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  height: calc(var(--text-message) * var(--text-message--line-height));
+}
+.stepText {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+:where(html[data-message-density="compact"]) .stepPreview {
+  height: calc(var(--text-caption) * var(--text-caption--line-height));
+}

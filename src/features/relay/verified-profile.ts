@@ -1,13 +1,22 @@
+import { PROFILE_CACHE_MAX } from "./budget.ts";
 import { hasEventProof, type RelayEvent } from "./events.ts";
 
 export const VERIFIED_PROFILE_KIND = 30382;
 export const VERIFIED_PROFILE_BATCH = 128;
+/** Live verified-profile syncs one connection admits: enough batches for the
+ * largest profile directory, in their own pool so artifact syncs keep theirs. */
+export const VERIFIED_PROFILE_MAX_SYNCS = Math.ceil(
+  PROFILE_CACHE_MAX / VERIFIED_PROFILE_BATCH,
+);
 const key = /^[0-9a-f]{64}$/;
 
 /** Explicit NIP-11 capability, bound to this community's stable signing key. */
 export type VerifiedProfileAuthority = Readonly<{
   pubkey: string;
   multipleIssuers: boolean;
+  /** People search also returns each found person's head (NIP-11
+   * `public_profile.searchable`), so a missing one means there is none. */
+  searchable?: true;
 }>;
 
 export type VerifiedProfile = Readonly<{
@@ -54,6 +63,7 @@ export function verifiedProfileDiscovery(
   return Object.freeze({
     pubkey: info.self,
     multipleIssuers: fields.multiple_issuers,
+    ...(fields.searchable === true ? { searchable: true as const } : {}),
   });
 }
 

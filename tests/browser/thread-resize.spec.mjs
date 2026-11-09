@@ -1,5 +1,5 @@
 import { test, expect } from "./fixture.mjs";
-import { open, settle, wheel } from "./timeline.mjs";
+import { frames, open, settle, wheel } from "./timeline.mjs";
 import { generateSecretKey, getPublicKey, finalizeEvent } from "nostr-tools";
 
 test.use({
@@ -132,9 +132,27 @@ test("thread preserves bottom and reading position through activity and composer
   });
   const gap = () =>
     history.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop);
+  // The thread corrects each resize in its ResizeObserver, which runs only in
+  // a rendering update. Those can be sparse (Linux WebKit under load), so
+  // geometry can rest with a correction still pending; render before settling.
+  const settled = async () => {
+    await frames(page);
+    await settle(page, history);
+  };
+  // Activity grows in and leaves over several rendering updates. Leaving hides
+  // its region at once, but it stays mounted until its animation ends; its
+  // removal is the last resize.
+  const arrived = (row) =>
+    row
+      .locator("[data-message-activity]")
+      .evaluate((section) =>
+        Promise.all(section.getAnimations().map((motion) => motion.finished)),
+      );
+  const left = (row) =>
+    expect(row.locator("[data-message-activity]")).toHaveCount(0);
   await expect(history.locator("[data-message-id]")).toHaveCount(33);
   await expect.poll(gap).toBeLessThan(4);
-  await settle(page, history);
+  await settled();
 
   // Observe layout delivery after the app's observer, before paint. Sampling
   // in a task can instead catch a newer DOM mutation awaiting its next layout.
@@ -185,11 +203,11 @@ test("thread preserves bottom and reading position through activity and composer
     await expect(
       history.getByText("Short send", { exact: true }),
     ).toBeVisible();
-    await settle(page, history);
+    await settled();
     await input.fill(
       `Multiline send\n${"Another line of the draft\n".repeat(8)}`,
     );
-    await settle(page, history);
+    await settled();
     expect(await gap()).toBeLessThan(4);
     await input.press("Enter");
     await expect(input).toHaveText("");
@@ -203,13 +221,12 @@ test("thread preserves bottom and reading position through activity and composer
     await expect(
       sent.getByRole("region", { name: "Agent activity on this message" }),
     ).toBeVisible();
-    await settle(page, history);
+    await arrived(sent);
+    await settled();
     expect(await gap()).toBeLessThan(4);
     stop("bottom");
-    await expect(
-      sent.getByRole("region", { name: "Agent activity on this message" }),
-    ).toHaveCount(0);
-    await settle(page, history);
+    await left(sent);
+    await settled();
     expect(await gap()).toBeLessThan(4);
     const samples = await sampling.evaluate((state) => {
       state.stop();
@@ -259,7 +276,7 @@ test("thread preserves bottom and reading position through activity and composer
     };
   });
   const unchanged = async () => {
-    await settle(page, history);
+    await settled();
     expect(
       await history.evaluate((el, anchor) => {
         const row = el.querySelector(`[data-message-id="${anchor.id}"]`);
@@ -272,23 +289,19 @@ test("thread preserves bottom and reading position through activity and composer
     ).toBeLessThan(4);
   };
   // Activity above the reader is a child-only reflow, not a thread snapshot.
+  const threadRoot = history.locator(`[data-message-id="${root.id}"]`);
   start(root.id, "reading");
   await expect(
-    history
-      .locator(`[data-message-id="${root.id}"]`)
-      .getByRole("region", { name: "Agent activity on this message" }),
+    threadRoot.getByRole("region", { name: "Agent activity on this message" }),
   ).toHaveCount(1);
+  await arrived(threadRoot);
   await unchanged();
   await input.fill("Growing draft\n".repeat(8));
   await unchanged();
   await input.fill("");
   await unchanged();
   stop("reading");
-  await expect(
-    history
-      .locator(`[data-message-id="${root.id}"]`)
-      .getByRole("region", { name: "Agent activity on this message" }),
-  ).toHaveCount(0);
+  await left(threadRoot);
   await unchanged();
 });
 

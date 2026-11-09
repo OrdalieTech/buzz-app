@@ -1,3 +1,4 @@
+import { browserOutboxStorage } from "../../src/features/relay/outbox-storage";
 // Browser-only native boundary and controllable plugin. Production service,
 // composition, admission, activity projection and UI are unchanged.
 import type {
@@ -12,7 +13,11 @@ import type { WorkOutcome } from "../../src/features/agents/local-activity";
 // the agent's memory.
 export const localAgentKey =
   "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-let identities: AgentIdentity[] = [];
+const resumable = import.meta.env.VITE_BUZZ_TEST_RESUME_AGENTS === true;
+const identityKey = "buzz-test-resumable-agent";
+let identities: AgentIdentity[] = resumable
+  ? JSON.parse(sessionStorage.getItem(identityKey) ?? "[]")
+  : [];
 /** Requests the owner stopped, in order. */
 const stopped: string[] = [];
 const pending: {
@@ -28,6 +33,7 @@ const latest = (id: string) => {
   return row;
 };
 const controls = {
+  outboxStorage: browserOutboxStorage,
   pending: () => pending.map((row) => row.id),
   stopped: () => [...stopped],
   /** Hands over and, like a real harness, reports a first step. */
@@ -69,6 +75,8 @@ export function localAgentsNative(): AgentsNative {
         deleted: false,
       };
       identities = [identity];
+      if (resumable)
+        sessionStorage.setItem(identityKey, JSON.stringify(identities));
       return identity;
     },
     portable: unsupported,
@@ -104,6 +112,7 @@ export const localAgentPlugin: BundledPlugin = {
       ctx.agents.register({
         id: "tester",
         title: "Local tester",
+        resumes: resumable,
         defaults: () => ({ config: {} }),
         // The remote agent type's Activity tab, so published turns can be seen.
         tabs: [

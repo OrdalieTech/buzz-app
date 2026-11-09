@@ -2,10 +2,14 @@ import {
   readComposerSnapshot,
   composerMarkdownContext,
 } from "../messages/composer-document";
-import type { ComposerSnapshot } from "../messages/mention-draft";
+import {
+  mentionTerminator,
+  type ComposerSnapshot,
+} from "../messages/mention-draft";
 import { scanMarkdown } from "../relay/message-content";
 import type { ComposerInputElement } from "../messages/composer-dom";
 import { createPortal } from "react-dom";
+import { RobotIcon } from "../../shared/design-system/icons/index";
 import { useCompletionPosition } from "./useCompletionPosition";
 import {
   useId,
@@ -284,9 +288,11 @@ function OwnedCompletion({
   const mention = provider.pluginId === "buzz.mentions";
   const channel = provider.pluginId === "buzz.channels";
   const named = mention || channel;
-  // Typing the terminator accepts the provider-verified exact match (spaceId):
-  // plain Space after a name, the closing colon after an emoji shortcode.
-  const terminator = provider.pluginId === "buzz.emoji" ? ":" : " ";
+  // Typing a terminator accepts the provider-verified exact match (spaceId):
+  // plain Space after a name, closing punctuation after a mention too, and the
+  // closing colon after an emoji shortcode.
+  const terminates = (key: string) =>
+    compact ? key === ":" : mention ? mentionTerminator(key) : key === " ";
   const popup = useCompletionPosition(
     input,
     compact ? 0.375 : 1,
@@ -399,7 +405,7 @@ function OwnedCompletion({
     // Publication is synchronous; React may still be displaying the previous
     // result. Keep the user's chosen ID, but use only its current evidence/edit.
     // The terminator names its own item, which that display may not have yet.
-    const id = key === terminator ? published.spaceId : items[index]?.id;
+    const id = terminates(key) ? published.spaceId : items[index]?.id;
     const item = published.items.find((item) => item.id === id);
     if (!item || item.disabled || item.canSelect?.(key) === false) return false;
     const accepted = current.current.replace(
@@ -436,9 +442,17 @@ function OwnedCompletion({
         current.current.editor.invalidate();
         return true;
       }
-      if (event.altKey || event.ctrlKey || event.metaKey) return false;
-      // Shift types ":" on common layouts; other shifted keys keep editing.
-      if (event.shiftKey && event.key !== ":") return false;
+      // Option types curly quotes and, on some Mac layouts, other closing
+      // punctuation, so it may close a mention; elsewhere it keeps editing.
+      if (event.ctrlKey || event.metaKey || (event.altKey && !mention))
+        return false;
+      // Shift types ":" and closing punctuation on common layouts; other
+      // modified keys, Space included, keep editing.
+      if (
+        (event.shiftKey || event.altKey) &&
+        (event.key === " " || !terminates(event.key))
+      )
+        return false;
       if (!active()) {
         // A displayed choice owns plain acceptance even when its final evidence
         // was revoked. Never turn a rejected edit into an unintended send.
@@ -457,12 +471,12 @@ function OwnedCompletion({
       // is never accepted on its own; only the publication selects.
       const published = latest.current;
       if (
-        event.key === terminator &&
+        terminates(event.key) &&
         published?.spaceId &&
         (!result?.spaceId || result.spaceId === published.spaceId)
       ) {
         // Selected by ID, so no displayed row is needed.
-        if (accept(-1, terminator)) {
+        if (accept(-1, event.key)) {
           event.preventDefault();
           event.stopPropagation();
           return true;
@@ -475,14 +489,14 @@ function OwnedCompletion({
       // as undecided: no other recipient overrules what the user saw, the
       // decision is deferred to the resolver under the full rule.
       if (
-        event.key === terminator &&
+        terminates(event.key) &&
         published?.spacePending &&
         !published.spaceId &&
         current.current.replace(
           { pending: published.spacePending },
           query,
           observation,
-          terminator,
+          event.key,
         )
       ) {
         event.preventDefault();
@@ -566,6 +580,9 @@ function OwnedCompletion({
                       : undefined
                   }
                   id={`${id}-${i}`}
+                  // The provider's identity for the row (a mention's key),
+                  // which its label no longer spells out.
+                  data-completion-id={item.id}
                   key={item.id}
                   onPointerDown={(event) => {
                     if (event.button === 0) event.preventDefault();
@@ -598,19 +615,21 @@ function OwnedCompletion({
                         keyboardSelected={keyboardSelection === item.id}
                       />
                     ) : named ? (
-                      <span className={styles.name}>{item.label}</span>
+                      // Only the name ellipsizes; the agent mark stays visible.
+                      <span className={styles.nameRow}>
+                        <span className={styles.name}>{item.label}</span>
+                        {item.agent && (
+                          <span aria-hidden="true" className={styles.agentMark}>
+                            <RobotIcon />
+                          </span>
+                        )}
+                        {item.agent && <span className="sr-only"> Agent</span>}
+                      </span>
                     ) : (
                       item.label
                     )}
                     {item.detail && (
-                      <small
-                        aria-hidden={compact || undefined}
-                        data-recipient-key={
-                          (mention && /^[0-9a-f]{64}$/.test(item.detail)) ||
-                          undefined
-                        }
-                        title={mention ? item.detail : undefined}
-                      >
+                      <small aria-hidden={compact || undefined}>
                         {item.detail}
                       </small>
                     )}

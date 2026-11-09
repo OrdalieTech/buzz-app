@@ -381,11 +381,11 @@ test("independent plugin consumes injected shortcuts; disable/re-enable and edit
   await openPage(page, "Shortcut counter");
   const count = page.getByRole("main").getByRole("status");
   await expect(count).toHaveText("Shortcut count: 0");
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   await expect(count).toHaveText("Shortcut count: 1");
   const input = page.getByRole("textbox", { name: "Shortcut typing guard" });
   await input.fill("Keep typing");
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   await expect(count).toHaveText("Shortcut count: 1");
   await page.evaluate(() => {
     const host = document.createElement("div");
@@ -395,7 +395,7 @@ test("independent plugin consumes injected shortcuts; disable/re-enable and edit
     root.append(input);
     input.focus();
   });
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   await expect(count).toHaveText("Shortcut count: 1");
   // Core zoom explicitly opts into editable targets, including Shadow DOM.
   await page.keyboard.press(`${modifier}+=`);
@@ -403,7 +403,7 @@ test("independent plugin consumes injected shortcuts; disable/re-enable and edit
   await page.keyboard.press(`${modifier}+0`);
   await scale(page, 1);
   await button(page, "Search Buzz").click();
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   // Base UI hides the background from assistive technology while modal.
   await expect(
     page
@@ -433,14 +433,14 @@ test("independent plugin consumes injected shortcuts; disable/re-enable and edit
   await expect(
     page.getByRole("dialog", { name: "Search Buzz", includeHidden: true }),
   ).toHaveCount(0);
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   await page.keyboard.press(`${modifier}+,`);
   await selectSettingsSection(page, "Manage plugins");
   await toggle.click();
   await closeSettings(page);
   await openPage(page, "Shortcut counter");
   await expect(count).toHaveText("Shortcut count: 0");
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   await expect(count).toHaveText("Shortcut count: 1");
 });
 
@@ -475,7 +475,7 @@ test("a shadow-root modal blocks Settings and plugin bindings but allows interfa
       includeHidden: true,
     }),
   ).toHaveCount(0);
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   await expect(page.getByRole("main").getByRole("status")).toHaveText(
     "Shortcut count: 0",
   );
@@ -486,7 +486,7 @@ test("a shadow-root modal blocks Settings and plugin bindings but allows interfa
   await page.keyboard.press("Escape");
   await page.evaluate(() => document.getElementById("shadow-modal").remove());
   await page.getByRole("main").focus();
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   await expect(page.getByRole("main").getByRole("status")).toHaveText(
     "Shortcut count: 1",
   );
@@ -504,7 +504,7 @@ test("Settings → Shortcuts rebinds a plugin shortcut live, blocks host conflic
   await openPage(page, "Shortcut counter");
   const count = page.getByRole("main").getByRole("status");
   await expect(count).toHaveText("Shortcut count: 0");
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   await expect(count).toHaveText("Shortcut count: 1");
   await page.keyboard.press(`${modifier}+,`);
   await button(page, "Shortcuts").click();
@@ -520,7 +520,7 @@ test("Settings → Shortcuts rebinds a plugin shortcut live, blocks host conflic
   ).toHaveCount(1);
   const row = region.getByRole("article", { name: title });
   await expect(
-    row.getByText(`${spokenModifiers} K`, { exact: true }),
+    row.getByText(`${spokenModifiers} G`, { exact: true }),
   ).toBeAttached();
   await button(row, `Change shortcut for ${title}`).click();
   const listening = page.getByRole("textbox", {
@@ -545,7 +545,7 @@ test("Settings → Shortcuts rebinds a plugin shortcut live, blocks host conflic
   await closeSettings(page);
   await openPage(page, "Shortcut counter");
   await expect(count).toHaveText("Shortcut count: 1");
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   await page.keyboard.press(`${modifier}+Shift+u`);
   await expect(count).toHaveText("Shortcut count: 2");
   await page.reload();
@@ -563,7 +563,7 @@ test("Settings → Shortcuts rebinds a plugin shortcut live, blocks host conflic
   await closeSettings(page);
   await openPage(page, "Shortcut counter");
   await page.keyboard.press(`${modifier}+Shift+u`);
-  await page.keyboard.press(`${modifier}+Shift+k`);
+  await page.keyboard.press(`${modifier}+Shift+g`);
   await expect(count).toHaveText("Shortcut count: 2");
 });
 

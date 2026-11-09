@@ -5,7 +5,29 @@ import type {
 } from "../../features/host/service";
 import script from "./codex.sh?raw";
 import type { Wire } from "./rpc";
-import { checkCodex, CodexSetup, withScript } from "./setup";
+import {
+  buzzHome,
+  checkCodex,
+  CodexSetup,
+  reviewHome,
+  withScript,
+} from "./setup";
+import manifest from "./manifest.json";
+
+it("declares protected file reads through the bundled helper with a positional path", () => {
+  expect(
+    manifest.host.processes.find((process) => process.id === "read-protected"),
+  ).toEqual({
+    id: "read-protected",
+    program: "buzz-agent-command",
+    bundled: true,
+    args: [
+      "--shell",
+      `case "$1" in "~/"*) set -- "$HOME/\${1:2}";; esac; exec /usr/bin/base64 -i "$1"`,
+      "buzz-read",
+    ],
+  });
+});
 
 type Result = { stdout?: string; stderr?: string; code: number | null };
 
@@ -172,7 +194,7 @@ it("stops asking an app server that does not answer within the check's bound", a
 
 it("runs sign-in, shows its output, and checks again after", async () => {
   const { spawn, calls } = scripted({
-    "codex login": { stdout: "Starting local login server…\n" },
+    login: { stdout: "Starting local login server…\n" },
     "codex --version": { stdout: "codex-cli 0.162.1\n" },
   });
   const setup = new CodexSetup(spawn);
@@ -184,10 +206,11 @@ it("runs sign-in, shows its output, and checks again after", async () => {
     output: "Starting local login server…\n",
     status: { state: "ready", version: "0.162.1" },
   });
-  expect(calls.map((call) => call.args.join(" "))).toEqual([
-    "login",
-    "--version",
-    "login status",
+  // Signing in through the review home, which records its workspace.
+  expect(calls.map((call) => `${call.id} ${call.args.join(" ")}`)).toEqual([
+    "login ",
+    "codex --version",
+    "codex login status",
   ]);
 });
 
@@ -337,13 +360,33 @@ it("starts Codex, its app server and install steps as steps of codex.sh", async 
   await run("codex", { args: ["--version"] });
   await run("app-server");
   await run("use", { args: ["0.163.0"] });
+  await run("login");
   await run("platform");
   expect(calls).toEqual([
     { id: "codex-sh", args: [script, "codex.sh", "run", "--version"] },
     { id: "codex-sh", args: [script, "codex.sh", "run", "app-server"] },
     { id: "codex-sh", args: [script, "codex.sh", "use", "0.163.0"] },
+    { id: "codex-sh", args: [script, "codex.sh", "login"] },
     { id: "platform", args: [] },
   ]);
+});
+
+it("looks up Buzz's homes, and refuses a step that prints no home", async () => {
+  const good = scripted({
+    home: { stdout: "/buzz/codex-home\n" },
+    review: { stdout: "/buzz/review-home\n/buzz/review-state\nworkspace-1\n" },
+  });
+  await expect(buzzHome(good.spawn)).resolves.toBe("/buzz/codex-home");
+  await expect(reviewHome(good.spawn)).resolves.toEqual({
+    home: "/buzz/review-home",
+    state: "/buzz/review-state",
+    workspace: "workspace-1",
+  });
+  const empty = scripted({ home: { stdout: "" }, review: { stdout: "/a\n" } });
+  await expect(buzzHome(empty.spawn)).rejects.toThrow("home is unavailable");
+  await expect(reviewHome(empty.spawn)).rejects.toThrow(
+    "review is unavailable",
+  );
 });
 
 /** `releases` whose first `id` process waits until `release` is called. */

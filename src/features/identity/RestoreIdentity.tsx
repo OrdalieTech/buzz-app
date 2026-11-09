@@ -1,3 +1,4 @@
+import { OnboardingBack } from "./OnboardingBack";
 import { useState } from "react";
 import { npubEncode } from "nostr-tools/nip19";
 import { publicKeyLabels } from "../../shared/identity/public-key";
@@ -53,7 +54,10 @@ export function RestoreIdentity({
   // A backup that failed to come back may hold the key: a retry may help.
   const failed = recovery.status === "choosing" && recovery.failedCount > 0;
   return (
-    <section className="flex flex-col gap-4" aria-label="Restore from backup">
+    <section
+      className="flex flex-1 flex-col gap-4"
+      aria-label="Restore from backup"
+    >
       {recovery.status === "waiting" ? (
         <p role="status">Sign in in your browser to find your backups…</p>
       ) : recovery.status === "saving" ? (
@@ -116,17 +120,17 @@ export function RestoreIdentity({
           </Field>
         </>
       )}
-      <div className="flex flex-wrap gap-3">
-        <Button
+      <div data-onboarding-actions="">
+        <OnboardingBack
+          aria-label={recovery.status === "waiting" ? "Cancel" : "Back"}
           disabled={
             recovery.status === "saving" || recovery.status === "canceling"
           }
           onClick={() => void identity.cancelRecovery()}
-        >
-          {recovery.status === "waiting" ? "Cancel" : "Back"}
-        </Button>
+        />
         {recovery.status === "choosing" && candidates.length > 0 ? (
           <Button
+            size="lg"
             variant="primary"
             disabled={!handle}
             onClick={() => handle && void identity.installRecovery(handle)}
@@ -136,6 +140,7 @@ export function RestoreIdentity({
         ) : mismatched && onImport ? (
           <>
             <Button
+              size="lg"
               variant={failed ? "subtle" : "prominent"}
               onClick={onImport}
             >
@@ -143,6 +148,7 @@ export function RestoreIdentity({
             </Button>
             {failed && (
               <Button
+                size="lg"
                 variant="prominent"
                 onClick={() => void identity.beginRecovery()}
               >
@@ -153,6 +159,7 @@ export function RestoreIdentity({
         ) : (recovery.status === "error" && !recoveryOff(recovery)) ||
           (recovery.status === "choosing" && recovered.length === 0) ? (
           <Button
+            size="lg"
             variant="primary"
             onClick={() => void identity.beginRecovery()}
           >

@@ -145,7 +145,7 @@ fn byte_ipc_refuses_headers_http_bad_limits_stale_disabled_and_undeclared_origin
 }
 
 #[test]
-fn byte_origin_recheck_observes_revocation_and_shared_admission_is_nonqueued() {
+fn byte_origin_recheck_observes_revocation_and_queue_respects_request_deadline() {
     // Hold process-wide fixture serialization outside the async task until it completes.
     let _serial = commands();
     tokio::runtime::Builder::new_current_thread()
@@ -166,8 +166,6 @@ fn byte_origin_recheck_observes_revocation_and_shared_admission_is_nonqueued() {
                     .is_err()
             );
             let permit = crate::host_files::BYTE_WORK.try_acquire().unwrap();
-            let error = f.save(b"bytes", &digest(b"bytes")).unwrap_err();
-            assert!(error.contains("already under way"));
             let result = plugin_host_request_bytes(
                 f.app.state(),
                 "example.bytes".into(),
@@ -179,7 +177,7 @@ fn byte_origin_recheck_observes_revocation_and_shared_admission_is_nonqueued() {
                 },
             )
             .await;
-            assert!(result.err().unwrap().contains("already under way"));
+            assert!(result.err().unwrap().contains("timed out"));
             drop(permit);
         });
 }

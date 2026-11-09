@@ -143,6 +143,7 @@ async function setup(
           : event.tags.find(([key]) => key === "role")?.[1];
     tick++;
   });
+  const write = vi.fn();
   let dialogReads = false;
   const query = vi.fn(async (filters: Parameters<typeof matchesEvent>[1][]) => {
     if (targetRole === "absent" && filters.some((filter) => filter.search))
@@ -160,25 +161,29 @@ async function setup(
     (url: string, size?: "small") =>
       `https://media.example/${size ?? "original"}?url=${encodeURIComponent(url)}`,
   );
-  const sessionOwner = createRelaySession({
-    viewer: viewer.pubkey,
-    relayAuthor: relay.pubkey,
-    media,
-    query,
-    ...(supported
-      ? {
-          memberAdministration: {
-            sign: async (template) => signed(viewer, template),
-            publish,
-          },
-        }
-      : {}),
-    writer: {
-      kinds: [9, 9000],
-      sign: async (template) => signed(viewer, template),
-      publish: vi.fn(),
+  const sessionOwner = createRelaySession(
+    {
+      viewer: viewer.pubkey,
+      relayAuthor: relay.pubkey,
+      media,
+      query,
+      ...(supported
+        ? {
+            memberAdministration: {
+              sign: async (template) => signed(viewer, template),
+              publish,
+            },
+          }
+        : {}),
+      writer: {
+        kinds: [9, 9000],
+        sign: async (template) => signed(viewer, template),
+        publish: write,
+      },
     },
-  });
+    // jsdom has no IndexedDB; plain Add needs a loadable outbox.
+    { outboxStorage: { load: () => [], save: () => {} } },
+  );
   stops.push(sessionOwner.dispose);
   const session = sessionOwner.session;
   session.channels.ensureList();
@@ -199,17 +204,18 @@ async function setup(
       open: openMessage,
     },
   };
-  render(
+  const button = (shown: typeof presentedSession) => (
     <ToastProvider>
       <ChannelMembersButton
-        session={presentedSession}
+        session={shown}
         channelId={id}
         canOpenLink={() => true}
         onOpenLink={onOpenLink}
         onOpenConversation={messageNavigation ? onOpenConversation : undefined}
       />
-    </ToastProvider>,
+    </ToastProvider>
   );
+  const view = render(button(presentedSession));
   const user = userEvent.setup();
   dialogReads = true;
   await user.click(screen.getByRole("button", { name: "Access" }));
@@ -227,6 +233,7 @@ async function setup(
     user,
     session,
     publish,
+    write,
     query,
     onOpenLink,
     onOpenConversation,
@@ -234,6 +241,8 @@ async function setup(
     target,
     viewer,
     relay,
+    /** A replaced session keeps the dialog mounted, as unkeyed hosts do. */
+    replaceSession: () => view.rerender(button({ ...presentedSession })),
     lag: () => {
       lag = true;
     },
@@ -296,21 +305,16 @@ it.each([
     const dialog = await screen.findByRole("dialog", { name: "Add member?" });
     expect(dialog).toHaveAccessibleDescription("Morgan");
     expect(t.publish).not.toHaveBeenCalled();
-    await vi.waitFor(() =>
-      expect(
-        within(dialog).getByRole("button", { name: "Cancel" }),
-      ).toHaveFocus(),
-    );
-    await t.user.click(
-      within(dialog).getByRole("button", {
-        name:
-          role === "guest"
-            ? "Add with view-only access"
-            : role === "member"
-              ? "Add to participate"
-              : "Add as admin",
-      }),
-    );
+    const add = within(dialog).getByRole("button", {
+      name:
+        role === "guest"
+          ? "Add with view-only access"
+          : role === "member"
+            ? "Add to participate"
+            : "Add as admin",
+    });
+    await vi.waitFor(() => expect(add).toHaveFocus());
+    await t.user.click(add);
     await vi.waitFor(() =>
       expect(
         t.session.memberAdministration.snapshot(id).operation?.status,
@@ -725,7 +729,7 @@ it("presents verified roles, protects owners/self, and confirms a separate delib
   let dialog = await t.choose("Set as admin");
   await vi.waitFor(() =>
     expect(
-      within(dialog).getByRole("button", { name: "Cancel" }),
+      within(dialog).getByRole("button", { name: "Set as admin" }),
     ).toHaveFocus(),
   );
   expect(
@@ -783,13 +787,175 @@ it.each(["cancel", "close", "escape", "outside"])(
       );
     const search = await screen.findByRole("searchbox");
     expect(search).toHaveValue("Morgan");
-    await vi.waitFor(() => expect(search).toHaveFocus());
+    await vi.waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Actions for Morgan" }),
+      ).toHaveFocus(),
+    );
     expect(screen.getByRole("dialog", { name: "Manage members" })).toBe(
       original,
     );
     expect(t.publish).not.toHaveBeenCalled();
   },
 );
+
+// Leave a step only after the other one's exit: within the crossfade the
+// Dialog re-enters the exiting list node, which keeps its offset by itself.
+const settledStep = () =>
+  vi.waitFor(
+    () =>
+      expect(document.querySelectorAll(".buzz-dialog-step")).toHaveLength(1),
+    { timeout: 3_000 },
+  );
+const actionsFor = (name: string) =>
+  screen.getByRole("button", { name: `Actions for ${name}` });
+// Holds the next member write until released; a rejected one fails as a relay would.
+function holdPublish(t: Awaited<ReturnType<typeof setup>>, rejected = false) {
+  const gate = deferred();
+  const publish = required(t.publish.getMockImplementation());
+  t.publish.mockImplementation(async (event) => {
+    await gate.promise;
+    if (rejected) throw new PublishRejected("Permission changed");
+    return publish(event);
+  });
+  return gate;
+}
+it("returns from a member change to the same place in the list", async () => {
+  const t = await setup();
+  memberData().scrollTop = 24;
+  let dialog = await t.choose("Set to viewing only");
+  await settledStep();
+  await t.user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  expect(memberData().scrollTop).toBe(24);
+  expect(actionsFor("Morgan")).toHaveFocus();
+  expect(t.publish).not.toHaveBeenCalled();
+  await settledStep();
+  memberData().scrollTop = 48;
+  dialog = await t.choose("Remove from channel");
+  await settledStep();
+  const gate = holdPublish(t);
+  try {
+    await t.user.click(
+      within(dialog).getByRole("button", { name: "Remove member" }),
+    );
+    await vi.waitFor(() => expect(t.publish).toHaveBeenCalledOnce());
+    // The member keeps focus until the removal takes its row.
+    expect(memberData().scrollTop).toBe(48);
+    expect(actionsFor("Morgan")).toHaveFocus();
+  } finally {
+    await act(async () => gate.resolve());
+  }
+  await vi.waitFor(() =>
+    expect(
+      screen.queryByRole("button", { name: "Actions for Morgan" }),
+    ).not.toBeInTheDocument(),
+  );
+  expect(actionsFor("Owner")).toHaveFocus();
+});
+it.each(["agents", "filtered"] as const)(
+  "after a removal from the %s list, hands focus to the member in its place across groups, or Search",
+  async (list) => {
+    const t = await setup(
+      "owner",
+      "member",
+      true,
+      undefined,
+      list === "agents",
+    );
+    if (list === "filtered")
+      await t.user.type(screen.getByRole("searchbox"), "Morgan");
+    const dialog = await t.choose("Remove from channel");
+    await settledStep();
+    await t.user.click(
+      within(dialog).getByRole("button", {
+        name: list === "agents" ? "Remove agent" : "Remove member",
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Actions for Morgan" }),
+      ).not.toBeInTheDocument(),
+    );
+    // The agent was the last row, alone in Agents; People's last row precedes it.
+    expect(
+      list === "agents" ? actionsFor("Owner") : screen.getByRole("searchbox"),
+    ).toHaveFocus();
+  },
+);
+it("keeps a focus move made while a removal is pending", async () => {
+  const t = await setup();
+  const dialog = await t.choose("Remove from channel");
+  await settledStep();
+  const gate = holdPublish(t);
+  try {
+    await t.user.click(
+      within(dialog).getByRole("button", { name: "Remove member" }),
+    );
+    await vi.waitFor(() => expect(t.publish).toHaveBeenCalledOnce());
+    expect(actionsFor("Morgan")).toHaveFocus();
+    await t.user.click(screen.getByRole("searchbox"));
+  } finally {
+    await act(async () => gate.resolve());
+  }
+  await vi.waitFor(() =>
+    expect(
+      screen.queryByRole("button", { name: "Actions for Morgan" }),
+    ).not.toBeInTheDocument(),
+  );
+  expect(screen.getByRole("searchbox")).toHaveFocus();
+});
+it.each(["kept", "scrolled", "unrelated"] as const)(
+  "keeps the member's Actions in view only for its own change's error (%s)",
+  async (outcome) => {
+    const t = await setup();
+    const scrolls = vi.mocked(HTMLElement.prototype.scrollIntoView);
+    memberData().scrollTop = 24;
+    const dialog = await t.choose("Set to viewing only");
+    await settledStep();
+    const gate = holdPublish(t, outcome !== "unrelated");
+    try {
+      await t.user.click(
+        within(dialog).getByRole("button", { name: "Set to viewing only" }),
+      );
+      await vi.waitFor(() => expect(t.publish).toHaveBeenCalledOnce());
+      // The person scrolls the list before the rejection arrives.
+      if (outcome === "scrolled") memberData().scrollTop = 30;
+    } finally {
+      await act(async () => gate.resolve());
+    }
+    if (outcome === "unrelated") {
+      await vi.waitFor(() =>
+        expect(
+          t.session.memberAdministration.snapshot(id).operation?.status,
+        ).toBe("confirmed"),
+      );
+      t.query.mockRejectedValue(new Error("Read failed"));
+      await act(async () => t.session.memberAdministration.refresh(id));
+    }
+    await screen.findAllByText(
+      outcome === "unrelated" ? "Read failed" : "Permission changed",
+    );
+    const actions = actionsFor("Morgan");
+    expect(actions).toHaveFocus();
+    expect(memberData().scrollTop).toBe(outcome === "scrolled" ? 30 : 24);
+    expect(
+      scrolls.mock.calls.filter(
+        (_, call) => scrolls.mock.contexts[call] === actions,
+      ),
+    ).toEqual(outcome === "kept" ? [[{ block: "nearest" }]] : []);
+  },
+);
+it("does not restore a list place into another session's list", async () => {
+  const t = await setup();
+  memberData().scrollTop = 24;
+  await t.choose("Remove from channel");
+  await settledStep();
+  t.replaceSession();
+  const search = await screen.findByRole("searchbox");
+  expect(memberData().scrollTop).toBe(0);
+  expect(search).toHaveFocus();
+  expect(t.publish).not.toHaveBeenCalled();
+});
 
 it("keeps confirmation read-only when the verified target role changes", async () => {
   const t = await setup();
@@ -1144,6 +1310,8 @@ it("retains roster and displays rejection with explicit refresh recovery", async
   const error = await screen.findByText("Permission changed");
   expect(error).toHaveAttribute("role", "alert");
   expect(error.closest(".buzz-toast")).toBeNull();
+  // A failed removal leaves its member, and focus, in place.
+  expect(actionsFor("Morgan")).toHaveFocus();
   expect(
     within(screen.getByRole("region", { name: "Member list" })).queryByText(
       "Permission changed",
@@ -1177,9 +1345,11 @@ it.each(["failed", "uncertain"])(
         ? /This request may have taken effect/
         : "Permission changed";
     await screen.findByText(message);
-    expect(
-      screen.getByRole("button", { name: "Retry member data" }),
-    ).toBeVisible();
+    await vi.waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Retry member data" }),
+      ).toBeVisible(),
+    );
     await vi.waitFor(() =>
       expect(memberData()).toHaveAttribute("data-refreshing", "false"),
     );
@@ -1831,6 +2001,63 @@ it("closing Members aborts the DM waiter and prevents late navigation", async ()
   expect(signal.aborted).toBe(true);
   await act(async () => release("dm-1"));
   expect(t.onOpenConversation).not.toHaveBeenCalled();
+  expect(t.publish).not.toHaveBeenCalled();
+});
+
+it("shows action feedback above the member list so a long roster cannot hide it", async () => {
+  const t = await setup(
+    "member",
+    "absent",
+    true,
+    undefined,
+    false,
+    undefined,
+    true,
+  );
+  const list = memberData();
+  const aboveList = (element: HTMLElement) => {
+    expect(list).not.toContainElement(element);
+    expect(
+      element.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  };
+  let fail!: (reason: Error) => void;
+  t.openMessage.mockImplementationOnce(
+    () =>
+      new Promise((_resolve, reject) => {
+        fail = reject;
+      }),
+  );
+  await t.user.click(
+    screen.getByRole("button", { name: /^Actions for Owner$/ }),
+  );
+  await t.user.click(
+    await screen.findByRole("menuitem", { name: "Send message" }),
+  );
+  aboveList(await screen.findByText("Opening conversation…"));
+  await act(async () => fail(new Error("DM unavailable")));
+  aboveList(await screen.findByText("DM unavailable"));
+  vi.spyOn(navigator.clipboard, "writeText").mockRejectedValueOnce(
+    new Error("Clipboard unavailable"),
+  );
+  await t.user.click(screen.getByRole("button", { name: "Copy link" }));
+  aboveList(await screen.findByText("Couldn’t copy the link."));
+  t.write.mockRejectedValueOnce(
+    new PublishRejected(
+      "blocked: you are not allowed to add members to this channel",
+    ),
+  );
+  await t.user.type(screen.getByRole("searchbox"), "Morgan");
+  await t.user.click(
+    await screen.findByRole("button", { name: /^Add Morgan \(/ }),
+  );
+  const refusal = await screen.findByText(/blocked: you are not allowed/);
+  aboveList(refusal);
+  expect(
+    within(refusal).getByRole("button", { name: "Retry adding Morgan" }),
+  ).toBeEnabled();
+  expect(within(list).queryByRole("alert")).toBeNull();
+  expect(screen.getAllByRole("alert")).toHaveLength(3);
   expect(t.publish).not.toHaveBeenCalled();
 });
 

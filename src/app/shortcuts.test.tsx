@@ -13,6 +13,20 @@ import { createNavigationController } from "../features/navigation/controller";
 import { createMemoryHistory } from "../features/navigation/history";
 import { createAppearance } from "../shared/theme/service";
 import { registerAppShortcuts, registerNavigationShortcuts } from "./shortcuts";
+import userEvent from "@testing-library/user-event";
+import { Dialog } from "../shared/design-system/ui/Dialog";
+import {
+  MenuItem,
+  MenuPopup,
+  MenuRoot,
+  MenuTrigger,
+} from "../shared/design-system/ui/Menu";
+import {
+  PopoverPopup,
+  PopoverRoot,
+  PopoverTrigger,
+} from "../shared/design-system/ui/Popover";
+import historyRequest from "../../src-tauri/src/history-request.js?raw";
 
 const close = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock("@tauri-apps/api/core", () => ({ isTauri: vi.fn(() => true) }));
@@ -40,10 +54,17 @@ function harness(platform = "Win32") {
   const bindings = createShortcutBindings(window);
   const shortcuts = new ShortcutsService(ctx, window, bindings);
   const appearance = createAppearance(window);
-  const remove = registerAppShortcuts(shortcuts, appearance, vi.fn(), true);
+  const openSettings = vi.fn();
+  const remove = registerAppShortcuts(
+    shortcuts,
+    appearance,
+    openSettings,
+    true,
+  );
   return {
     ctx,
     shortcuts,
+    openSettings,
     bindings,
     remove,
     async dispose() {
@@ -576,6 +597,198 @@ it.each([
         ).toBe(false);
       }
       expect(target()).toEqual({ version: 1, kind: "home" });
+    } finally {
+      remove();
+      controller.dispose();
+      await h.dispose();
+    }
+  },
+);
+
+it("the macOS Settings menu request opens Settings, not behind a modal", async () => {
+  const h = harness("MacIntel");
+  const request = () => window.dispatchEvent(new Event("buzz:open-settings"));
+  const confirmation = document.createElement("div");
+  confirmation.setAttribute("role", "alertdialog");
+  confirmation.setAttribute("aria-modal", "true");
+  try {
+    document.body.append(confirmation);
+    request();
+    expect(h.openSettings).not.toHaveBeenCalled();
+    confirmation.remove();
+    request();
+    expect(h.openSettings).toHaveBeenCalledOnce();
+  } finally {
+    confirmation.remove();
+    await h.dispose();
+  }
+  request();
+  expect(h.openSettings).toHaveBeenCalledOnce();
+});
+
+it("mouse back/forward requests run the Back/Forward shortcuts, not behind a modal", async () => {
+  const h = harness("MacIntel");
+  const controller = createNavigationController(createMemoryHistory());
+  const { navigation } = controller;
+  const remove = registerNavigationShortcuts(h.shortcuts, navigation);
+  const target = () => navigation.snapshot().attempt.entry.target;
+  // As the macOS monitor evaluates it in the main view, no browser focused.
+  const request = (historyEvent: string) =>
+    new Function(
+      "window",
+      "document",
+      "Event",
+      "CSS",
+      "browserSessionId",
+      "historyEvent",
+      `return eval(${JSON.stringify(historyRequest)})`,
+    )(window, document, Event, CSS, null, historyEvent);
+  const confirmation = document.createElement("div");
+  confirmation.setAttribute("role", "alertdialog");
+  confirmation.setAttribute("aria-modal", "true");
+  try {
+    void navigation.open({ version: 1, kind: "home" });
+    void navigation.open({ version: 1, kind: "settings" });
+    await vi.waitFor(() => expect(navigation.snapshot().canGoBack).toBe(true));
+    document.body.append(confirmation);
+    request("buzz:history-back");
+    await Promise.resolve();
+    expect(target()).toEqual({ version: 1, kind: "settings" });
+    confirmation.remove();
+    request("buzz:history-back");
+    await vi.waitFor(() =>
+      expect(target()).toEqual({ version: 1, kind: "home" }),
+    );
+    request("buzz:history-forward");
+    await vi.waitFor(() =>
+      expect(target()).toEqual({ version: 1, kind: "settings" }),
+    );
+  } finally {
+    confirmation.remove();
+    remove();
+    controller.dispose();
+    await h.dispose();
+  }
+});
+
+it("Back and Forward step through an addressable dialog, not past a confirmation over it", async () => {
+  const h = harness("MacIntel");
+  const controller = createNavigationController(createMemoryHistory());
+  const { navigation } = controller;
+  const remove = registerNavigationShortcuts(h.shortcuts, navigation);
+  const target = () => navigation.snapshot().attempt.entry.target;
+  const keyboard = (key: string) =>
+    press(document.body, { ctrlKey: false, metaKey: true, key });
+  const mouse = (historyEvent: string) =>
+    new Function(
+      "window",
+      "document",
+      "Event",
+      "CSS",
+      "browserSessionId",
+      "historyEvent",
+      `return eval(${JSON.stringify(historyRequest)})`,
+    )(window, document, Event, CSS, null, historyEvent);
+  // As the shared Dialog renders a visit, and an AlertDialog over it.
+  const visit = document.createElement("div");
+  visit.setAttribute("role", "dialog");
+  visit.setAttribute("aria-modal", "true");
+  visit.dataset.navigationVisit = "";
+  const confirmation = document.createElement("div");
+  confirmation.setAttribute("role", "alertdialog");
+  confirmation.setAttribute("aria-modal", "true");
+  const settings = { version: 1, kind: "settings" } as const;
+  const home = { version: 1, kind: "home" } as const;
+  try {
+    const inputs: [() => void, () => void][] = [
+      [() => keyboard("["), () => keyboard("]")],
+      [() => mouse("buzz:history-back"), () => mouse("buzz:history-forward")],
+    ];
+    for (const [back, forward] of inputs) {
+      void navigation.open(home);
+      void navigation.open(settings);
+      await vi.waitFor(() => expect(target()).toEqual(settings));
+      document.body.append(visit, confirmation);
+      back();
+      await Promise.resolve();
+      expect(target()).toEqual(settings);
+      confirmation.remove();
+      back();
+      await vi.waitFor(() => expect(target()).toEqual(home));
+      forward();
+      await vi.waitFor(() => expect(target()).toEqual(settings));
+      visit.remove();
+    }
+  } finally {
+    visit.remove();
+    confirmation.remove();
+    remove();
+    controller.dispose();
+    await h.dispose();
+  }
+});
+
+it.each(["menu", "popover"] as const)(
+  "Back and Forward stay put while a %s is open over an addressable dialog",
+  async (surface) => {
+    const h = harness("MacIntel");
+    const controller = createNavigationController(createMemoryHistory());
+    const { navigation } = controller;
+    const remove = registerNavigationShortcuts(h.shortcuts, navigation);
+    const target = () => navigation.snapshot().attempt.entry.target;
+    const settings = { version: 1, kind: "settings" } as const;
+    const user = userEvent.setup();
+    render(
+      <Dialog open visit title="Visit" onOpenChange={() => {}}>
+        {surface === "menu" ? (
+          <MenuRoot>
+            <MenuTrigger>Open layer</MenuTrigger>
+            <MenuPopup>
+              <MenuItem>Layer action</MenuItem>
+            </MenuPopup>
+          </MenuRoot>
+        ) : (
+          <PopoverRoot>
+            <PopoverTrigger>Open layer</PopoverTrigger>
+            <PopoverPopup>
+              <button type="button">Layer action</button>
+            </PopoverPopup>
+          </PopoverRoot>
+        )}
+      </Dialog>,
+    );
+    try {
+      // Settings sits between two visits, so both directions are available.
+      const home = { version: 1, kind: "home" } as const;
+      void navigation.open(home);
+      void navigation.open(settings);
+      void navigation.open(home);
+      await vi.waitFor(() => expect(target()).toEqual(home));
+      navigation.back();
+      await vi.waitFor(() => expect(target()).toEqual(settings));
+      expect(navigation.snapshot()).toMatchObject({
+        canGoBack: true,
+        canGoForward: true,
+      });
+      await user.click(screen.getByRole("button", { name: "Open layer" }));
+      const action = await screen.findByText("Layer action");
+      for (const [key, historyEvent] of [
+        ["[", "buzz:history-back"],
+        ["]", "buzz:history-forward"],
+      ] as const) {
+        press(action, { ctrlKey: false, metaKey: true, key });
+        new Function(
+          "window",
+          "document",
+          "Event",
+          "CSS",
+          "browserSessionId",
+          "historyEvent",
+          `return eval(${JSON.stringify(historyRequest)})`,
+        )(window, document, Event, CSS, null, historyEvent);
+        await act(async () => {});
+        expect(target()).toEqual(settings);
+      }
     } finally {
       remove();
       controller.dispose();

@@ -7,9 +7,12 @@ import { createAgentLibrary } from "../agents/library";
 import type { RelaySession } from "../relay/session";
 import { readView } from "../../shared/view-state";
 import {
+  clearDefaultAgent,
+  clearDeletedDefaultAgent,
   chooseDefaultAgent,
   forgetDefaultAgent,
   restoreDefaultAgent,
+  savedAgentStore,
   setDefaultAgent,
   useDefaultAgent,
   useSavedAgentState,
@@ -361,7 +364,7 @@ it("a read begun before the delete can't bring the deleted main agent back", asy
 });
 
 function accountSession(
-  saved: string | undefined,
+  saved: string | null | undefined,
   archived: string[] = [],
   archives = "ready",
 ) {
@@ -386,11 +389,12 @@ function accountSession(
     // Resolves with the record as it was when the read began.
     read: vi.fn(() => {
       const record = saved;
-      return new Promise<string | undefined>((resolve) => {
+      return new Promise<string | null | undefined>((resolve) => {
         read = () => resolve(record);
       });
     }),
-    write: vi.fn(async (agent: string) => {
+    // None reads back as a saved none, as the account's reader does.
+    write: vi.fn(async (agent: string | null) => {
       saved = agent;
     }),
     saved: () => saved,
@@ -453,6 +457,50 @@ it("keeps automatic picks on the device and saves explicit choices to the accoun
   await act(() => chooseDefaultAgent(session, "account", "b".repeat(64)));
   expect(screen.getByRole("status").textContent).toBe("Second");
   expect(account.saved()).toBe("b".repeat(64));
+});
+
+it("saves no Bestie to the account and restores the device choice when that save fails", async () => {
+  const scope = "clear-account";
+  const pubkey = "b".repeat(64);
+  setDefaultAgent(scope, pubkey);
+  const write = vi.fn(async (_agent: string | null) => {
+    throw new Error("offline");
+  });
+  const session = {
+    mainAgent: { read: async () => pubkey, write },
+  } as unknown as RelaySession;
+  await expect(clearDefaultAgent(session, scope)).rejects.toThrow(
+    "Removing your Bestie couldn't be saved to your account. Try again.",
+  );
+  expect(write).toHaveBeenCalledWith(null);
+  expect(readView(scope, "solo:default-agent", null)).toBe(pubkey);
+});
+
+it("clears a deleted agent only when it is still the account's Bestie", async () => {
+  const scope = "delete-account";
+  const deleted = "b".repeat(64);
+  const other = "a".repeat(64);
+  let saved: string | undefined = other;
+  const write = vi.fn(async (agent: string | null) => {
+    saved = agent ?? undefined;
+  });
+  const clear = vi.fn(async (expected: string) => {
+    if (saved === expected) saved = undefined;
+    return saved;
+  });
+  const session = {
+    mainAgent: { read: async () => saved, write, clear },
+  } as unknown as RelaySession;
+  expect(await clearDeletedDefaultAgent(session, scope, deleted)).toBe(false);
+  expect(write).not.toHaveBeenCalled();
+  expect(clear).toHaveBeenCalledWith(deleted);
+  expect(readView(scope, "solo:default-agent", null)).toBe(other);
+  saved = deleted;
+  setDefaultAgent(scope, deleted);
+  expect(await clearDeletedDefaultAgent(session, scope, deleted)).toBe(true);
+  expect(clear).toHaveBeenCalledWith(deleted);
+  expect(write).not.toHaveBeenCalled();
+  expect(saved).toBeUndefined();
 });
 
 it("restores an abandoned replacement without overwriting a newer choice", () => {
@@ -879,4 +927,158 @@ it("still picks a main agent when the account can't be read", async () => {
   render(<Selection />);
   await act(async () => {});
   expect(screen.getByRole("status").textContent).toBe("First");
+});
+
+it("clears the main agent on this device and saves none to the account", async () => {
+  const { account, session } = accountSession("b".repeat(64));
+  const store = savedAgentStore(session, "clear");
+  const stop = store.subscribe(() => {});
+  // Not known while the account is read.
+  expect(store.known()).toBe(false);
+  await act(async () => account.resolve());
+  expect(store.snapshot()).toBe("b".repeat(64));
+  expect(store.known()).toBe(true);
+  expect(readView("clear", "solo:default-agent", null)).toBe("b".repeat(64));
+  await clearDefaultAgent(session, "clear");
+  expect(account.write).toHaveBeenLastCalledWith(null);
+  expect(account.saved()).toBeNull();
+  expect(store.snapshot()).toBeUndefined();
+  expect(store.known()).toBe(true);
+  expect(readView("clear", "solo:default-agent", null)).toBeNull();
+  stop();
+});
+
+it("knows the account saved none only once its read succeeded", async () => {
+  const failing = accountSession(undefined);
+  failing.account.read.mockRejectedValueOnce(new Error("offline"));
+  const unread = savedAgentStore(failing.session, "unknown");
+  const stop = unread.subscribe(() => {});
+  await act(async () => {});
+  expect(unread.snapshot()).toBeUndefined();
+  expect(unread.known()).toBe(false);
+  stop();
+
+  const none = accountSession(undefined);
+  const read = savedAgentStore(none.session, "none");
+  const stopNone = read.subscribe(() => {});
+  await act(async () => none.account.resolve());
+  expect(read.known()).toBe(true);
+  stopNone();
+});
+
+it("tells an account that saved none from one with no record", async () => {
+  const never = accountSession(undefined);
+  const empty = savedAgentStore(never.session, "never");
+  const stopNever = empty.subscribe(() => {});
+  await act(async () => never.account.resolve());
+  expect(empty.known()).toBe(true);
+  expect(empty.recorded()).toBe(false);
+  stopNever();
+
+  const removed = accountSession(null);
+  const none = savedAgentStore(removed.session, "removed");
+  const stopRemoved = none.subscribe(() => {});
+  await act(async () => removed.account.resolve());
+  expect(none.snapshot()).toBeUndefined();
+  expect(none.known()).toBe(true);
+  expect(none.recorded()).toBe(true);
+  stopRemoved();
+
+  // Removing a Bestie here saves a record of none.
+  const cleared = accountSession(undefined);
+  const store = savedAgentStore(cleared.session, "cleared");
+  const stop = store.subscribe(() => {});
+  await act(async () => cleared.account.resolve());
+  await clearDefaultAgent(cleared.session, "cleared");
+  expect(store.recorded()).toBe(true);
+  stop();
+});
+
+it("brings this device's choice back when none can't be saved to the account", async () => {
+  const { account, session } = accountSession("b".repeat(64));
+  setDefaultAgent("unsaved-clear", "b".repeat(64));
+  account.write.mockRejectedValueOnce(new Error("offline"));
+  await expect(clearDefaultAgent(session, "unsaved-clear")).rejects.toThrow(
+    "Removing your Bestie couldn't be saved to your account. Try again.",
+  );
+  expect(readView("unsaved-clear", "solo:default-agent", null)).toBe(
+    "b".repeat(64),
+  );
+  expect(account.saved()).toBe("b".repeat(64));
+  expect(savedAgentStore(session, "unsaved-clear").known()).toBe(false);
+});
+
+it("doesn't know the account saved none while a save is pending or after one failed during its read", async () => {
+  const { account, session } = accountSession("b".repeat(64));
+  const store = savedAgentStore(session, "pending-clear");
+  const stop = store.subscribe(() => {});
+  account.write.mockRejectedValueOnce(new Error("offline"));
+  const clearing = expect(
+    clearDefaultAgent(session, "pending-clear"),
+  ).rejects.toThrow();
+  await act(async () => account.resolve());
+  await clearing;
+  // The removal failed, so the read's B comes back, but a removal was asked
+  // for during that read, so the account's choice isn't known.
+  expect(store.snapshot()).toBe("b".repeat(64));
+  expect(store.known()).toBe(false);
+
+  let save!: () => void;
+  account.write.mockImplementationOnce(
+    () => new Promise<void>((resolve) => (save = resolve)),
+  );
+  const retry = clearDefaultAgent(session, "pending-clear");
+  expect(store.known()).toBe(false);
+  await act(async () => {
+    save();
+    await retry;
+  });
+  expect(store.known()).toBe(true);
+  stop();
+});
+
+it("brings the removed Bestie back over an automatic pick, but not over a newer choice", async () => {
+  const { account, session } = accountSession("b".repeat(64));
+  setDefaultAgent("auto-clear", "b".repeat(64));
+  let fail!: () => void;
+  account.write.mockImplementationOnce(
+    () => new Promise<void>((_, reject) => (fail = () => reject(new Error()))),
+  );
+  const clearing = clearDefaultAgent(session, "auto-clear");
+  // A composer picks a fallback while the save is pending.
+  setDefaultAgent("auto-clear", "a".repeat(64));
+  fail();
+  await expect(clearing).rejects.toThrow();
+  expect(readView("auto-clear", "solo:default-agent", null)).toBe(
+    "b".repeat(64),
+  );
+
+  account.write.mockImplementationOnce(
+    () => new Promise<void>((_, reject) => (fail = () => reject(new Error()))),
+  );
+  const again = clearDefaultAgent(session, "auto-clear");
+  const choosing = chooseDefaultAgent(session, "auto-clear", "a".repeat(64));
+  fail();
+  await expect(again).rejects.toThrow();
+  await choosing;
+  expect(readView("auto-clear", "solo:default-agent", null)).toBe(
+    "a".repeat(64),
+  );
+});
+
+it("a choice in another community doesn't keep a failed removal from coming back", async () => {
+  const here = accountSession("b".repeat(64));
+  const there = accountSession("a".repeat(64));
+  setDefaultAgent("turn-here", "b".repeat(64));
+  let fail!: () => void;
+  here.account.write.mockImplementationOnce(
+    () => new Promise<void>((_, reject) => (fail = () => reject(new Error()))),
+  );
+  const clearing = clearDefaultAgent(here.session, "turn-here");
+  await chooseDefaultAgent(there.session, "turn-there", "a".repeat(64));
+  fail();
+  await expect(clearing).rejects.toThrow();
+  expect(readView("turn-here", "solo:default-agent", null)).toBe(
+    "b".repeat(64),
+  );
 });

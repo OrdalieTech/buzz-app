@@ -1,4 +1,5 @@
 import type { ChannelMessage } from "../relay/contracts";
+import { calendarDay } from "../../shared/datetime";
 
 export function continuesMessageGroup(
   previous: ChannelMessage | undefined,
@@ -15,10 +16,28 @@ export function continuesMessageGroup(
     !previous.sentFromThread &&
     previous.channelId === current.channelId &&
     previous.authorId === current.authorId &&
-    previous.audience === current.audience &&
+    (previous.audience === current.audience || current.audience === "agents") &&
     current.createdAt >= previous.createdAt &&
     current.createdAt - previous.createdAt <= 5 * 60 &&
-    new Date(previous.createdAt * 1000).toDateString() ===
-      new Date(current.createdAt * 1000).toDateString()
+    calendarDay(previous.createdAt) === calendarDay(current.createdAt)
   );
+}
+
+/** Only same-author activity can bridge two public messages. */
+export function publicMessageNeighbor(
+  rows: readonly ChannelMessage[],
+  index: number,
+  direction: -1 | 1,
+) {
+  for (
+    let next = index + direction;
+    next >= 0 && next < rows.length;
+    next += direction
+  ) {
+    const row = rows[next];
+    if (!row) continue;
+    if (row.audience !== "agents") return row;
+    if (rows[index] && row.authorId !== rows[index]?.authorId) return undefined;
+  }
+  return undefined;
 }

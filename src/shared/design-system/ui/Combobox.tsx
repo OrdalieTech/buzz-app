@@ -146,12 +146,21 @@ function Popup({
   empty,
   className = "",
   collisionBoundary,
+  side = "bottom",
+  collisionAvoidance,
+  size = "default",
   search = false,
 }: {
   children: ReactNode;
   search?: boolean;
   empty: ReactNode;
   className?: string | undefined;
+  /** Compact keeps search visible above a bounded, scrollable result list. */
+  size?: "default" | "compact";
+  side?: ComponentProps<typeof BaseCombobox.Positioner>["side"];
+  collisionAvoidance?: ComponentProps<
+    typeof BaseCombobox.Positioner
+  >["collisionAvoidance"];
   /** Constrain nested choices to their containing surface; Base UI owns sizing. */
   collisionBoundary?: ComponentProps<
     typeof BaseCombobox.Positioner
@@ -160,14 +169,17 @@ function Popup({
   return (
     <BaseCombobox.Portal>
       <BaseCombobox.Positioner
+        side={side}
         sideOffset={4}
         collisionBoundary={collisionBoundary}
+        collisionAvoidance={collisionAvoidance}
         className="buzz-select-positioner"
       >
         <BaseCombobox.Popup
           data-buzz-ui=""
           className={`buzz-select-popup text-body ${className}`}
           data-variant="field"
+          data-combobox-size={size}
           initialFocus={search ? true : undefined}
         >
           {search && <Search />}

@@ -33,11 +33,11 @@ for (const startingScope of ["Primary", "Personal space"]) {
     await button(page, "Continue").click();
     await expect(
       page.getByRole("heading", {
-        name: "Your profile in Secondary",
+        name: "Your profile",
         exact: true,
       }),
     ).toBeVisible();
-    await button(page, "Open community").click();
+    await button(page, "Continue").click();
     await expect(
       rail.getByRole("button", { name: "Community switcher: Secondary" }),
     ).toBeVisible({ timeout: 1500 });

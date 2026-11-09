@@ -3,6 +3,7 @@ import type { CustomEmoji } from "./emoji";
 import { validatedBlurhash } from "./blurhash";
 import { threadReference } from "./thread-reference";
 import { agentAudience } from "./audience";
+import { pluginRequestId } from "./plugin-request";
 import { emojiTags } from "./emoji";
 import { objectBody } from "./body";
 import { huddleRoom } from "../huddle/lifecycle";
@@ -10,17 +11,24 @@ import { newer } from "./events";
 import type { EventData } from "./events";
 import {
   MAX_ATTACHMENT_DURATION_SECONDS,
+  MEDIA_TARGET_TAG,
   type Attachment,
   type ChannelMessage,
 } from "./contracts";
 import {
+  IMETA_DIM,
   projectMarkdownAttachments,
   relayHashBasename,
   safeAttachmentName,
   safeMessageUrl,
 } from "./message-content";
 
-import { channelRowKind, membershipChange } from "./membership";
+import {
+  channelRowChannel,
+  channelRowKind,
+  membershipChange,
+} from "./membership";
+import { reactionTarget } from "./reaction-target";
 import { compareMessages, eventMs } from "./message-order";
 const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -102,7 +110,7 @@ export function parseAttachments(
     seen.add(url);
     // Treat signed metadata as untrusted layout input. Invalid/missing dimensions
     // use the renderer's stable fallback rather than image-load-driven geometry.
-    const dim = /^(\d{1,6})x(\d{1,6})$/.exec(fields.dim ?? "");
+    const dim = IMETA_DIM.exec(fields.dim ?? "");
     const width = Number(dim?.[1]),
       height = Number(dim?.[2]);
     const blurhash = validatedBlurhash(fields.blurhash);
@@ -280,7 +288,7 @@ export function foldMessages(
       if (
         rootId &&
         pendingReplies?.has(event.id) &&
-        event.tags.some((entry) => entry[0] === "h" && entry[1] === channelId)
+        channelRowChannel(event) === channelId
       ) {
         const list = replies.get(rootId) ?? [];
         list.push(event);
@@ -294,7 +302,9 @@ export function foldMessages(
         summaries.set(target, newer(summaries.get(target), event));
       continue;
     }
-    for (const entry of event.tags) {
+    const references =
+      event.kind === 7 ? [["e", reactionTarget(event)]] : event.tags;
+    for (const entry of references) {
       if (entry[0] !== "e" || !entry[1]) continue;
       const list = overlays.get(entry[1]) ?? [];
       list.push(event);
@@ -317,8 +327,7 @@ export function foldMessages(
   const rows: ChannelMessage[] = [];
   for (const event of events) {
     if (!channelRowKind(event.kind)) continue;
-    if (!event.tags.some((entry) => entry[0] === "h" && entry[1] === channelId))
-      continue;
+    if (channelRowChannel(event) !== channelId) continue;
     if (
       !includeReplies &&
       event.tags.some((entry) => entry[0] === "e" && entry[3] === "reply") &&
@@ -403,6 +412,14 @@ export function foldMessages(
     for (const { url, name } of projected.names)
       if (!attachmentNames.has(url)) attachmentNames.set(url, name);
     const authorId = messageAuthor(event, signingAuthority);
+    const mediaTargets = event.tags.filter(
+      (tag) => tag.length === 2 && tag[0] === MEDIA_TARGET_TAG,
+    );
+    const mediaTargetUrl =
+      mediaTargets.length === 1
+        ? safeMessageUrl(mediaTargets[0]?.[1] ?? "")
+        : undefined;
+    const pluginRequest = pluginRequestId(event);
     const summary = parseSummary(summaries.get(event.id));
     const pending = includeReplies
       ? []
@@ -423,6 +440,7 @@ export function foldMessages(
         channelId,
         threadRootId: threadReference(event)?.rootId,
         replyParentId: threadReference(event)?.parentId,
+        ...(mediaTargetUrl ? { mediaTargetUrl } : {}),
         sentFromThread: (() => {
           const tag = event.tags.find(
             ([name, id]) =>
@@ -446,6 +464,16 @@ export function foldMessages(
         ...(projected.content !== content ? { sourceContent: content } : {}),
         ...(event.kind === 40002 ? { agentEnvelope: true as const } : {}),
         ...(agentAudience(event) ? { audience: "agents" as const } : {}),
+        ...(event.kind === 9 &&
+        event.tags.some(
+          (tag) =>
+            tag.length === 2 &&
+            tag[0] === "buzz:notice" &&
+            tag[1] === "execution-failure",
+        )
+          ? { notice: "execution-failure" as const }
+          : {}),
+        ...(pluginRequest ? { pluginRequest: { id: pluginRequest } } : {}),
         ...(event.kind === 40008
           ? {
               diff: Object.freeze({

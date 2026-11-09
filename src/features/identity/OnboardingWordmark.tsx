@@ -87,7 +87,9 @@ export function OnboardingWordmark() {
         canvas.width = width;
         canvas.height = height;
       }
-      const dark = document.documentElement.dataset.colorMode === "dark";
+      const dark =
+        canvas.closest("[data-color-mode]")?.getAttribute("data-color-mode") ===
+        "dark";
       gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
       gl.uniform2f(size, gl.drawingBufferWidth, gl.drawingBufferHeight);
       gl.uniform1f(phase, (time % 400) / 400);

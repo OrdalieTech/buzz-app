@@ -287,6 +287,7 @@ it("keeps a Solo chat mention visible when an earlier archive covers only part o
   const merged: InboxItem = {
     ...archived,
     id: "chat:chat",
+    timeline: true,
     messageIds: [...kept.messageIds, ...archived.messageIds],
     messages: [...kept.messages, ...archived.messages],
   };
@@ -618,4 +619,35 @@ it("reports a genuine reopening write failure without retiring the archive", () 
     "Could not save the reopened Inbox conversation",
   );
   expect(viewRevision(h.scope, archiveKey)).toBe(revision);
+});
+
+it("reopens a flat Solo conversation on an ordinary response", () => {
+  const h = fixture();
+  const item = {
+    ...h.item,
+    id: "room:room",
+    timeline: true as const,
+    mentioned: false,
+    messages: h.item.messages.map((entry) => ({ ...entry, mentioned: false })),
+  };
+  updateArchive(h.scope, item, true);
+  expect(h.archived(item)).toBe(true);
+  const fresh = {
+    ...item,
+    messageIds: [...item.messageIds, "b".repeat(64)],
+    messages: [
+      ...item.messages,
+      { id: "b".repeat(64), createdAt: 31, mentioned: false },
+    ],
+  };
+  expect(h.archived(fresh)).toBe(false);
+  reopenArchives(h.scope, [fresh]);
+  expect(h.archived(item)).toBe(false);
+  expect(
+    isArchived(
+      archiveIndex(readArchives(viewRevision(h.scope, archiveKey))),
+      fresh,
+      true,
+    ),
+  ).toBe(true);
 });

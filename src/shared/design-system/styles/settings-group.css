@@ -48,6 +48,37 @@
   .buzz-settings-group[data-layout="rows"] > * + * {
     border-block-start: 1px solid var(--border-standard);
   }
+  /* Embedded disclosures share the group's frame and row content inset. */
+  .buzz-settings-group[data-layout="rows"]
+  > .buzz-accordion[data-variant="settings"] {
+    margin-inline: calc(0px - var(--settings-group-inset));
+  }
+  .buzz-settings-group[data-layout="rows"]
+    > .buzz-accordion[data-variant="settings"]
+    + .buzz-preference-row {
+    margin-inline: calc(0px - var(--settings-group-inset));
+    padding-inline: var(--settings-group-inset);
+  }
+  .buzz-settings-group[data-layout="rows"]
+    > .buzz-accordion[data-variant="settings"]
+    :is(
+      .buzz-accordion-item,
+      .buzz-accordion-trigger,
+      .buzz-accordion-content
+    ) {
+    border: 0;
+    border-radius: 0;
+  }
+  .buzz-settings-group[data-layout="rows"]
+    > .buzz-accordion[data-variant="settings"]
+    :is(.buzz-accordion-trigger, .buzz-accordion-content) {
+    padding-inline: var(--settings-group-inset);
+  }
+  .buzz-settings-group[data-layout="rows"]
+    > .buzz-accordion[data-variant="settings"]
+    .buzz-accordion-content {
+    padding-block-start: 0;
+  }
   .buzz-settings-group[data-layout="form"] {
     display: grid;
     grid-template-columns: minmax(0, 1fr);

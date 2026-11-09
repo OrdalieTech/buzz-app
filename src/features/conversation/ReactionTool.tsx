@@ -40,18 +40,21 @@ export function ReactionTool({
     registry.snapshot,
   );
   const tool = selectReactionTool(tools);
+  // Host-owned marker: message shortcuts open the picker through its trigger.
   return tool ? (
-    <ContributionBoundary
-      key={contributionKey(tool)}
-      fallback={<span role="status">Reactions unavailable</span>}
-    >
-      <OwnedReactionTool
-        key={messageViewKey(props.session, props.scope, props.messageId)}
-        registry={registry}
-        tool={tool}
-        {...props}
-      />
-    </ContributionBoundary>
+    <span className="contents" data-reaction-tool="">
+      <ContributionBoundary
+        key={contributionKey(tool)}
+        fallback={<span role="status">Reactions unavailable</span>}
+      >
+        <OwnedReactionTool
+          key={messageViewKey(props.session, props.scope, props.messageId)}
+          registry={registry}
+          tool={tool}
+          {...props}
+        />
+      </ContributionBoundary>
+    </span>
   ) : null;
 }
 

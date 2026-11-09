@@ -1,5 +1,6 @@
 import { afterEach, assert, expect, it, vi } from "vitest";
 import type { ChannelQueries, ChannelSummary } from "./contracts";
+import type { ProfileQueries } from "./profile-directory";
 import { createReadState } from "./read-state";
 import { readJournal, type ReadJournal } from "./read-state-storage";
 import { keypair, message, signed } from "./testing";
@@ -16,7 +17,7 @@ function at<T>(values: readonly T[], index: number): T {
   return value;
 }
 
-async function setup(count = 3) {
+async function setup(count = 3, profiles?: ProfileQueries) {
   const viewer = keypair(),
     peer = keypair();
   const roster: readonly ChannelSummary[] = Array.from(
@@ -45,6 +46,7 @@ async function setup(count = 3) {
   let journal: ReadJournal | undefined;
   const reader = { read: vi.fn(async () => []) };
   const reads = createReadState({
+    floor: () => 0,
     viewer: viewer.pubkey,
     reader,
     host: undefined,
@@ -63,6 +65,7 @@ async function setup(count = 3) {
     channels,
     reader,
     viewer: viewer.pubkey,
+    ...(profiles && { profiles }),
   });
   owners.push(owner);
   const targets = roster.map(({ id }) => ({
@@ -104,6 +107,95 @@ it("does not trust workflow-owner metadata without a configured relay identity",
     mentioned: true,
     unread: true,
   });
+});
+
+it("republishes activity folded before an owner answer changed", async () => {
+  const agent = keypair(),
+    controller = keypair();
+  let verified: string | undefined;
+  let notify = () => {};
+  const profiles = {
+    snapshot: () => new Map(),
+    subscribe(listener: () => void) {
+      notify = listener;
+      return () => {};
+    },
+    ensure: async () => {},
+    owner: (pubkey: string) => (pubkey === agent.pubkey ? verified : undefined),
+  } satisfies ProfileQueries;
+  const h = await setup(2, profiles);
+  h.owner.accept(
+    h.rows.flatMap((row, i) => {
+      const reply = message(agent, `c${i}`, "Whole answer", 12, [
+        ["e", row.id, "", "reply"],
+        ["p", h.viewer.pubkey],
+      ]);
+      const edit = signed(controller, {
+        kind: 40003,
+        created_at: 13,
+        content: "Spoken",
+        tags: [
+          ["h", `c${i}`],
+          ["e", reply.id],
+        ],
+      });
+      return [reply, edit];
+    }),
+  );
+  const preview = (channelId: string) =>
+    h.unread.activity(channelId).items?.[0]?.preview;
+  expect(preview("c0")).toBe("Whole answer");
+  // One owner resolves before the directory's batch notification.
+  verified = controller.pubkey;
+  expect(preview("c1")).toBe("Spoken");
+  notify();
+  expect(preview("c0")).toBe("Spoken");
+});
+
+it("keeps folded rows through a profile change that leaves owners alone", async () => {
+  const agent = keypair(),
+    controller = keypair();
+  let notify = () => {};
+  const owner = vi.fn((pubkey: string) =>
+    pubkey === agent.pubkey ? controller.pubkey : undefined,
+  );
+  const profiles = {
+    snapshot: () => new Map(),
+    subscribe(listener: () => void) {
+      notify = listener;
+      return () => {};
+    },
+    ensure: async () => {},
+    owner,
+  } satisfies ProfileQueries;
+  const h = await setup(2, profiles);
+  h.owner.accept(
+    h.rows.flatMap((row, i) => {
+      const reply = message(agent, `c${i}`, "Whole answer", 12, [
+        ["e", row.id, "", "reply"],
+        ["p", h.viewer.pubkey],
+      ]);
+      const edit = signed(controller, {
+        kind: 40003,
+        created_at: 13,
+        content: "Spoken",
+        tags: [
+          ["h", `c${i}`],
+          ["e", reply.id],
+        ],
+      });
+      return [reply, edit];
+    }),
+  );
+  h.unread.subscribeActivity("c0", () => {});
+  h.unread.subscribeActivity("c1", () => {});
+  expect(owner).toHaveBeenCalled();
+  owner.mockClear();
+  // A display-only change reads the one recorded owner; the next projections
+  // reuse their folded rows instead of asking again.
+  notify();
+  await h.reads.markLocalUnread("c0", () => true);
+  expect(owner).toHaveBeenCalledTimes(1);
 });
 
 it("keeps read-state and freshness invalidation global", async () => {

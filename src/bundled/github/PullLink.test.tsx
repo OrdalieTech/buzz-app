@@ -26,7 +26,7 @@ import inlineStyles from "../../shared/InlineReference.module.css";
 import { apply as applyLinks } from "../links/index";
 import { apply } from "./index";
 import { PullLink } from "./PullLink";
-import { stateIcons } from "./pull-state-view";
+import { issueIcons, stateIcons } from "./pull-state-view";
 import type { PullState, PullStates } from "./pull-states";
 
 afterEach(() => {
@@ -35,6 +35,8 @@ afterEach(() => {
 });
 
 const pull = "https://github.com/block/buzz-app/pull/7";
+const issue = "https://github.com/block/buzz-app/issues/7";
+const issueCased = "https://github.com/Block/Buzz-App/issues/7";
 
 /** A store the test moves by hand. */
 function fakeStates(initial?: PullState | "failed") {
@@ -59,7 +61,11 @@ function fakeStates(initial?: PullState | "failed") {
     },
   } satisfies PullStates & Record<string, unknown>;
 }
-const glyph = (Icon: (typeof stateIcons)[keyof typeof stateIcons]) =>
+const glyph = (
+  Icon:
+    | (typeof stateIcons)[keyof typeof stateIcons]
+    | (typeof issueIcons)[keyof typeof issueIcons],
+) =>
   renderToStaticMarkup(
     <Icon aria-hidden="true" className={inlineStyles.icon} />,
   );
@@ -104,6 +110,51 @@ it("shows the authored label with the plain pull request glyph until read, then 
   expect(describe).toHaveBeenLastCalledWith("Pull request, unavailable");
   expect(icon(container)?.innerHTML).toBe(glyph(stateIcons.open));
   // A removed link leaves the anchor undescribed.
+  unmount();
+  expect(describe).toHaveBeenLastCalledWith(undefined);
+});
+
+it("shows an issue link's authored label with the plain issue glyph until read, then each state's own", () => {
+  const states = fakeStates();
+  const describe = vi.fn();
+  const { container, unmount } = render(
+    <LinkDescriptionContext value={describe}>
+      <LinkLabelContext value="the crash">
+        <PullLink url={issue} states={states} />
+      </LinkLabelContext>
+    </LinkDescriptionContext>,
+  );
+  expect(container).toHaveTextContent(/^the crash$/);
+  expect(icon(container)).toHaveAttribute("data-pr-state", "unknown");
+  expect(icon(container)).toHaveAttribute("title", "Issue");
+  expect(describe).toHaveBeenLastCalledWith("Issue");
+  expect(icon(container)?.innerHTML).toBe(glyph(issueIcons.open));
+  for (const [state, shown, words] of [
+    [{ state: "open", title: "Crash on start" }, "open", "Issue, open"],
+    [
+      { state: "closed", reason: "completed", title: "Crash on start" },
+      "completed",
+      "Issue, closed as completed",
+    ],
+    [
+      { state: "closed", reason: "not planned", title: "Crash on start" },
+      "not planned",
+      "Issue, closed as not planned",
+    ],
+  ] as const) {
+    act(() => states.set(state));
+    expect(icon(container)).toHaveAttribute("data-pr-state", shown);
+    expect(icon(container)).toHaveAttribute("title", words);
+    expect(describe).toHaveBeenLastCalledWith(words);
+    expect(icon(container)?.innerHTML).toBe(glyph(issueIcons[shown]));
+    // The authored label stays; the title read with the state doesn't join it.
+    expect(container).toHaveTextContent(/^the crash$/);
+  }
+  act(() => states.set("failed"));
+  expect(icon(container)).toHaveAttribute("data-pr-state", "unknown");
+  expect(icon(container)).toHaveAttribute("title", "Issue, unavailable");
+  expect(describe).toHaveBeenLastCalledWith("Issue, unavailable");
+  expect(icon(container)?.innerHTML).toBe(glyph(issueIcons.open));
   unmount();
   expect(describe).toHaveBeenLastCalledWith(undefined);
 });
@@ -178,21 +229,31 @@ const message = (
     </ToastProvider>,
   );
 
-it("takes pull request links from Links, which keeps the rest of GitHub and stands in without it", async () => {
+it("takes pull request and issue links from Links, which keeps the rest of GitHub and stands in without it", async () => {
   const { links, github } = renderers();
   expect(resolveLink(pull, [links, github])).toBe(github);
-  expect(
-    resolveLink("https://github.com/block/buzz-app", [github, links]),
-  ).toBe(links);
-  expect(
-    resolveLink("https://github.com/block/buzz-app/issues/7", [github, links]),
-  ).toBe(links);
-  expect(resolveLink(`${pull}#issuecomment-1`, [github, links])).toBe(github);
+  for (const url of [issue, `${issue}?q=1`, `${issue}/`, issueCased])
+    expect(resolveLink(url, [links, github])).toBe(github);
+  // Pull request sub-targets share the parent's badge; issue ones stay Links'.
+  for (const url of [`${pull}#issuecomment-1`, `${pull}/files`])
+    expect(resolveLink(url, [github, links])).toBe(github);
+  for (const url of [
+    "https://github.com/block/buzz-app",
+    "https://github.com/block/buzz-app/commit/abcdef1",
+    `${issue}#issuecomment-1`,
+    `${issue}/timeline`,
+  ])
+    expect(resolveLink(url, [github, links])).toBe(links);
 
   // Without gh in this host, the state comes from the public API.
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => new Response(JSON.stringify({ state: "open" }))),
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ title: "A useful change", state: "open" }),
+        ),
+    ),
   );
   const both = message([links, github]);
   const anchor = screen.getByRole("link", { name: "Fix the lab" });
@@ -203,9 +264,11 @@ it("takes pull request links from Links, which keeps the rest of GitHub and stan
   await waitFor(() =>
     expect(icon(both.container)).toHaveAttribute("data-pr-state", "open"),
   );
-  // The state describes the link; the link keeps its authored name.
+  // The state describes the link; the link keeps its authored name, not the
+  // title read with the state.
   expect(anchor).toHaveAttribute("aria-description", "Pull request, open");
   expect(screen.getByRole("link", { name: "Fix the lab" })).toBe(anchor);
+  expect(anchor).not.toHaveTextContent("A useful change");
   cleanup();
 
   const only = message([links]);
@@ -266,35 +329,146 @@ it("shares one PR badge state across anchors and subpages while keeping each ful
   }
 });
 
-it("names a pull request link shown as its URL by the URL alone, whatever its state", async () => {
-  const { links, github } = renderers();
-  // Its own pull request: the store keeps what earlier tests read.
-  const raw = "https://github.com/block/buzz-app/pull/8";
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(
-      async () =>
-        new Response(JSON.stringify({ state: "closed", merged: true })),
-    ),
-  );
-  const { container } = render(
+/** A link pasted as its URL, as messages give the renderer one. */
+const pasted = (entries: readonly Contribution<LinkRenderer>[], url: string) =>
+  render(
     <ToastProvider>
       <MessageLink
-        url={raw}
-        registry={registry([links, github])}
+        url={url}
+        registry={registry(entries)}
         onOpenLink={() => true}
-      >
-        {raw}
-      </MessageLink>
+      />
     </ToastProvider>,
   );
-  const anchor = screen.getByRole("link", { name: raw });
+
+it("names a pasted pull request link by its repository and number, then the title read with its state", async () => {
+  const { links, github } = renderers();
+  const raw = "https://github.com/block/buzz-app/pull/8";
+  const fetch = vi.fn(
+    async () =>
+      new Response(
+        JSON.stringify({ title: "Fix the lab", state: "closed", merged: true }),
+      ),
+  );
+  vi.stubGlobal("fetch", fetch);
+  const { container } = pasted([links, github], raw);
+  const anchor = screen.getByRole("link", { name: "buzz-app#8" });
+  expect(anchor).toHaveAttribute("href", raw);
   expect(anchor).toHaveAttribute("aria-description", "Pull request");
   await waitFor(() =>
     expect(icon(container)).toHaveAttribute("data-pr-state", "merged"),
   );
-  expect(screen.getByRole("link", { name: raw })).toBe(anchor);
+  // The title arrives with the state, from the one read the icon makes.
+  expect(anchor).toHaveAccessibleName("buzz-app#8 · Fix the lab");
   expect(anchor).toHaveAttribute("aria-description", "Pull request, merged");
+  // The owner the name leaves out is in the URL its tooltip shows.
+  expect(anchor).toHaveAttribute("title", raw);
+  expect(fetch).toHaveBeenCalledOnce();
+  expect(fetch).toHaveBeenCalledWith(
+    "https://api.github.com/repos/block/buzz-app/pulls/8",
+    expect.anything(),
+  );
+});
+
+it("names a pasted issue link by its repository and number, then the title read with its state", async () => {
+  const { links, github } = renderers();
+  const raw = "https://github.com/block/buzz-app/issues/12";
+  const fetch = vi.fn(
+    async () =>
+      new Response(
+        JSON.stringify({
+          title: "Crash on start",
+          state: "closed",
+          state_reason: "not_planned",
+        }),
+      ),
+  );
+  vi.stubGlobal("fetch", fetch);
+  const { container } = pasted([links, github], raw);
+  const anchor = screen.getByRole("link", { name: "buzz-app#12" });
+  expect(anchor).toHaveAttribute("href", raw);
+  expect(anchor).toHaveAttribute("data-link-renderer", "buzz.github/pull");
+  expect(anchor).toHaveAttribute("aria-description", "Issue");
+  await waitFor(() =>
+    expect(icon(container)).toHaveAttribute("data-pr-state", "not planned"),
+  );
+  // The title arrives with the state, from the one read the icon makes.
+  expect(anchor).toHaveAccessibleName("buzz-app#12 · Crash on start");
+  expect(anchor).toHaveAttribute(
+    "aria-description",
+    "Issue, closed as not planned",
+  );
+  expect(fetch).toHaveBeenCalledOnce();
+  expect(fetch).toHaveBeenCalledWith(
+    "https://api.github.com/repos/block/buzz-app/issues/12",
+    expect.anything(),
+  );
+});
+
+it.each([
+  ["pull request", "pull", "Pull request, unavailable"],
+  ["issue", "issues", "Issue, unavailable"],
+])(
+  "names a pasted %s link by its repository and number when it cannot be read",
+  async (_, surface, words) => {
+    const { links, github } = renderers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(null, { status: 404 })),
+    );
+    const { container } = pasted(
+      [links, github],
+      `https://github.com/block/buzz-app/${surface}/9`,
+    );
+    const anchor = screen.getByRole("link", { name: "buzz-app#9" });
+    await waitFor(() =>
+      expect(anchor).toHaveAttribute("aria-description", words),
+    );
+    expect(icon(container)).toHaveAttribute("data-pr-state", "unknown");
+    expect(anchor).toHaveAccessibleName("buzz-app#9");
+  },
+);
+
+it("renames a pasted pull request link with each title the store reads, and names it by number alone when nothing is held", () => {
+  const states = fakeStates({ state: "open", title: "Fix the lab" });
+  const { container } = render(<PullLink url={pull} states={states} />);
+  expect(container).toHaveTextContent(/^buzz-app#7 · Fix the lab$/);
+  act(() => states.set({ state: "merged", title: "Fix the lab, renamed" }));
+  expect(container).toHaveTextContent(/^buzz-app#7 · Fix the lab, renamed$/);
+  act(() => states.set("failed"));
+  expect(container).toHaveTextContent(/^buzz-app#7$/);
+});
+
+it("renames a pasted issue link with each title the store reads, and shows what is held of it while composing, without watching it", () => {
+  const states = fakeStates({ state: "open", title: "Crash on start" });
+  const shown = render(<PullLink url={issue} states={states} />);
+  expect(shown.container).toHaveTextContent(/^buzz-app#7 · Crash on start$/);
+  expect(states.watch).toHaveBeenCalledWith(issue, expect.any(Function));
+  act(() =>
+    states.set({
+      state: "closed",
+      reason: "completed",
+      title: "Crash on start, renamed",
+    }),
+  );
+  expect(shown.container).toHaveTextContent(
+    /^buzz-app#7 · Crash on start, renamed$/,
+  );
+  shown.unmount();
+  states.watch.mockClear();
+  const composing = render(
+    <LinkInteractiveContext value={false}>
+      <PullLink url={issueCased} states={states} />
+    </LinkInteractiveContext>,
+  );
+  expect(icon(composing.container)).toHaveAttribute(
+    "data-pr-state",
+    "completed",
+  );
+  expect(composing.container).toHaveTextContent(
+    /^Buzz-App#7 · Crash on start, renamed$/,
+  );
+  expect(states.watch).not.toHaveBeenCalled();
 });
 
 it("reads nothing for a pull request link while it is composed", async () => {

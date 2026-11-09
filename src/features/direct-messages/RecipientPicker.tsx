@@ -13,13 +13,24 @@ import {
   searchOrder,
 } from "../search/usage";
 import { useSearchHighlight } from "../search/use-search-highlight";
-import { publicKeyLabels } from "../../shared/identity/public-key";
+import {
+  abbreviatedPublicKey,
+  publicKeyLabels,
+  typedPublicKey,
+} from "../../shared/identity/public-key";
 import { SEARCH_MIN_CHARS } from "../../shared/search-debounce";
 import { Avatar } from "../../shared/design-system/ui/Avatar";
 import { Button } from "../../shared/design-system/ui/Button";
 import { NavigationItem } from "../../shared/design-system/ui/NavigationItem";
 import { XIcon } from "../../shared/design-system/icons/index";
 import { usePeople, type Recipient } from "./usePeople";
+import {
+  useVerifiedNames,
+  verifiedName,
+  withVerifiedNames,
+  type VerifiedPerson,
+} from "../profiles/useVerifiedNames";
+import type { VerifiedProfile } from "../relay/verified-profile";
 import { peopleRelationships } from "../profiles/relationships";
 import { useChipRemoval } from "./useChipRemoval";
 import styles from "./NewMessage.module.css";
@@ -43,9 +54,12 @@ export function RecipientPicker({
   session,
   scope,
   selected,
+  labels,
   disabled,
   excludedPubkeys = noExclusions,
   initiallyOpen = true,
+  maxRecipients = 8,
+  appearance = "header",
   onChange,
   onComplete,
   onTyped,
@@ -54,10 +68,15 @@ export function RecipientPicker({
   /** View-state partition whose DM visits and earlier choices rank people. */
   scope: string;
   selected: Recipient[];
+  /** `selected` as shown: named by their current verified names. */
+  labels: readonly VerifiedPerson<Recipient>[];
   disabled: boolean;
   excludedPubkeys?: readonly string[];
   /** Share dialogs keep the people list closed until the To field is used. */
   initiallyOpen?: boolean;
+  maxRecipients?: number;
+  /** A panel's header row, or a filled control inside a dialog form. */
+  appearance?: "header" | "field";
   onChange(people: Recipient[]): void;
   onComplete(): void;
   /** Whether the To field holds text that is not a recipient yet. */
@@ -75,9 +94,15 @@ export function RecipientPicker({
   const id = useId();
   const errorId = useId();
   const directory = usePeople(session, query);
+  // Searched people the community verified carry their verified names, as in
+  // Command-K; the read waits for the directory to settle.
+  const verified = useVerifiedNames(session, directory.people, {
+    key: query,
+    settled: !directory.loading,
+  });
   const agents = useAgentChoices(session, false);
   const removal = useChipRemoval();
-  const atLimit = selected.length >= 8;
+  const atLimit = selected.length >= maxRecipients;
   const needle = query.trim().toLowerCase();
   const typed = pickerText("dm", needle);
   const invalid = !open && !!needle && selected.length > 0;
@@ -90,13 +115,17 @@ export function RecipientPicker({
   });
   const channels = session.channels.list().channels;
   const profiles = session.profiles.snapshot();
-  const people = directory.people;
+  const people = useMemo(
+    () => withVerifiedNames(directory.people, verified, profiles),
+    [directory.people, verified, profiles],
+  );
   const viewer = session.viewer;
   const {
     controlled,
     eligible,
     namesOf,
     byPubkey,
+    raw,
     candidates,
     identities,
     keys,
@@ -116,17 +145,58 @@ export function RecipientPicker({
           : [],
       ),
     );
-    const namesOf = (person: Recipient) => {
-      const own = agentName.get(person.pubkey);
-      return own && own !== person.name ? [person.name, own] : [person.name];
-    };
-    const byAgentName = query.trim()
+    // The names a row shows: its label, a verified handle and full name, and
+    // an eligible agent's own name. Editable profile names stay hidden.
+    const namesOf = (person: VerifiedPerson<Recipient>) => [
+      ...new Set(
+        [
+          person.name,
+          agentName.get(person.pubkey),
+          ...(person.profileNames ? [person.username, person.fullName] : []),
+        ].filter((name): name is string => !!name),
+      ),
+    ];
+    // People verified by a matching name, in the shared profiles (as Command-K
+    // finds them) or found here and verified for a page. The directory's
+    // profile-name search cannot find them by that name.
+    const pool: Recipient[] = [];
+    const pageNames = new Map<string, VerifiedProfile>();
+    if (query.trim())
+      for (const [pubkey, person] of [...profiles, ...known.current]) {
+        if (person.isAgent || inDirectory.has(pubkey) || pageNames.has(pubkey))
+          continue;
+        const identity = verifiedName(session.profiles, pubkey);
+        if (
+          identity &&
+          [identity.displayName, identity.username, identity.fullName].some(
+            (name) => !!name && matchPerson(name, query) !== undefined,
+          )
+        ) {
+          pageNames.set(pubkey, identity);
+          // A shared head replaced the profile name with the verified one:
+          // keep the profile seen here, or the key, for when it is withdrawn.
+          const { verified: _verified, username: _username, ...facts } = person;
+          pool.push(
+            person.verified
+              ? (known.current.get(pubkey) ?? {
+                  ...facts,
+                  pubkey,
+                  name: abbreviatedPublicKey(pubkey) ?? pubkey,
+                })
+              : { ...person, pubkey },
+          );
+        }
+      }
+    const byVerifiedName = withVerifiedNames(pool, pageNames, profiles);
+    const typedKey = typedPublicKey(query);
+    const localAgents = query.trim()
       ? agents.identities.flatMap((agent): Recipient[] => {
           if (
             !canMessageAgent(agent) ||
             !agent.name ||
             inDirectory.has(agent.pubkey) ||
-            matchPerson(agent.name, query) === undefined
+            (agent.pubkey !== typedKey &&
+              matchPerson(agent.name, query) === undefined)
           )
             return [];
           // Show the profile already seen for this key, as browsing did.
@@ -141,7 +211,11 @@ export function RecipientPicker({
           ];
         })
       : [];
-    const eligible = [...people, ...byAgentName].filter(
+    const eligible: VerifiedPerson<Recipient>[] = [
+      ...people,
+      ...byVerifiedName,
+      ...localAgents,
+    ].filter(
       (person) =>
         person.pubkey !== viewer &&
         !excludedPubkeys.includes(person.pubkey) &&
@@ -156,7 +230,7 @@ export function RecipientPicker({
     // name, then the person chosen before for this text, then relationship,
     // then match quality lifted by how often you choose this person or visit
     // your DM with them. The directory's own order breaks ties.
-    const order = (person: Recipient) => {
+    const order = (person: VerifiedPerson<Recipient>) => {
       if (!needle) return 0;
       const key = personKey(person.pubkey);
       const dm = relationships.dm(person.pubkey);
@@ -181,17 +255,37 @@ export function RecipientPicker({
         .map((person) => person.pubkey),
     );
     const byPubkey = new Map(eligible.map((person) => [person.pubkey, person]));
+    // Rows as found, before naming: a choice keeps these facts, so its label
+    // follows the current verification instead of the one shown when chosen.
+    const raw = new Map(
+      [...directory.people, ...pool, ...localAgents].map((person) => [
+        person.pubkey,
+        person,
+      ]),
+    );
     const candidates = ordered.current.pubkeys.flatMap((pubkey) => {
       const person = byPubkey.get(pubkey);
       return person ? [person] : [];
     });
     for (const person of [...candidates, ...selected])
-      known.current.set(person.pubkey, person);
+      known.current.set(person.pubkey, raw.get(person.pubkey) ?? person);
+    const knownNames = new Map<string, VerifiedProfile>();
+    for (const pubkey of known.current.keys()) {
+      const identity = verifiedName(session.profiles, pubkey);
+      if (identity) knownNames.set(pubkey, identity);
+    }
+    // Everyone seen, by the names they show now; chosen people as their chips.
+    const shown = new Map(
+      withVerifiedNames([...known.current.values()], knownNames, profiles).map(
+        (person) => [person.pubkey, person.name],
+      ),
+    );
+    for (const person of labels) shown.set(person.pubkey, person.name);
     const groups = new Map<string, string[]>();
-    for (const person of known.current.values()) {
-      const keys = groups.get(person.name) ?? [];
-      keys.push(person.pubkey);
-      groups.set(person.name, keys);
+    for (const [pubkey, name] of shown) {
+      const keys = groups.get(name) ?? [];
+      keys.push(pubkey);
+      groups.set(name, keys);
     }
     const identities = new Map<string, string>();
     for (const keys of groups.values()) {
@@ -204,6 +298,7 @@ export function RecipientPicker({
       eligible,
       namesOf,
       byPubkey,
+      raw,
       candidates,
       identities,
       keys: candidates.map((person) => person.pubkey),
@@ -212,6 +307,7 @@ export function RecipientPicker({
     agents.identities,
     channels,
     profiles,
+    directory.people,
     people,
     viewer,
     query,
@@ -219,9 +315,22 @@ export function RecipientPicker({
     typed,
     usage,
     selected,
+    labels,
     excludedPubkeys,
+    session.profiles,
   ]);
   const discriminator = (person: Recipient) => identities.get(person.pubkey);
+  // Only a community-verified identity supplies the detail beside the name.
+  const verifiedDetail = (person: VerifiedPerson<Recipient>) =>
+    person.profileNames
+      ? [
+          person.fullName !== person.name ? person.fullName : undefined,
+          // Kept when it equals the name: it marks the name as verified.
+          `@${person.username}`,
+        ]
+          .filter(Boolean)
+          .join(" · ") || undefined
+      : undefined;
   const label = (person: Recipient) =>
     [person.name, discriminator(person)].filter(Boolean).join(" ");
   const listed = open && !disabled && !atLimit;
@@ -238,10 +347,15 @@ export function RecipientPicker({
   // Space completes like an @ mention: only for one exact name, and only when
   // no longer name continues it ("Avery" waits while "Avery Chen" exists).
   // A search still running, failed, or with more pages could hold that longer
-  // name or a namesake, so Space waits for the full list.
+  // name or a namesake, so Space waits for the full list. A verified person
+  // found by an editable profile name is that name's namesake too.
   const exactRecipient = () =>
     listed && !directory.loading && !directory.error && !directory.tooShort
-      ? exactName(eligible, namesOf, query)
+      ? exactName(
+          eligible,
+          (person) => [...namesOf(person), ...(person.profileNames ?? [])],
+          query,
+        )
       : undefined;
   const loadingRows = useRef(10);
   useEffect(() => {
@@ -264,7 +378,7 @@ export function RecipientPicker({
   function choose(person: Recipient) {
     if (
       disabled ||
-      selection.current.length >= 8 ||
+      selection.current.length >= maxRecipients ||
       person.pubkey === session.viewer ||
       excludedPubkeys.includes(person.pubkey) ||
       (person.isAgent && !controlled.has(person.pubkey)) ||
@@ -272,11 +386,20 @@ export function RecipientPicker({
     )
       return;
     recordChoice(scope, typed, personKey(person.pubkey));
-    selection.current = [...selection.current, person];
+    selection.current = [
+      ...selection.current,
+      raw.get(person.pubkey) ?? person,
+    ];
     onChange(selection.current);
     setQuery("");
     onTyped(false);
     focus();
+    // The pick that fills a one-person To closes the list rather than show
+    // the limit it just reached: the dialog's purpose and "1 person selected"
+    // already say it is full. A multi-person field's count ("8 people
+    // selected") doesn't state the maximum, so it keeps showing the limit.
+    if (maxRecipients === 1 && selection.current.length >= maxRecipients)
+      setOpen(false);
   }
   function remove(pubkey: string, point?: { x: number; y: number }) {
     if (
@@ -301,13 +424,14 @@ export function RecipientPicker({
       shape={person.isAgent ? "squircle" : "circle"}
     />
   );
-  const renderOption = (person: Recipient, index: number) => (
+  const renderOption = (person: VerifiedPerson<Recipient>, index: number) => (
     <RecipientOption
       key={person.pubkey}
       person={person}
       id={highlight.rowId(person.pubkey)}
       active={person.pubkey === highlight.active}
       discriminator={discriminator(person)}
+      verified={verifiedDetail(person)}
       query={needle}
       media={session.media}
       position={index + 1}
@@ -338,6 +462,7 @@ export function RecipientPicker({
       <fieldset
         aria-label="Recipients"
         className={styles.recipientHeader}
+        data-appearance={appearance}
         ref={field}
         onBlur={(event) => {
           if (
@@ -354,14 +479,15 @@ export function RecipientPicker({
           className={styles.toField}
           onClick={focus}
           onKeyDown={(event) => {
-            if (event.key === "Escape") {
+            // Escape closes an open list; otherwise it is the host's.
+            if (event.key === "Escape" && open && !disabled) {
               event.stopPropagation();
               setOpen(false);
             }
           }}
         >
           <label htmlFor={id}>To:</label>
-          {selected.map((person) => (
+          {labels.map((person) => (
             <span className={styles.chip} key={person.pubkey}>
               <button
                 type="button"
@@ -411,7 +537,7 @@ export function RecipientPicker({
             placeholder={
               selected.length
                 ? atLimit
-                  ? "8 people selected"
+                  ? `${maxRecipients} ${maxRecipients === 1 ? "person" : "people"} selected`
                   : "Add another person…"
                 : "Find a person…"
             }
@@ -444,9 +570,11 @@ export function RecipientPicker({
                 const last = selected.at(-1);
                 if (last) remove(last.pubkey);
               } else if (event.key === "Escape") {
-                event.preventDefault();
-                event.stopPropagation();
-                setOpen(false);
+                if (open && !disabled) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setOpen(false);
+                }
               } else if (
                 event.key === "Tab" &&
                 !event.shiftKey &&
@@ -515,8 +643,16 @@ export function RecipientPicker({
               finalFocus={false}
               className={styles.picker}
             >
+              {/* Shown whenever a full field's list is open: right after the
+                  eighth pick in New message, and when a full one-person
+                  field is used again. The one-person text explains the
+                  limit rather than asking for a choice already made. */}
               {atLimit ? (
-                <p role="status">You can message up to 8 people at once.</p>
+                <p role="status">
+                  {maxRecipients === 1
+                    ? "One person at a time. Remove them to choose someone else."
+                    : `You can message up to ${maxRecipients} people at once.`}
+                </p>
               ) : (
                 <div
                   className={styles.people}
@@ -626,6 +762,7 @@ const RecipientOption = memo(function RecipientOption({
   id,
   active,
   discriminator,
+  verified,
   query,
   media,
   position,
@@ -635,6 +772,8 @@ const RecipientOption = memo(function RecipientOption({
   id: string;
   active: boolean;
   discriminator: string | undefined;
+  /** The verified full name and handle, never an editable profile name. */
+  verified: string | undefined;
   query: string;
   media: RelaySession["media"];
   position: number;
@@ -648,7 +787,7 @@ const RecipientOption = memo(function RecipientOption({
       role="option"
       aria-posinset={position}
       aria-setsize={count}
-      aria-label={`${[person.name, discriminator].filter(Boolean).join(" ")}${person.isAgent ? ", Agent" : ""}`}
+      aria-label={`${[person.name, discriminator].filter(Boolean).join(" ")}${verified ? `, ${verified}` : ""}${person.isAgent ? ", Agent" : ""}`}
       tabIndex={-1}
       selected={active}
       aria-selected={active}
@@ -663,12 +802,19 @@ const RecipientOption = memo(function RecipientOption({
         />
       }
       label={
-        <MatchedLabel
-          label={person.name}
-          positions={
-            query ? matchPerson(person.name, query)?.positions : undefined
-          }
-        />
+        // The verified detail sits below the name, as in mentions, so a long
+        // full name never squeezes the name it identifies.
+        <span className="flex flex-col whitespace-normal">
+          <span>
+            <MatchedLabel
+              label={person.name}
+              positions={
+                query ? matchPerson(person.name, query)?.positions : undefined
+              }
+            />
+          </span>
+          {verified && <small className={styles.agent}>{verified}</small>}
+        </span>
       }
       trailing={
         discriminator || person.isAgent ? (

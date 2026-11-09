@@ -1,4 +1,8 @@
 import { afterEach, expect, it, vi } from "vitest";
+import {
+  promptMessage,
+  promptSections,
+} from "../../features/agents/activity-transcript";
 import type { AddedTool } from "../../buzz-mcp/session-tools";
 import { pubkeyOf } from "../../features/agents/membership";
 import { ownerReads } from "../../features/agents/reads";
@@ -362,9 +366,11 @@ it("hands an owner's mention to its thread's Pi conversation", async () => {
   });
   const text = String(delivered?.params.text);
   expect(text).toContain(`Thread root: ${root.id}`);
-  expect(text).toContain(`Alice (${alice})`);
+  expect(text).toMatch(/^<thread-context>\n/);
+  expect(text).toContain(`"pubkey":"${alice}"`);
   expect(text).toContain("Build is red");
-  expect(text).toContain("Content: @Pi can you look?");
+  expect(text).toContain('Request: "@Pi can you look?"');
+  expect(promptMessage(promptSections(text)).text).toBe("@Pi can you look?");
   expect(String(delivered?.params.steer)).toContain("@Pi can you look?");
   expect(String(delivered?.params.instructions)).toContain(self);
   expect(turn.workingUntil).toHaveBeenCalledTimes(1);

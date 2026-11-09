@@ -1,7 +1,8 @@
 // The session of the conversation an agent's profile was opened from, set
 // apart above the agent's other conversations. Types list their own sessions.
-import { useEffect, useId, useRef, useState } from "react";
+import { type ReactNode, useEffect, useId, useRef, useState } from "react";
 import { formatItemTimestamp } from "../../shared/datetime";
+import { useClockFormat } from "../../shared/clock-preference";
 import styles from "./ActivityLayout.module.css";
 import { Button } from "../../shared/design-system/ui/Button";
 import { InlineHeader } from "../../shared/design-system/ui/Header";
@@ -226,6 +227,7 @@ export function OpenedConversation({
   searching,
   error,
   status,
+  detail,
   onView,
 }: {
   conversation: AgentConversation;
@@ -238,8 +240,11 @@ export function OpenedConversation({
   error?: string | undefined;
   /** The session's live state, when it is running. */
   status?: string | undefined;
+  /** More about that state, as the type shows it for its other sessions. */
+  detail?: ReactNode;
   onView(): void;
 }) {
+  useClockFormat();
   const id = useId();
   const place = (session ? session.root : conversation.rootId)
     ? "thread"
@@ -248,46 +253,55 @@ export function OpenedConversation({
     <section aria-labelledby={id} className={styles.section}>
       <InlineHeader id={id} title={`This ${place}`} />
       <SettingsGroup layout="form">
-        <div className={styles.row}>
-          {session ? (
-            <>
-              <span className={styles.copy}>
-                <ConversationName session={session} className="text-label-sm" />
-                <span className="block text-body-sm text-subtle">
-                  {[
-                    status,
-                    session.at &&
-                      `Last active ${formatItemTimestamp(session.at / 1000, { withTime: true })}`,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ") || `${harness} session`}
+        {/* The detail sits with its row, as in a type's own session lists. */}
+        <div className="grid gap-2">
+          <div className={styles.row}>
+            {session ? (
+              <>
+                <span className={styles.copy}>
+                  <ConversationName
+                    session={session}
+                    className="text-label-sm"
+                  />
+                  <span className="block text-body-sm text-subtle">
+                    {[
+                      status,
+                      session.at &&
+                        `Last active ${formatItemTimestamp(session.at / 1000, { withTime: true })}`,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ") || `${harness} session`}
+                  </span>
+                </span>
+                <Button
+                  variant="subtle"
+                  size="sm"
+                  aria-label={`View transcript: ${session.name || session.channelId.slice(0, 8)}`}
+                  onClick={onView}
+                >
+                  View transcript
+                </Button>
+              </>
+            ) : searching ? (
+              <span role="status" className="text-body-sm text-subtle">
+                Looking for a {harness} session…
+              </span>
+            ) : error ? (
+              <span role="alert" className="text-body-sm">
+                Could not look for a {harness} session: {error}
+              </span>
+            ) : (
+              <span className="grid gap-1">
+                <span className="text-label">
+                  No {harness} session here yet
+                </span>
+                <span className="text-body-sm text-subtle">
+                  One starts when you mention the agent in this {place}.
                 </span>
               </span>
-              <Button
-                variant="subtle"
-                size="sm"
-                aria-label={`View transcript: ${session.name || session.channelId.slice(0, 8)}`}
-                onClick={onView}
-              >
-                View transcript
-              </Button>
-            </>
-          ) : searching ? (
-            <span role="status" className="text-body-sm text-subtle">
-              Looking for a {harness} session…
-            </span>
-          ) : error ? (
-            <span role="alert" className="text-body-sm">
-              Could not look for a {harness} session: {error}
-            </span>
-          ) : (
-            <span className="grid gap-1">
-              <span className="text-label">No {harness} session here yet</span>
-              <span className="text-body-sm text-subtle">
-                One starts when you mention the agent in this {place}.
-              </span>
-            </span>
-          )}
+            )}
+          </div>
+          {session && detail}
         </div>
       </SettingsGroup>
     </section>

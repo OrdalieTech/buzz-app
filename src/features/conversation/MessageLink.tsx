@@ -1,3 +1,4 @@
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useConversationPresentation } from "./ConversationPresentation";
 import {
   useContext,
@@ -34,16 +35,23 @@ import {
   type ComposerSession,
 } from "../messages/composer-session";
 import { parseBuzzLink, isBuzzLink } from "../navigation/buzz-links";
+import { safeLinkUrl } from "../relay/message-content";
 import {
   LinkChannelPrivateContext,
   LinkDescriptionContext,
   LinkInteractiveContext,
   LinkLabelContext,
   LinkContentContext,
+  LinkPreviewContext,
   LinkThreadTabContext,
+  type LinkPreview,
 } from "./LinkLabelContext";
-import { BuzzLinkPreview, ChannelLinkPreview } from "./BuzzLinkPreview";
-import { useChannelReference } from "./channel-reference";
+import {
+  BuzzLinkPreview,
+  ChannelLinkPreview,
+  previewFailures,
+} from "./BuzzLinkPreview";
+import { namedChannel, useChannelReference } from "./channel-reference";
 import { useLinkedMessageByline } from "./linked-message";
 import { messageViewKey } from "../messages/view-key";
 import { soloChatLinkName } from "../solo/labels";
@@ -61,11 +69,28 @@ export const resolveLink = (
   renderers: readonly Contribution<LinkRenderer>[],
 ) => resolveMatch(renderers, url);
 
+const previewGap = 8;
+
+/** Lift a preview above the hovered message's actions, not over them. */
+function clearMessageActions(link: HTMLElement | null) {
+  const actions = link
+    ?.closest("[data-actions-revealed]")
+    ?.querySelector("[data-message-actions]");
+  if (!link || !actions) return previewGap;
+  return Math.max(
+    previewGap,
+    link.getBoundingClientRect().top -
+      actions.getBoundingClientRect().top +
+      previewGap,
+  );
+}
+
 export function MessageLink({
   url,
   children,
   registry,
   onOpenLink,
+  canOpenLink,
   label,
   directoryLabel,
   session,
@@ -77,6 +102,7 @@ export function MessageLink({
   children?: ReactNode;
   registry: ContributionReader<LinkRenderer> | undefined;
   onOpenLink(url: string): boolean;
+  canOpenLink?: ((url: string) => boolean) | undefined;
   label?: string | undefined;
   /** The receiving community's name for a raw destination. Display only: a raw
    * link copies as its URL. */
@@ -96,9 +122,15 @@ export function MessageLink({
   const [unavailable, setUnavailable] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [description, setDescription] = useState<string>();
+  // A renderer's own hover card, such as an agent card's Add to Buzz.
+  const [offered, setOffered] = useState<LinkPreview>();
+  const offeredAction = useRef<HTMLDivElement>(null);
   if (!active && previewOpen) setPreviewOpen(false);
   const trigger = useRef<HTMLAnchorElement>(null);
-  const internal = isBuzzLink(url);
+  // Entering the card hides the row's actions; keep its lift while it's open.
+  const lift = useRef(previewGap);
+  const panelTarget = !safeLinkUrl(url) && !isBuzzLink(url) && !!canOpenLink;
+  const internal = isBuzzLink(url) || panelTarget;
   const parsed = internal ? parseBuzzLink(url) : null;
   const destination = parsed?.format === "legacy" ? parsed : undefined;
   const host = fullSession(session);
@@ -141,14 +173,7 @@ export function MessageLink({
   const chipName =
     chatName || sentChatName || destination?.channelId.slice(0, 8);
   const chatLabel = chatChip ? `Chat: ${chipName}` : undefined;
-  // DMs and sessions keep their existing presentation.
-  const named =
-    reference.state === "found" &&
-    !reference.hidden &&
-    reference.channelType !== "dm" &&
-    reference.channelType !== "solo"
-      ? reference
-      : undefined;
+  const named = namedChannel(reference);
   const withheld = reference.state === "withheld";
   // The authored label is message text, so it stays; the lock marks it. A raw
   // destination has no name to show.
@@ -209,7 +234,7 @@ export function MessageLink({
   const openInternal = () => {
     if (trigger.current?.isConnected)
       trigger.current.focus({ preventScroll: true });
-    const opened = onOpenLink(url);
+    const opened = (!panelTarget || !!canOpenLink?.(url)) && onOpenLink(url);
     setUnavailable(!opened);
     if (opened) setPreviewOpen(false);
   };
@@ -224,6 +249,18 @@ export function MessageLink({
       if (internal) {
         event.preventDefault();
         openInternal();
+        return;
+      }
+      // Tauri's automatic external-link opener skips Command-clicks.
+      if (external && event.metaKey && event.button === 0 && isTauri()) {
+        event.preventDefault();
+        setNotice(undefined);
+        void invoke("plugin:opener|open_url", { url }).catch(() => {
+          setNotice({
+            text: "Couldn’t open the link in your browser.",
+            error: true,
+          });
+        });
         return;
       }
       if (
@@ -291,6 +328,7 @@ export function MessageLink({
             : description
         }
         data-link-label={label ?? ""}
+        data-panel-target={panelTarget ? url : undefined}
         data-solo-link={chatChip ? "" : undefined}
         title={
           chatLabel
@@ -298,7 +336,7 @@ export function MessageLink({
               ? `${chatLabel}. Chat unavailable. You don’t have access, or it no longer exists.`
               : chatLabel
             : withheld
-              ? "Private channel. You aren’t a member, or it no longer exists."
+              ? previewFailures.withheld
               : !preview && !named
                 ? url
                 : undefined
@@ -356,21 +394,56 @@ export function MessageLink({
                 label: "Channel preview",
                 body: <ChannelLinkPreview channel={named} />,
               }
-            : undefined;
+            : offered
+              ? {
+                  label: offered.label,
+                  body: (
+                    <div ref={offeredAction} tabIndex={-1}>
+                      {offered.render((target) => {
+                        if (!active) return false;
+                        const opened = onOpenLink(target);
+                        setUnavailable(!opened);
+                        if (opened) setPreviewOpen(false);
+                        return opened;
+                      })}
+                    </div>
+                  ),
+                  controls: true,
+                }
+              : undefined;
     // A channel-only link keeps one root while its name resolves, so a link
     // focused during the lookup keeps its focus. Its card opens once found.
+    // A renderer that may offer its own card keeps one root too: wrapping
+    // the link when the card arrives would remount the renderer offering it.
     const root =
       card ??
       (active && interactive && session && referenced
         ? { label: "Channel preview", body: null }
-        : undefined);
+        : active && interactive && host && entry
+          ? { label: "Link preview", body: null }
+          : undefined);
+    // A card with its own controls is not itself the link's destination.
+    const controls = !!card && "controls" in card;
     const linked = root ? (
       <PreviewCard
         trigger={menuTrigger}
-        link={<a href={url} {...navigation} />}
+        {...(controls
+          ? { actionRef: offeredAction }
+          : { link: <a href={url} {...navigation} /> })}
         open={previewOpen && !!card && !menuOpen}
-        onOpenChange={setPreviewOpen}
+        onOpenChange={(next) => {
+          if (next) lift.current = previewGap;
+          setPreviewOpen(next);
+        }}
         side="top"
+        sideOffset={({ side }) => {
+          if (side !== "top") return previewGap;
+          lift.current = Math.max(
+            lift.current,
+            clearMessageActions(trigger.current),
+          );
+          return lift.current;
+        }}
         className={styles.popup ?? ""}
         aria-label={root.label}
       >
@@ -467,7 +540,11 @@ export function MessageLink({
             <LinkDescriptionContext
               value={interactive ? setDescription : undefined}
             >
-              {result}
+              <LinkPreviewContext
+                value={interactive && host ? setOffered : undefined}
+              >
+                {result}
+              </LinkPreviewContext>
             </LinkDescriptionContext>
           </LinkInteractiveContext>
         </LinkContentContext>

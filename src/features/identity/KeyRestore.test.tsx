@@ -41,17 +41,15 @@ const unmatched = (failedCount: number): RecoveryState => ({
   failedCount,
 });
 
-it("when every backup came back and none holds the linked key, offers only Enter your private key", () => {
+it("when every backup came back and none holds the linked key, offers only Enter my private key", () => {
   mount(unmatched(0));
   expect(screen.getByRole("alert")).toHaveTextContent(
-    "None of your backups holds the key linked to this account, so nothing was restored.",
+    "We found backups, but none contains the key linked to your account. Enter your private key to continue.",
   );
   expect(
-    screen.getByRole("button", { name: "Enter your private key" }),
+    screen.getByRole("button", { name: "Enter my private key" }),
   ).toBeEnabled();
-  expect(
-    screen.queryByRole("button", { name: "Try recovery again" }),
-  ).toBeNull();
+  expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   expect(
     screen.queryByText("Your key is stored securely on this device."),
   ).toBeNull();
@@ -60,14 +58,12 @@ it("when every backup came back and none holds the linked key, offers only Enter
 it("when a backup failed to come back, does not claim none holds the key and retries over the live attempt", async () => {
   const stub = mount(unmatched(1));
   expect(screen.getByRole("alert")).toHaveTextContent(
-    "Some of your backups couldn’t be recovered, and the ones that were don’t hold the key linked to this account.",
+    "We couldn’t check all your backups. Try again, or enter your private key if you have a copy.",
   );
   expect(
-    screen.getByRole("button", { name: "Enter your private key" }),
+    screen.getByRole("button", { name: "Enter my private key" }),
   ).toBeEnabled();
-  await userEvent.click(
-    screen.getByRole("button", { name: "Try recovery again" }),
-  );
+  await userEvent.click(screen.getByRole("button", { name: "Try again" }));
   // The service refuses a new attempt over one that recovered something:
   // the retry cancels first, then begins.
   await waitFor(() => expect(stub.beginRecovery).toHaveBeenCalledTimes(1));
@@ -82,9 +78,71 @@ it("when a backup failed to come back, does not claim none holds the key and ret
 
 it("starts no new attempt when the live one could not be canceled", async () => {
   const stub = mount(unmatched(1), false);
-  await userEvent.click(
-    screen.getByRole("button", { name: "Try recovery again" }),
-  );
+  await userEvent.click(screen.getByRole("button", { name: "Try again" }));
   await waitFor(() => expect(stub.cancelRecovery).toHaveBeenCalledTimes(1));
   expect(stub.beginRecovery).not.toHaveBeenCalled();
+});
+
+it("restores the already selected linked identity without a second choice", async () => {
+  const stub = mount({
+    status: "choosing",
+    candidates: [
+      { handle: "other", pubkey: other },
+      { handle: "linked", pubkey: linked },
+    ],
+    currentPubkey: other,
+    failedCount: 0,
+  });
+  await waitFor(() =>
+    expect(stub.installRecovery).toHaveBeenCalledExactlyOnceWith("linked"),
+  );
+  expect(
+    screen.queryByRole("button", { name: "Restore this identity" }),
+  ).toBeNull();
+  expect(screen.queryByRole("radiogroup")).toBeNull();
+});
+
+it("retries installation when a new attempt returns the same handle", async () => {
+  const candidate: RecoveryState = {
+    status: "choosing",
+    candidates: [{ handle: "same", pubkey: linked }],
+    currentPubkey: null,
+    failedCount: 0,
+  };
+  let state: RecoveryState = candidate;
+  const listeners = new Set<() => void>();
+  const update = (next: RecoveryState) => {
+    state = next;
+    for (const listener of listeners) listener();
+  };
+  const stub: Recovery = {
+    snapshot: () => state,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    installRecovery: vi.fn(async () => {
+      update({ status: "error", error: "Could not save key" });
+    }),
+    cancelRecovery: vi.fn(async () => true),
+    beginRecovery: vi.fn(async () => {
+      update(candidate);
+    }),
+  };
+  render(
+    <KeyRestore
+      recovery={stub}
+      expectedPubkey={linked}
+      onBack={() => {}}
+      onImport={() => {}}
+      onInstalled={() => {}}
+    />,
+  );
+  await screen.findByRole("heading", { name: "Couldn’t restore your key" });
+  expect(stub.installRecovery).toHaveBeenCalledTimes(1);
+  await userEvent.click(screen.getByRole("button", { name: "Try again" }));
+  await waitFor(() => expect(stub.installRecovery).toHaveBeenCalledTimes(2));
+  expect(stub.cancelRecovery).toHaveBeenCalledTimes(1);
 });

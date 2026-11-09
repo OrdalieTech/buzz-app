@@ -1,20 +1,26 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
-import { Dialog } from "../../shared/design-system/ui/Dialog";
+import { flushSync } from "react-dom";
+import { Dialog, type DialogProps } from "../../shared/design-system/ui/Dialog";
+import { Avatar } from "../../shared/design-system/ui/Avatar";
+import { communityName } from "./community-name";
 import { Field } from "../../shared/design-system/ui/Field";
 import { Input } from "../../shared/design-system/ui/Input";
 import { Checkbox } from "../../shared/design-system/ui/Checkbox";
 import { Button } from "../../shared/design-system/ui/Button";
-import { ArrowUpRightIcon } from "../../shared/design-system/icons";
 import { communityRequest, inspectProfile, type CommunityInfo } from "./api";
 import type { Communities, PersonalProfile } from "./service";
 import { canSaveProfile, ProfileFields, profilesEqual } from "./ProfileFields";
 import { communityDestination, relayOrigin } from "./destination";
 import { nativeIdentityEnabled } from "../identity/service";
-import { readErrorKind } from "../relay/errors";
+import { isTransientFailure, readErrorKind } from "../relay/errors";
 import { createJoinJournal, type PendingJoin } from "./join-journal";
 import { admitCommunity, completeJoin, type Current } from "./join";
+import { consentAsked, type JoinPolicy } from "./join-policy";
+import { ACCOUNT_CONSENT, accountConsents } from "./account-consent";
 import { CommunitySignIn } from "../federated-identity/CommunitySignIn";
 import type { FederatedIdentity } from "../federated-identity/service";
+import { OnboardingBack } from "../identity/OnboardingBack";
+import { OnboardingScreen } from "../identity/OnboardingScreen";
 import styles from "./Communities.module.css";
 
 export function CommunityDialog({
@@ -24,6 +30,8 @@ export function CommunityDialog({
   onJoined,
   invite,
   connectionFrom,
+  submittedDestination = false,
+  onboarding = false,
   federatedIdentity,
 }: {
   communities: Communities;
@@ -34,6 +42,9 @@ export function CommunityDialog({
   onJoined?: (id: string) => void;
   /** A deliberate connection edit uses the same admission flow, never rekeys existing data. */
   connectionFrom?: string;
+  /** The landing form already submitted this destination. */
+  submittedDestination?: boolean;
+  onboarding?: boolean;
   invite?:
     | Readonly<{
         community: string;
@@ -41,6 +52,7 @@ export function CommunityDialog({
       }>
     | undefined;
 }) {
+  const BackControl = onboarding ? OnboardingBack : Button;
   const formId = useId();
   const destinationInput = useRef<HTMLInputElement>(null);
   const nameInput = useRef<HTMLInputElement>(null);
@@ -80,30 +92,51 @@ export function CommunityDialog({
   const [original, setOriginal] =
     useState<Awaited<ReturnType<typeof inspectProfile>>>();
   const [code, setCode] = useState(invite?.code ?? "");
+  const [needsInvite, setNeedsInvite] = useState(!!invite?.code);
   const [agreed, setAgreed] = useState(false);
   const [adult, setAdult] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(recovery.error);
   const mounted = useRef(true);
+  const attempt = useRef<AbortController>(undefined);
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
     };
   }, []);
-  async function work(action: () => Promise<void>) {
+  async function work(action: (signal: AbortSignal) => Promise<void>) {
+    const controller = new AbortController();
+    attempt.current = controller;
+    const { signal } = controller;
     focusFrom.current = document.activeElement;
     setBusy(true);
     setError("");
     try {
-      await action();
+      await action(signal);
     } catch (reason) {
-      if (mounted.current)
+      // A step that was left settles without changing anything.
+      if (mounted.current && !signal.aborted) {
+        if (
+          step === "access" &&
+          info?.membershipRequired === true &&
+          readErrorKind(reason) === "denied"
+        )
+          setNeedsInvite(true);
         setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
-      if (mounted.current) setBusy(false);
+      if (mounted.current && !signal.aborted) setBusy(false);
     }
+  }
+  function abandon() {
+    attempt.current?.abort();
+    setBusy(false);
+  }
+  function leave() {
+    abandon();
+    close();
   }
   useLayoutEffect(() => {
     if (busy || step !== "profile" || !focusProfile.current) return;
@@ -116,10 +149,20 @@ export function CommunityDialog({
     )
       nameInput.current?.focus();
   }, [busy, step]);
+  const startedDestination = useRef(false);
+  useEffect(() => {
+    if (!submittedDestination || startedDestination.current || unavailable)
+      return;
+    startedDestination.current = true;
+    void submit();
+  });
   const policy = info?.policy;
-  const allowed =
-    (!policy?.age_attestation_required || adult) &&
-    (!(policy?.terms_markdown || policy?.privacy_markdown) || agreed);
+  // The signed-in account's consent covers a community its server hosts, so
+  // the access step asks for none.
+  const consentGiven =
+    !!destination && accountConsents(federatedIdentity, destination.url);
+  const asked = consentAsked(policy, consentGiven);
+  const allowed = (!asked.age || adult) && (!asked.agreement || agreed);
   const current: Current = (entry) =>
     mounted.current && (!entry || journal?.current(entry) === true);
   function showProfile(
@@ -133,39 +176,92 @@ export function CommunityDialog({
     focusProfile.current = true;
     setStep("profile");
   }
+  /** The access step's admission, with the account's consent when it covers `url`. */
+  async function admit(
+    community: string,
+    url: string,
+    joinPolicy: JoinPolicy | null | undefined,
+  ) {
+    const admission = await admitCommunity({
+      community,
+      journal,
+      code,
+      policy: joinPolicy,
+      consent: accountConsents(federatedIdentity, url)
+        ? ACCOUNT_CONSENT
+        : { adult, agreed },
+      current,
+    });
+    if (admission) showProfile(admission.found, admission.entry);
+  }
   async function submit() {
     if (uploading || unavailable) return;
     if (step === "destination") {
-      await work(async () => {
+      await work(async (signal) => {
         const next = communityDestination(relayOrigin(url));
         setDestination(next);
-        const value = await communityRequest<CommunityInfo>(next.id, "info");
-        if (!mounted.current) return;
+        // Transport text names neither the host nor a next step, and differs by engine.
+        const explained = (reason: unknown) =>
+          isTransientFailure(reason)
+            ? new Error(
+                `Couldn’t reach ${next.name}. Check the address, or try again.`,
+              )
+            : reason;
+        const value = await communityRequest<CommunityInfo>(
+          next.id,
+          "info",
+          undefined,
+          signal,
+        ).catch((reason: unknown) => {
+          throw explained(reason);
+        });
+        // A host that was left gets no signed profile read, even from a late answer.
+        if (!mounted.current || signal.aborted) return;
         const pending = journal?.get(next.id);
         // Restoring an existing admitted profile is not a new join or policy acceptance.
         const found = await inspectProfile(next.id).catch((reason: unknown) => {
-          if (pending && readErrorKind(reason) !== "denied") throw reason;
+          if (pending && readErrorKind(reason) !== "denied")
+            throw explained(reason);
+          if (
+            mounted.current &&
+            !signal.aborted &&
+            value.membershipRequired === true &&
+            readErrorKind(reason) === "denied"
+          )
+            setNeedsInvite(true);
           return undefined;
         });
-        if (current(pending)) {
+        if (!signal.aborted && current(pending)) {
           setInfo(value);
           if (found && (found.exists || pending)) showProfile(found, pending);
-          else setStep("access");
+          else if (
+            !accountConsents(federatedIdentity, next.url) ||
+            (!found && !code.trim())
+          )
+            setStep("access");
+          else {
+            // The account's consent leaves the access step nothing to ask
+            // (no code is needed, or one is given), so Continue goes on to its
+            // admission. A refusal is shown there, where a code can be entered.
+            await admit(next.id, next.url, value.policy).catch(
+              (reason: unknown) => {
+                if (current()) {
+                  setStep("access");
+                  if (
+                    value.membershipRequired === true &&
+                    readErrorKind(reason) === "denied"
+                  )
+                    setNeedsInvite(true);
+                }
+                throw reason;
+              },
+            );
+          }
         }
       });
     } else if (step === "access") {
-      if (!allowed) return;
-      await work(async () => {
-        const admission = await admitCommunity({
-          community: id,
-          journal,
-          code,
-          policy,
-          consent: { adult, agreed },
-          current,
-        });
-        if (admission) showProfile(admission.found, admission.entry);
-      });
+      if (!allowed || !destination) return;
+      await work(() => admit(id, destination.url, policy));
     } else {
       if (!profile.name.trim()) return;
       await work(async () => {
@@ -204,14 +300,29 @@ export function CommunityDialog({
     mode === "join" &&
     !!original?.exists &&
     profilesEqual(profile, original.profile);
+  const looking = busy && step === "destination";
+  // While busy, the primary action names the operation its step started.
+  const [action, actionPending] =
+    step === "destination"
+      ? ["Continue", "Connecting…"]
+      : step === "access"
+        ? ["Continue", "Joining…"]
+        : mode === "profile"
+          ? ["Save profile", "Saving…"]
+          : keepsProfile
+            ? ["Continue", "Joining…"]
+            : ["Publish profile & open", "Publishing…"];
+
   return (
-    <Dialog
+    <JoinSurface
+      onboarding={onboarding}
       open
       dismissOnOutsideClick={false}
       onOpenChange={(next) => {
-        if (!next) close();
+        if (!next) leave();
       }}
-      preventClose={busy}
+      // A lookup only reads, so it can be left; access and profile steps write.
+      preventClose={busy && !looking}
       initialFocus={(type) => {
         // Controlled entry has no Base UI trigger to report touch modality.
         touchOpening.current =
@@ -235,20 +346,49 @@ export function CommunityDialog({
               ? "Enter a wss:// or https:// relay address without a path. Changing the connection URL does not rename or move this community."
               : "Use your identity across communities. Your profile and conversations stay separate in each one."
             : step === "access"
-              ? `Connect to ${destination?.name} with your Buzz identity.`
+              ? destination && (
+                  <span className="flex items-center gap-3 rounded-[var(--radius-row)] bg-surface-inset p-4">
+                    {info?.icon && (
+                      <Avatar
+                        alt=""
+                        src={info.icon}
+                        fallback={communityName(info.name, destination.name)}
+                        shape="squircle"
+                        size="large"
+                      />
+                    )}
+                    <span className="min-w-0 flex-1 break-words text-body text-standard">
+                      <span>{communityName(info?.name, destination.name)}</span>
+                      <span className="block break-all text-body-sm text-subtle">
+                        {destination.url}
+                      </span>
+                    </span>
+                  </span>
+                )
               : mode === "profile"
                 ? "Your local default. Use it when joining communities; saving here does not publish changes to them."
                 : original?.exists
-                  ? "Your existing community profile is loaded. Keep it or update it here."
+                  ? undefined
                   : "Start with your local profile, or choose how you appear in this community."
       }
       leadingActions={
         !unavailable && (
-          <Button
+          <BackControl
             type="button"
-            disabled={busy || uploading}
+            disabled={(busy && !looking) || uploading}
             onClick={() => {
-              if (step === "destination" || mode === "profile") close();
+              if (looking && !onboarding) {
+                // Cancel keeps the address to correct or retry. The field is
+                // disabled while busy, so the busy=false render must commit
+                // before focus() can land on it.
+                flushSync(abandon);
+                destinationInput.current?.focus();
+              } else if (
+                step === "destination" ||
+                mode === "profile" ||
+                (submittedDestination && step === "access")
+              )
+                leave();
               else {
                 setError("");
                 setStep(step === "profile" ? "access" : "destination");
@@ -257,14 +397,15 @@ export function CommunityDialog({
               }
             }}
           >
-            Back
-          </Button>
+            {onboarding ? undefined : looking ? "Cancel" : "Back"}
+          </BackControl>
         )
       }
       actions={
         !unavailable && (
           <Button
             variant="prominent"
+            {...(onboarding ? { size: "lg" as const } : {})}
             type="submit"
             form={formId}
             disabled={
@@ -277,15 +418,7 @@ export function CommunityDialog({
                   : !canSaveProfile(profile)))
             }
           >
-            {busy
-              ? "Working…"
-              : step === "profile"
-                ? mode === "profile"
-                  ? "Save profile"
-                  : keepsProfile
-                    ? "Open community"
-                    : "Publish profile & open"
-                : "Continue"}
+            {busy ? actionPending : action}
           </Button>
         )
       }
@@ -293,7 +426,7 @@ export function CommunityDialog({
         mode === "profile"
           ? "Your profile"
           : step === "profile"
-            ? `Your profile in ${info?.name && info.name !== "Buzz Relay" ? info.name : destination?.name}`
+            ? "Your profile"
             : connectionFrom
               ? "Edit connection"
               : "Join a community"
@@ -302,15 +435,12 @@ export function CommunityDialog({
       <form
         id={formId}
         noValidate
-        className="space-y-6"
+        className="w-full space-y-6 text-left"
         onSubmit={(event) => {
           event.preventDefault();
           void submit();
         }}
       >
-        {mode === "join" && step !== "destination" && destination && (
-          <p className={styles.note}>Community URL: {destination.url}</p>
-        )}
         {unavailable ? (
           <p>
             {client.status === "loading"
@@ -321,81 +451,94 @@ export function CommunityDialog({
           </p>
         ) : (
           <>
-            {step === "destination" && (
-              <Field
-                label="Community URL"
-                error={error || undefined}
-                description={
-                  connectionFrom
-                    ? undefined
-                    : "Paste your community link. Continue shares your Buzz identity with the community so you can preview it before joining."
-                }
-              >
-                <Input
-                  ref={destinationInput}
-                  type="url"
-                  required
-                  autoComplete="url"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                  placeholder="wss://communities.buzz.xyz"
-                  maxLength={2048}
-                  disabled={busy}
-                  value={url}
-                  onChange={(e) => {
-                    setUrl(e.target.value);
-                    setDestination(undefined);
-                    setCode("");
-                    setAgreed(false);
-                    setAdult(false);
-                    setInfo(undefined);
-                    setOriginal(undefined);
-                    setProfile(client.profile);
-                    setError("");
-                  }}
-                />
-              </Field>
+            {step === "destination" && submittedDestination && busy ? (
+              <p role="status">Finding your community…</p>
+            ) : (
+              step === "destination" && (
+                <Field
+                  label="Community URL"
+                  error={error || undefined}
+                  description={
+                    connectionFrom
+                      ? undefined
+                      : "Paste your community link. Continue shares your Buzz identity with the community so you can preview it before joining."
+                  }
+                >
+                  <Input
+                    ref={destinationInput}
+                    type="url"
+                    required
+                    autoComplete="url"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    placeholder="wss://communities.buzz.xyz"
+                    maxLength={2048}
+                    disabled={busy}
+                    value={url}
+                    onChange={(e) => {
+                      setUrl(e.target.value);
+                      setDestination(undefined);
+                      setCode("");
+                      setNeedsInvite(false);
+                      setAgreed(false);
+                      setAdult(false);
+                      setInfo(undefined);
+                      setOriginal(undefined);
+                      setProfile(client.profile);
+                      setError("");
+                    }}
+                  />
+                </Field>
+              )
             )}
             {step === "access" && (
               <>
-                <Field label="Invite code (if required)">
-                  <Input
-                    disabled={busy}
-                    value={code}
-                    onChange={(e) => setCode(e.target.value)}
-                    placeholder="Existing members can leave this blank"
-                    maxLength={256}
-                  />
-                </Field>
-                {policy && (
+                {needsInvite && (
+                  <Field label="Invite code">
+                    <Input
+                      disabled={busy}
+                      value={code}
+                      onChange={(e) => setCode(e.target.value)}
+                      maxLength={256}
+                    />
+                  </Field>
+                )}
+                {policy && !consentGiven && (
                   <div className={styles.policy}>
-                    {policy.terms_markdown && (
-                      <a
-                        className="inline-flex items-center gap-1 self-start"
-                        href={`${destination?.url}/api/join-policy/terms`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        Terms of Service
-                        <ArrowUpRightIcon size={16} aria-hidden="true" />
-                      </a>
-                    )}
-                    {policy.privacy_markdown && (
-                      <a
-                        className="inline-flex items-center gap-1 self-start"
-                        href={`${destination?.url}/api/join-policy/privacy`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        Privacy Notice
-                        <ArrowUpRightIcon size={16} aria-hidden="true" />
-                      </a>
-                    )}
                     {(policy.terms_markdown || policy.privacy_markdown) && (
                       <Checkbox
                         checked={agreed}
+                        aria-label={`I agree to this community’s ${[policy.terms_markdown && "Terms of Service", policy.privacy_markdown && "Privacy Notice"].filter(Boolean).join(" and ")}.`}
                         onCheckedChange={setAgreed}
-                        label="I agree to this community’s Terms of Service and Privacy Notice."
+                        label={
+                          <>
+                            I agree to this community’s{" "}
+                            {policy.terms_markdown && (
+                              <a
+                                className="underline"
+                                href={`${destination?.url}/api/join-policy/terms`}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                Terms of Service
+                              </a>
+                            )}
+                            {policy.terms_markdown &&
+                              policy.privacy_markdown &&
+                              " and "}
+                            {policy.privacy_markdown && (
+                              <a
+                                className="underline"
+                                href={`${destination?.url}/api/join-policy/privacy`}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                Privacy Notice
+                              </a>
+                            )}
+                            .
+                          </>
+                        }
                       />
                     )}
                     {policy.age_attestation_required && (
@@ -407,14 +550,14 @@ export function CommunityDialog({
                     )}
                   </div>
                 )}
-                <p className={styles.note}>
-                  If access is denied, ask a community administrator for an
-                  invite code.
-                </p>
               </>
             )}
             {step === "profile" && (
               <ProfileFields
+                showAbout={!onboarding}
+                {...(onboarding
+                  ? { emptyAvatarStyle: "dotted-circle" as const }
+                  : {})}
                 nameRef={nameInput}
                 community={mode === "profile" ? undefined : id}
                 onBusyChange={setUploading}
@@ -430,8 +573,14 @@ export function CommunityDialog({
             )}
             {error && (
               <CommunitySignIn
-                identity={federatedIdentity}
+                identity={
+                  (destination &&
+                    federatedIdentity?.forCommunity?.(destination.url)) ||
+                  federatedIdentity
+                }
                 error={error}
+                relay={destination?.url}
+                memberships={client.memberships}
                 // Sign-in only clears the refusal: Continue then runs the current
                 // step with current input, never one captured before the login.
                 retry={() => setError("")}
@@ -440,6 +589,40 @@ export function CommunityDialog({
           </>
         )}
       </form>
-    </Dialog>
+    </JoinSurface>
+  );
+}
+
+/** First-run joins share the admission form with Add community, without a modal. */
+function JoinSurface({
+  onboarding,
+  ...props
+}: DialogProps & { onboarding: boolean }) {
+  const titleId = useId();
+  const heading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (onboarding && props.title) heading.current?.focus();
+  }, [onboarding, props.title]);
+  if (!onboarding) return <Dialog {...props} />;
+  return (
+    <OnboardingScreen
+      labelledBy={titleId}
+      intro={
+        <>
+          <h1 ref={heading} tabIndex={-1} id={titleId} className="text-heading">
+            {props.title}
+          </h1>
+          {props.description && (
+            <p className="text-body text-subtle">{props.description}</p>
+          )}
+        </>
+      }
+    >
+      {props.children}
+      <div data-onboarding-actions="" className="w-full">
+        {props.leadingActions}
+        {props.actions}
+      </div>
+    </OnboardingScreen>
   );
 }

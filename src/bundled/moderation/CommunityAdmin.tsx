@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { decode } from "nostr-tools/nip19";
 import { communityFromScope } from "../../features/relay/gifs";
 import {
   useProfileGeneration,
@@ -10,6 +9,7 @@ import type { RelaySession } from "../../features/relay/session";
 import {
   formatPublicKey,
   publicKeyLabels,
+  typedPublicKey,
 } from "../../shared/identity/public-key";
 import {
   CaretDownIcon,
@@ -142,6 +142,7 @@ function Members({
   const refreshing = membershipState.refreshing;
   const [query, setQuery] = useState("");
   const [pending, setPending] = useState<Pending | null>(null);
+  const proceed = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
   const [inviting, setInviting] = useState(false);
   const profiles = useSyncExternalStore(
@@ -378,6 +379,7 @@ function Members({
                   : "They will no longer be able to invite people or manage members."
           }
           pending={busy}
+          initialFocus={pending.action === "remove" ? undefined : proceed}
           onClose={() => setPending(null)}
           actions={
             <>
@@ -385,6 +387,7 @@ function Members({
                 Cancel
               </Button>
               <Button
+                ref={proceed}
                 variant={
                   pending.action === "remove" ? "destructive" : "primary"
                 }
@@ -428,14 +431,8 @@ function Members({
 }
 
 function publicKey(input: string) {
-  const value = input.trim();
-  if (/^[0-9a-f]{64}$/i.test(value)) return value.toLowerCase();
-  try {
-    const decoded = decode(value);
-    if (decoded.type === "npub") return decoded.data;
-  } catch {
-    // Reported below.
-  }
+  const key = typedPublicKey(input);
+  if (key) return key;
   throw new Error("Enter an npub or 64-character hex public key.");
 }
 

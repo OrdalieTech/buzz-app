@@ -77,24 +77,30 @@ it("keeps unchanged native file access in the unchanged view", () => {
   expect(screen.getByRole("button", { name: /Read your files/ })).toBeVisible();
 });
 
-it("discloses hook access as a new permission for each harness", () => {
-  render(
-    <PluginAccessReview
-      manifest={{
-        id: "policy",
-        name: "Policy",
-        apiVersion: 1,
-        host: { agentHooks: ["buzz.pi/pi"] },
-      }}
-      previousManifest={{ id: "policy", name: "Policy", apiVersion: 1 }}
-    />,
-  );
-  expect(
-    within(
-      screen.getByRole("region", { name: "Added declarations" }),
-    ).getByRole("button", { name: /Observe and influence buzz.pi\/pi/ }),
-  ).toBeVisible();
-});
+it.each([
+  ["agentHooks", /Observe and influence buzz.pi\/pi/],
+  ["agentExecution", /Run buzz.pi\/pi on another host/],
+] as const)(
+  "discloses %s access as a new permission for each harness",
+  (grant, label) => {
+    render(
+      <PluginAccessReview
+        manifest={{
+          id: "policy",
+          name: "Policy",
+          apiVersion: 1,
+          host: { [grant]: ["buzz.pi/pi"] },
+        }}
+        previousManifest={{ id: "policy", name: "Policy", apiVersion: 1 }}
+      />,
+    );
+    expect(
+      within(
+        screen.getByRole("region", { name: "Added declarations" }),
+      ).getByRole("button", { name: label }),
+    ).toBeVisible();
+  },
+);
 
 it("shows a registered harness title while keeping its exact key in details", async () => {
   const types = [{ key: "third/custom", title: "Custom Agent" }];

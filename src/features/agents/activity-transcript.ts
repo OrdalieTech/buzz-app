@@ -1,5 +1,9 @@
 /** Owner-only display projection of observer telemetry into turns and items.
  * Raw session retention is unchanged; this reads allowlisted ACP fields only. */
+import { isMessageTool } from "../../buzz-mcp/message-tools";
+import { readEventBody } from "../agent-harness/turn-records";
+import { terminalOutcome } from "./observer";
+
 type Source = Readonly<{
   id: string;
   agent: string;
@@ -15,7 +19,12 @@ type Base = { id: string; at: number };
 /** ACP `diff` tool content; a missing old text is a new file. */
 export type ToolDiff = { path: string; oldText?: string; newText: string };
 /** Tool names and inputs are adapter-specific, so they are shown as sent;
- * only ACP's standard `kind`, `status`, `locations` and content are read. */
+ * only ACP's standard `kind`, `status`, `locations` and content are read.
+ * The exception is a Buzz message tool, recognized by a title of
+ * `buzz__<tool>` or `mcp__buzz__<tool>`: when it completes with a
+ * `rawInput.text` and no `rawOutput.isError`, it is shown as the agent's
+ * posted message instead of as a tool. Renaming those titles or fields in an
+ * adapter turns its sends back into tool rows. */
 export type ToolItem = Base & {
   type: "tool";
   toolCallId: string;
@@ -38,6 +47,7 @@ export type TranscriptItem =
       type: "prompt";
       text: string;
       author?: string;
+      authorPubkey?: string;
       sections: PromptSection[];
       steer: boolean;
     })
@@ -60,10 +70,13 @@ export type TranscriptTurn = {
   triggeringEventIds: string[];
   sessionId?: string;
   newSession: boolean;
+  /** The first shown turn of a session that began before the shown ones. */
+  continued?: boolean;
   /** Selected ACP session config values, e.g. model and thinking level. */
   config: string[];
   startedAt: number;
   endedAt?: number;
+  outcome?: ReturnType<typeof terminalOutcome>;
   error?: string;
   stopReason?: string;
   context?: { used: number; size: number };
@@ -81,6 +94,12 @@ const object = (value: unknown): Json | undefined =>
     ? (value as Json)
     : undefined;
 const str = (value: unknown) => (typeof value === "string" ? value : "");
+/** Whether a tool title names a Buzz message tool, as goose (and so kgoose)
+ * names it, `buzz__send`, or as Claude Code does, `mcp__buzz__send`. */
+const postsMessage = (title: string) => {
+  const name = /^(?:mcp__)?buzz__(\w+)$/.exec(title.trim())?.[1];
+  return !!name && isMessageTool(name);
+};
 const number = (value: unknown) =>
   typeof value === "number" && Number.isFinite(value) ? value : undefined;
 const eventId = (value: unknown) =>
@@ -91,6 +110,34 @@ const PROMPT_METHODS = new Set([
   "_session/steering",
   "_goose/unstable/session/steer",
 ]);
+
+const TITLES = new Map(
+  Object.entries({
+    identity: "Identity",
+    base: "Base",
+    workspace: "Workspace",
+    "community-repositories": "Repositories folder",
+    "agent-instructions": "Agent instructions",
+    team: "Team",
+    "core-memory": "Core memory",
+    "recent-notes": "Recent notes",
+    context: "Context",
+    mention: "Mention",
+    "buzz-event": "Buzz event",
+    "buzz-events": "Buzz events",
+    "thread-context": "Thread context",
+    "conversation-context": "Conversation context",
+    "turn-context": "Turn context",
+    interest: "Interest",
+    text: "Text",
+  }),
+);
+/** A prompt section's readable title; an unknown tag shows as it is. */
+export const sectionTitle = (tag: string) => TITLES.get(tag) ?? tag;
+
+/** A steer's section holds its event, or before exact records, a whole turn. */
+export const STEER = "new-message-arrived-while-you-were-working";
+const EVENT_TAGS = new Set(["buzz-event", STEER]);
 
 /** Split top-level `<tag attrs>` … `</tag>` prompt framing; other text is kept. */
 export function promptSections(text: string): PromptSection[] {
@@ -116,14 +163,42 @@ export function promptSections(text: string): PromptSection[] {
   return sections;
 }
 
-/** The triggering Buzz event(s): author label and content, without tags. */
-export function promptMessage(sections: PromptSection[]) {
-  const events = sections.filter(
-    (section) => section.tag === "buzz-event" || section.tag === "buzz-events",
-  );
+/** The triggering Buzz event(s): author label and content, without tags.
+ * An event sent as an exact record names its author by `name`, if known. */
+export function promptMessage(
+  sections: PromptSection[],
+  name: (pubkey: string) => string | undefined = () => undefined,
+) {
   const authors: string[] = [];
+  const authorKeys: string[] = [];
   const contents: string[] = [];
-  for (const { body } of events)
+  for (const { tag, body } of sections) {
+    const record = EVENT_TAGS.has(tag) ? readEventBody(body) : undefined;
+    if (record) {
+      contents.push(record.request);
+      authorKeys.push(record.pubkey);
+      const author = name(record.pubkey);
+      if (author) authors.push(author);
+      continue;
+    }
+    if (tag !== "buzz-event" && tag !== "buzz-events") continue;
+    // Turns from before exact records serialized the event as escaped JSON.
+    // Never parse its decoded content again as framing; older saved
+    // transcripts use the lines below.
+    let event: Json | undefined;
+    try {
+      event = object(JSON.parse(body));
+    } catch {
+      // Legacy human-readable event block.
+    }
+    if (event && typeof event.content === "string") {
+      contents.push(event.content);
+      const key = str(event.pubkey);
+      if (/^[0-9a-f]{64}$/.test(key)) authorKeys.push(key);
+      const author = str(event.author) || str(event.npub) || str(event.pubkey);
+      if (author) authors.push(author);
+      continue;
+    }
     for (const block of body.split(/\n(?=--- Event \d+ )/)) {
       const from = /^From: (.*)$/m.exec(block)?.[1];
       const start = block.indexOf("\nContent: ");
@@ -134,9 +209,14 @@ export function promptMessage(sections: PromptSection[]) {
       );
       if (from) authors.push(from.replace(/ \((?:npub|hex)[^)]*\)$/, ""));
     }
+  }
   return {
     text: contents.join("\n\n"),
     author: [...new Set(authors)].join(", ") || undefined,
+    authorPubkey:
+      contents.length === authorKeys.length && new Set(authorKeys).size === 1
+        ? authorKeys[0]
+        : undefined,
   };
 }
 
@@ -147,6 +227,22 @@ function promptThread(sections: PromptSection[]) {
   const root = eventId(/^Thread root: (\S+)$/m.exec(context)?.[1]);
   if (root) return root;
   return /^Scope: (?:channel|dm)$/m.test(context) ? null : undefined;
+}
+
+/** Older harnesses supplied thread scope only in the captured ACP prompt. */
+export function activityPromptThread(payload: unknown) {
+  const request = object(payload);
+  if (!PROMPT_METHODS.has(str(request?.method))) return undefined;
+  const prompt = object(request?.params)?.prompt;
+  if (!Array.isArray(prompt)) return undefined;
+  return promptThread(
+    promptSections(
+      prompt
+        .map((block) => str(object(block)?.text))
+        .filter(Boolean)
+        .join("\n"),
+    ),
+  );
 }
 
 const display = (value: unknown) =>
@@ -198,9 +294,36 @@ function configLabels(options: unknown) {
   });
 }
 
+// Snapshot record arrays are frozen and replaced on change, while indicators,
+// stop controls and previews read the same agent/channel on every tick.
+const transcripts = new WeakMap<object, Map<string, Transcript>>();
+
 export function activityTranscript(
   records: readonly Source[],
   scope: TranscriptScope,
+  /** Names an exact-record prompt's author, if known. */
+  name?: (pubkey: string) => string | undefined,
+): Transcript {
+  // The cache is per records, agent and channel, not per `name`.
+  if (name || !Object.isFrozen(records))
+    return buildTranscript(records, scope, name);
+  let byScope = transcripts.get(records);
+  if (!byScope) {
+    byScope = new Map();
+    transcripts.set(records, byScope);
+  }
+  const key = `${scope.agent}\n${scope.channelId ?? ""}`;
+  const cached = byScope.get(key);
+  if (cached) return cached;
+  const transcript = buildTranscript(records, scope);
+  byScope.set(key, transcript);
+  return transcript;
+}
+
+function buildTranscript(
+  records: readonly Source[],
+  scope: TranscriptScope,
+  name?: (pubkey: string) => string | undefined,
 ): Transcript {
   const events: { id: string; at: number; order: number; event: Json }[] = [];
   for (const record of records) {
@@ -237,6 +360,10 @@ export function activityTranscript(
 
   type Draft = TranscriptTurn & {
     tools: Map<string, ToolItem>;
+    /** Text of each call's arguments, for calls that may post a message. */
+    sent: Map<string, string>;
+    /** Calls whose result reported an error, whatever their status says. */
+    errored: Set<string>;
     plan?: Extract<TranscriptItem, { type: "plan" }>;
     piStartup?: string;
     payloadThread?: string;
@@ -317,6 +444,8 @@ export function activityTranscript(
         partial: true,
         items: [],
         tools: new Map(),
+        sent: new Map(),
+        errored: new Set(),
       };
       turns.set(turnId, turn);
     }
@@ -338,8 +467,12 @@ export function activityTranscript(
       turn.newSession = payload.isNewSession === true;
     } else if (kind === "session_config_captured") {
       turn.config = configLabels(payload.configOptions) ?? turn.config;
-    } else if (kind === "turn_completed") turn.endedAt ??= at;
-    else if (kind === "turn_error" || kind === "agent_panic") {
+    } else if (kind === "turn_completed") {
+      if (turn.endedAt === undefined) {
+        turn.endedAt = at;
+        turn.outcome = terminalOutcome(kind, payload.outcome);
+      }
+    } else if (kind === "turn_error" || kind === "agent_panic") {
       turn.endedAt ??= at;
       turn.error =
         str(payload.error).slice(0, 2000) || str(payload.outcome) || kind;
@@ -366,7 +499,7 @@ export function activityTranscript(
           .filter(Boolean)
           .join("\n");
         const sections = promptSections(text);
-        const message = promptMessage(sections);
+        const message = promptMessage(sections, name);
         const thread = promptThread(sections);
         if (thread !== undefined) turn.promptThread = thread;
         turn.items.push({
@@ -379,6 +512,9 @@ export function activityTranscript(
             sections.find((section) => section.tag === "text")?.body ||
             text,
           ...(message.author ? { author: message.author } : {}),
+          ...(message.authorPubkey
+            ? { authorPubkey: message.authorPubkey }
+            : {}),
           sections,
           steer: method !== "session/prompt",
         });
@@ -458,8 +594,14 @@ export function activityTranscript(
           if (str(update.title)) item.title = str(update.title);
           if (str(update.kind)) item.kind = str(update.kind);
           if (str(update.status)) item.status = str(update.status);
-          if (update.rawInput !== undefined)
+          if (update.rawInput !== undefined) {
             item.input = display(update.rawInput);
+            const text = str(object(update.rawInput)?.text);
+            if (text.trim()) turn.sent.set(callId, text);
+          }
+          // MCP application errors can arrive as completed calls.
+          if (object(update.rawOutput)?.isError === true)
+            turn.errored.add(callId);
           const { diffs, output } = toolContent(update);
           if (output) item.output = output;
           if (diffs.length) item.diffs = diffs;
@@ -532,12 +674,26 @@ export function activityTranscript(
     turns: drafts.map((draft) => {
       const {
         tools: _tools,
+        sent,
+        errored,
         plan: _plan,
         piStartup: _piStartup,
         payloadThread,
         promptThread: prompt,
         ...turn
       } = draft;
+      // A Buzz message a tool posted reads as the agent's reply, as the local
+      // harnesses' transcripts show it. A failed, erroring or unfinished send
+      // stays a tool, with its error.
+      turn.items = turn.items.map((item) => {
+        const text = item.type === "tool" && sent.get(item.toolCallId);
+        return text &&
+          item.status === "completed" &&
+          !errored.has(item.toolCallId) &&
+          postsMessage(item.title)
+          ? { id: item.id, at: item.at, type: "message", text, posted: true }
+          : item;
+      });
       // Older harnesses omit threadRootEventId; the prompt context still names it.
       turn.threadRootId = payloadThread ?? prompt;
       return turn;

@@ -1151,3 +1151,62 @@ test("Up and Down move one line at a time through links that wrap", async ({
     await server.close();
   }
 });
+
+test("Apple paragraph commands cross a link instead of stopping at it", async ({
+  page,
+}) => {
+  // Native paragraph commands stop at an uneditable link chip: WebKit's
+  // Control-A, Control-E and Option-Up/Down, and Control-K in both engines.
+  // Only a real browser runs the native commands the editor must replace.
+  test.skip(process.platform !== "darwin", "Apple key bindings");
+  await page.addInitScript(() => {
+    localStorage.setItem("buzz-remember-mentioned-agents.v1", "off");
+  });
+  const server = await createServer({
+    root: fileURLToPath(new URL("../../", import.meta.url)),
+    configFile: false,
+    envFile: false,
+    plugins: [react()],
+    logLevel: "error",
+    server: { host: "127.0.0.1", port: 0 },
+  });
+  await server.listen();
+  try {
+    await page.goto(
+      `http://127.0.0.1:${server.httpServer.address().port}/tests/fixtures/link-messages.html`,
+    );
+    const input = page.getByRole("textbox", {
+      name: "Message #design",
+      exact: true,
+    });
+    const link = "https://github.com/block/buzz/pull/117/changes";
+    const text = `top line\nbefore ${link} after\nend line`;
+    const start = text.indexOf("before");
+    const end = text.indexOf("\nend");
+    await input.fill(text);
+    await expect(input.locator("[data-source]")).toHaveCount(1);
+    // Presses `keys` from a caret at `from`, returning the selection. WebKit
+    // settles a caret beside a link when it draws it, so a press waits for that.
+    const press = async (from, ...keys) => {
+      await input.evaluate((el, at) => el.setSelectionRange(at, at), from);
+      await page.evaluate(
+        () =>
+          new Promise((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(resolve)),
+          ),
+      );
+      for (const key of keys) await page.keyboard.press(key);
+      return input.evaluate((el) => [el.selectionStart, el.selectionEnd]);
+    };
+    expect(await press(end, "Control+a")).toEqual([start, start]);
+    expect(await press(start, "Control+e")).toEqual([end, end]);
+    expect(await press(end, "Shift+Control+a")).toEqual([start, end]);
+    expect(await press(end, "Alt+ArrowUp")).toEqual([start, start]);
+    expect(await press(end, "Alt+ArrowUp", "Alt+ArrowUp")).toEqual([0, 0]);
+    expect(await press(start, "Alt+ArrowDown")).toEqual([end, end]);
+    expect(await press(start, "Control+k")).toEqual([start, start]);
+    await expect(input).toHaveJSProperty("value", "top line\n\nend line");
+  } finally {
+    await server.close();
+  }
+});

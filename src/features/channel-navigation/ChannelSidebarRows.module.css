@@ -1,0 +1,12 @@
+.rows {
+  position: relative;
+}
+
+.row {
+  position: relative;
+}
+
+.row[data-moving] {
+  border-radius: var(--radius-row);
+  background: var(--surface-panel);
+}

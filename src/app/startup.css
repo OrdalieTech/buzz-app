@@ -14,6 +14,8 @@
 }
 
 .buzz-launch {
+  -webkit-user-select: none;
+  user-select: none;
   min-height: 100dvh;
   display: grid;
   place-items: center;
@@ -34,6 +36,7 @@
 
 .buzz-launch picture,
 .buzz-launch img {
+  pointer-events: none;
   display: block;
   width: 4.5rem;
   height: 4.5rem;
@@ -47,4 +50,15 @@
   #buzz-launch {
     transition-duration: 120ms;
   }
+}
+
+/* Native Mac first-welcome reveal; other launches retain the normal loader. */
+html[data-welcome-intro] {
+  background: transparent;
+}
+html[data-welcome-intro] .buzz-launch {
+  background: transparent;
+}
+html[data-welcome-intro] .buzz-launch picture {
+  visibility: hidden;
 }

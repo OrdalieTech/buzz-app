@@ -3,6 +3,7 @@
 // memory is read back through the owner's own session, to whom it is
 // encrypted.
 import type { BuzzClient, Memories } from "./client";
+import { prepareAttachment } from "../features/messages/prepare-attachment";
 import type { AgentHandle, AgentHandoff } from "../features/agents/service";
 import type {
   HostProcess,
@@ -12,7 +13,7 @@ import type {
 type Spawn = (id: string, options?: HostProcessOptions) => Promise<HostProcess>;
 
 /** The largest file a tool reads: the community's upload limit. */
-const READ_LIMIT = 50 * 1024 * 1024;
+export const READ_LIMIT = 50 * 1024 * 1024;
 const READ_TIMEOUT_MS = 60_000;
 
 export function appClient(
@@ -30,6 +31,8 @@ export function appClient(
     check?(): void;
     signal?: AbortSignal;
     protectionContext?(): Promise<unknown>;
+    /** The runtime reviews each tool call itself before Buzz dispatches it. */
+    nativeToolGate?: boolean;
   }>,
 ): BuzzClient {
   const check = () => {
@@ -43,6 +46,15 @@ export function appClient(
     return found;
   };
   const handoff = agent.handoff;
+  const plugins = agent.plugins;
+  const { settings, ownerAccess } = agent;
+  /** An owner read, only while the turn still holds before and after it. */
+  const owned = async <T>(read: (signal?: AbortSignal) => Promise<T>) => {
+    check();
+    const result = await read(options.signal);
+    check();
+    return result;
+  };
   return {
     ...(agent.protection
       ? {
@@ -72,11 +84,30 @@ export function appClient(
             );
             check();
           },
+          ...(options.nativeToolGate ? { nativeToolGate: true as const } : {}),
         }
       : {}),
     pubkey: agent.pubkey,
     key: agent.key,
     owner: agent.owner,
+    ...(ownerAccess && {
+      ownerAccess: {
+        channels: () => owned((signal) => ownerAccess.channels(signal)),
+        channel: (id) => owned((signal) => ownerAccess.channel(id, signal)),
+        members: (id, page) =>
+          owned((signal) => ownerAccess.members(id, page, signal)),
+        messages: (request) =>
+          owned((signal) => ownerAccess.messages(request, signal)),
+        canvas: (channel, revision) =>
+          owned((signal) => ownerAccess.canvas(channel, revision, signal)),
+        canvasHistory: (channel, cursor) =>
+          owned((signal) => ownerAccess.canvasHistory(channel, cursor, signal)),
+        held: (execution) => {
+          check();
+          ownerAccess.held(execution);
+        },
+      },
+    }),
     relayAuthor: options.relayAuthor,
     signingAuthority: options.signingAuthority,
     attention: agent.attention && {
@@ -127,6 +158,26 @@ export function appClient(
       check();
       return agent.upload(toBase64(data), mime);
     },
+    uploadPicture: async (data, mime) => {
+      check();
+      const file = new File([new Uint8Array(data)], "picture", { type: mime });
+      const picture = await prepareAttachment(
+        file,
+        options.signal ?? new AbortController().signal,
+        true,
+      );
+      // It returns a file it doesn't recognize as an image unprepared.
+      if (picture === file)
+        throw new Error("picture must be a PNG, JPEG, GIF or WebP image");
+      check();
+      const upload = await agent.upload(
+        toBase64(new Uint8Array(await picture.arrayBuffer())),
+        picture.type,
+      );
+      // A turn stopped during the upload proposes nothing.
+      check();
+      return upload;
+    },
     media: (url) => {
       check();
       return agent.media(url);
@@ -173,6 +224,48 @@ export function appClient(
         throw new Error("Agent changes are unavailable on this host");
       return agent.updateAgent(input);
     },
+    readAgents: async (target) => {
+      check();
+      if (!agent.readAgents)
+        throw new Error("Agent reads are unavailable on this host");
+      return agent.readAgents(target);
+    },
+    readTeams: async (target) => {
+      check();
+      if (!agent.readTeams)
+        throw new Error("Team reads are unavailable on this host");
+      return agent.readTeams(target);
+    },
+    updateTeam: async (input) => {
+      check();
+      if (!agent.updateTeam)
+        throw new Error("Team changes are unavailable on this host");
+      return agent.updateTeam(input);
+    },
+    ...(plugins && {
+      plugins: {
+        list: () => {
+          check();
+          return plugins.list();
+        },
+        discover: (repository, reference) => {
+          check();
+          return plugins.discover(repository, reference);
+        },
+        disable: (id) => {
+          check();
+          return plugins.disable(id);
+        },
+        request: (input) => {
+          check();
+          return plugins.request(input);
+        },
+        status: (requestId) => {
+          check();
+          return plugins.status(requestId);
+        },
+      },
+    }),
     ...(handoff
       ? {
           handoff: (wake: AgentHandoff) => {
@@ -191,17 +284,39 @@ export function appClient(
       close: (channel, root) => tabs().close(channel, root),
       rename: (channel, root, name) => tabs().rename(channel, root, name),
     },
+    ...(settings
+      ? {
+          settings: {
+            list: () => {
+              check();
+              return settings.list();
+            },
+            get: (key) => {
+              check();
+              return settings.get(key);
+            },
+            // Synchronous, so the check holds until the write is read back.
+            set: (key, value) => {
+              check();
+              return settings.set(key, value);
+            },
+          },
+        }
+      : {}),
   };
 }
 
 /** Reads a file with the plugin's declared `read` process (`base64 -i`),
- * which passes binary files through intact. */
+ * which passes binary files through intact, or another that prints base64
+ * given the path and `args`. */
 export async function readFile(
   spawn: Spawn,
   cwd: string,
   path: string,
   signal?: AbortSignal,
   protection?: ProcessProtection,
+  process = protection ? "read-protected" : "read",
+  args: string[] = [],
 ) {
   // `-` would wait on stdin.
   if (path.trim() === "-" || !path.trim())
@@ -210,8 +325,8 @@ export async function readFile(
   let error = "";
   let large = false;
   let child: Awaited<ReturnType<Spawn>> | undefined;
-  child = await spawn(protection ? "read-protected" : "read", {
-    args: [path],
+  child = await spawn(process, {
+    args: [path, ...args],
     cwd,
     ...(protection ? { protection: structuredClone(protection) } : {}),
     onStdout: (data) => {

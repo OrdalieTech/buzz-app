@@ -4,7 +4,7 @@ import {
   HashIcon,
   LockIcon,
 } from "../../shared/design-system/icons/index";
-import { channelIcon, channelText } from "./channel-icon";
+import { channelIcon, channelIconLabel, channelText } from "./channel-icon";
 
 it("shows a channel as the sidebar does: a hash, a lock, or a chat bubble", () => {
   expect(channelIcon({})).toBe(HashIcon);
@@ -14,6 +14,17 @@ it("shows a channel as the sidebar does: a hash, a lock, or a chat bubble", () =
   expect(channelIcon({ channelType: "solo", private: true })).toBe(
     ChatCircleIcon,
   );
+});
+
+it("names what a channel's icon shows", () => {
+  expect(channelIconLabel({})).toBe("Public channel");
+  expect(channelIconLabel({ private: true, channelType: "forum" })).toBe(
+    "Private channel",
+  );
+  expect(channelIconLabel({ channelType: "dm", private: true })).toBe(
+    "Direct message",
+  );
+  expect(channelIconLabel({ channelType: "solo", private: true })).toBe("Chat");
 });
 
 it("prefixes a channel's name with # only where its icon is a hash", () => {

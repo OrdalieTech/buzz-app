@@ -148,6 +148,35 @@ it("notifies a reminder from slow history even after a live update moved the clo
   expect(submit).toHaveBeenCalledTimes(1);
 });
 
+it.each([
+  "The answer is ||Rosebud||",
+  "The answer is ||Rosebud…",
+  "The answer is ||decoy || Rosebud || more||",
+])(
+  "submits redacted text when an old reminder becomes due: %s",
+  async (preview) => {
+    const event = {
+      ...wire("spoiler", 110),
+      content: JSON.stringify({
+        target: { ...target, preview },
+        status: "pending",
+      }),
+    } as RelayEvent;
+    const { submit, connect, dispose } = mount();
+    try {
+      connect(`origin:${viewer}`, session(Promise.resolve([event])).capability);
+      await flush();
+      at(120);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(submit).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ body: "The answer is [Spoiler]" }),
+      );
+    } finally {
+      dispose();
+    }
+  },
+);
+
 it("suppresses reminders already due when a community is first bound, and fires late timers", async () => {
   const { submit, connect } = mount();
   const first = session(Promise.resolve([wire("old", 50), wire("soon", 110)]));

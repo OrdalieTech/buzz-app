@@ -885,3 +885,37 @@ it("removes cancellation listeners on disposal and reattaches on remount", async
   expect(c.calls).toEqual([]);
   c.driver.R();
 });
+
+it("reports actual correction writes separately from coalesced reader movement", () => {
+  const c = setup({ platform: "Linux x86_64", offset: 1300 });
+  const corrections = [];
+  c.viewport.addEventListener("virtua-scroll-correction", (event) =>
+    corrections.push(event.detail),
+  );
+  c.viewport.scrollTop -= 50; // wheel before its native scroll notification
+  c.prepend();
+  expect(corrections).toEqual([{ before: 1250, after: 3250 }]);
+  c.viewport.scrollTop -= 40; // wheel after correction, same native event frame
+  c.viewport.dispatchEvent(new Event("scroll"));
+  expect(c.viewport.scrollTop).toBe(3210);
+  c.driver.U();
+  expect(corrections).toHaveLength(1);
+  c.driver.R();
+});
+
+it("reports clamped fractional correction offsets, not requested deltas", () => {
+  const c = setup({ platform: "Linux x86_64", offset: 1490 });
+  const corrections = [];
+  c.viewport.addEventListener("virtua-scroll-correction", (event) =>
+    corrections.push(event.detail),
+  );
+  c.viewport.max = 1420.5;
+  c.store.h(3, [
+    [1, 60.25],
+    [2, 60.25],
+  ]);
+  c.driver.U();
+  expect(corrections).toEqual([{ before: 1490, after: c.viewport.scrollTop }]);
+  expect(c.viewport.scrollTop).toBe(1410);
+  c.driver.R();
+});

@@ -7,7 +7,7 @@ import {
   settingsDialog,
 } from "./navigation.mjs";
 import { test, expect } from "./fixture.mjs";
-import { hoverRow, open, virtuaIdle } from "./timeline.mjs";
+import { frames, hoverRow, open, virtuaIdle } from "./timeline.mjs";
 
 test.use({
   productionBroker: true,
@@ -118,9 +118,13 @@ test("Buzz channel and message links render, reveal verified targets, and preser
   // Closing the thread widens the timeline. Its rows re-measure, and the
   // scroller compensates over several scroll events, longer on a slow runner.
   // Virtua holds the list's pointer events off for 150ms after each one, so a
-  // still pointer leaves the link and nothing re-enters it. Wait for idle.
+  // still pointer leaves the link and nothing re-enters it. Let late size
+  // updates reach Virtua, then wait for the link's centre to hit-test before
+  // one raw move: locator.hover() can scroll again during a retry.
   await virtuaIdle(page);
-  await link.hover();
+  await frames(page);
+  await virtuaIdle(page);
+  await hoverRow(page, link);
   await expect(
     preview.getByText("Broadcast reply", { exact: true }),
   ).toBeVisible();
@@ -462,7 +466,8 @@ test("a hovered message preview survives the timeline's scroll-time pointer-even
   await expect(preview).toHaveAttribute("data-open", "");
   // The link cannot hear a real leave while the list ignores the pointer.
   await hitTest("none");
-  await page.mouse.move(point.x, box.y - 120, { steps: 4 });
+  // Leave sideways: the preview sits above the message.
+  await page.mouse.move(box.x - 200, point.y, { steps: 4 });
   await expect(preview).toHaveCount(0);
 });
 
@@ -715,11 +720,28 @@ test("unavailable messages fail honestly and legacy links still open when Links 
 
 test.describe("links to channels the reader hasn't joined", () => {
   test.use({ openSearch: true });
-  test("name an open channel with a hover card and lock a withheld one", async ({
+  test("name an open channel with a hover card, preview its messages and lock a withheld one", async ({
     page,
     app,
   }) => {
     await open(page, app);
+    // Before any channel link looks it up, a message card does, as a click
+    // does, and only then reads the message.
+    const [openRoot] = app.histories.get(`primary/${app.openChannelId}`);
+    const href = `buzz://message?channel=${app.openChannelId}&id=${openRoot.id}`;
+    const linking = app.append("primary", "alpha", `Read <${href}>.`);
+    const messageLink = page.locator(
+      `[data-channel-timeline] [data-message-id="${linking.id}"] a[href="${href}"]`,
+    );
+    await expect(messageLink).toBeVisible();
+    await virtuaIdle(page);
+    await messageLink.hover();
+    const preview = page.getByLabel("Message preview", { exact: true });
+    await expect(
+      preview.getByText("Public conversation root", { exact: true }),
+    ).toBeVisible();
+    await expect(preview.getByText("open", { exact: true })).toBeVisible();
+    await expect(preview).toHaveAttribute("href", href);
     const secret = "5ec2e700-0000-4000-8000-000000000001";
     const message = app.append(
       "primary",
@@ -735,7 +757,12 @@ test.describe("links to channels the reader hasn't joined", () => {
       name: "Private channel",
       exact: true,
     });
-    await expect(locked).toHaveAttribute("title", /aren’t a member/);
+    // Links don't record their community: one from another community is
+    // withheld here too, so the explanation covers it.
+    await expect(locked).toHaveAttribute(
+      "title",
+      "Private channel. You aren’t a member, it no longer exists, or the link is from another community.",
+    );
     // The authored label is message text; it stays beside the lock.
     const authored = row.getByRole("link", {
       name: "#launch-plans",
@@ -746,5 +773,36 @@ test.describe("links to channels the reader hasn't joined", () => {
     await named.hover();
     const card = page.getByLabel("Channel preview", { exact: true });
     await expect(card).toContainText("Public channel · Not joined");
+  });
+
+  test("link previews open above the message's hover actions", async ({
+    page,
+    app,
+  }) => {
+    await open(page, app);
+    // A link below the first line puts its preview's default place over the
+    // actions above the message.
+    const message = app.append(
+      "primary",
+      "alpha",
+      `Release notes:\nsee <buzz://channel/${app.openChannelId}>`,
+    );
+    const row = page.locator(
+      `[data-channel-timeline] [data-message-id="${message.id}"]`,
+    );
+    const channel = row.getByRole("link", { name: "#open", exact: true });
+    await expect(channel).toBeVisible();
+    await virtuaIdle(page);
+    await channel.hover();
+    const card = page.getByRole("link", {
+      name: "Channel preview",
+      exact: true,
+    });
+    await expect(card).toContainText("Public channel · Not joined");
+    const actions = row.getByRole("group", { name: "Message actions" });
+    await expect(actions).toBeVisible();
+    // A trial click fails while the preview covers the action.
+    for (const control of await actions.getByRole("button").all())
+      await control.click({ trial: true });
   });
 });

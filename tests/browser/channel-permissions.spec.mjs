@@ -41,7 +41,7 @@ async function readPermalink(page, app, messageId, joined = false) {
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Join", exact: true }),
-  ).toHaveCount(0);
+  ).toHaveCount(joined ? 0 : 2);
   await expect(page.locator('[contenteditable="true"]')).toHaveCount(0);
   // Opening the actual message menu settles the deferred message actions.
   await hoverMessage(row);
@@ -110,7 +110,7 @@ test.describe("Guest-default permalinks", () => {
 
   test.describe("nonmember", () => {
     test.use({ lifecycleRole: "nonmember" });
-    test("old message and nested reply links read without joining", async ({
+    test("old message and nested reply links read without joining, then join explicitly", async ({
       page,
       app,
     }) => {
@@ -118,6 +118,23 @@ test.describe("Guest-default permalinks", () => {
       await readPermalink(page, app, app.exact.root.id);
       await readPermalink(page, app, app.exact.target.id);
       expectNotJoined(app);
+      const join = page
+        .getByRole("button", { name: "Join", exact: true })
+        .last();
+      await join.focus();
+      await join.press("Enter");
+      await expect(
+        page.getByRole("button", { name: "Join", exact: true }),
+      ).toHaveCount(0);
+      await expect(
+        page
+          .getByRole("navigation", { name: "Subscribed channels" })
+          .getByRole("button", { name: /^Lifecycle channel/ }),
+      ).toBeVisible();
+      await readPermalink(page, app, app.exact.target.id, true);
+      expect(app.report.lifecyclePublications.map(({ kind }) => kind)).toEqual([
+        9021,
+      ]);
     });
   });
 
@@ -199,7 +216,7 @@ test("a joined guest can read and leave without receiving a composer or Join pro
     page.getByRole("button", { name: "Channel actions", exact: true }),
   ).toBeFocused();
   await page
-    .getByRole("button", { name: "Manage members", exact: true })
+    .getByRole("button", { name: /^Channel access for /, exact: true })
     .click();
   const members = page.getByRole("dialog", {
     name: "Channel access",
@@ -228,6 +245,10 @@ test("a joined guest can read and leave without receiving a composer or Join pro
     name: "Canvas Markdown",
     exact: true,
   });
+  await expect(
+    canvas.getByRole("article", { name: "Saved Canvas" }),
+  ).toBeVisible();
+  await canvas.getByRole("tab", { name: "Edit", exact: true }).click();
   await expect(editor).toBeEnabled();
   await expect(editor).toHaveJSProperty("readOnly", true);
   await expect(

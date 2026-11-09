@@ -1,0 +1,37 @@
+/* biome-ignore-all lint/correctness/noUnknownTypeSelector: View-transition arguments are custom identifiers, not HTML element names. */
+/* Only explicit forward/back navigation uses these snapshots. */
+html[data-onboarding-direction]::view-transition-old(root),
+html[data-onboarding-direction]::view-transition-new(root) {
+  animation: none;
+}
+html[data-onboarding-direction]::view-transition-old(onboarding) {
+  animation: onboarding-out 180ms ease-out both;
+}
+html[data-onboarding-direction]::view-transition-new(onboarding) {
+  animation: onboarding-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+html[data-onboarding-direction="back"]::view-transition-old(onboarding),
+html[data-onboarding-direction="back"]::view-transition-new(onboarding) {
+  /* Back reverses travel, not opacity. */
+  --onboarding-travel: -1;
+}
+@keyframes onboarding-in {
+  from {
+    opacity: 0;
+    transform: translateX(calc(24px * var(--onboarding-travel, 1)));
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes onboarding-out {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(calc(-24px * var(--onboarding-travel, 1)));
+  }
+}

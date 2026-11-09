@@ -13,6 +13,19 @@
         "id": "graphql",
         "program": "gh",
         "args": ["api", "graphql", "--hostname", "github.com", "--input", "-"]
+      },
+      {
+        "id": "diff",
+        "program": "gh",
+        "args": [
+          "api",
+          "--hostname",
+          "github.com",
+          "--method",
+          "GET",
+          "--header",
+          "Accept: application/vnd.github.diff"
+        ]
       }
     ]
   }

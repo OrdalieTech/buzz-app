@@ -128,7 +128,10 @@ test("bold mention completion keeps its identity and same-text replacement revok
   await input.focus();
   await input.press("ControlOrMeta+b");
   await page.keyboard.type("@Ho");
-  await page.getByRole("option", { name: new RegExp(first) }).click();
+  await page
+    .getByRole("option")
+    .and(page.locator(`[data-completion-id="${first}"]`))
+    .click();
   await expect(input).toHaveJSProperty("value", "@Honey ");
   await expect(input.locator("strong .inline-chip")).toHaveText("@Honey");
   await input.evaluate((el) => el.setSelectionRange(2, 2));
@@ -142,7 +145,10 @@ test("bold mention completion keeps its identity and same-text replacement revok
   await input.focus();
   await input.press("ControlOrMeta+b");
   await page.keyboard.type("@Ho");
-  await page.getByRole("option", { name: new RegExp(first) }).click();
+  await page
+    .getByRole("option")
+    .and(page.locator(`[data-completion-id="${first}"]`))
+    .click();
   await expect(input).toHaveJSProperty("value", "@Honey ");
   await input.evaluate((el) => el.setSelectionRange(2, 3));
   await page.keyboard.insertText("o");

@@ -3,16 +3,25 @@ import {
   TOP_LEVEL_PROMPT,
   CHANNEL_LEVEL_PROMPT,
 } from "../../buzz-mcp/prompt";
-import { BASE_PROMPT } from "../../features/agent-harness/base-prompt";
+import {
+  BASE_PROMPT,
+  MENTION_PROMPT,
+} from "../../features/agent-harness/base-prompt";
 import { coreMemorySection } from "../../features/agent-harness/core-memory";
 import {
   type ConversationWake,
+  unframed,
   wakeSection,
 } from "../../features/agent-harness/plugin-wake";
 import type { AgentKey } from "../../features/agents/membership";
 import type { AgentHandle } from "../../features/agents/service";
 import type { EventData } from "../../features/relay/events";
 import { threadReference } from "../../features/relay/thread-reference";
+import {
+  type AuthorNames,
+  eventBody,
+  quoted,
+} from "../../features/agent-harness/turn-records";
 import type { Config } from "./config";
 
 /** A conversation's routing default. Solo chats forbid replies; an addressed
@@ -25,8 +34,6 @@ export type Conversation = {
   /** A channel-level default, without the Solo chat reply restriction. */
   threadReplies?: true;
 };
-const quoted = (value: unknown) =>
-  JSON.stringify(value).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e");
 export const rootOf = (event: EventData) =>
   threadReference(event)?.rootId ?? event.id;
 export function developerInstructions(
@@ -60,9 +67,10 @@ export function turnContext(
   const text = `You are ${agent.name} (pubkey ${agent.pubkey}).\nCurrent Buzz custom instructions replace all prior Buzz custom instructions. An empty section means no custom instructions apply.\n<agent-instructions>\n${settings.instructions}\n</agent-instructions>\n\nCurrent team sections replace all prior team sections. None means you are on no team.${team ? `\n${team}` : ""}${core ? `\n\nCurrent core memory replaces all prior core memory.\n${core}` : ""}`;
   const values = [""];
   let size = 0;
-  for (const line of `${text}${repositories ? `\n\n${repositories}` : ""}`.split(
-    /(?<=\n)/,
-  )) {
+  // None of it is Buzz's event or steer section.
+  for (const line of unframed(
+    `${text}${repositories ? `\n\n${repositories}` : ""}`,
+  ).split(/(?<=\n)/)) {
     // A line over the limit splits by code point.
     const pieces = bytes(line) > CONTEXT_VALUE_BYTES ? [...line] : [line];
     for (const piece of pieces) {
@@ -96,17 +104,17 @@ export function turnInput(
   note?: string,
   /** A plugin's wake, whose section takes the place of `event`'s. */
   wake?: ConversationWake,
+  /** The names shown beside the event author's pubkey, when known. */
+  names?: AuthorNames,
 ) {
   const section = steering
     ? "new-message-arrived-while-you-were-working"
     : "buzz-event";
-  const body = wake
-    ? wakeSection(wake)
-    : `${quoted(event)}\nRequest: ${quoted(text)}`;
+  const body = wake ? wakeSection(wake) : eventBody(event, text, names);
   const routing = conversation.topLevel
     ? { posting: "top-level" }
     : { session_thread: conversation.root, reply_to: rootOf(event) };
-  return `<context>\n${quoted({ agent, channel_id: conversation.channelId, channel_name: conversation.name, session_scope: conversation.root ? "thread" : "channel", ...routing })}\n</context>\n${conversation.topLevel ? `${conversation.threadReplies ? CHANNEL_LEVEL_PROMPT : TOP_LEVEL_PROMPT}\n` : ""}${wake && !steering ? body : `<${section}>\n${body}\n</${section}>`}${note ? `\n\n${note}` : ""}`;
+  return `<context>\n${quoted({ agent, channel_id: conversation.channelId, channel_name: conversation.name, session_scope: conversation.root ? "thread" : "channel", ...routing })}\n</context>\n${conversation.topLevel ? `${conversation.threadReplies ? CHANNEL_LEVEL_PROMPT : TOP_LEVEL_PROMPT}\n` : ""}${wake ? "" : `${MENTION_PROMPT}\n`}${wake && !steering ? body : `<${section}>\n${body}\n</${section}>`}${note ? `\n\n${note}` : ""}`;
 }
 /** The readable part of a conversation's thread name; earlier versions used
  * it alone. */

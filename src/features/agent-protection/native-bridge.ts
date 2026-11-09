@@ -1,6 +1,7 @@
 import type { HostMcpServer, McpHandler } from "../host/service";
 import {
   ALL_PHASES,
+  ProtectionDenied,
   type AgentProtection,
   type ProtectionAction,
 } from "./service";
@@ -23,6 +24,12 @@ export async function nativeProtectionBridge(
   protection.assertAvailable();
   const lifetime = new AbortController();
   let pending = 0;
+  // Numbers checks as they start, so a turn can tell its own from earlier ones.
+  let started = 0;
+  // Why the provider denied a session's model input, and in which check,
+  // until its runtime takes it to tell people why the turn stopped. One nobody
+  // takes ages out, as at most as many as can be checked at once are kept.
+  const explained = new Map<string, { reason: string; check: number }>();
   const server = await serve(async (message) => {
     const call = message as {
       id?: string;
@@ -59,10 +66,25 @@ export async function nativeProtectionBridge(
     )
       throw new Error("Invalid native security request");
     pending++;
+    const check = ++started;
     try {
       await protection.check(structuredClone(action), lifetime.signal);
       return { jsonrpc: "2.0", id: call.id, result: { allowed: true } };
-    } catch {
+    } catch (error) {
+      // A check from an earlier turn that settles late keeps a newer reason.
+      if (
+        action.kind === "context" &&
+        error instanceof ProtectionDenied &&
+        error.reason &&
+        (explained.get(action.session)?.check ?? 0) < check
+      ) {
+        explained.delete(action.session);
+        explained.set(action.session, { reason: error.reason, check });
+        if (explained.size > 16) {
+          const [oldest = ""] = explained.keys();
+          explained.delete(oldest);
+        }
+      }
       return { jsonrpc: "2.0", id: call.id, result: { allowed: false } };
     } finally {
       pending--;
@@ -81,6 +103,16 @@ export async function nativeProtectionBridge(
       ...protectionEnvironment(protection),
       BUZZ_SECURITY_URL: server.url,
       BUZZ_SECURITY_TOKEN: authorization.slice(7),
+    },
+    /** Starts a turn of `session`. What it returns takes the reason given for
+     * denying model input in a check started since, if any. */
+    explainer(session: string) {
+      const since = started;
+      return () => {
+        const denial = explained.get(session);
+        explained.delete(session);
+        return denial && denial.check > since ? denial.reason : undefined;
+      };
     },
     async close() {
       lifetime.abort();

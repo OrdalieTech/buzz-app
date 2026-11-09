@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import "../../../tests/sonner-dom";
+import "@testing-library/jest-dom/vitest";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   act,
@@ -23,6 +24,9 @@ import {
   scriptedTransport,
   signed,
 } from "../relay/testing";
+import type { ConversationExtensions } from "../conversation/contracts";
+import { VoiceNoteCard } from "../../bundled/voice-notes/VoiceNoteCard";
+import { ThreadPanel } from "./ThreadPanel";
 import { ChannelTimeline } from "./ChannelTimeline";
 
 // Virtualizer boundary: render only "visible" indices plus `keepMounted`,
@@ -84,6 +88,8 @@ beforeEach(() => {
       disconnect() {}
     },
   );
+  vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+  vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
 });
 afterEach(() => {
   cleanup();
@@ -94,11 +100,22 @@ afterEach(() => {
   localStorage.clear();
 });
 
-function mount(publish: (event: RelayEvent) => Promise<void>) {
+function mount(
+  publish: (event: RelayEvent) => Promise<void>,
+  targetEvent = target,
+  initial = [targetEvent, neighbor],
+  threadRoot?: string,
+  options: {
+    media?: (url: string) => string;
+    extensions?: ConversationExtensions;
+  } = {},
+) {
   let live: LiveCallbacks | undefined;
   const owner = createRelaySession(
     {
       ...scriptedTransport(viewer.pubkey, relay.pubkey).transport,
+      ...(threadRoot ? { query: async () => initial } : {}),
+      ...(options.media ? { media: options.media } : {}),
       writer: { sign: async (template) => signed(viewer, template), publish },
       subscribe(callbacks) {
         live = callbacks;
@@ -109,26 +126,46 @@ function mount(publish: (event: RelayEvent) => Promise<void>) {
   );
   owners.push(owner);
   owner.session.channels.ensure("c");
-  live?.receive([roster(relay, "c", [viewer.pubkey], 1), target, neighbor]);
+  live?.receive([roster(relay, "c", [viewer.pubkey], 1), ...initial]);
   const tree = () => (
     <StrictMode>
       <ToastProvider>
-        <ChannelTimeline
-          channelId="c"
-          scope="viewer"
-          queries={owner.session}
-          window={owner.session.channels.window("c")}
-          onOpenLink={() => false}
-        />
+        {threadRoot ? (
+          <ThreadPanel
+            session={owner.session}
+            scope="viewer"
+            channelName="C"
+            channelId="c"
+            messageId={threadRoot}
+            onOpenLink={() => false}
+          />
+        ) : (
+          <ChannelTimeline
+            channelId="c"
+            scope="viewer"
+            queries={owner.session}
+            window={owner.session.channels.window("c")}
+            onOpenLink={() => false}
+            extensions={options.extensions}
+          />
+        )}
       </ToastProvider>
     </StrictMode>
   );
   const result = render(tree());
   const row = () =>
-    document.querySelector<HTMLElement>(`[data-message-id="${target.id}"]`);
+    document.querySelector<HTMLElement>(
+      `[data-message-id="${targetEvent.id}"]`,
+    );
   const neighborRow = () =>
     document.querySelector(`[data-message-id="${neighbor.id}"]`);
   return {
+    receive(event: RelayEvent) {
+      act(() => {
+        live?.receive([event]);
+        result.rerender(tree());
+      });
+    },
     row,
     neighborRow,
     // Scroll the target out of the virtualizer buffer.
@@ -149,10 +186,13 @@ function mount(publish: (event: RelayEvent) => Promise<void>) {
 
 async function openReport(row: HTMLElement) {
   const user = userEvent.setup();
-  const trigger = within(row).getByRole("button", {
+  const more = within(row).queryByRole("button", {
     name: "More message actions",
   });
-  await user.click(trigger);
+  const trigger =
+    more ?? within(row).getByRole("button", { name: /Working on the report/ });
+  if (more) await user.click(trigger);
+  else fireEvent.contextMenu(trigger);
   await user.click(await screen.findByRole("menuitem", { name: "Report" }));
   await screen.findByRole("dialog", { name: "Report message" });
   return { user, trigger };
@@ -322,3 +362,295 @@ it("closing the image viewer before the report notice ends keeps the row pinned 
   await waitFor(() => expect(h.row()).toBeNull());
   expect(h.neighborRow()).not.toBeNull();
 });
+
+// Inline audio plays only from the relay proxy; other sources are file cards.
+const proxied = (url: string) =>
+  `/api/relay/primary/media?url=${encodeURIComponent(url)}`;
+// Readers must return stable snapshots, or useSyncExternalStore loops.
+const empty: never[] = [];
+const none = { snapshot: () => empty, subscribe: () => () => {} };
+const voiceNote = [
+  {
+    key: "voice-notes:player",
+    pluginId: "voice-notes",
+    revision: "1",
+    id: "player",
+    title: "Voice note",
+    matches: (attachment: { name?: string }) =>
+      !!attachment.name?.endsWith(".m4a"),
+    component: ({ source }: { source: string }) => (
+      <VoiceNoteCard source={source} duration={120} />
+    ),
+  },
+];
+const voiceNotes: ConversationExtensions = {
+  tools: none,
+  inline: none,
+  attachments: { snapshot: () => voiceNote, subscribe: () => () => {} },
+};
+
+it.each([
+  ["a plain audio attachment", "a.mp3", "audio/mpeg", "Play a.mp3", "pause"],
+  ["a voice note", "voice.m4a", "audio/mp4", "Play voice note", "pause"],
+  [
+    "a voice note (reloaded)",
+    "voice.m4a",
+    "audio/mp4",
+    "Play voice note",
+    "emptied",
+  ],
+  ["an inline video", "a.mp4", "video/mp4", "Open video fullscreen", "ended"],
+] as const)(
+  "keeps a row mounted while %s plays, then lets it go when playback stops",
+  async (_, file, mime, control, stop) => {
+    const playing = message(other, "c", "Listen", 1, [
+      ["imeta", `url https://relay.test/media/${file}`, `m ${mime}`],
+    ]);
+    const h = mount(async () => {}, playing, [playing, neighbor], undefined, {
+      media: proxied,
+      extensions: voiceNotes,
+    });
+    const row = h.row();
+    const player = row?.querySelector<HTMLMediaElement>("audio, video");
+    if (!row || !player) throw new Error("Missing media row");
+    within(row).getByRole("button", { name: control });
+    // jsdom has no playback; report what a browser reports while playing.
+    let paused = false;
+    Object.defineProperty(player, "paused", { get: () => paused });
+    fireEvent.play(player);
+    // A browser delivers the play's mutation records before playback stops.
+    await act(async () => {});
+    h.evict();
+    expect(h.row()).toBe(row);
+    expect(player.isConnected).toBe(true);
+    paused = true;
+    fireEvent[stop](player);
+    await waitFor(() => expect(h.row()).toBeNull());
+    expect(h.neighborRow()).not.toBeNull();
+  },
+);
+
+it("keeps a row mounted while another of its players still plays", async () => {
+  const both = message(other, "c", "Listen", 1, [
+    ["imeta", "url https://relay.test/media/a.mp3", "m audio/mpeg"],
+    ["imeta", "url https://relay.test/media/a.mp4", "m video/mp4"],
+  ]);
+  const h = mount(async () => {}, both, [both, neighbor], undefined, {
+    media: proxied,
+  });
+  const row = h.row();
+  const audio = row?.querySelector("audio");
+  const video = row?.querySelector("video");
+  if (!row || !audio || !video) throw new Error("Missing media row");
+  const playing = new Set<HTMLMediaElement>([audio, video]);
+  for (const player of playing)
+    Object.defineProperty(player, "paused", {
+      get: () => !playing.has(player),
+    });
+  fireEvent.play(audio);
+  fireEvent.play(video);
+  playing.delete(audio);
+  fireEvent.pause(audio);
+  // A released pin lets go a task later; wait it out before evicting.
+  await act(() => new Promise((resolve) => setTimeout(resolve)));
+  h.evict();
+  expect(h.row()).toBe(row);
+  playing.delete(video);
+  fireEvent.pause(video);
+  await waitFor(() => expect(h.row()).toBeNull());
+});
+
+it("lets a playing row go when its voice note fails", async () => {
+  const failing = message(other, "c", "Listen", 1, [
+    ["imeta", "url https://relay.test/media/voice.m4a", "m audio/mp4"],
+  ]);
+  const h = mount(async () => {}, failing, [failing, neighbor], undefined, {
+    media: proxied,
+    extensions: voiceNotes,
+  });
+  const row = h.row();
+  const audio = row?.querySelector("audio");
+  if (!row || !audio) throw new Error("Missing media row");
+  // A failed element can still report paused false.
+  Object.defineProperty(audio, "paused", { get: () => false });
+  fireEvent.play(audio);
+  // A decode error is not retried.
+  Object.defineProperty(audio, "error", { get: () => ({ code: 3 }) });
+  fireEvent.error(audio);
+  within(row).getByText("Audio unavailable. Retry playback.");
+  // The card keeps its failed player, so no removal releases the row.
+  expect(audio.isConnected).toBe(true);
+  h.evict();
+  await waitFor(() => expect(h.row()).toBeNull());
+  expect(h.neighborRow()).not.toBeNull();
+});
+
+const claimer = [
+  {
+    key: "cards:claimer",
+    pluginId: "cards",
+    revision: "1",
+    id: "claimer",
+    title: "Claimed card",
+    matches: (message: { content: string }) => message.content === "Claimed",
+    ownsAttachment: () => true,
+    component: () => <p>Claimed card</p>,
+  },
+];
+const cards: ConversationExtensions = {
+  tools: none,
+  inline: none,
+  messages: { snapshot: () => claimer, subscribe: () => () => {} },
+};
+
+// An edit listing no attachments keeps the original's, so only a claim can
+// unmount the whole list.
+it.each([
+  ["is edited out", "Listen", "url https://relay.test/media/b.pdf"],
+  [
+    "is claimed, emptying the list",
+    "Claimed",
+    "url https://relay.test/media/a.mp3",
+  ],
+] as const)(
+  "lets a playing row go when its player %s",
+  async (_, content, url) => {
+    const playing = message(other, "c", "Listen", 1, [
+      ["imeta", "url https://relay.test/media/a.mp3", "m audio/mpeg"],
+    ]);
+    const h = mount(async () => {}, playing, [playing, neighbor], undefined, {
+      media: proxied,
+      extensions: cards,
+    });
+    const row = h.row();
+    const audio = row?.querySelector("audio");
+    if (!row || !audio) throw new Error("Missing media row");
+    Object.defineProperty(audio, "paused", { get: () => false });
+    fireEvent.play(audio);
+    h.evict();
+    expect(h.row()).toBe(row);
+    // React no longer dispatches events for the removed player.
+    h.receive(
+      signed(other, {
+        kind: 40003,
+        content,
+        created_at: 3,
+        tags: [
+          ["h", "c"],
+          ["e", playing.id],
+          ["imeta", url],
+        ],
+      }),
+    );
+    expect(audio.isConnected).toBe(false);
+    await waitFor(() => expect(h.row()).toBeNull());
+    expect(h.neighborRow()).not.toBeNull();
+  },
+);
+
+it("lets a playing agents row go when it collapses", async () => {
+  const root = message(viewer, "c", "Request", 1);
+  const step = message(other, "c", "Listen", 3, [
+    ["audience", "agents"],
+    ["imeta", "url https://relay.test/media/a.mp3", "m audio/mpeg"],
+  ]);
+  const h = mount(async () => {}, step, [root, neighbor, step], undefined, {
+    media: proxied,
+  });
+  fireEvent.click(
+    await screen.findByRole("button", { name: /Show activity history/ }),
+  );
+  // The group's toggle takes focus, and a focused group stays mounted.
+  act(() => (document.activeElement as HTMLElement).blur());
+  const row = h.row();
+  if (!row) throw new Error("Missing agents row");
+  const line = within(row).getByRole("button", { name: /Listen/ });
+  fireEvent.click(line);
+  const audio = await waitFor(() => {
+    const player = row.querySelector("audio");
+    if (!player) throw new Error("Missing player");
+    return player;
+  });
+  let paused = false;
+  Object.defineProperty(audio, "paused", { get: () => paused });
+  fireEvent.play(audio);
+  fireEvent.click(line);
+  await waitFor(() => expect(audio.isConnected).toBe(false));
+  // A browser pauses the detached player, but React drops its pause.
+  paused = true;
+  fireEvent.pause(audio);
+  h.evict();
+  await waitFor(() => expect(h.row()).toBeNull());
+  expect(h.neighborRow()).not.toBeNull();
+});
+
+it.each([
+  ["channel", "draft"],
+  ["channel", "pending"],
+  ["thread", "draft"],
+  ["thread", "pending"],
+] as const)(
+  "retains the %s report owner through completion with a %s report",
+  async (host, phase) => {
+    let release!: () => void;
+    const publish = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const root = message(viewer, "c", "Request", 1);
+    const tags =
+      host === "thread"
+        ? [
+            ["e", root.id, "", "root"],
+            ["e", root.id, "", "reply"],
+          ]
+        : [];
+    const step = message(other, "c", "Working on the report", 2, [
+      ["audience", "agents"],
+      ...tags,
+    ]);
+    const h = mount(
+      publish,
+      step,
+      [root, step],
+      host === "thread" ? root.id : undefined,
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: /Show activity history/ }),
+    );
+    const original = h.row();
+    if (!original) throw new Error("Missing contained activity");
+    const { user } = await openReport(original);
+    await user.click(screen.getByRole("radio", { name: "Spam" }));
+    const context = screen.getByRole("textbox", {
+      name: "Additional context (optional)",
+    });
+    await user.type(context, "Keep this draft");
+    try {
+      if (phase === "pending") {
+        await user.click(screen.getByRole("button", { name: "Submit report" }));
+        await waitFor(() => expect(publish).toHaveBeenCalledOnce());
+      }
+      h.receive(message(other, "c", "Finished the work", 3, tags));
+      expect(h.row()).toBe(original);
+      expect(
+        screen.getByRole("dialog", { name: "Report message" }),
+      ).toBeTruthy();
+      expect(context).toHaveValue("Keep this draft");
+    } finally {
+      if (phase === "pending") await act(async () => release());
+    }
+    if (phase === "pending") {
+      expect(
+        await screen.findByText("Report submitted to community moderators"),
+      ).toBeTruthy();
+      expect(h.row()).toBe(original);
+      await user.click(screen.getByRole("button", { name: /dismiss/i }));
+    } else {
+      await user.click(screen.getByRole("button", { name: "Cancel" }));
+    }
+    expect(h.row()).toBeInTheDocument();
+  },
+);

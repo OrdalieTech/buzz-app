@@ -3,6 +3,7 @@ import { purgeOutboxStorage } from "./outbox-storage";
 import { relayPartition } from "./partition";
 import { createHeadPersistence } from "./persistence";
 import { purgeReadStateStorage } from "./read-state-storage";
+import { purgeSoloModelPicks } from "../messages/solo-model-picks-storage";
 
 /** Clears the relay's durable stores for one partition, each through the
  * caller's `attempt` so an unavailable store neither keeps the others nor goes
@@ -27,4 +28,7 @@ export async function purgeRelayPartition(
   await attempt("read state", () => purgeReadStateStorage(partition));
   await attempt("outbox", () => purgeOutboxStorage(partition));
   await attempt("artifacts", () => purgeArtifactStorage(viewer, origin));
+  await attempt("model and effort choices", () =>
+    purgeSoloModelPicks(partition),
+  );
 }

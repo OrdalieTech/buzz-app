@@ -28,6 +28,8 @@ export type FakeTurn = {
 export type FakeGoose = {
   id: string;
   options: HostProcessOptions;
+  /** The agent its credential was bound to, if any. */
+  actedAs?: Readonly<{ pubkey: string; relay: string }>;
   /** Every message written to its stdin. */
   received: Message[];
   /** Each `session/new`'s params. */
@@ -113,9 +115,13 @@ export function fakeSpawn(
     /** Requests each process never answers. */
     silent?: readonly string[];
     /** The thinking levels a session lists on each model, `""` being the
-     * one it opens on; one not here lists none. */
+     * one it opens on; one not here lists none. `grouped` lists them in one
+     * ACP option group. */
     thinking?: Readonly<
-      Record<string, Readonly<{ current: string; levels: readonly string[] }>>
+      Record<
+        string,
+        Readonly<{ current: string; levels: readonly string[]; grouped?: true }>
+      >
     >;
   }> = {},
 ) {
@@ -168,19 +174,21 @@ export function fakeSpawn(
     const models = new Map<string, string>();
     const configOptions = (sessionId: string) => {
       const thinking = options.thinking?.[models.get(sessionId) ?? ""];
-      return thinking
-        ? [
-            {
-              id: "thinking_effort",
-              category: "thought_level",
-              currentValue: thinking.current,
-              options: thinking.levels.map((level) => ({
-                value: level,
-                name: level,
-              })),
-            },
-          ]
-        : [];
+      if (!thinking) return [];
+      const levels = thinking.levels.map((level) => ({
+        value: level,
+        name: level,
+      }));
+      return [
+        {
+          id: "thinking_effort",
+          category: "thought_level",
+          currentValue: thinking.current,
+          options: thinking.grouped
+            ? [{ group: "levels", name: "Levels", options: levels }]
+            : levels,
+        },
+      ];
     };
     const answers = new Map<number | string, (message: Message) => void>();
     const send = (message: Message) =>
@@ -251,6 +259,11 @@ export function fakeSpawn(
       if (fake.silent.has(method)) return;
       const sessionId = String(params.sessionId ?? "");
       switch (method) {
+        case "_buzz/security/capabilities":
+          return reply(id, {
+            version: 2,
+            enabled: fake.env.BUZZ_SECURITY_URL != null,
+          });
         case "initialize":
           return reply(id, {
             protocolVersion: 1,
@@ -467,6 +480,11 @@ export function fakeSpawn(
         fake.killed = true;
         fake.exit(null);
       },
+      ...(process.agentCredential && {
+        actAs: async (agent: Readonly<{ pubkey: string; relay: string }>) => {
+          fake.actedAs = agent;
+        },
+      }),
       exited,
     };
   };
@@ -489,3 +507,49 @@ export function fakeSpawn(
 export const flush = async (rounds = 10) => {
   for (let index = 0; index < rounds; index++) await Promise.resolve();
 };
+
+/** Holds each goose's requests for `method` until they are released, as a
+ * slow goose's answers are; those whose session `rejects` names are answered
+ * with an error instead. `wrap` makes the spawn that hands them out. */
+export function gated(
+  method: string,
+  rejects: (sessionId: string) => boolean = () => false,
+) {
+  const held: { sessionId: string; resume(): void }[] = [];
+  return {
+    wrap:
+      (spawn: ReturnType<typeof fakeSpawn>["spawn"]) =>
+      async (id: string, options: HostProcessOptions = {}) => {
+        const process = await spawn(id, options);
+        return {
+          ...process,
+          write: async (data: string) => {
+            if (id !== "goose" || !data.includes(`"method":"${method}"`))
+              return process.write(data);
+            const { id: requestId, params } = JSON.parse(data);
+            const sessionId = String(params?.sessionId ?? "");
+            await new Promise<void>((resume) =>
+              held.push({ sessionId, resume }),
+            );
+            if (!rejects(sessionId)) return process.write(data);
+            options.onStdout?.(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id: requestId,
+                error: { code: -32602, message: "No active run" },
+              })}\n`,
+            );
+          },
+        };
+      },
+    /** The sessions whose request is held. */
+    waiting: () => held.map((request) => request.sessionId),
+    /** Lets the request of `sessionId` go, or every held one. */
+    release: (sessionId?: string) => {
+      for (const request of held.splice(0))
+        if (sessionId === undefined || request.sessionId === sessionId)
+          request.resume();
+        else held.push(request);
+    },
+  };
+}

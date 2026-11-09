@@ -48,7 +48,8 @@ test("editing selected name plus pasting same name cannot transfer notification 
       .getByRole("button", { name: "Mention a member", exact: true })
       .click();
     await page
-      .getByRole("button", { name: `Honey ${first}`, exact: true })
+      .getByRole("button")
+      .and(page.locator(`[data-mention-choice="${first}"]`))
       .click();
     await expect(input).toHaveJSProperty("value", "@Honey ");
     // The picker restores focus/caret on the next animation frame. Let that
@@ -94,7 +95,8 @@ test("typing after an unchanged agent prefill does not consume a stale caret com
     .getByRole("button", { name: "Mention a member", exact: true })
     .click();
   await page
-    .getByRole("button", { name: `Honey (agent) ${agent}`, exact: true })
+    .getByRole("button")
+    .and(page.locator(`[data-mention-choice="${agent}"]`))
     .click();
   await expect(input).toHaveJSProperty("value", "@Honey ");
   await expect(input).toBeFocused();
@@ -140,7 +142,8 @@ test("focus during the first edit after send preserves the advanced native caret
     .getByRole("button", { name: "Mention a member", exact: true })
     .click();
   await page
-    .getByRole("button", { name: `Honey (agent) ${agent}`, exact: true })
+    .getByRole("button")
+    .and(page.locator(`[data-mention-choice="${agent}"]`))
     .click();
   await expect(input).toHaveJSProperty("value", "@Honey ");
   await page.keyboard.type("hello");

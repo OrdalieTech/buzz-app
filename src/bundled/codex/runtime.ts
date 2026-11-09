@@ -1,8 +1,17 @@
+import { openVoice } from "./voice";
+import { isHuddleRoom } from "../../features/huddle/lifecycle";
+import type {
+  AgentExecution,
+  AgentExecutionSession,
+} from "../../features/agents/execution";
+import { CodexExecution } from "./execution";
 import { callbackHookArgs, openHookBridge } from "./hook-bridge";
 import type { Host } from "../../features/host/service";
 import { nativeHookState } from "./hooks";
 import { isFinalMessage } from "../../buzz-mcp/session-tools";
 import type { WorkOutcome } from "../../features/agents/local-activity";
+import type { AgentProtection } from "../../features/agent-protection/service";
+import { nativeProtectionBridge } from "../../features/agent-protection/native-bridge";
 import { fromOwner, workflowOf } from "../../features/agents/owner-attestation";
 import {
   type ConversationWake,
@@ -11,10 +20,15 @@ import {
 } from "../../features/agent-harness/plugin-wake";
 import type { AgentKey } from "../../features/agents/membership";
 import type { AgentReads } from "../../features/agents/reads";
+import {
+  EACH_TURN,
+  sessionPrompts,
+} from "../../features/agents/session-prompts";
 import { localStore, type AgentStore } from "../../features/agents/store";
 import type {
   Agent,
   AgentHandle,
+  AgentVoiceSeat,
   Agents,
   Delivery,
   Models,
@@ -22,6 +36,8 @@ import type {
   TurnResult,
 } from "../../features/agents/service";
 import type { EventData } from "../../features/relay/events";
+import { CREDENTIAL_ENV } from "../../features/host/service";
+import { threadReference } from "../../features/relay/thread-reference";
 import type { ChannelLabel } from "../../features/channels/channel-icon";
 import { appClient, readFile } from "../../buzz-mcp/app-client";
 import { readProject } from "../../features/agent-harness/project";
@@ -53,6 +69,7 @@ import {
 } from "./config";
 import { unsupportedSynced } from "../../features/agents/agent-config";
 import { conversationHistory } from "./history";
+import { buzzHome } from "./setup";
 import {
   developerInstructions,
   rootOf,
@@ -75,10 +92,13 @@ type Request = {
   current?: () => boolean;
   /** The agent's community and owner, as `origin:viewer`. */
   scope: string;
-  event: EventData;
+  /** Publish/activity root; unlike toolRoot, retained in DMs. */
+  replyRoot?: string;
   agent: AgentHandle;
   settings: Config;
   conversation: Conversation;
+  /** Presentation scope, independent of the harness session and reply routing. */
+  activityScope: string;
   /** A plugin's wake, for which `event` is its local anchor. */
   wake?: ConversationWake;
   wakeText?: Delivery["wakeText"];
@@ -97,6 +117,8 @@ type Request = {
    * a steering rejection is posted in its place, or the turn ends normally.
    * `stopped` is that the owner's interrupt ended the turn. */
   answered: (stopped?: boolean) => void;
+  /** A failed final delivery stays pending until this request gets a reply. */
+  finalDelivery?: Error | true;
   step?: (tool: string, target?: string) => void;
   acknowledged?: () => void;
   superseded?: () => void;
@@ -109,14 +131,20 @@ type Request = {
    * one that fails or is cancelled before then leaves them for the next. */
   notes?: readonly string[];
 };
+type TextRequest = Request & { event: EventData; adopted?: never };
 /** `at` is when the binding last took in a message or ended a turn; bindings
  * saved before it existed have none. `tools` is the `addedKey` of the
- * thread's tools, absent when plugins added none. */
+ * thread's tools, absent when plugins added none. `protection` is the
+ * `stateKey` of the protection the thread ran under, absent when unprotected;
+ * only a run under the same state resumes it. */
 type Saved = {
   threadId: string;
   workspace: string;
   at?: number;
   tools?: string;
+  /** A lost first-turn response must not be treated as an empty session. */
+  pending?: true;
+  protection?: string;
 };
 type Active = {
   /** The server this turn runs on; steering must reach the same process. */
@@ -124,6 +152,7 @@ type Active = {
   threadId?: string;
   turnId?: string;
   ready: Promise<void>;
+  released: Promise<void>;
   steering: Promise<void>;
   reply: Request;
   finished: boolean;
@@ -159,6 +188,7 @@ type Lane = {
   /** Turns waiting on `tail` to start; steering past them would reorder. */
   queued: number;
   active?: Active;
+  voice?: { loaded: Loaded; signal: AbortSignal };
 };
 type Entry = {
   storageKey: string;
@@ -172,11 +202,16 @@ type Entry = {
   /** Requests delivered and not yet taken into a turn, nor ended. */
   waiting: Set<Request>;
 };
+type Loaded = Awaited<ReturnType<CodexRuntime["loadThread"]>>;
 type Server = {
+  protection?: AgentProtection;
   rpc: AppServer;
   opening: Promise<AppServer>;
   /** Threads this process has loaded, and the agent, by key, each belongs to. */
   threads: Map<string, AgentKey>;
+  /** Starts a turn of a thread. What it returns takes why the provider refused
+   * that turn's model input, if it said. */
+  explainer?(threadId: string): () => string | undefined;
 };
 export type SessionView = { key: string; status: string; detail: string };
 /** A saved binding, newest first, for the owner's transcript list, with the
@@ -192,6 +227,12 @@ export type SavedConversation = Partial<ChannelLabel> & {
  * one over about 50ms after the turn ends. */
 const STOP_LINGER_MS = 1_000;
 const LINGER_POLL_MS = 100;
+/** The binding a run under `protection` may resume: threads never cross
+ * protection state keys, protected or not. */
+const resumable = (
+  saved: Saved | undefined,
+  protection: Pick<AgentProtection, "stateKey"> | undefined,
+) => (saved?.protection === protection?.stateKey ? saved : undefined);
 const input = (text: string) => [{ type: "text", text, text_elements: [] }];
 /** Codex's own small model for titles, and its title rules. */
 const TITLE_MODEL = "gpt-5.6-luna";
@@ -234,15 +275,44 @@ function textOf(event: EventData, name: string) {
   return text;
 }
 
-/** Agents owns admission/identity. This plugin owns work after hand-over, and
- * uses one app-server for every agent. Each conversation is its own Codex
- * thread carrying its agent's workspace, instructions and tools, and tool
- * calls find their agent by thread and turn. */
+/** Local agents share one app-server. Each remote session owns its server.
+ * Each conversation carries its agent's workspace, instructions and tools.
+ * Tool calls find their agent by thread and turn. */
 export class CodexRuntime {
+  private remote = new Map<
+    string,
+    {
+      agent: AgentKey;
+      runtime: CodexRuntime;
+      execution: AgentExecution;
+    }
+  >();
+  private disposed = false;
+  private opening = new Map<
+    string,
+    {
+      agent: AgentKey;
+      abort: AbortController;
+      ready: Promise<CodexRuntime>;
+    }
+  >();
   private entries = new Map<AgentKey, Entry>();
+  private actions = new Map<
+    AgentKey,
+    Set<{ abort: AbortController; done: Promise<void> }>
+  >();
   private server: Server | undefined;
+  private protectedServers = new Map<AgentKey, Server>();
   private stopping = new Map<AgentKey, Promise<void>>();
+  private stopped = new Map<AgentKey, Entry>();
+  private disposals = new Map<
+    AgentKey,
+    Map<AgentExecution, { done: Promise<void>; failed: boolean }>
+  >();
   private views = new Map<AgentKey, readonly SessionView[]>();
+  private inventories = new Map<AgentKey, SavedConversation[] | null>();
+  private inventoryReads = new Map<AgentKey, object>();
+  private inventoryVersions = new Map<AgentKey, number>();
   private listeners = new Set<() => void>();
   /** Read-only model discovery, kept until effective model settings change. */
   private previews = new Map<
@@ -257,7 +327,10 @@ export class CodexRuntime {
     /** The agent's `core` memory as the host keeps it (`Agents.core`). */
     private readonly core: Agents["core"],
     private readonly storage: AgentStore = localStore(),
-    private readonly resolveConfig: (raw: unknown) => Config = config,
+    private readonly resolveConfig: (
+      raw: unknown,
+      remote?: boolean,
+    ) => Config = config,
     /** The tools plugins add to every thread now. */
     private readonly added: () => readonly AddedTool[] = () => [],
     /** Desktop-local repository instructions; standalone hosts keep their own layout. */
@@ -272,7 +345,138 @@ export class CodexRuntime {
         input: unknown,
       ): Promise<Record<string, unknown>>;
     },
+    private readonly execution?: Agents["execution"],
+    private readonly target?: AgentExecution,
+    private readonly inspect?: Agents["inspectExecution"],
+    private readonly targetKey?: string,
+    private readonly protectionHost?: Pick<Host, "spawn" | "serveMcp">,
+    private readonly handle: (pubkey: string) => AgentHandle | undefined = () =>
+      undefined,
   ) {}
+  private executionKey(agent: AgentKey, scope: string, conversation: string) {
+    return `buzz.codex.sessions.execution.v1:${scope}:${agent}:${conversation}`;
+  }
+  private sessionRecord(text: string): {
+    key: string;
+    intent: "new" | "existing";
+  } {
+    const value = JSON.parse(text);
+    if (
+      !value ||
+      typeof value.key !== "string" ||
+      !value.key ||
+      (value.intent !== "new" && value.intent !== "existing")
+    )
+      throw new Error("Invalid saved execution session");
+    return value;
+  }
+  private async connection(
+    agent: AgentKey,
+    scope: string,
+    conversation: string,
+    signal?: AbortSignal,
+  ): Promise<CodexRuntime> {
+    if (this.disposed) throw new Error("Codex runtime is disposed");
+    if (!this.execution || !(await this.inspect?.(agent))) return this;
+    const key = this.executionKey(agent, scope, conversation);
+    const held = this.remote.get(key);
+    if (held && !held.execution.signal.aborted) return held.runtime;
+    const pending = this.opening.get(key);
+    if (pending) return pending.ready;
+    const abort = new AbortController();
+    const cancel = () => abort.abort(signal?.reason);
+    signal?.addEventListener("abort", cancel, { once: true });
+    if (signal?.aborted) cancel();
+    const lifetime = abort.signal;
+    const ready = (async () => {
+      const stored = this.sessionRecord(
+        (await this.storage.read(key)) ??
+          (await this.storage.add(
+            key,
+            JSON.stringify({ key: crypto.randomUUID(), intent: "new" }),
+          )),
+      );
+      const sessionKey = stored.key;
+      lifetime.throwIfAborted();
+      const savedKey = this.storageKey(scope, agent, sessionKey);
+      const saved = this.load(
+        savedKey,
+        await this.storage.read(savedKey),
+        true,
+      );
+      const session: AgentExecutionSession = {
+        key: sessionKey,
+        intent: stored.intent,
+        signal: lifetime,
+      };
+      const execution = await this.execution?.(agent, session);
+      if (this.disposed || lifetime.aborted) {
+        if (execution) await this.disposeExecution(agent, execution);
+        throw new Error("Codex runtime is retired");
+      }
+      if (!execution) return this;
+      try {
+        if (stored.intent === "new")
+          await this.storage.set(
+            key,
+            JSON.stringify({ key: sessionKey, intent: "existing" }),
+          );
+        lifetime.throwIfAborted();
+        execution.signal.throwIfAborted();
+      } catch (error) {
+        await this.disposeExecution(agent, execution);
+        throw error;
+      }
+      const transport = new CodexExecution(execution);
+      const runtime = new CodexRuntime(
+        transport.spawn,
+        (key) => (key === agent ? this.reads(key) : undefined),
+        this.core,
+        this.storage,
+        (raw) => ({
+          ...this.resolveConfig(raw, true),
+          workspace: execution.workspace,
+        }),
+        this.added,
+        () => "",
+        this.hooks && { serve: transport.serve, run: this.hooks.run },
+        undefined,
+        execution,
+        undefined,
+        sessionKey,
+      );
+      const update = () => {
+        this.views.set(
+          agent,
+          [...this.remote.values()]
+            .filter((entry) => entry.agent === agent)
+            .flatMap((entry) => entry.runtime.sessions(agent)),
+        );
+        for (const listener of this.listeners) listener();
+      };
+      runtime.entry(agent, scope, saved);
+      runtime.subscribe(update);
+      this.remote.set(key, { agent, runtime, execution });
+      execution.signal.addEventListener(
+        "abort",
+        () => {
+          runtime.dispose();
+          update();
+        },
+        { once: true },
+      );
+      return runtime;
+    })();
+    this.opening.set(key, { agent, abort, ready });
+    for (const listener of this.listeners) listener();
+    try {
+      return await ready;
+    } finally {
+      signal?.removeEventListener("abort", cancel);
+      if (this.opening.get(key)?.ready === ready) this.opening.delete(key);
+      for (const listener of this.listeners) listener();
+    }
+  }
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
     return () => {
@@ -293,19 +497,107 @@ export class CodexRuntime {
     ]);
   }
   sessionState(agent: Agent, place: SessionPlace): SessionState {
+    const scope = this.reads(agent.key)?.scope;
+    const remoteKey =
+      scope &&
+      this.executionKey(agent.key, scope, this.controlKey(agent, place));
+    const remote = remoteKey ? this.remote.get(remoteKey) : undefined;
     const key = this.controlKey(agent, place);
     if (this.controls.compacting(`${agent.key}/${key}`)) return "compacting";
+    if (remote?.runtime.sessionState(agent, place) === "compacting")
+      return "compacting";
+    if (this.controls.active(`${agent.key}/${key}`)) return "active";
+    if (remote) return remote.runtime.sessionState(agent, place);
+    if (remoteKey && this.opening.has(remoteKey)) return "active";
     return this.controls.active(`${agent.key}/${key}`) ||
       this.entries.get(agent.key)?.lanes.has(key)
       ? "active"
       : "idle";
   }
-  async session(
+  session(agent: Agent, place: SessionPlace, action: SessionControlAction) {
+    const abort = new AbortController();
+    const pending = {
+      abort,
+      done: this.changeSession(agent, place, action, abort.signal),
+    };
+    const actions = this.actions.get(agent.key) ?? new Set();
+    this.actions.set(agent.key, actions);
+    actions.add(pending);
+    return pending.done.finally(() => {
+      actions.delete(pending);
+      if (!actions.size) this.actions.delete(agent.key);
+    });
+  }
+  private async changeSession(
     agent: Agent,
     place: SessionPlace,
     action: SessionControlAction,
-  ) {
+    lifetime: AbortSignal,
+  ): Promise<void> {
     const reads = this.reads(agent.key);
+    const remote = await this.inspect?.(agent.key);
+    lifetime.throwIfAborted();
+    if (reads && remote) {
+      const conversation = this.controlKey(agent, place);
+      const key = this.executionKey(agent.key, reads.scope, conversation);
+      if (action === "interrupt") {
+        if (this.controls.interrupt(`${agent.key}/${conversation}`)) return;
+        const pending = this.opening.get(key);
+        if (pending) {
+          pending.abort.abort();
+          return;
+        }
+        const held = this.remote.get(key);
+        if (held && !held.execution.signal.aborted)
+          await held.runtime.session(agent, place, action);
+        return;
+      }
+      if (this.sessionState(agent, place) !== "idle")
+        throw new Error("Wait for the active turn to finish first.");
+      if (action === "new")
+        return this.controls.run(
+          `${agent.key}/${conversation}`,
+          action,
+          async () => {
+            await this.storage.set(
+              key,
+              JSON.stringify({ key: crypto.randomUUID(), intent: "new" }),
+            );
+            this.inventoryReads.delete(agent.key);
+            this.inventories.set(
+              agent.key,
+              (this.inventories.get(agent.key) ?? []).filter(
+                (row) => row.key !== conversation,
+              ),
+            );
+            this.inventoryVersions.set(
+              agent.key,
+              this.conversationVersion(agent.key) + 1,
+            );
+            const prior = this.remote.get(key);
+            this.remote.delete(key);
+            prior?.runtime.dispose();
+            if (prior) await this.disposeExecution(agent.key, prior.execution);
+            this.views.set(
+              agent.key,
+              [...this.remote.values()]
+                .filter((entry) => entry.agent === agent.key)
+                .flatMap((entry) => entry.runtime.sessions(agent.key)),
+            );
+            for (const listener of this.listeners) listener();
+          },
+        );
+      if ((await this.storage.read(key)) === null) {
+        throw new Error("There is no session here to compact yet.");
+      }
+      const runtime = await this.connection(
+        agent.key,
+        reads.scope,
+        conversation,
+        lifetime,
+      );
+      return runtime.session(agent, place, action);
+    }
     if (!reads) throw new Error("Connect to the agent's community first.");
     const key = this.controlKey(agent, place);
     const control = `${agent.key}/${key}`;
@@ -319,7 +611,7 @@ export class CodexRuntime {
     if (this.sessionState(agent, place) !== "idle")
       throw new Error("Wait for the active turn to finish first.");
     return this.controls.run(control, action, async (cancel) => {
-      const signal = AbortSignal.any([entry.abort.signal, cancel]);
+      const signal = AbortSignal.any([entry.abort.signal, cancel, lifetime]);
       signal.throwIfAborted();
       const saved = entry.saved[key];
       if (action === "new") {
@@ -331,14 +623,18 @@ export class CodexRuntime {
           entry.saved[key] = saved;
           throw error;
         }
+        this.forget(agent.key, key);
         return;
       }
-      if (!saved) throw new Error("There is no session here to compact yet.");
-      const server = this.open();
+      if (agent.protection && !this.handle(agent.key)?.protection)
+        throw new Error("The protected agent has no live policy binding");
+      const thread = resumable(saved, this.handle(agent.key)?.protection);
+      if (!thread) throw new Error("There is no session here to compact yet.");
+      const server = this.open(this.handle(agent.key));
       const rpc = await server.opening;
       const settings = this.resolveConfig(agent.config);
       const workspace = await this.workspace(settings.workspace);
-      if (workspace !== saved.workspace)
+      if (workspace !== thread.workspace)
         throw new Error(
           "The workspace changed. Send a message to start its session first.",
         );
@@ -351,14 +647,14 @@ export class CodexRuntime {
       );
       try {
         signal.throwIfAborted();
-        bridge?.bind(saved.threadId);
+        bridge?.bind(thread.threadId);
         await rpc.request("thread/resume", {
           ...params,
-          threadId: saved.threadId,
+          threadId: thread.threadId,
           excludeTurns: true,
         });
         signal.throwIfAborted();
-        await this.compact(rpc, signal, saved.threadId, agent.key, key);
+        await this.compact(rpc, signal, thread.threadId, agent.key, key);
         this.status(agent.key, key, "Idle");
       } catch (error) {
         this.status(
@@ -371,19 +667,42 @@ export class CodexRuntime {
       } finally {
         await bridge?.close();
         await rpc
-          .request("thread/unsubscribe", { threadId: saved.threadId })
+          .request("thread/unsubscribe", { threadId: thread.threadId })
           .catch(() => undefined);
       }
     });
   }
-  preview(agent: Agent) {
+  preview(agent: Agent): Promise<Models> {
+    const handle = this.handle(agent.key);
+    if (handle?.protection) this.assertRetired(agent.key, true);
+    if (agent.protection && !handle?.protection)
+      throw new Error("The protected agent has no live policy binding");
+    handle?.protection?.assertAvailable();
     const settings = this.resolveConfig(agent.config);
-    const key = JSON.stringify([settings.model, settings.effort]);
+    const key = JSON.stringify([
+      settings.model,
+      settings.effort,
+      handle?.protection?.key,
+    ]);
     const existing = this.previews.get(agent.key);
     if (existing?.key === key) return existing.ready;
-    const server = this.open();
-    const rpc = server.rpc;
-    const ready = (async () => {
+    const ready = Promise.resolve().then(async () => {
+      const binding = await this.inspect?.(agent.key);
+      if (this.disposed) throw new Error("Codex runtime is disposed");
+      if (this.previews.get(agent.key) !== entry)
+        throw new Error("Codex model preview is retired");
+      if (binding) {
+        const remote = this.resolveConfig(agent.config, true);
+        return {
+          current: remote.model,
+          sendDefaults: true,
+          models: remote.model
+            ? [{ id: remote.model, label: remote.model, efforts: [] }]
+            : [],
+        };
+      }
+      const server = this.open(handle);
+      const rpc = server.rpc;
       await server.opening;
       const models = await listModels(rpc);
       const model = resolveModel(settings.model, models);
@@ -411,7 +730,7 @@ export class CodexRuntime {
             sendDefaults: true,
             models: [{ id: model, label: model, efforts: [] }, ...offered],
           };
-    })();
+    });
     const entry = { key, ready };
     this.previews.set(agent.key, entry);
     void ready.catch(() => {
@@ -421,7 +740,24 @@ export class CodexRuntime {
     return ready;
   }
 
+  /** A file as the agent's turns read one here: in its saved workspace. On
+   * an execution target only a conversation's session can read it. */
+  async workspaceFile(agent: Agent, path: string, signal: AbortSignal) {
+    if (this.target || (await this.inspect?.(agent.key)))
+      throw new Error(
+        `This agent reads files only in a conversation on its execution target, not ${path}`,
+      );
+    const saved = this.resolveConfig(agent.config).workspace;
+    if (!validWorkspace(saved))
+      throw new Error(
+        "Choose an absolute workspace path or ~/.buzz in Codex settings first.",
+      );
+    const workspace = await this.workspace(saved);
+    signal.throwIfAborted();
+    return readFile(this.spawn, workspace, path, signal);
+  }
   private async workspace(path: string) {
+    if (this.target) return this.target.resolveDirectory(this.target.workspace);
     if (absoluteWorkspace(path)) return path;
     let directory = "";
     const process = await this.spawn("workspace", {
@@ -438,6 +774,7 @@ export class CodexRuntime {
   }
   /** Copies `threadId` from the user's Codex home, if it is there. */
   private async adopt(threadId: string) {
+    if (this.target) return;
     const process = await this.spawn("adopt", { args: [threadId] });
     await process.exited;
   }
@@ -461,20 +798,149 @@ export class CodexRuntime {
     );
     for (const listener of this.listeners) listener();
   }
+  private disposeExecution(
+    agent: AgentKey,
+    execution: AgentExecution,
+    retry = false,
+  ) {
+    const disposals = this.disposals.get(agent) ?? new Map();
+    const prior = disposals.get(execution);
+    if (prior && (!retry || !prior.failed)) return prior.done;
+    const disposal = { done: Promise.resolve(), failed: false };
+    this.disposals.set(agent, disposals);
+    disposals.set(execution, disposal);
+    disposal.done = Promise.resolve()
+      .then(() => execution.dispose())
+      .then(
+        () => {
+          disposals.delete(execution);
+          if (!disposals.size) this.disposals.delete(agent);
+        },
+        (error) => {
+          disposal.failed = true;
+          throw error;
+        },
+      );
+    return disposal.done;
+  }
+  retire(agent: AgentKey): Promise<void> {
+    const prior = this.stopping.get(agent);
+    const disposals = [...(this.disposals.get(agent)?.keys() ?? [])].map(
+      (execution) => this.disposeExecution(agent, execution, true),
+    );
+    const entry = this.entries.get(agent) ?? this.stopped.get(agent);
+    const protectedServer =
+      this.protectedServers.get(agent) ?? this.unretired.get(agent);
+    const actions = [...(this.actions.get(agent) ?? [])];
+    for (const action of actions) action.abort.abort();
+    entry?.abort.abort();
+    if (entry) this.stopped.set(agent, entry);
+    this.entries.delete(agent);
+    this.views.delete(agent);
+    this.previews.delete(agent);
+    this.inventories.delete(agent);
+    this.inventoryReads.delete(agent);
+    this.inventoryVersions.delete(agent);
+    const pending = [...this.opening.values()].filter(
+      (opening) => opening.agent === agent,
+    );
+    for (const opening of pending) opening.abort.abort();
+    const remotes = [...this.remote].filter(
+      ([, remote]) => remote.agent === agent,
+    );
+    const stopped = Promise.allSettled([
+      prior,
+      ...disposals,
+      ...actions.map((action) => action.done.catch(() => undefined)),
+      ...(entry
+        ? [
+            (async () => {
+              if (protectedServer) await this.shutdown(agent, protectedServer);
+              const server = protectedServer ?? this.server;
+              if (server) await this.stop(server, agent, entry);
+              if (this.stopped.get(agent) === entry) this.stopped.delete(agent);
+            })(),
+          ]
+        : []),
+      ...(!entry && protectedServer
+        ? [this.shutdown(agent, protectedServer)]
+        : []),
+      ...pending.map((opening) => opening.ready.catch(() => undefined)),
+      ...remotes.map(async ([key, remote]) => {
+        try {
+          await remote.runtime.retire(agent);
+        } finally {
+          remote.runtime.dispose();
+          await this.disposeExecution(agent, remote.execution);
+        }
+        if (this.remote.get(key) === remote) this.remote.delete(key);
+      }),
+    ]).then(async (results) => {
+      const disposed = await Promise.allSettled(
+        [...(this.disposals.get(agent)?.values() ?? [])].map(
+          (disposal) => disposal.done,
+        ),
+      );
+      const failure = [...results, ...disposed].find(
+        (result) => result.status === "rejected",
+      );
+      if (failure?.status === "rejected") throw failure.reason;
+    });
+    this.stopping.set(agent, stopped);
+    const clear = () => {
+      if (this.stopping.get(agent) === stopped) this.stopping.delete(agent);
+    };
+    void stopped.then(clear, clear);
+    for (const listener of this.listeners) listener();
+    return stopped;
+  }
+  /** Protected servers whose retirement has not confirmed the process exited. */
+  private readonly unretired = new Map<AgentKey, Server>();
+  private assertRetired(agent: AgentKey, protectedStart = false) {
+    if (
+      this.unretired.has(agent) ||
+      (protectedStart && this.stopping.has(agent))
+    )
+      throw new Error("This agent’s previous native sessions have not retired");
+  }
+  /** Closes a protected server; starts for its agent stay refused until the
+   * process has exited. */
+  private async shutdown(agent: AgentKey, server: Server) {
+    this.unretired.set(agent, server);
+    await server.rpc.close();
+    // A pending start fails and closes its late process; the second close
+    // repeats that close if it failed.
+    await server.opening.catch(() => undefined);
+    await server.rpc.close();
+    if (this.unretired.get(agent) === server) this.unretired.delete(agent);
+    if (this.protectedServers.get(agent) === server)
+      this.protectedServers.delete(agent);
+  }
   sync(agents: readonly Agent[]) {
     const present = new Set(agents.map((agent) => agent.key));
-    for (const key of this.previews.keys())
-      if (!present.has(key)) {
-        this.previews.delete(key);
-      }
-    for (const [key, entry] of this.entries)
-      if (!present.has(key)) {
-        entry.abort.abort();
-        this.entries.delete(key);
-        this.views.delete(key);
-        if (this.server) this.stop(this.server, key, entry);
-      }
-    if (!present.size) this.close();
+    const held = new Set([
+      ...this.entries.keys(),
+      ...this.protectedServers.keys(),
+      ...this.unretired.keys(),
+      ...this.stopped.keys(),
+      ...this.disposals.keys(),
+      ...this.actions.keys(),
+      ...this.views.keys(),
+      ...this.previews.keys(),
+      ...this.inventories.keys(),
+      ...this.inventoryReads.keys(),
+      ...[...this.opening.values()].map((opening) => opening.agent),
+      ...[...this.remote.values()].map((remote) => remote.agent),
+    ]);
+    for (const agent of held)
+      if (!present.has(agent))
+        void this.retire(agent).catch((error) =>
+          console.error("Codex could not retire an agent", agent, error),
+        );
+    if (!present.size) {
+      void this.server?.rpc.close();
+      this.server = undefined;
+    }
     for (const listener of this.listeners) listener();
   }
   /** Other agents share the server, so a stopped agent's turns interrupt
@@ -491,25 +957,33 @@ export class CodexRuntime {
       ]);
       for (const [threadId, owner] of server.threads)
         if (owner === agent) {
-          if (this.server !== server) return;
+          if (
+            this.server !== server &&
+            this.protectedServers.get(agent) !== server
+          )
+            return;
+          await server.rpc.request("thread/backgroundTerminals/clean", {
+            threadId,
+          });
           server.threads.delete(threadId);
-          await server.rpc
-            .request("thread/backgroundTerminals/clean", { threadId })
-            .catch((error) =>
-              console.error(
-                "Codex could not clean a stopped agent's terminals",
-                error,
-              ),
-            );
         }
     })();
-    this.stopping.set(agent, stopped);
-    void stopped.finally(() => {
-      if (this.stopping.get(agent) === stopped) this.stopping.delete(agent);
-    });
+    return stopped;
   }
   dispose() {
+    this.disposed = true;
+    for (const actions of this.actions.values())
+      for (const action of actions) action.abort.abort();
+    for (const opening of this.opening.values()) opening.abort.abort();
+    for (const remote of this.remote.values()) {
+      remote.runtime.dispose();
+      void remote.execution.dispose();
+    }
+    this.remote.clear();
     this.previews.clear();
+    this.inventories.clear();
+    this.inventoryReads.clear();
+    this.inventoryVersions.clear();
     for (const entry of this.entries.values()) entry.abort.abort();
     this.entries.clear();
     this.views.clear();
@@ -521,10 +995,96 @@ export class CodexRuntime {
     this.open();
   }
   private close() {
+    for (const server of this.protectedServers.values())
+      void server.rpc.close();
+    this.protectedServers.clear();
+    for (const server of this.unretired.values()) void server.rpc.close();
+    this.unretired.clear();
     void this.server?.rpc.close();
     this.server = undefined;
   }
-  private open() {
+  private open(agent?: Pick<AgentHandle, "key" | "pubkey" | "protection">) {
+    if (agent?.protection) {
+      const protection = agent.protection;
+      this.assertRetired(agent.key, true);
+      protection.assertAvailable();
+      // A prior worker with another key belongs to a replaced provider, which
+      // is already stopping it; the replacement starts once it has exited.
+      const prior = this.protectedServers.get(agent.key);
+      if (prior?.protection?.key === protection.key) return prior;
+      const host = this.protectionHost;
+      if (!host?.serveMcp)
+        throw new Error("Protected Codex requires the desktop security host");
+      const serveMcp = host.serveMcp.bind(host);
+      const rpc = new AppServer((call) => this.tool(call));
+      const server: Server = {
+        rpc,
+        protection,
+        threads: new Map(),
+        opening: Promise.resolve(rpc),
+      };
+      server.opening = (async () => {
+        await prior?.rpc.close();
+        const bridge = await nativeProtectionBridge(serveMcp, protection);
+        server.explainer = bridge.explainer;
+        rpc.onMessage((wire) => {
+          if (wire.method !== "connection/closed") return;
+          void bridge.close();
+          if (this.protectedServers.get(agent.key) !== server) return;
+          this.protectedServers.delete(agent.key);
+          // A failed connection can leave its process running; unless a
+          // retirement already owns its close, it is tracked until it exits.
+          if (!rpc.exited && !this.unretired.has(agent.key))
+            void this.shutdown(agent.key, server).catch(() => undefined);
+        });
+        try {
+          // Buzz's home, as `codex.sh run` sets it, so the engine's state and
+          // sign-in are not the user's `~/.codex`; no home, no engine.
+          const home = await buzzHome(this.spawn);
+          return await rpc.open(
+            (_id, options) =>
+              protection.spawn({
+                ...options,
+                args: [
+                  ...(options?.args ?? []),
+                  "-c",
+                  `sqlite_home=${home}`,
+                  // Tool shells do not inherit the protection bridge's address and token.
+                  "-c",
+                  'shell_environment_policy.set.BUZZ_SECURITY_URL=""',
+                  "-c",
+                  'shell_environment_policy.set.BUZZ_SECURITY_TOKEN=""',
+                ],
+                env: {
+                  ...bridge.env,
+                  CODEX_HOME: home,
+                  // Remote control would follow enrollments in worker-writable state.
+                  CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED: "1",
+                  BASH_ENV: null,
+                  ENV: null,
+                  DYLD_INSERT_LIBRARIES: null,
+                  DYLD_LIBRARY_PATH: null,
+                  DYLD_FRAMEWORK_PATH: null,
+                  LD_PRELOAD: null,
+                  LD_LIBRARY_PATH: null,
+                },
+              }),
+            defaults.workspace,
+            true,
+          );
+        } catch (error) {
+          await bridge.close();
+          await rpc.close();
+          throw error;
+        }
+      })();
+      this.protectedServers.set(agent.key, server);
+      void server.opening.catch(() => {
+        if (this.protectedServers.get(agent.key) === server)
+          this.protectedServers.delete(agent.key);
+      });
+      return server;
+    }
     if (this.server) return this.server;
     const rpc = new AppServer((call) => this.tool(call));
     // Threads set their own cwd; the process just needs a directory that exists.
@@ -536,7 +1096,7 @@ export class CodexRuntime {
             ...options,
             args: [
               ...(options?.args ?? []),
-              ...(this.hooks ? callbackHookArgs : []),
+              ...(this.hooks && !this.target ? callbackHookArgs : []),
             ],
           }),
         defaults.workspace,
@@ -555,14 +1115,21 @@ export class CodexRuntime {
     this.server = server;
     return server;
   }
-  private entry(agent: AgentKey, scope: string) {
+  private entry(
+    agent: AgentKey,
+    scope: string,
+    initial?: Record<string, Saved>,
+  ) {
+    this.assertRetired(agent);
     const prior = this.entries.get(agent);
     if (prior) return prior;
-    const saved = this.load(this.storageKey(scope, agent));
+    const saved = initial ?? this.load(this.storageKey(scope, agent));
     const entry: Entry = {
       storageKey: this.storageKey(scope, agent),
       abort: new AbortController(),
-      after: this.stopping.get(agent) ?? Promise.resolve(),
+      after:
+        this.stopping.get(agent) ??
+        (this.stopped.has(agent) ? this.retire(agent) : Promise.resolve()),
       saved,
       lanes: new Map(),
       onces: new Set(),
@@ -571,9 +1138,26 @@ export class CodexRuntime {
     this.entries.set(agent, entry);
     return entry;
   }
-  private load(storageKey: string) {
+  private load(
+    storageKey: string,
+    text = this.storage.get(storageKey),
+    strict = !!this.target,
+  ) {
     try {
-      const stored: unknown = JSON.parse(this.storage.get(storageKey) ?? "{}");
+      const stored: unknown = JSON.parse(text ?? "{}");
+      if (
+        strict &&
+        (!stored ||
+          typeof stored !== "object" ||
+          Array.isArray(stored) ||
+          Object.values(stored).some(
+            (value) =>
+              !value ||
+              typeof value.threadId !== "string" ||
+              typeof value.workspace !== "string",
+          ))
+      )
+        throw new Error("Invalid saved Codex session");
       if (stored && typeof stored === "object" && !Array.isArray(stored))
         return Object.fromEntries(
           Object.entries(stored).filter(
@@ -583,18 +1167,97 @@ export class CodexRuntime {
               typeof value.workspace === "string",
           ),
         ) as Record<string, Saved>;
-    } catch {
+    } catch (error) {
+      if (strict) throw error;
       /* Start fresh after malformed local data. */
     }
     return {};
   }
-  /** The agent's bindings in this community, most recently used first. */
+  async listConversations(agent: AgentKey): Promise<SavedConversation[]> {
+    const request = {};
+    this.inventoryReads.set(agent, request);
+    let rows: SavedConversation[] | null = null;
+    if (await this.inspect?.(agent)) {
+      const reads = this.reads(agent);
+      if (!reads) throw new Error("The agent's community is unavailable.");
+      rows = [];
+      const prefix = `buzz.codex.sessions.execution.v1:${reads.scope}:${agent}:`;
+      const pointers = await this.storage.scan(prefix);
+      for (const text of Object.values(pointers)) {
+        const key = this.storageKey(
+          reads.scope,
+          agent,
+          this.sessionRecord(text).key,
+        );
+        rows.push(
+          ...this.savedConversations(
+            agent,
+            this.load(key, await this.storage.read(key), true),
+          ),
+        );
+      }
+      rows.sort((a, b) => (b.at ?? 0) - (a.at ?? 0));
+    }
+    if (!this.disposed && this.inventoryReads.get(agent) === request)
+      this.inventories.set(agent, rows);
+    return rows
+      ? this.withHeldConversations(agent, rows)
+      : this.localConversations(agent);
+  }
+  conversationVersion = (agent: AgentKey) =>
+    this.inventoryVersions.get(agent) ?? 0;
+  /** The last observed bindings, most recently used first. */
   conversations(agent: AgentKey): SavedConversation[] {
+    if (this.inventories.has(agent)) {
+      const rows = this.inventories.get(agent);
+      return rows
+        ? this.withHeldConversations(agent, rows)
+        : this.localConversations(agent);
+    }
+    if (this.execution) {
+      const scope = this.reads(agent)?.scope;
+      if (scope) {
+        const prefix = `buzz.codex.sessions.execution.v1:${scope}:${agent}:`;
+        const remote = this.storage
+          .keys()
+          .filter((key) => key.startsWith(prefix))
+          .flatMap((key) => {
+            const stored = this.storage.get(key);
+            if (!stored) return [];
+            return this.savedConversations(
+              agent,
+              this.load(
+                this.storageKey(scope, agent, this.sessionRecord(stored).key),
+              ),
+            );
+          })
+          .sort((a, b) => (b.at ?? 0) - (a.at ?? 0));
+        const conversations = this.withHeldConversations(agent, remote);
+        if (conversations.length) return conversations;
+      }
+    }
+    return this.localConversations(agent);
+  }
+  private withHeldConversations(
+    agent: AgentKey,
+    saved: readonly SavedConversation[],
+  ) {
+    const held = [...this.remote.values()]
+      .filter((entry) => entry.agent === agent)
+      .flatMap((entry) => entry.runtime.conversations(agent));
+    return [
+      ...new Map([...saved, ...held].map((row) => [row.key, row])).values(),
+    ].sort((a, b) => (b.at ?? 0) - (a.at ?? 0));
+  }
+  private localConversations(agent: AgentKey) {
     const reads = this.reads(agent);
     const saved =
       this.entries.get(agent)?.saved ??
       (reads ? this.load(this.storageKey(reads.scope, agent)) : {});
-    // Untimestamped bindings keep save order, newest last; listed newest first.
+    return this.savedConversations(agent, saved);
+  }
+  private savedConversations(agent: AgentKey, saved: Record<string, Saved>) {
+    const reads = this.reads(agent);
     return Object.entries(saved)
       .reverse()
       .flatMap(([key, { threadId, at }]) => {
@@ -629,6 +1292,7 @@ export class CodexRuntime {
     place: Readonly<{ channelId: string; root?: string }>,
     signal: AbortSignal,
   ): Promise<SavedConversation | undefined> {
+    if (this.target || (await this.inspect?.(agent.key))) return;
     const label = this.reads(agent.key)?.channelLabel(place.channelId);
     const found = await findConversation(
       this.spawn,
@@ -648,7 +1312,15 @@ export class CodexRuntime {
   channelLabel(agent: AgentKey, channelId: string) {
     return this.reads(agent)?.channelLabel(channelId);
   }
-  private storageKey(scope: string, agent: AgentKey) {
+  /** What each of the agent's threads started with. */
+  prompts(agent: AgentKey) {
+    return sessionPrompts(this.storage, "codex", agent);
+  }
+  private storageKey(
+    scope: string,
+    agent: AgentKey,
+    sessionKey = this.targetKey,
+  ) {
     // Resume restores the persisted tool schema, so a binding from before a
     // tool change starts fresh. v5 added channel and member management; v6
     // added the shared session tools; v7 added shared notes; v8 added agent
@@ -658,7 +1330,7 @@ export class CodexRuntime {
     // canvas_set; v15 removes message keywords; v16 splits channel and
     // channels into the channel_* tools; v17 splits members into the
     // member_* tools.
-    return `buzz.codex.sessions.v17:${scope}:${agent}`;
+    return `buzz.codex.sessions.v17:${scope}:${agent}${sessionKey ? `:session:${sessionKey}` : ""}`;
   }
   private save(request: Request, entry: Entry, key: string, saved: Saved) {
     // Reinserted so the bounded set keeps the most recently used bindings.
@@ -666,25 +1338,246 @@ export class CodexRuntime {
     entry.saved[key] = saved;
     // Retain a bounded set of bindings; this never deletes Codex's own history.
     entry.saved = Object.fromEntries(Object.entries(entry.saved).slice(-200));
-    void this.storage
-      .set(entry.storageKey, JSON.stringify(entry.saved))
-      .catch((error: unknown) =>
-        this.status(
-          request.agent.key,
-          key,
-          "Session could not be saved",
-          message(error),
-        ),
-      );
+    const savedWrite = this.storage.set(
+      entry.storageKey,
+      JSON.stringify(entry.saved),
+    );
+    if (this.target) return savedWrite;
+    void savedWrite.catch((error: unknown) =>
+      this.status(
+        request.agent.key,
+        key,
+        "Session could not be saved",
+        message(error),
+      ),
+    );
   }
   /** Dates the binding now, when it takes in a message or ends a turn. */
   private touch(request: Request, entry: Entry, key: string) {
     const saved = entry.saved[key];
     if (!saved) return;
-    this.save(request, entry, key, { ...saved, at: Date.now() });
+    void Promise.resolve(
+      this.save(request, entry, key, { ...saved, at: Date.now() }),
+    ).catch((error) =>
+      this.status(
+        request.agent.key,
+        key,
+        "Session could not be saved",
+        message(error),
+      ),
+    );
+
     for (const listener of this.listeners) listener();
   }
-  async run(delivery: Delivery) {
+  async voice(seat: AgentVoiceSeat, agent: AgentHandle) {
+    if (this.disposed) throw new Error("Codex runtime is disposed");
+    seat.signal.throwIfAborted();
+    // Protection is not known to review realtime input, so voice refuses it.
+    if (seat.agent.protection || agent.protection)
+      throw new Error("Voice is unavailable for protected agents");
+    // Voice runs on this computer; a plugin execution target has no voice seat.
+    if (await this.inspect?.(agent.key))
+      throw new Error("Voice is unsupported for agents on an execution target");
+    const reads = this.reads(agent.key);
+    if (!reads) throw new Error("Connect to the agent's community first");
+    const settings = this.resolveConfig(seat.config);
+    if (!validWorkspace(settings.workspace))
+      throw new Error("Choose an absolute Codex workspace first");
+    const { channelId } = seat.conversation;
+    const key = JSON.stringify([channelId, "channel"]);
+    const entry = this.entry(agent.key, reads.scope);
+    const lane = entry.lanes.get(key) ?? { tail: entry.after, queued: 0 };
+    if (lane.voice)
+      throw new Error("This conversation already has a voice seat");
+    entry.lanes.set(key, lane);
+    const abort = new AbortController();
+    const signal = AbortSignal.any([
+      seat.signal,
+      entry.abort.signal,
+      abort.signal,
+    ]);
+    const request: Request = {
+      scope: reads.scope,
+      agent,
+      settings,
+      team: seat.team ?? "",
+      ...(seat.synced ? { synced: seat.synced } : {}),
+      activityScope: channelId,
+      conversation: {
+        channelId,
+        name: reads.channelLabel(channelId)?.name ?? channelId,
+        topLevel: true,
+      },
+      answered() {},
+      failActivity: (reason) =>
+        this.status(agent.key, key, "Needs attention", reason),
+    };
+    const server = this.open(agent);
+    let loaded: Loaded | undefined;
+    let media: Awaited<ReturnType<typeof openVoice>> | undefined;
+    let delegatedThinking = false;
+    let realtimeThinking = false;
+    const thinking = () =>
+      seat.thinking?.(delegatedThinking || realtimeThinking);
+    let off = () => {};
+    let closing: Promise<void> | undefined;
+    const close = () => {
+      if (closing) return closing;
+      signal.removeEventListener("abort", onAbort);
+      abort.abort();
+      off();
+      // Stop media, await the surviving typed turn, then unsubscribe.
+      // New text waits on closing, installed as lane.tail below.
+      const tail = lane.tail;
+      const opened = media;
+      const stopped = opened?.close();
+      closing = (async () => {
+        await stopped;
+        await tail.catch(() => {});
+        if (media !== opened) await media?.close();
+        if (loaded) {
+          await server.rpc
+            .request("thread/unsubscribe", { threadId: loaded.threadId })
+            .catch(() => {});
+          await loaded.bridge?.close();
+        }
+        delete lane.voice;
+        if (!lane.active && !lane.queued && entry.lanes.get(key) === lane)
+          entry.lanes.delete(key);
+      })();
+      lane.tail = closing;
+      return closing;
+    };
+    const onAbort = () => {
+      void close();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    const opening = lane.tail
+      .catch(() => {})
+      .then(async () => {
+        signal.throwIfAborted();
+        const rpc = await server.opening;
+        const memory = await this.core(agent.key, signal);
+        const instructions =
+          Object.values(
+            turnContext(
+              agent,
+              settings,
+              request.team,
+              memory,
+              this.repositories(reads.scope),
+            ),
+          )
+            .map((item) => item.value)
+            .join("\n") +
+          `\nVoice work acts for owner ${agent.owner}. Buzz tools default to room ${channelId} at top level. This is the room's existing conversation. A turn that starts with <realtime_delegation> is a spoken request: the voice model speaks only your final answer, so put the result there in a few plain spoken sentences, not in a send. When you delegate, say only a short acknowledgement, then wait: never state a fact the delegated work has not returned yet.`;
+        loaded = await this.loadThread(
+          request,
+          entry,
+          key,
+          signal,
+          server,
+          rpc,
+          instructions,
+        );
+        // A resumed thread keeps its first developer message, not resume's.
+        if (!loaded.fresh)
+          await rpc.request("thread/inject_items", {
+            threadId: loaded.threadId,
+            items: [
+              {
+                type: "message",
+                role: "developer",
+                content: [{ type: "input_text", text: instructions }],
+              },
+            ],
+          });
+        signal.throwIfAborted();
+        lane.voice = { loaded, signal };
+        const threadId = loaded.threadId;
+        off = rpc.onMessage(({ method, params }) => {
+          const p = params as
+            | {
+                threadId?: string;
+                turn?: { id: string };
+                role?: string;
+                text?: string;
+              }
+            | undefined;
+          if (signal.aborted || p?.threadId !== threadId) return;
+          if (method === "turn/started" || method === "turn/completed") {
+            delegatedThinking = method === "turn/started";
+            thinking();
+          }
+          if (
+            method === "turn/started" &&
+            p.turn &&
+            (!lane.active || lane.active.finished)
+          ) {
+            // execute installs the normal Request synchronously, before the next RPC tool call.
+            const previous = lane.tail;
+            const delegated = this.execute(
+              { ...request, adopted: p.turn.id },
+              "",
+              key,
+              lane,
+              entry,
+            );
+            lane.tail = Promise.all([previous, delegated]).then(() => {});
+          }
+          if (
+            method === "thread/realtime/transcript/done" &&
+            p.text?.trim() &&
+            ["user", "assistant"].includes(p.role ?? "")
+          ) {
+            void seat
+              .transcript(p.role === "user" ? "owner" : "agent", p.text)
+              .catch((error) => {
+                if (!signal.aborted) seat.ended(new Error(message(error)));
+              });
+          }
+        });
+        media = await openVoice(
+          rpc,
+          threadId,
+          signal,
+          seat.output,
+          (error) => {
+            void close();
+            seat.ended(error);
+          },
+          instructions,
+          (active) => {
+            realtimeThinking = active;
+            thinking();
+          },
+        );
+        signal.throwIfAborted();
+        this.save(request, entry, key, {
+          threadId,
+          workspace: loaded.workspace,
+          at: Date.now(),
+          ...(loaded.tools ? { tools: loaded.tools } : {}),
+          ...(agent.protection
+            ? { protection: agent.protection.stateKey }
+            : {}),
+        });
+        return { input: media.input, close };
+      });
+    // Reserve startup in the ordinary lane; later text work waits for it.
+    lane.tail = opening.then(
+      () => {},
+      () => {},
+    );
+    try {
+      return await opening;
+    } catch (error) {
+      await close();
+      throw error;
+    }
+  }
+  async run(delivery: Delivery): Promise<void> {
+    if (this.disposed) throw new Error("Codex runtime is disposed");
     delivery.signal.throwIfAborted();
     const { trigger, agent } = delivery;
     // Unaddressed watches and timers come as standalone turns (`runOnce`).
@@ -719,7 +1612,8 @@ export class CodexRuntime {
     const settings = this.resolveConfig(delivery.config);
     const channel = await reads.channel(channelId);
     const solo = await reads.soloChat(agent.owner, channelId, delivery.signal);
-    const topLevel = solo || wake?.topLevel === true;
+    const huddle = isHuddleRoom(channel?.about);
+    const topLevel = solo || huddle || wake?.topLevel === true;
     if (wake && !wakeLands(wake, topLevel)) return delivery.ignored?.();
     // Only a Solo chat's Canvas is handed over.
     const canvas = reads.canvas?.bind(reads);
@@ -733,6 +1627,24 @@ export class CodexRuntime {
     const toolRoot = channel?.dm || topLevel ? undefined : rootOf(event);
     const root = settings.scope === "channel" ? undefined : toolRoot;
     delivery.signal.throwIfAborted();
+    const conversationKey = JSON.stringify([channelId, root ?? "channel"]);
+    if (await this.inspect?.(agent.key)) {
+      const handoff = this.controls.deliver(
+        `${agent.key}/${conversationKey}`,
+        async () => {
+          const runtime = await this.connection(
+            agent.key,
+            reads.scope,
+            conversationKey,
+            delivery.signal,
+          );
+          await runtime.run(delivery);
+        },
+      );
+      return handoff.done;
+    }
+    if (this.disposed) throw new Error("Codex runtime is disposed");
+    delivery.signal.throwIfAborted();
     let finishActivity!: (result: WorkOutcome) => void;
     const replied = new Promise<WorkOutcome>((resolve) => {
       finishActivity = resolve;
@@ -744,10 +1656,11 @@ export class CodexRuntime {
     delivery.workingUntil(replied);
     // Codex makes one more model call after a final send before its turn
     // ends; the agent is done working on this request once it has replied.
-    const request: Request = {
+    const request: TextRequest = {
       scope: reads.scope,
       ...(wake ? { current: delivery.current } : {}),
       event,
+      ...(!topLevel ? { replyRoot: rootOf(event) } : {}),
       ...(wake ? { wake } : {}),
       ...(delivery.wakeText ? { wakeText: delivery.wakeText } : {}),
       agent,
@@ -756,12 +1669,16 @@ export class CodexRuntime {
       ...(delivery.model ? { model: delivery.model } : {}),
       ...(delivery.effort ? { effort: delivery.effort } : {}),
       ...(delivery.synced ? { synced: delivery.synced } : {}),
+      activityScope: topLevel
+        ? channelId
+        : (threadReference(event)?.rootId ??
+          (channel?.dm ? channelId : event.id)),
       conversation: {
         channelId,
         name: channel?.name ?? channelId,
         ...(root ? { root } : {}),
         ...(topLevel ? { topLevel } : {}),
-        ...(topLevel && !solo ? { threadReplies: true } : {}),
+        ...(topLevel && !solo && !huddle ? { threadReplies: true } : {}),
       },
       team: delivery.team ?? "",
       ...(project ? { project: `${project}\n` } : {}),
@@ -855,7 +1772,7 @@ export class CodexRuntime {
                 threadId: active.threadId,
                 expectedTurnId: active.turnId,
                 input: input(
-                  `${context}${request.project ?? ""}${turnInput(request.agent.key, request.event, request.conversation, text, true, noteOf(request), wake)}`,
+                  `${context}${request.project ?? ""}${turnInput(request.agent.key, request.event, request.conversation, text, true, noteOf(request), wake, this.reads(request.agent.key)?.authorNames?.(request.event.pubkey))}`,
                 ),
               });
               active.reply = request;
@@ -923,11 +1840,40 @@ export class CodexRuntime {
     signal: turnSignal,
     prompt,
   }: StandaloneTurn): Promise<TurnResult> {
+    if (this.disposed) throw new Error("Codex runtime is disposed");
     const { agent } = delivery;
     const reads = this.reads(agent.key);
     if (!reads)
       return { ok: false, error: "Connect to the agent's community first" };
     const { scope } = reads;
+    if (this.execution && (await this.inspect?.(agent.key))) {
+      const conversation = `once:${crypto.randomUUID()}`;
+      const storageKey = this.executionKey(agent.key, scope, conversation);
+      let runtime: CodexRuntime | undefined;
+      try {
+        runtime = await this.connection(
+          agent.key,
+          scope,
+          conversation,
+          turnSignal,
+        );
+        return await runtime.runOnce({
+          delivery,
+          key,
+          signal: turnSignal,
+          prompt,
+        });
+      } finally {
+        this.remote.delete(storageKey);
+        runtime?.dispose();
+        if (runtime?.target)
+          await this.disposeExecution(agent.key, runtime.target);
+        await this.storage.set(storageKey, null);
+      }
+    }
+    if (this.disposed) throw new Error("Codex runtime is disposed");
+    if (turnSignal.aborted)
+      return { ok: false, error: message(turnSignal.reason) };
     const entry = this.entry(agent.key, scope);
     const settings = this.resolveConfig(delivery.config);
     const team = delivery.team ?? "";
@@ -939,8 +1885,10 @@ export class CodexRuntime {
         error:
           "Choose an absolute workspace path or ~/.buzz in Codex settings first.",
       };
-    await entry.after.catch(() => undefined);
-    const server = this.open();
+    await entry.after;
+    if (entry.abort.signal.aborted)
+      return { ok: false, error: "Codex was stopped" };
+    const server = this.open(agent);
     const signal = AbortSignal.any([entry.abort.signal, turnSignal]);
     let release!: () => void;
     const once: Once = {
@@ -980,7 +1928,7 @@ export class CodexRuntime {
         {
           ...params,
           ephemeral: true,
-          dynamicTools: dynamicTools(this.added()),
+          dynamicTools: dynamicTools(this.added(), !!agent.ownerAccess),
         },
       );
       once.threadId = started.thread.id;
@@ -1079,9 +2027,7 @@ export class CodexRuntime {
    * and a top-level chat is one scope. */
   private acknowledgeActivity(active: Active, request: Request) {
     if (!request.step) return;
-    const scope = request.conversation.topLevel
-      ? request.conversation.channelId
-      : rootOf(request.event);
+    const scope = request.activityScope;
     const prior = active.activity.get(scope);
     if (prior === request) return;
     prior?.superseded?.();
@@ -1134,7 +2080,7 @@ export class CodexRuntime {
   }
 
   private start(
-    request: Request,
+    request: TextRequest,
     text: string,
     key: string,
     lane: Lane,
@@ -1145,6 +2091,8 @@ export class CodexRuntime {
     const job = lane.tail
       .catch(() => undefined)
       .then(async () => {
+        // A server-started voice turn can arrive after this job was queued.
+        while (current.active) await current.active.released;
         current.queued--;
         entry.waiting.delete(request);
         if (entry.abort.signal.aborted) {
@@ -1155,22 +2103,35 @@ export class CodexRuntime {
           request.answered();
           return;
         }
-        await this.execute(request, text, key, current, entry);
+        try {
+          await entry.after;
+          await this.execute(request, text, key, current, entry);
+        } catch (error) {
+          request.failActivity(message(error));
+          throw error;
+        }
       });
     lane.tail = job;
     this.status(request.agent.key, key, "Starting");
     // Agents can deliver follow-ups and other conversations immediately.
     void job
-      .catch((error) => console.error("Codex turn failed", error))
+      .catch(async (error) => {
+        request.failActivity(message(error));
+        const reason = `Codex could not start: ${message(error)}.`;
+        this.status(request.agent.key, key, "Needs attention", reason);
+        await this.publish(request, reason).catch((failure) =>
+          console.error("Codex could not publish its failure", failure),
+        );
+      })
       .finally(() => {
-        if (current.tail === job && !current.active) {
+        if (current.tail === job && !current.active && !current.voice) {
           entry.lanes.delete(key);
           for (const listener of this.listeners) listener();
         }
       });
     return job;
   }
-  private async history(request: Request, signal: AbortSignal) {
+  private async history(request: TextRequest, signal: AbortSignal) {
     signal.throwIfAborted();
     const reads = this.reads(request.agent.key);
     if (reads?.scope !== request.scope)
@@ -1195,9 +2156,9 @@ export class CodexRuntime {
       content,
       tags: [
         ["h", request.conversation.channelId],
-        ...(request.conversation.topLevel
-          ? []
-          : [["e", rootOf(request.event), "", "reply"]]),
+        ...(request.replyRoot !== undefined
+          ? [["e", request.replyRoot, "", "reply"]]
+          : []),
         ["p", request.agent.owner],
       ],
     });
@@ -1217,7 +2178,7 @@ export class CodexRuntime {
     if (
       !turn ||
       call.namespace !== "buzz" ||
-      !sessionTools(this.added()).some((tool) => tool.name === call.tool)
+      !sessionTools(this.added(), true).some((tool) => tool.name === call.tool)
     )
       throw new Error("No active Buzz tool for this thread and turn");
     const check = () => {
@@ -1237,9 +2198,31 @@ export class CodexRuntime {
     const owner = request ?? (once as Once);
     const { agent } = owner;
     const client = appClient(agent, {
+      // Its tool registry reviews every call, Buzz's dynamic tools included.
+      nativeToolGate: true,
+      protectionContext: async () => {
+        const rpc =
+          active?.rpc ??
+          this.protectedServers.get(agent.key)?.rpc ??
+          this.server?.rpc;
+        if (!rpc) throw new Error("The protected Codex session is unavailable");
+        return rpc.request("thread/read", {
+          threadId: call.threadId,
+          includeTurns: true,
+        });
+      },
       relayAuthor: this.reads(agent.key)?.relayAuthor?.(),
       signingAuthority: this.reads(agent.key)?.workflowAuthority(),
-      read: (path) => readFile(this.spawn, turn.workspace, path, turn.signal),
+      read: (path) =>
+        this.target
+          ? this.target.readFile(path, { cwd: turn.workspace })
+          : readFile(
+              this.spawn,
+              turn.workspace,
+              path,
+              turn.signal,
+              agent.protection?.processProtection,
+            ),
       check,
       signal: turn.signal,
       memories: async (slug) => {
@@ -1266,16 +2249,35 @@ export class CodexRuntime {
             : {}),
         }
       : {};
+    const final = isFinalMessage(call.tool, args);
     const reply = await callSessionTool(
-      client,
+      this.target
+        ? {
+            ...client,
+            media: async () => {
+              this.target?.signal.throwIfAborted();
+              throw new Error(
+                "Media download is unavailable for remote Codex agents.",
+              );
+            },
+          }
+        : client,
       context,
       call.tool,
       args,
       this.added(),
-    );
-    const final = isFinalMessage(call.tool, args);
+    ).catch((error) => {
+      if (final)
+        for (const taken of answering)
+          if (taken.finalDelivery !== true)
+            taken.finalDelivery = new Error(message(error));
+      throw error;
+    });
     if (final) {
-      for (const taken of answering) taken.answered();
+      for (const taken of answering) {
+        taken.finalDelivery = true;
+        taken.answered();
+      }
     }
     return {
       success: true,
@@ -1438,23 +2440,13 @@ export class CodexRuntime {
     }
   }
 
-  /** What a thread for `agent` starts or resumes with in `workspace`, and the
-   * model and effort its turn runs on: `pick`'s when available. */
-  private async prepare(
+  /** The model and effort a turn runs on: `pick`'s when available. */
+  private async turnModel(
     rpc: AppServer,
-    agent: Pick<AgentHandle, "key" | "name" | "pubkey">,
     settings: Config,
-    workspace: string,
     pick: Readonly<{ model?: string; effort?: string }>,
     synced?: Delivery["synced"],
   ) {
-    const normalized = await rpc.request<{
-      config: {
-        mcp_servers?: Record<string, Record<string, unknown>>;
-        model_reasoning_summary?: string | null;
-        features?: { hooks?: boolean; codex_hooks?: boolean };
-      };
-    }>("config/read", { cwd: workspace });
     const models = await listModels(rpc);
     const own = resolveModel(settings.model, models);
     // Model and effort are per turn, so a pick changes nothing after it.
@@ -1477,6 +2469,27 @@ export class CodexRuntime {
     const kept = synced?.effort;
     if (kept && !pick.model && !pick.effort && effort !== kept)
       throw new Error(unsupportedSynced("effort", kept, `Codex's ${model}`));
+    return { model, effort };
+  }
+
+  /** What a thread for `agent` starts or resumes with in `workspace`, and the
+   * model and effort its turn runs on: `pick`'s when available. */
+  private async prepare(
+    rpc: AppServer,
+    agent: Pick<AgentHandle, "key" | "name" | "pubkey" | "relay">,
+    settings: Config,
+    workspace: string,
+    pick: Readonly<{ model?: string; effort?: string }>,
+    synced?: Delivery["synced"],
+  ) {
+    const normalized = await rpc.request<{
+      config: {
+        mcp_servers?: Record<string, Record<string, unknown>>;
+        model_reasoning_summary?: string | null;
+        features?: { hooks?: boolean; codex_hooks?: boolean };
+      };
+    }>("config/read", { cwd: workspace });
+    const { model, effort } = await this.turnModel(rpc, settings, pick, synced);
     const mcp = Object.fromEntries(
       Object.entries(normalized.config.mcp_servers ?? {}).map(
         ([name, server]) => [
@@ -1497,12 +2510,15 @@ export class CodexRuntime {
       !disabled && this.server?.rpc === rpc && this.hooks
         ? await nativeHookState(rpc, workspace)
         : undefined;
-    const hookAdapter = disabled ? undefined : this.hooks;
+    const hookAdapter =
+      !disabled && this.server?.rpc === rpc ? this.hooks : undefined;
     const bridge = hookAdapter
       ? await openHookBridge(hookAdapter.serve, (session, event, input) =>
           hookAdapter.run(agent.key, session, event, input),
         )
       : undefined;
+    // Codex sets it on this thread's commands only; app-server has none.
+    const credential = await rpc.toolCredential(agent);
     const params = {
       model,
       cwd: workspace,
@@ -1517,6 +2533,9 @@ export class CodexRuntime {
         mcp_servers: { ...mcp, ...bridge?.config },
         "features.plugins": false,
         "features.apps": false,
+        ...(credential && {
+          [`shell_environment_policy.set.${CREDENTIAL_ENV}`]: credential,
+        }),
       },
     };
     // Ask for reasoning summaries unless the user chose a summary mode.
@@ -1525,29 +2544,165 @@ export class CodexRuntime {
       : { summary: "auto" };
     return { params, model, effort, summary, bridge };
   }
-  private async execute(
+  /** Shared thread setup; a voice seat retains it between delegated turns. */
+  async loadThread(
     request: Request,
+    entry: Entry,
+    key: string,
+    signal: AbortSignal,
+    server: Server,
+    rpc: AppServer,
+    voiceInstructions?: string,
+  ) {
+    const { settings, agent } = request;
+    // The process host expands ~/… and creates the directory; Codex's RPC needs
+    // an absolute path rather than shell-style home notation.
+    const workspace = await this.workspace(settings.workspace);
+    signal.throwIfAborted();
+    const saved = entry.saved[key];
+    const existing = resumable(saved, agent.protection);
+    const { params, model, effort, summary, bridge } = await this.prepare(
+      rpc,
+      agent,
+      settings,
+      workspace,
+      request,
+      request.synced,
+    );
+    if (voiceInstructions) {
+      Object.assign(params.config, {
+        "realtime.type": "conversational",
+        "features.realtime_conversation": true,
+      });
+      params.developerInstructions += `\n${voiceInstructions}`;
+    }
+    let threadId: string | undefined;
+    try {
+      // Resume restores the thread's tools, so one started with other added
+      // tools starts fresh.
+      const added = this.added();
+      const owner = !!agent.ownerAccess;
+      const tools = addedKey(added) + (owner ? ":owner" : "");
+      const resuming =
+        existing?.workspace === workspace && (existing.tools ?? "") === tools;
+      type Started = { thread: { id: string; cwd: string } };
+      const start = () =>
+        rpc.request<Started>("thread/start", {
+          ...params,
+          dynamicTools: dynamicTools(added, owner),
+        });
+      const resume = (threadId: string) =>
+        rpc.request<Started>("thread/resume", {
+          ...params,
+          threadId,
+          excludeTurns: true,
+        });
+      if (this.target && existing && !resuming)
+        throw Object.assign(
+          new Error(
+            "The Codex workspace or tools changed. Start a new session to continue.",
+          ),
+          { code: "EXECUTION_SESSION_RESET_REQUIRED" },
+        );
+      let started: Started;
+      // Only a thread started here keeps what it started with.
+      let fresh = !resuming;
+      if (resuming) {
+        const { threadId } = existing;
+        const missing = (error: unknown) => {
+          if (message(error) !== `no rollout found for thread id ${threadId}`)
+            throw error;
+          if (this.target)
+            throw Object.assign(
+              new Error(
+                "The remote Codex session cannot be restored. Start a new session to continue.",
+              ),
+              { code: "EXECUTION_SESSION_RESET_REQUIRED" },
+            );
+        };
+        // A thread saved before Buzz had its own Codex home is in the user's;
+        // continue a copy, or start fresh if there is none.
+        started = await resume(threadId)
+          .catch(async (error) => {
+            missing(error);
+            await this.adopt(threadId);
+            return resume(threadId);
+          })
+          .catch(async (error) => {
+            missing(error);
+            fresh = true;
+            return start();
+          });
+      } else started = await start();
+      if (this.target && resuming && existing.pending) {
+        const { pending: _, ...accepted } = existing;
+        await this.save(request, entry, key, accepted);
+      }
+      threadId = started.thread.id;
+      bridge?.bind(threadId);
+      server.threads.set(threadId, agent.key);
+      signal.throwIfAborted();
+      await rpc.request("thread/name/set", {
+        threadId: threadId,
+        name: sessionName(agent, request.conversation),
+      });
+      return {
+        threadId,
+        workspace,
+        params,
+        model,
+        effort,
+        summary,
+        bridge,
+        tools,
+        saved,
+        existing,
+        resuming,
+        fresh,
+      };
+    } catch (error) {
+      if (threadId)
+        await rpc.request("thread/unsubscribe", { threadId }).catch(() => {});
+      await bridge?.close();
+      throw error;
+    }
+  }
+
+  private async execute(
+    request: TextRequest | (Request & { adopted: string }),
     text: string,
     key: string,
     lane: Lane,
     entry: Entry,
   ) {
+    const { adopted } = request;
     let ready!: () => void;
     let notReady!: (error: unknown) => void;
+    let release!: () => void;
     const turnAbort = new AbortController();
-    const server = this.open();
+    const server = this.open(request.agent);
     // No deadline of our own: a turn runs until Codex ends it.
-    const signal = AbortSignal.any([entry.abort.signal, turnAbort.signal]);
+    const signal = AbortSignal.any([
+      entry.abort.signal,
+      turnAbort.signal,
+      ...(adopted && lane.voice ? [lane.voice.signal] : []),
+    ]);
     const active: Active = {
       rpc: server.rpc,
+      ...(adopted && lane.voice
+        ? { threadId: lane.voice.loaded.threadId, turnId: adopted }
+        : {}),
       ready: new Promise((resolve, reject) => {
         ready = resolve;
         notReady = reject;
       }),
+      released: new Promise((resolve) => {
+        release = resolve;
+      }),
       steering: Promise.resolve(),
       reply: request,
       finished: false,
-      workspace: request.settings.workspace,
+      workspace: lane.voice?.loaded.workspace ?? request.settings.workspace,
       signal,
       requests: [request],
       activity: new Map(),
@@ -1571,129 +2726,138 @@ export class CodexRuntime {
         );
     });
     let hookBridge: Awaited<ReturnType<typeof openHookBridge>> | undefined;
+    let explain: (() => string | undefined) | undefined;
     try {
       const rpc = await server.opening;
       signal.throwIfAborted();
-      // The process host expands ~/… and creates the directory; Codex's RPC needs
-      // an absolute path rather than shell-style home notation.
-      const workspace = await this.workspace(settings.workspace);
-      signal.throwIfAborted();
-      active.workspace = workspace;
-      const existing = entry.saved[key];
-      const { params, model, effort, summary, bridge } = await this.prepare(
-        rpc,
-        agent,
-        settings,
+      const seat = lane.voice;
+      const loaded =
+        seat?.loaded ??
+        (await this.loadThread(request, entry, key, signal, server, rpc));
+      // A typed turn on a seat's thread still runs on its own picks.
+      const { model, effort } =
+        seat && adopted === undefined
+          ? await this.turnModel(rpc, settings, request, request.synced)
+          : loaded;
+      const {
+        threadId,
         workspace,
-        request,
-        request.synced,
-      );
-      hookBridge = bridge;
+        params,
+        summary,
+        bridge,
+        tools,
+        saved,
+        resuming,
+        fresh,
+      } = loaded;
+      active.threadId = threadId;
+      // A refusal outside this turn does not explain how it ends.
+      explain = server.explainer?.(threadId);
+      active.workspace = workspace;
       active.model = model;
       active.effort = effort;
-      // Resume restores the thread's tools, so one started with other added
-      // tools starts fresh.
-      const added = this.added();
-      const tools = addedKey(added);
-      const resuming =
-        existing?.workspace === workspace && (existing.tools ?? "") === tools;
-      type Started = { thread: { id: string; cwd: string } };
-      const start = () =>
-        rpc.request<Started>("thread/start", {
-          ...params,
-          dynamicTools: dynamicTools(added),
-        });
-      const resume = (threadId: string) =>
-        rpc.request<Started>("thread/resume", {
-          ...params,
-          threadId,
-          excludeTurns: true,
-        });
-      let started: Started;
-      if (resuming) {
-        const { threadId } = existing;
-        const missing = (error: unknown) => {
-          if (message(error) !== `no rollout found for thread id ${threadId}`)
-            throw error;
-        };
-        // A thread saved before Buzz had its own Codex home is in the user's;
-        // continue a copy, or start fresh if there is none.
-        started = await resume(threadId)
-          .catch(async (error) => {
-            missing(error);
-            await this.adopt(threadId);
-            return resume(threadId);
-          })
-          .catch(async (error) => {
-            missing(error);
-            return start();
-          });
-      } else started = await start();
-      active.threadId = started.thread.id;
-      bridge?.bind(active.threadId);
-      server.threads.set(active.threadId, agent.key);
-      signal.throwIfAborted();
-      await rpc.request("thread/name/set", {
-        threadId: active.threadId,
-        name: sessionName(agent, request.conversation),
-      });
-      const [context, memory] = await Promise.all([
-        this.history(request, signal),
-        this.core(request.agent.key, signal),
-      ]);
-      const wake = request.wake && {
-        ...request.wake,
-        text: (await request.wakeText?.()) ?? request.wake.text,
-      };
-      signal.throwIfAborted();
-      if (request.current && !request.current()) {
-        restoreNotes(request);
-        request.answered();
-        this.status(agent.key, key, "Idle");
-        active.finished = true;
+      // The seat owns its retained bridge; individual turns must not close it.
+      hookBridge = lane.voice ? undefined : bridge;
+      if (request.adopted !== undefined) {
         ready();
-        return;
-      }
-      const turn = await rpc.request<{ turn: { id: string } }>("turn/start", {
-        threadId: active.threadId,
-        input: input(
-          `${context}${request.project ?? ""}${turnInput(request.agent.key, request.event, request.conversation, text, false, noteOf(request), wake)}`,
-        ),
-        model,
-        effort,
-        ...summary,
-        // Application context is a developer message that updates on each turn.
-        additionalContext: turnContext(
+      } else {
+        const [context, memory] = await Promise.all([
+          this.history(request, signal),
+          this.core(request.agent.key, signal),
+        ]);
+        const wake = request.wake && {
+          ...request.wake,
+          text: (await request.wakeText?.()) ?? request.wake.text,
+        };
+        signal.throwIfAborted();
+        if (request.current && !request.current()) {
+          restoreNotes(request);
+          request.answered();
+          this.status(agent.key, key, "Idle");
+          active.finished = true;
+          ready();
+          return;
+        }
+        const additionalContext = turnContext(
           agent,
           settings,
           request.team,
           memory,
           this.repositories(request.scope),
-        ),
-      });
-      active.turnId = turn.turn.id;
-      this.acknowledgeActivity(active, request);
-      // A conversation new to this agent: name its Solo chat meanwhile.
-      if (request.named && !existing)
-        void this.offerTitle(
-          rpc,
-          request.named,
-          text,
-          entry.abort.signal,
-          params,
-        ).catch((error) => {
-          if (!entry.abort.signal.aborted)
-            console.warn("Codex could not title the chat", error);
+        );
+        if (this.target && !resuming)
+          await this.save(request, entry, key, {
+            pending: true,
+            threadId,
+            workspace,
+            at: Date.now(),
+            ...(tools ? { tools } : {}),
+          });
+        const turn = await rpc
+          .request<{ turn: { id: string } }>("turn/start", {
+            threadId: active.threadId,
+            input: input(
+              `${context}${request.project ?? ""}${turnInput(request.agent.key, request.event, request.conversation, text, false, noteOf(request), wake, this.reads(request.agent.key)?.authorNames?.(request.event.pubkey))}`,
+            ),
+            model,
+            effort,
+            ...summary,
+            // Application context is a developer message that updates on each turn.
+            additionalContext,
+          })
+          .catch(async (error: unknown) => {
+            if (this.target && !resuming && error instanceof Refused) {
+              const { [key]: _, ...kept } = entry.saved;
+              await this.storage.set(entry.storageKey, JSON.stringify(kept));
+              entry.saved = kept;
+            }
+            throw error;
+          });
+        active.turnId = turn.turn.id;
+        if (fresh)
+          void this.prompts(agent.key).save(
+            this.targetKey
+              ? JSON.stringify([this.targetKey, active.threadId])
+              : active.threadId,
+            [
+              {
+                label: "base",
+                text: params.developerInstructions,
+              },
+              {
+                label: EACH_TURN,
+                text: Object.values(additionalContext)
+                  .map(({ value }) => value)
+                  .join(""),
+              },
+            ],
+          );
+        this.acknowledgeActivity(active, request);
+        // A conversation new to this agent: name its Solo chat meanwhile.
+        if (request.named && !saved && !server.protection)
+          void this.offerTitle(
+            rpc,
+            request.named,
+            text,
+            entry.abort.signal,
+            params,
+          ).catch((error) => {
+            if (!entry.abort.signal.aborted)
+              console.warn("Codex could not title the chat", error);
+          });
+        // Empty threads have no resumable rollout until a user turn is accepted.
+        await this.save(request, entry, key, {
+          threadId,
+          workspace,
+          at: Date.now(),
+          ...(tools ? { tools } : {}),
+          ...(agent.protection
+            ? { protection: agent.protection.stateKey }
+            : {}),
         });
-      // Empty threads have no resumable rollout until a user turn is accepted.
-      this.save(request, entry, key, {
-        threadId: started.thread.id,
-        workspace,
-        at: Date.now(),
-        ...(tools ? { tools } : {}),
-      });
-      ready();
-      this.status(agent.key, key, "Working");
+        ready();
+        this.status(agent.key, key, "Working");
+      }
       const status = await followed.completed;
       await active.steering;
       signal.throwIfAborted();
@@ -1711,6 +2875,10 @@ export class CodexRuntime {
         );
         this.status(agent.key, key, "Interrupted");
       } else {
+        const failed = active.requests.find(
+          (taken) => taken.finalDelivery instanceof Error,
+        )?.finalDelivery;
+        if (failed instanceof Error) throw failed;
         // A turn may end without a reply when there is nothing new to say.
         for (const taken of active.requests) taken.answered();
         this.status(agent.key, key, "Idle");
@@ -1736,12 +2904,20 @@ export class CodexRuntime {
           await server.rpc.close();
         }
       }
-      if (!entry.abort.signal.aborted) {
+      const why = explain?.();
+      if (!signal.aborted) {
         const reason = `Codex could not finish: ${message(error)}.`;
         await this.publish(active.reply, reason).catch((failure) =>
           console.error("Codex could not publish its failure", failure),
         );
-        this.status(agent.key, key, "Needs attention", reason);
+        // The denied input may have shaped the provider's reason, so it shows
+        // only on the owner's Activity tab, never in the thread agents read.
+        this.status(
+          agent.key,
+          key,
+          "Needs attention",
+          why ? `${reason} Reason: ${why}` : reason,
+        );
       }
     } finally {
       for (const taken of active.requests)
@@ -1753,12 +2929,13 @@ export class CodexRuntime {
       turnAbort.abort(new Error("The Codex turn has ended"));
       // Release the subscription before the next resume: loaded-thread rejoin
       // ignores instruction/config overrides while a client is subscribed.
-      if (active.threadId)
+      if (active.threadId && !lane.voice)
         await server.rpc
           .request("thread/unsubscribe", { threadId: active.threadId })
           .catch(() => server.rpc.close());
       await hookBridge?.close();
       if (lane.active === active) delete lane.active;
+      release();
     }
   }
 }
@@ -1801,7 +2978,9 @@ function follow(
       fail(new Error(p?.message ?? "Codex connection closed"));
       return;
     }
-    if (!p || !turn.threadId || p.threadId !== turn.threadId) return;
+    if (!p || !turn.threadId || p.threadId !== turn.threadId || turn.finished)
+      return;
+    if (p.turn && turn.turnId && p.turn.id !== turn.turnId) return;
     if (wire.method === "turn/started" && p.turn) turn.turnId = p.turn.id;
     if (p.item && wire.method) onItem?.(wire.method, p.item);
     if (wire.method === "turn/completed" && p.turn) {
@@ -1823,12 +3002,12 @@ function follow(
  * keeps a deferred tool from the model until its tool search finds it. Every
  * model in Codex's catalog has tool search (supports_search_tool); one
  * without it would not see deferred tools. */
-const dynamicTools = (added: readonly AddedTool[]) => [
+const dynamicTools = (added: readonly AddedTool[], owner: boolean) => [
   {
     type: "namespace",
     name: "buzz",
-    description: sessionHint(added),
-    tools: sessionTools(added).map(({ load, ...tool }) => ({
+    description: sessionHint(added, owner),
+    tools: sessionTools(added, owner).map(({ load, ...tool }) => ({
       type: "function",
       ...tool,
       ...(load === "search" ? { deferLoading: true } : {}),

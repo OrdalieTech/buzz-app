@@ -11,16 +11,7 @@ export function peopleRelationships(
   channels: readonly ChannelSummary[],
   messageableAgents: ReadonlySet<string>,
 ) {
-  const dms = new Map<string, string>();
-  const interacted = new Set<string>();
-  const shared = new Set<string>();
-  for (const channel of channels) {
-    for (const pubkey of channel.members ?? []) shared.add(pubkey);
-    if (channel.channelType !== "dm") continue;
-    for (const pubkey of channel.participants ?? []) interacted.add(pubkey);
-    const only = channel.participants?.length === 1 && channel.participants[0];
-    if (only) dms.set(only, channel.id);
-  }
+  const { dms, interacted, shared } = channelRelationships(channels);
   return {
     /** The one-to-one DM with this person, if one is listed. */
     dm: (pubkey: string) => dms.get(pubkey),
@@ -35,4 +26,31 @@ export function peopleRelationships(
               ? 3
               : 4,
   };
+}
+// Every render ranks against the same list until it changes; large channels
+// make the member walk the expensive part.
+const indexes = new WeakMap<
+  readonly ChannelSummary[],
+  Readonly<{
+    dms: ReadonlyMap<string, string>;
+    interacted: ReadonlySet<string>;
+    shared: ReadonlySet<string>;
+  }>
+>();
+function channelRelationships(channels: readonly ChannelSummary[]) {
+  const known = indexes.get(channels);
+  if (known) return known;
+  const dms = new Map<string, string>();
+  const interacted = new Set<string>();
+  const shared = new Set<string>();
+  for (const channel of channels) {
+    for (const pubkey of channel.members ?? []) shared.add(pubkey);
+    if (channel.channelType !== "dm") continue;
+    for (const pubkey of channel.participants ?? []) interacted.add(pubkey);
+    const only = channel.participants?.length === 1 && channel.participants[0];
+    if (only) dms.set(only, channel.id);
+  }
+  const index = { dms, interacted, shared };
+  indexes.set(channels, index);
+  return index;
 }

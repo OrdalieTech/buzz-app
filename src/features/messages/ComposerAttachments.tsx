@@ -8,6 +8,7 @@ import { useConversationPresentation } from "../conversation/ConversationPresent
 import { useRef, useState } from "react";
 import { FileTypeIcon } from "./FileTypeIcon";
 import fileIconStyles from "./FileTypeIcon.module.css";
+import { Button } from "../../shared/design-system/ui/Button";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
 import {
   AnimatePresence,
@@ -21,7 +22,7 @@ import {
   draftAttachmentMedia,
   useDraftAttachmentSource,
 } from "./use-draft-attachment-source";
-import { ArrowsClockwiseIcon, XIcon } from "../../shared/design-system/icons";
+import { XIcon } from "../../shared/design-system/icons";
 import type { DraftAttachment } from "./attachment-draft";
 import styles from "./ComposerAttachments.module.css";
 import { useMediaElementSource } from "./use-media-element-source";
@@ -246,6 +247,7 @@ function AttachmentItem({
 }) {
   const { instant, appearance } = useItemAppearance();
   const { source, image, video } = useDraftAttachmentSource(item, media);
+  const previewButton = useRef<HTMLButtonElement>(null);
   const [failedSource, setFailedSource] = useState<string>();
   const element = useMediaElementSource(video ? source : undefined);
   const videoSource = element.src;
@@ -259,6 +261,7 @@ function AttachmentItem({
     bytes < 1024 * 1024
       ? `${Math.max(1, Math.round(bytes / 1024))} KB`
       : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  const uploadFailed = item.status === "error";
   const status = {
     queued: "Queued",
     preparing: "Preparing…",
@@ -320,10 +323,12 @@ function AttachmentItem({
       layout={!instant}
       {...appearance}
       className={styles.item}
-      data-media={image || video ? "" : undefined}
+      data-media={!uploadFailed && (image || video) ? "" : undefined}
+      data-upload-error={uploadFailed || undefined}
     >
       {source && !failed && (image || video) ? (
         <button
+          ref={previewButton}
           data-media-preview=""
           data-draft-preview={item.id}
           className={styles.preview}
@@ -385,6 +390,7 @@ function AttachmentItem({
             variant="bare"
             size="compact"
             style={{ width: "100%", height: "100%", borderRadius: "inherit" }}
+            ref={previewButton}
             data-draft-preview={item.id}
             aria-label={`Preview ${item.file.name}`}
             onClick={(event) => preview(event.currentTarget)}
@@ -403,126 +409,123 @@ function AttachmentItem({
           aria-atomic="true"
         >
           <span className="sr-only">{item.file.name}: </span>
-          {size} · {status}
+          {uploadFailed ? size : `${size} · ${status}`}
         </span>
         {failed && <span className="sr-only">Preview unavailable</span>}
       </div>
+      {uploadFailed && (
+        <p className={styles.error} role="alert">
+          <span className="sr-only">{item.file.name}: </span>
+          {item.error || "Upload failed. Retry or remove it to send."}
+        </p>
+      )}
       <div
         className={styles.actions}
-        data-remove={!busy && item.status !== "error" ? "" : undefined}
+        data-remove={!busy && !uploadFailed ? "" : undefined}
       >
-        <IconButton
-          size="xs"
-          shape="round"
-          variant="media"
-          type="button"
-          disabled={disabled}
-          data-remove-action={!busy && item.status !== "error" ? "" : undefined}
-          aria-label={`${item.status === "error" ? "Retry" : "Remove"} ${item.file.name}`}
-          title={
-            item.status === "error"
-              ? `${item.error || "Retry upload"} Press Delete to remove.`
-              : busy
-                ? "Cancel upload and remove attachment"
-                : undefined
-          }
-          onKeyDown={(event) => {
-            if (
-              item.status === "error" &&
-              (event.key === "Delete" || event.key === "Backspace")
-            ) {
-              event.preventDefault();
-              remove(item.id);
-            }
-          }}
-          onClick={() =>
-            item.status === "error" ? retry(item.id) : remove(item.id)
-          }
-          icon={
-            busy ? (
-              <span className={styles.uploadControl}>
-                <span
-                  className={styles.progress}
-                  role="progressbar"
-                  aria-label={`${item.status === "queued" ? "Queued" : "Uploading"} ${item.file.name}`}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-valuenow={
-                    item.transfer
-                      ? Math.round(
-                          (item.transfer.sent / item.transfer.total) * 100,
-                        )
-                      : undefined
-                  }
-                  aria-valuetext={
-                    item.transfer
-                      ? item.transfer.sent === item.transfer.total
-                        ? "Transfer complete; waiting for server confirmation"
-                        : undefined
-                      : item.status === "queued"
-                        ? "Queued"
-                        : "Preparing upload"
-                  }
-                >
-                  <svg
-                    key={item.transfer ? "transfer" : "preparation"}
-                    viewBox="0 0 24 24"
-                    aria-hidden="true"
-                    className={!item.transfer ? styles.preparing : undefined}
-                  >
-                    <circle
-                      cx="12"
-                      cy="12"
-                      r="9"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="3"
-                      opacity="0.5"
-                    />
-                    <circle
-                      data-upload-progress=""
-                      className={styles.progressArc}
-                      cx="12"
-                      cy="12"
-                      r="9"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="3"
-                      pathLength="100"
-                      strokeDasharray={`${item.transfer ? (item.transfer.sent / item.transfer.total) * 100 : 25} 100`}
-                      transform="rotate(-90 12 12)"
-                    />
-                  </svg>
-                </span>
-                <XIcon
-                  size={16}
-                  className={styles.uploadRemove}
-                  data-upload-cancel=""
-                />
-              </span>
-            ) : item.status === "error" ? (
-              <ArrowsClockwiseIcon size={16} />
-            ) : (
-              <XIcon size={16} />
-            )
-          }
-        />
-        {item.status === "error" && (
+        {uploadFailed ? (
+          <>
+            <Button
+              size="sm"
+              disabled={disabled}
+              aria-label={`Retry ${item.file.name}`}
+              onClick={(event) => {
+                // Retry replaces this control. Hand off only focus that it owns.
+                if (document.activeElement === event.currentTarget)
+                  previewButton.current?.focus();
+                retry(item.id);
+              }}
+            >
+              Retry
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={disabled}
+              aria-label={`Remove ${item.file.name}`}
+              onClick={() => remove(item.id)}
+            >
+              Remove
+            </Button>
+          </>
+        ) : (
           <IconButton
             size="xs"
             shape="round"
             variant="media"
+            type="button"
             disabled={disabled}
-            data-remove-action=""
+            data-remove-action={!busy ? "" : undefined}
             aria-label={`Remove ${item.file.name}`}
+            title={busy ? "Cancel upload and remove attachment" : undefined}
             onClick={() => remove(item.id)}
-            icon={<XIcon size={16} />}
+            icon={
+              busy ? (
+                <span className={styles.uploadControl}>
+                  <span
+                    className={styles.progress}
+                    role="progressbar"
+                    aria-label={`${item.status === "queued" ? "Queued" : "Uploading"} ${item.file.name}`}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={
+                      item.transfer
+                        ? Math.round(
+                            (item.transfer.sent / item.transfer.total) * 100,
+                          )
+                        : undefined
+                    }
+                    aria-valuetext={
+                      item.transfer
+                        ? item.transfer.sent === item.transfer.total
+                          ? "Transfer complete; waiting for server confirmation"
+                          : undefined
+                        : item.status === "queued"
+                          ? "Queued"
+                          : "Preparing upload"
+                    }
+                  >
+                    <svg
+                      key={item.transfer ? "transfer" : "preparation"}
+                      viewBox="0 0 24 24"
+                      aria-hidden="true"
+                      className={!item.transfer ? styles.preparing : undefined}
+                    >
+                      <circle
+                        cx="12"
+                        cy="12"
+                        r="9"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="3"
+                        opacity="0.5"
+                      />
+                      <circle
+                        data-upload-progress=""
+                        className={styles.progressArc}
+                        cx="12"
+                        cy="12"
+                        r="9"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="3"
+                        pathLength="100"
+                        strokeDasharray={`${item.transfer ? (item.transfer.sent / item.transfer.total) * 100 : 25} 100`}
+                        transform="rotate(-90 12 12)"
+                      />
+                    </svg>
+                  </span>
+                  <XIcon
+                    size={16}
+                    className={styles.uploadRemove}
+                    data-upload-cancel=""
+                  />
+                </span>
+              ) : (
+                <XIcon size={16} />
+              )
+            }
           />
-        )}
-        {item.error && (
-          <span role="alert" className="sr-only">
-            {item.error}
-          </span>
         )}
       </div>
     </motion.li>

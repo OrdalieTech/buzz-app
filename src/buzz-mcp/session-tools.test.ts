@@ -9,6 +9,7 @@ import {
   sessionTools,
 } from "./session-tools";
 import { TOOLS } from "./tools";
+import type { ProtectionAction } from "../features/agent-protection/service";
 
 const tool = (name: string, description = "Does it."): AddedTool => ({
   name,
@@ -97,6 +98,29 @@ it("holds a protected tool until approval and executes only the reviewed argumen
     "tool-result",
   ]);
   expect(protect.mock.calls[0]?.[0].command).toBe("echo reviewed");
+});
+it("does not review a natively gated tool call twice unless a captured file changed it", async () => {
+  const protect = vi.fn(async (_action: ProtectionAction) => {});
+  const client = {
+    protect,
+    nativeToolGate: true,
+    read: vi.fn(async () => new TextEncoder().encode("Private notes")),
+  } as unknown as import("./client").BuzzClient;
+  const call = vi.fn(async () => "done");
+  await callSessionTool(client, {}, "plugin_write", { text: "hi" }, [
+    { ...tool("plugin_write"), call },
+  ]);
+  expect(protect.mock.calls.map(([action]) => action.kind)).toEqual([
+    "tool-result",
+  ]);
+  protect.mockClear();
+  await callSessionTool(client, {}, "send", { path: "notes.md" }).catch(
+    () => undefined,
+  );
+  expect(protect.mock.calls[0]?.[0]).toMatchObject({
+    kind: "tool",
+    content: { title: "send", arguments: { text: "Private notes" } },
+  });
 });
 it("withholds a denied tool result and checks thrown tool errors before exposing them", async () => {
   const client = {

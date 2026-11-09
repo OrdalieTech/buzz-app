@@ -90,6 +90,28 @@ impl AgentState {
         Ok(items)
     }
 
+    /// Reads one key. Only a missing file is absent; other failures stop the read.
+    pub(crate) fn read(&self, key: &str) -> Result<Option<String>, String> {
+        if key.is_empty() {
+            return Err("Invalid agent state key".into());
+        }
+        let name = file_name(key);
+        let text = match fs::read_to_string(self.dir()?.join(&name)) {
+            Ok(text) => text,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("Could not read agent state".into()),
+        };
+        if !name.starts_with(HASHED) {
+            return Ok(Some(text));
+        }
+        let saved =
+            serde_json::from_str::<Hashed>(&text).map_err(|_| "Could not read agent state")?;
+        if saved.key != key {
+            return Err("Invalid agent state key".into());
+        }
+        Ok(Some(saved.value.into_owned()))
+    }
+
     /// Saves `value` under `key`, or removes the key when `value` is `None`.
     pub(crate) fn set(&self, key: &str, value: Option<&str>) -> Result<(), String> {
         self.write(key, value, false).map(|_| ())
@@ -217,8 +239,16 @@ pub(crate) fn decode(name: &str) -> Option<String> {
 #[tauri::command]
 pub(crate) async fn app_agent_state_load(
     state: tauri::State<'_, AgentState>,
+    key: Option<String>,
 ) -> Result<HashMap<String, String>, String> {
-    state.load()
+    match key {
+        Some(key) => Ok(state
+            .read(&key)?
+            .map(|value| (key, value))
+            .into_iter()
+            .collect()),
+        None => state.load(),
+    }
 }
 
 /// Saves or removes `value` under `key`. With `absent`, it saves only if no
@@ -305,6 +335,32 @@ mod tests {
         assert_eq!(state.load().unwrap()[&long], "first");
         // No write in progress is left behind.
         assert_eq!(fs::read_dir(root.path().join("state")).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn reads_one_key_without_writing_and_rejects_unreadable_state() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("state");
+        let state = AgentState::new(Ok(dir.clone()));
+        assert_eq!(state.read("missing").unwrap(), None);
+        assert!(!dir.exists());
+        for key in ["short".to_owned(), "k".repeat(NAME_LIMIT + 1)] {
+            state.set(&key, Some("first")).unwrap();
+            assert_eq!(state.read(&key).unwrap().as_deref(), Some("first"));
+            state.set(&key, Some("second")).unwrap();
+            assert_eq!(state.read(&key).unwrap().as_deref(), Some("second"));
+            let path = dir.join(file_name(&key));
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            assert!(state.read(&key).is_err());
+            fs::remove_dir(&path).unwrap();
+        }
+        let key = "k".repeat(NAME_LIMIT + 1);
+        let path = dir.join(file_name(&key));
+        for text in ["not json", r#"{"key":"other","value":"x"}"#] {
+            fs::write(&path, text).unwrap();
+            assert!(state.read(&key).is_err());
+        }
     }
 
     #[test]

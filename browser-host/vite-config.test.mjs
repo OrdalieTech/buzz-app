@@ -1,11 +1,17 @@
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getPublicKey } from "nostr-tools";
+import { createServer } from "vite";
 import { expect, it } from "vitest";
+import { relayBrokerPlugin } from "./relay-broker.mjs";
 
 it("loads the broker's Vite config without native-compatibility warnings", () => {
   // A fresh Node process exercises real config imports, not Vitest's resolver.
-  // Loading config creates the plugin but never invokes configureServer, so it
-  // cannot read the Keychain, open a server, or contact a relay.
+  // Loading and resolving config never invoke configureServer, so they cannot
+  // read the Keychain, open a server, or contact a relay.
   const result = spawnSync(
     process.execPath,
     [
@@ -16,7 +22,7 @@ it("loads the broker's Vite config without native-compatibility warnings", () =>
           import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
           import { tmpdir } from 'node:os';
           import { join } from 'node:path';
-          import { loadConfigFromFile } from 'vite';
+          import { loadConfigFromFile, resolveConfig } from 'vite';
           const configFile = join(process.cwd(), 'vite.config.ts');
           // Load the real config with isolated .env files, never personal settings.
           const directory = mkdtempSync(join(tmpdir(), 'buzz-vite-config-'));
@@ -28,6 +34,26 @@ it("loads the broker's Vite config without native-compatibility warnings", () =>
             );
             assert(loaded?.config.plugins.some(p => p?.name === 'buzz-relay-broker'));
             assert.equal(loaded.config.define['import.meta.env.VITE_BUZZ_LIVE'], '"1"');
+            // Inline server options are how Vite applies CLI --host overrides.
+            // Resolve the real config without opening any listener or reading credentials.
+            for (const host of [undefined, false, 'localhost', '127.0.0.1', '::1']) {
+              await resolveConfig({ configFile, server: { host } }, 'serve');
+            }
+            const unsafeHosts = [true, '0.0.0.0', '::', '', '192.0.2.1', 'dev.example'];
+            for (const host of unsafeHosts) {
+              await assert.rejects(
+                resolveConfig({ configFile, server: { host } }, 'serve'),
+                /requires a loopback-only Vite listener/,
+              );
+            }
+            // Unpinned fixture servers and packaged builds do not load a signer.
+            process.env.BUZZ_DEV_VIEWER = '';
+            const fixture = await resolveConfig({ configFile, server: { host: true } }, 'serve');
+            assert(!fixture.plugins.some(p => p.name === 'buzz-relay-broker'));
+            assert.equal(fixture.server.host, true);
+            process.env.BUZZ_DEV_VIEWER = 'a'.repeat(64);
+            const packaged = await resolveConfig({ configFile, server: { host: true } }, 'build');
+            assert(!packaged.plugins.some(p => p.name === 'buzz-relay-broker'));
             for (const command of ['serve', 'build']) {
               for (const setting of [undefined, '', '0', '1', 'true', 'invalid']) {
                 if (setting === undefined) delete process.env.BUZZ_DEV_NOTIFICATIONS;
@@ -180,6 +206,28 @@ it("loads the broker's Vite config without native-compatibility warnings", () =>
               );
               assert.equal(result.config.define['import.meta.env.VITE_BUZZ_BUILDERLAB_URL'], JSON.stringify(expected));
             }
+            // The Apps control plane follows the native build's sources too:
+            // a mode file alone sets nothing, .env.local and process do.
+            delete process.env.BUZZ_BUILDERLAB_URL;
+            const plane = 'import.meta.env.VITE_BUZZ_BUILDERLAB_APPS_CONTROL_PLANE';
+            writeFileSync('.env.local', '');
+            writeFileSync('.env.production', 'BUZZ_BUILDERLAB_APPS_CONTROL_PLANE=https://ctrl.example');
+            const modeOnly = await loadConfigFromFile({ command: 'build', mode: 'production' }, configFile);
+            assert.equal(modeOnly.config.define[plane], JSON.stringify(''));
+            writeFileSync('.env.local', 'BUZZ_BUILDERLAB_APPS_CONTROL_PLANE=https://local.example');
+            const local = await loadConfigFromFile({ command: 'build', mode: 'production' }, configFile);
+            assert.equal(local.config.define[plane], JSON.stringify('https://local.example'));
+            process.env.BUZZ_BUILDERLAB_APPS_CONTROL_PLANE = 'https://process.example';
+            const fromProcess = await loadConfigFromFile({ command: 'build', mode: 'production' }, configFile);
+            assert.equal(fromProcess.config.define[plane], JSON.stringify('https://process.example'));
+            process.env.BUZZ_BUILDERLAB_APPS_CONTROL_PLANE = 'https://process.example/';
+            await assert.rejects(
+              loadConfigFromFile({ command: 'build', mode: 'production' }, configFile),
+              /HTTPS origin/,
+            );
+            delete process.env.BUZZ_BUILDERLAB_APPS_CONTROL_PLANE;
+            writeFileSync('.env.local', '');
+            writeFileSync('.env.production', '');
             // The first-run account seed reaches only a dev server, and a
             // malformed value fails at configuration time without being echoed.
             for (const command of ['serve', 'build']) {
@@ -262,3 +310,50 @@ it("loads the broker's Vite config without native-compatibility warnings", () =>
   expect(result.status, result.stderr).toBe(0);
   expect(result.stderr).not.toContain("configLoader: 'native'");
 }, 35_000);
+
+it("refuses exposed Vite servers before reading identity and serves the broker on loopback", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "buzz-broker-listener-"));
+  const key = new Uint8Array(32).fill(1);
+  let identityReads = 0;
+  const options = (host) => ({
+    root: directory,
+    configFile: false,
+    logLevel: "silent",
+    optimizeDeps: { noDiscovery: true, include: [] },
+    server: { host, port: 0, watch: null, hmr: false },
+    plugins: [
+      relayBrokerPlugin({
+        archiveFile: ":memory:",
+        identity: () => {
+          identityReads++;
+          return key.slice();
+        },
+      }),
+    ],
+  });
+  try {
+    // Real Vite server construction, without listen(), is safe even pre-fix.
+    // A rejected config must never reach the broker's credential loader.
+    await expect(async () => {
+      const server = await createServer(options(true));
+      await server.close();
+    }).rejects.toThrow("requires a loopback-only Vite listener");
+    expect(identityReads).toBe(0);
+    const server = await createServer(options("127.0.0.1"));
+    try {
+      expect(identityReads).toBe(1);
+      await server.listen();
+      const address = server.httpServer.address();
+      expect(address.address).toBe("127.0.0.1");
+      const response = await fetch(
+        `http://127.0.0.1:${address.port}/api/relay/identity`,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ viewer: getPublicKey(key) });
+    } finally {
+      await server.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

@@ -7,16 +7,17 @@ export type Contribution<T> = Readonly<
 >;
 /** How strongly a contribution claims a target: lower wins, default 0. Bands by
  * convention: -10 specialises a known plugin, 0 default/specific, 100 catch-all. */
-export type MatchOrder = number | ((target: string) => number);
+export type MatchOrder<Target = string> = number | ((target: Target) => number);
 /** Among active matches, the lowest order for this target wins; ties fall to the
  * contribution key so activation or re-enable order never decides. A throwing
  * matcher is skipped; a throwing or non-finite order counts as the default. */
 export function resolveMatch<
   T extends {
-    matches(target: string): boolean;
-    order?: MatchOrder | undefined;
+    matches(target: Target): boolean;
+    order?: MatchOrder<Target> | undefined;
   },
->(entries: readonly Contribution<T>[], target: string) {
+  Target = string,
+>(entries: readonly Contribution<T>[], target: Target) {
   const orderOf = (entry: T) => {
     try {
       const order =

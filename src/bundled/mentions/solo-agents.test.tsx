@@ -48,7 +48,15 @@ import {
 import { MENTION_RESOLVE_TIMEOUT_MS } from "../../features/conversation/completion";
 import { createProfileDirectory } from "../../features/relay/profile-directory";
 import type { RelayEvent } from "../../features/relay/events";
-import { keypair, profile } from "../../features/relay/testing";
+import {
+  PROFILE_CACHE_BASE,
+  PROFILE_CACHE_MAX,
+} from "../../features/relay/budget";
+import {
+  keypair,
+  profile,
+  unsignedProfiles,
+} from "../../features/relay/testing";
 // jsdom lacks scrollIntoView; the search highlight keeps its row in view.
 beforeEach(() => {
   Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
@@ -61,6 +69,31 @@ afterEach(() => {
   vi.useRealTimers();
   Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
 });
+// A person row's accessible name is its label then its detail line (no key).
+// The lines are separate elements, so the gap between them may be empty.
+const rowName = (label: string, detail = "") => {
+  const escapeText = (text: string) =>
+    text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Agent rows also announce "Agent" after the name.
+  return new RegExp(
+    `^${escapeText(label)}(?:\\s*Agent)?\\s*${escapeText(detail)}$`,
+  );
+};
+// Which of these labelled rows are shown, in the order they appear.
+const rowsInOrder = (labels: readonly string[]) =>
+  labels
+    .flatMap((label) =>
+      screen
+        .queryAllByRole("button", { name: rowName(label) })
+        .map((button) => ({ button, label })),
+    )
+    .sort((a, b) =>
+      a.button.compareDocumentPosition(b.button) &
+      Node.DOCUMENT_POSITION_FOLLOWING
+        ? -1
+        : 1,
+    )
+    .map(({ label }) => label);
 function setup(parent: boolean | null = true, archived = false) {
   const key = "b".repeat(64),
     member = "a".repeat(64);
@@ -194,12 +227,7 @@ it("uses the same alphabetical and prefix ordering for typed and button mentions
   );
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
-  const pickerNames = () =>
-    screen
-      .getAllByRole("button")
-      .map((button) => button.getAttribute("aria-label"))
-      .filter((label) => keys.some((key) => label?.endsWith(key)))
-      .map((label) => label?.slice(0, -65));
+  const pickerNames = () => rowsInOrder(names);
   expect(pickerNames()).toEqual(["Adam Avery", "Avery", "Zoe"]);
   await user.type(screen.getByRole("searchbox"), "avery");
   expect(pickerNames()).toEqual(["Avery", "Adam Avery"]);
@@ -220,7 +248,7 @@ it("offers outside agents in the Solo chat mention picker while ordinary channel
   );
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
   expect(
-    screen.queryByRole("button", { name: `Outside agent ${test.key}` }),
+    screen.queryByRole("button", { name: /^Outside agent/ }),
   ).not.toBeInTheDocument();
   view.rerender(
     <MentionPicker
@@ -232,9 +260,7 @@ it("offers outside agents in the Solo chat mention picker while ordinary channel
       select={select}
     />,
   );
-  await user.click(
-    await screen.findByRole("button", { name: `Outside agent ${test.key}` }),
-  );
+  await user.click(await outsideRow());
   expect(select).toHaveBeenCalledWith({
     pubkey: test.key,
     name: "Outside agent",
@@ -242,6 +268,164 @@ it("offers outside agents in the Solo chat mention picker while ordinary channel
   view.unmount();
   test.library.dispose();
 });
+it("marks agents, not people, in both mention menus", async () => {
+  const test = setup();
+  const publish = vi.fn();
+  const view = render(
+    <MentionCompletion
+      session={test.session}
+      scope="test"
+      channelId="parent"
+      inviteAgents
+      observation={{ revision: 1, text: "@", start: 1, end: 1 }}
+      query={{ start: 0, end: 1, query: "" }}
+      publish={publish}
+    />,
+  );
+  await waitFor(() =>
+    expect(
+      (publish.mock.lastCall?.[0] as CompletionResult | undefined)?.items.map(
+        ({ label, agent }) => [label, agent],
+      ),
+    ).toEqual([
+      ["Member", false],
+      ["Outside agent", true],
+    ]),
+  );
+  view.unmount();
+  render(
+    <MentionPicker
+      scope="test"
+      session={test.session}
+      channelId="parent"
+      disabled={false}
+      inviteAgents
+      select={() => true}
+    />,
+  );
+  await userEvent
+    .setup()
+    .click(screen.getByRole("button", { name: "Mention a member" }));
+  expect(
+    await screen.findByRole("button", {
+      name: /^Outside agent\s*Agent\s*Adds to channel when you send$/,
+    }),
+  ).toBeVisible();
+  expect(screen.getByRole("button", { name: /^Member$/ })).toBeVisible();
+  test.library.dispose();
+});
+it.each(["completion", "picker"] as const)(
+  "updates remote %s cues from the shared inventory without changing recipients",
+  async (surface) => {
+    const test = setup();
+    const lifetime = new AbortController();
+    const owner = "f".repeat(64);
+    const relayUrl = "https://relay.example";
+    const remote = {
+      pubkey: "c".repeat(64),
+      name: "Cloud agent",
+      owner,
+      relayUrl,
+      runtime: "block.builderlab/builderlab",
+    };
+    const local = { ...remote, pubkey: "d".repeat(64), name: "Device agent" };
+    const channel = test.session.channels.list().channels[0];
+    if (!channel) throw new Error("Missing fixture channel");
+    Object.assign(channel, {
+      members: [test.member, remote.pubkey],
+    });
+    const native = localAgentsFixture([local]);
+    native.set({ hosted: [remote] });
+    const agentChoices = createAgentChoices({
+      scope: `${relayUrl}:${owner}`,
+      library: test.library.queries,
+      native,
+      signal: lifetime.signal,
+    });
+    const publish = vi.fn();
+    const select = vi.fn(() => true);
+    const session = { ...test.session, agentChoices };
+    const view = render(
+      surface === "completion" ? (
+        <MentionCompletion
+          session={session}
+          scope="test"
+          channelId="parent"
+          inviteAgents
+          observation={{ revision: 1, text: "@", start: 1, end: 1 }}
+          query={{ start: 0, end: 1, query: "" }}
+          publish={publish}
+        />
+      ) : (
+        <MentionPicker
+          session={session}
+          scope="test"
+          channelId="parent"
+          inviteAgents
+          disabled={false}
+          select={select}
+        />
+      ),
+    );
+    const item = (key: string) =>
+      (publish.mock.lastCall?.[0] as CompletionResult | undefined)?.items.find(
+        (row) => row.id === key,
+      );
+    try {
+      if (surface === "picker")
+        await userEvent
+          .setup()
+          .click(screen.getByRole("button", { name: "Mention a member" }));
+      if (surface === "completion") {
+        await waitFor(() => expect(item(remote.pubkey)?.detail).toBe("Remote"));
+        expect(item(remote.pubkey)?.edit).toEqual({
+          mention: { pubkey: remote.pubkey, name: remote.name },
+        });
+        expect(item(local.pubkey)?.detail).toBe("Adds to channel");
+        await waitFor(() =>
+          expect(item(test.key)?.detail).toBe("Adds to channel"),
+        );
+      } else {
+        expect(
+          await screen.findByRole("button", {
+            name: rowName(remote.name, "Remote"),
+          }),
+        ).toBeVisible();
+        expect(
+          screen.getByRole("button", {
+            name: rowName(local.name, "Adds to channel when you send"),
+          }),
+        ).toBeVisible();
+        expect(
+          await screen.findByRole("button", {
+            name: rowName("Outside agent", "Adds to channel when you send"),
+          }),
+        ).toBeVisible();
+      }
+      act(() =>
+        native.set({ hosted: [{ ...remote, runtime: "other/provider" }] }),
+      );
+      if (surface === "completion")
+        await waitFor(() => expect(item(remote.pubkey)?.detail).toBe("Remote"));
+      else {
+        await userEvent.setup().click(
+          await screen.findByRole("button", {
+            name: rowName(remote.name, "Remote"),
+          }),
+        );
+        expect(select).toHaveBeenCalledWith({
+          pubkey: remote.pubkey,
+          name: remote.name,
+        });
+      }
+    } finally {
+      view.unmount();
+      lifetime.abort();
+      test.library.dispose();
+    }
+  },
+);
+
 function renderAudiencePicker(
   test: ReturnType<typeof setup>,
   recipients: readonly { pubkey: string; name: string }[],
@@ -264,8 +448,10 @@ function renderAudiencePicker(
   );
   return { view, only, toggle, focusDraft, select };
 }
-const outsideRow = (test: ReturnType<typeof setup>) =>
-  screen.findByRole("button", { name: `Outside agent ${test.key}` });
+const outsideRow = () =>
+  screen.findByRole("button", {
+    name: rowName("Outside agent", "Adds to channel when you send"),
+  });
 
 it("an agents-only audience pill replaces the mention button and never inserts a mention", async () => {
   const test = setup(),
@@ -276,7 +462,7 @@ it("an agents-only audience pill replaces the mention button and never inserts a
   });
   expect(screen.queryByRole("button", { name: "Mention a member" })).toBeNull();
   await userEvent.setup().click(pill);
-  await outsideRow(test);
+  await outsideRow();
   expect(select).not.toHaveBeenCalled();
   view.unmount();
   test.library.dispose();
@@ -288,7 +474,7 @@ it("clicking an agent row in the pill menu toggles that agent and keeps the menu
     agent = { pubkey: test.key, name: "Outside agent" };
   const { view, only, toggle } = renderAudiencePicker(test, []);
   await user.click(screen.getByRole("button", { name: "Choose agent" }));
-  await user.click(await outsideRow(test));
+  await user.click(await outsideRow());
   expect(toggle).toHaveBeenCalledExactlyOnceWith(agent);
   expect(only).not.toHaveBeenCalled();
   expect(screen.getByRole("searchbox")).toBeInTheDocument();
@@ -306,7 +492,7 @@ it("with one agent addressed, its row shows a check and is pressed, not filled",
       name: "Sending to Outside agent. Change agents",
     }),
   );
-  const row = await outsideRow(test);
+  const row = await outsideRow();
   expect(row).not.toHaveAttribute("data-selected");
   expect(row).toHaveAttribute("aria-pressed", "true");
   expect(row.querySelector("svg")).not.toBeNull();
@@ -327,7 +513,7 @@ it("with several agents addressed, the pill is a menu button and each addressed 
       name: "Sending to Outside agent, Another. Change agents",
     }),
   );
-  const row = await outsideRow(test);
+  const row = await outsideRow();
   expect(row).not.toHaveAttribute("data-selected");
   expect(row).toHaveAttribute("aria-pressed", "true");
   expect(row.querySelector("svg")).not.toBeNull();
@@ -348,7 +534,7 @@ it("picking an addressed row while several agents are addressed toggles it", asy
       name: "Sending to Outside agent, Another. Change agents",
     }),
   );
-  await user.click(await outsideRow(test));
+  await user.click(await outsideRow());
   expect(toggle).toHaveBeenCalledExactlyOnceWith(agent);
   expect(screen.getByRole("searchbox")).toBeInTheDocument();
   view.unmount();
@@ -361,12 +547,12 @@ it("closing the pill menu resumes typing in the draft, unless the click went els
   const { view, focusDraft } = renderAudiencePicker(test, []);
   const pill = screen.getByRole("button", { name: "Choose agent" });
   await user.click(pill);
-  await outsideRow(test);
+  await outsideRow();
   await user.keyboard("{Escape}");
   await waitFor(() => expect(screen.queryByRole("searchbox")).toBeNull());
   await waitFor(() => expect(focusDraft).toHaveBeenCalledOnce());
   await user.click(pill);
-  await outsideRow(test);
+  await outsideRow();
   await user.click(document.body);
   await waitFor(() => expect(screen.queryByRole("searchbox")).toBeNull());
   expect(focusDraft).toHaveBeenCalledOnce();
@@ -397,9 +583,9 @@ it("the pill changing shape while its menu is open leaves focus in the menu", as
       name: "Sending to Outside agent. Change agents",
     }),
   );
-  await outsideRow(test);
+  await outsideRow();
   view.rerender(picker([agent, { pubkey: "c".repeat(64), name: "Another" }]));
-  await outsideRow(test);
+  await outsideRow();
   expect(focusDraft).not.toHaveBeenCalled();
   await user.keyboard("{Escape}");
   await waitFor(() => expect(focusDraft).toHaveBeenCalledOnce());
@@ -412,7 +598,7 @@ it("the pill menu highlights a row only while the pointer is on it", async () =>
     user = userEvent.setup();
   const { view } = renderAudiencePicker(test, []);
   await user.click(screen.getByRole("button", { name: "Choose agent" }));
-  const row = await outsideRow(test);
+  const row = await outsideRow();
   expect(row).not.toHaveAttribute("data-highlighted");
   const move = (clientX: number) =>
     fireEvent.pointerMove(row, { pointerType: "mouse", clientX, clientY: 4 });
@@ -434,7 +620,7 @@ it("in the pill menu, Enter on a row toggles that agent and keeps the menu open"
     agent = { pubkey: test.key, name: "Outside agent" };
   const { view, toggle } = renderAudiencePicker(test, []);
   await user.click(screen.getByRole("button", { name: "Choose agent" }));
-  const row = await outsideRow(test);
+  const row = await outsideRow();
   row.focus();
   await user.keyboard("{Enter}");
   expect(toggle).toHaveBeenCalledExactlyOnceWith(agent);
@@ -618,7 +804,8 @@ it("offers a known member for Tab while agents load, then appends late agents", 
     expect(completionLabels(publish)).toEqual(["Member"]);
     expect(result().items[0]?.canSelect?.("Tab")).toBe(true);
     expect(result().spaceId).toBeUndefined();
-    expect(result().items[0]?.canSelect?.(" ")).toBe(false);
+    for (const key of [" ", ",", "’"])
+      expect(result().items[0]?.canSelect?.(key), key).toBe(false);
     view.rerender(<MentionCompletion {...props} />);
     await act(async () => release());
     await waitFor(() =>
@@ -723,12 +910,11 @@ it("navigates namesakes with arrows and selects the highlighted exact identity w
     />,
   );
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
+  // Same name; the member row has no detail line, the outside agent does.
   const first = await screen.findByRole("button", {
-    name: `Outside agent ${test.member}`,
+    name: rowName("Outside agent"),
   });
-  const last = await screen.findByRole("button", {
-    name: `Outside agent ${test.key}`,
-  });
+  const last = await outsideRow();
   // Focus stays in search; the first row is highlighted before typing, and
   // the arrows wrap.
   const search = screen.getByRole("searchbox");
@@ -768,12 +954,11 @@ it("keeps focus on the highlighted row after Tab, for arrows and pointer", async
     />,
   );
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
+  // Same name; the member row has no detail line, the outside agent does.
   const first = await screen.findByRole("button", {
-    name: `Outside agent ${test.member}`,
+    name: rowName("Outside agent"),
   });
-  const last = await screen.findByRole("button", {
-    name: `Outside agent ${test.key}`,
-  });
+  const last = await outsideRow();
   for (let i = 0; i < 10 && document.activeElement !== first; i += 1)
     await user.tab();
   expect(first).toHaveFocus();
@@ -904,7 +1089,7 @@ it("Solo picker discloses history access before selection", async () => {
   try {
     await user.click(screen.getByRole("button", { name: "Mention a member" }));
     const agent = await screen.findByRole("button", {
-      name: `Outside agent ${test.key}`,
+      name: rowName("Outside agent", "Adds to chat when you send"),
     });
     expect(
       screen.getByText(
@@ -945,9 +1130,7 @@ it.each([true, false, null])(
       expect(result?.items).toEqual([
         expect.objectContaining({
           id: test.key,
-          detail: expect.stringContaining(
-            parent ? "Adds to channel" : "Adds to chat ·",
-          ),
+          detail: parent ? "Adds to channel" : "Adds to chat",
           edit: { mention: { pubkey: test.key, name: "Outside agent" } },
         }),
       ]),
@@ -1020,6 +1203,195 @@ it.each([
       );
       expect(result?.items).toHaveLength(1);
       expect(result?.retry).toEqual(expect.any(Function));
+    } finally {
+      view.unmount();
+      test.library.dispose();
+    }
+  },
+);
+
+it.each([
+  ["a member who never set a name", false, undefined],
+  [
+    "a names read that failed",
+    true,
+    "Could not load some names. Retry to refresh.",
+  ],
+])("reports %s only when it failed", async (_case, fails, status) => {
+  const test = setup();
+  const nameless = "c".repeat(64);
+  const channel = test.session.channels.list().channels[0];
+  if (channel) Object.assign(channel, { members: [test.member, nameless] });
+  const ensure = vi.fn(async () => {
+    if (fails) throw new Error("relay unavailable");
+  });
+  const session = {
+    ...test.session,
+    profiles: { ...test.session.profiles, ensure },
+  } as RelaySession;
+  let result: CompletionResult | undefined;
+  const view = render(
+    <MentionCompletion
+      session={session}
+      scope="test"
+      channelId="parent"
+      observation={{ revision: 1, text: "@Mem", start: 4, end: 4 }}
+      query={{ start: 0, end: 4, query: "Mem" }}
+      publish={(next: CompletionResult) => {
+        result = next;
+        return () => {};
+      }}
+    />,
+  );
+  try {
+    await waitFor(() => expect(ensure).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(result?.items).toHaveLength(1);
+      expect(result?.status).toBe(status);
+    });
+    if (fails) expect(result?.retry).toEqual(expect.any(Function));
+    else expect(result?.retry).toBeUndefined();
+  } finally {
+    view.unmount();
+    test.library.dispose();
+  }
+});
+
+it.each(["after", "before"] as const)(
+  "keeps a failed names read and its Retry across keystrokes that remount the provider (%s it fails)",
+  async (order) => {
+    const test = setup();
+    const nameless = "c".repeat(64);
+    const channel = test.session.channels.list().channels[0];
+    if (channel) Object.assign(channel, { members: [test.member, nameless] });
+    let fail: (() => void) | undefined;
+    let fails = true;
+    const ensure = vi.fn(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          if (!fails) return resolve();
+          fail = () => reject(new Error("relay unavailable"));
+        }),
+    );
+    const session = {
+      ...test.session,
+      profiles: { ...test.session.profiles, ensure },
+    } as RelaySession;
+    let result: CompletionResult | undefined;
+    // The host keys each keystroke's provider by revision: a new mount.
+    const typed = (revision: number, query: string) => (
+      <MentionCompletion
+        key={revision}
+        session={session}
+        scope="test"
+        channelId="parent"
+        observation={{
+          revision,
+          text: `@${query}`,
+          start: query.length + 1,
+          end: query.length + 1,
+        }}
+        query={{ start: 0, end: query.length + 1, query }}
+        publish={(next: CompletionResult) => {
+          result = next;
+          return () => {};
+        }}
+      />
+    );
+    const failed = "Could not load some names. Retry to refresh.";
+    const view = render(typed(1, "M"));
+    try {
+      await waitFor(() => expect(ensure).toHaveBeenCalledTimes(1));
+      if (order === "after") {
+        await act(async () => fail?.());
+        await waitFor(() => expect(result?.status).toBe(failed));
+        view.rerender(typed(2, "Me"));
+      } else {
+        view.rerender(typed(2, "Me"));
+        await act(async () => fail?.());
+      }
+      await waitFor(() => expect(result?.status).toBe(failed));
+      expect(result?.retry).toEqual(expect.any(Function));
+      // Typing does not reread the failed names; only Retry does.
+      view.rerender(typed(3, "Mem"));
+      await waitFor(() => expect(result?.status).toBe(failed));
+      expect(ensure).toHaveBeenCalledTimes(1);
+      fails = false;
+      await act(async () => result?.retry?.());
+      await waitFor(() => expect(result?.status).toBeUndefined());
+      expect(result?.retry).toBeUndefined();
+      expect(ensure).toHaveBeenCalledTimes(2);
+    } finally {
+      view.unmount();
+      test.library.dispose();
+    }
+  },
+);
+
+it.each(["loaded by another reader", "removed from the channel"] as const)(
+  "reports a failed names read only for members still unresolved (%s)",
+  async (recovery) => {
+    const test = setup();
+    const unread = "c".repeat(64);
+    const channel = test.session.channels.list().channels[0];
+    if (channel) Object.assign(channel, { members: [test.member, unread] });
+    // The cached member is never read; the batch fails for the unread one.
+    let profiles = new Map(test.profiles);
+    const listeners = new Set<() => void>();
+    const ensure = vi.fn(async () => {
+      throw new Error("relay unavailable");
+    });
+    const session = {
+      ...test.session,
+      profiles: {
+        ...test.session.profiles,
+        snapshot: () => profiles,
+        subscribe: (listener: () => void) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+        ensure,
+      },
+    } as RelaySession;
+    let result: CompletionResult | undefined;
+    const typed = (revision: number, query: string) => (
+      <MentionCompletion
+        key={revision}
+        session={session}
+        scope="test"
+        channelId="parent"
+        observation={{
+          revision,
+          text: `@${query}`,
+          start: query.length + 1,
+          end: query.length + 1,
+        }}
+        query={{ start: 0, end: query.length + 1, query }}
+        publish={(next: CompletionResult) => {
+          result = next;
+          return () => {};
+        }}
+      />
+    );
+    const view = render(typed(1, "M"));
+    try {
+      await waitFor(() =>
+        expect(result?.status).toBe(
+          "Could not load some names. Retry to refresh.",
+        ),
+      );
+      act(() => {
+        if (recovery === "loaded by another reader") {
+          profiles = new Map([...profiles, [unread, { name: "Una" }]]);
+          for (const listener of listeners) listener();
+        } else if (channel) Object.assign(channel, { members: [test.member] });
+      });
+      // Every later keystroke remounts; none brings the warning back.
+      view.rerender(typed(2, "Me"));
+      view.rerender(typed(3, "Mem"));
+      await waitFor(() => expect(result?.status).toBeUndefined());
+      expect(result?.retry).toBeUndefined();
+      expect(ensure).toHaveBeenCalledTimes(1);
     } finally {
       view.unmount();
       test.library.dispose();
@@ -1116,7 +1488,9 @@ it.each(["picker", "completion"] as const)(
           screen.getByRole("button", { name: "Mention a member" }),
         );
         await user.click(
-          await screen.findByRole("button", { name: `Native Mic ${test.key}` }),
+          await screen.findByRole("button", {
+            name: rowName("Native Mic", "Adds to channel when you send"),
+          }),
         );
       } else {
         await waitFor(() => expect(result?.items[0]?.label).toBe("Native Mic"));
@@ -1328,6 +1702,8 @@ it("prioritizes the viewer-owned namesake in both menus and selects the exact ow
       snapshot: () => profiles,
       subscribe: () => () => {},
       ensure: async () => {},
+      // Only attested owners are named as managers.
+      owner: (key: string) => ({ [mine]: viewer, [test.key]: owner })[key],
     },
     channels: { ...test.session.channels, list: () => list },
   };
@@ -1350,9 +1726,12 @@ it("prioritizes the viewer-owned namesake in both menus and selects the exact ow
   );
   expect(
     (publish.mock.lastCall?.[0] as CompletionResult | undefined)?.items.map(
-      (item) => item.id,
+      ({ id, agent, detail }) => [id, agent, detail],
     ),
-  ).toEqual([mine, test.key]);
+  ).toEqual([
+    [mine, true, undefined],
+    [test.key, true, "Managed by Wes"],
+  ]);
   completion.unmount();
   const select = vi.fn(() => true);
   const view = render(
@@ -1367,19 +1746,84 @@ it("prioritizes the viewer-owned namesake in both menus and selects the exact ow
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
   await user.type(screen.getByRole("searchbox"), "hon");
+  // Someone else's agent also says who manages it; your own does not.
+  const wes = await screen.findByRole("button", {
+    name: rowName("Wes’s Honey", "Managed by Wes"),
+  });
+  const own = screen.getByRole("button", { name: rowName("Honey") });
   expect(
-    screen
-      .getAllByRole("button")
-      .map((button) => button.getAttribute("aria-label"))
-      .filter((label) => label?.endsWith(mine) || label?.endsWith(test.key)),
-  ).toEqual([`Honey ${mine}`, `Wes’s Honey ${test.key}`]);
-  await user.click(
-    await screen.findByRole("button", { name: `Wes’s Honey ${test.key}` }),
-  );
+    own.compareDocumentPosition(wes) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
+  await user.click(wes);
   expect(select).toHaveBeenCalledWith({ pubkey: test.key, name: "Honey" });
   view.unmount();
   names.dispose();
   library.dispose();
+  test.library.dispose();
+});
+
+it("names a manager only once ownership is attested and the owner has a real name", async () => {
+  const test = setup();
+  const viewer = "1".repeat(64),
+    owner = "2".repeat(64),
+    unnamed = "3".repeat(64),
+    other = "e".repeat(64);
+  const profiles = new Map([
+    [viewer, { name: "Logan" }],
+    [owner, { name: "Wes" }],
+    [unnamed, { name: unnamed.slice(0, 10), nameIsFallback: true as const }],
+    [test.key, { name: "Honey", isAgent: true as const, ownerPubkey: owner }],
+    [other, { name: "Bee", isAgent: true as const, ownerPubkey: unnamed }],
+  ]);
+  const listeners = new Set<() => void>();
+  const attested = new Map<string, string>();
+  const list = {
+    status: "ready" as const,
+    channels: [{ id: "parent", name: "Parent", members: [test.key, other] }],
+  };
+  const session = {
+    ...test.session,
+    viewer,
+    profiles: {
+      snapshot: () => profiles,
+      subscribe: (listener: () => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      ensure: async () => {},
+      owner: (key: string) => attested.get(key),
+    },
+    channels: { ...test.session.channels, list: () => list },
+  };
+  const view = render(
+    <MentionPicker
+      scope="scope"
+      session={session}
+      channelId="parent"
+      disabled={false}
+      select={() => true}
+    />,
+  );
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Mention a member" }));
+  // A self-declared owner is not a manager.
+  expect(
+    await screen.findByRole("button", { name: rowName("Honey") }),
+  ).toBeVisible();
+  expect(screen.queryByText(/Managed by/)).toBeNull();
+  // Attestation settles later and notifies without a new profile snapshot.
+  act(() => {
+    attested.set(test.key, owner);
+    attested.set(other, unnamed);
+    for (const listener of listeners) listener();
+  });
+  expect(
+    screen.getByRole("button", { name: rowName("Honey", "Managed by Wes") }),
+  ).toBeVisible();
+  // An owner without a name never shows a key fragment instead.
+  expect(screen.getByRole("button", { name: rowName("Bee") })).toBeVisible();
+  expect(screen.queryByText(/Managed by 3/)).toBeNull();
+  view.unmount();
   test.library.dispose();
 });
 
@@ -1426,7 +1870,7 @@ it("keeps an outside namesake discoverable and qualifies the actual choice set",
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
   expect(
-    await screen.findByRole("button", { name: `Larry ${member}` }),
+    await screen.findByRole("button", { name: rowName("Larry") }),
   ).toBeInTheDocument();
   view.rerender(
     <MentionPicker
@@ -1438,15 +1882,14 @@ it("keeps an outside namesake discoverable and qualifies the actual choice set",
       select={select}
     />,
   );
+  // Namesakes are qualified; only the outside agent has a detail line.
   const outsideButton = await screen.findByRole("button", {
-    name: new RegExp(`Larry · .+ ${outside}`),
+    name: /^Larry · \S+?\s*Adds to channel when you send$/,
   });
   expect(
-    screen.getByRole("button", { name: new RegExp(`Larry · .+ ${member}`) }),
+    screen.getByRole("button", { name: /^Larry · \S+$/ }),
   ).toBeInTheDocument();
-  expect(
-    screen.queryByRole("button", { name: new RegExp(unrelated) }),
-  ).not.toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: /^Larry/ })).toHaveLength(2);
   await user.click(outsideButton);
   expect(select).toHaveBeenCalledWith({ pubkey: outside, name: "Larry" });
   view.unmount();
@@ -1499,9 +1942,9 @@ it("discovers outside humans from the selected directory in both menus, not cach
     .setup()
     .click(screen.getByRole("button", { name: "Mention a member" }));
   const row = await screen.findByRole("button", {
-    name: `${outsider.name} ${outsider.pubkey}`,
+    name: rowName(outsider.name, "Not in channel"),
   });
-  expect(row).toHaveTextContent("Choose whether to add");
+  expect(row).not.toHaveTextContent(outsider.pubkey);
   expect(
     screen.queryByRole("button", { name: new RegExp(cached) }),
   ).not.toBeInTheDocument();
@@ -1743,7 +2186,7 @@ it("shows local rows before the directory, appends outside rows, and reuses sett
     pages.get("La")?.({ people: [lara, larry], hasMore: true }),
   );
   expect(labels()).toEqual(["Larkin", "Lara", "Larry Outside"]);
-  expect(last()?.status).toBe("Narrow your search to see more members.");
+  expect(last()?.status).toBeUndefined();
   // A new query keeps still-matching people from the last page while it loads.
   view.rerender(
     <MentionCompletion
@@ -1766,7 +2209,7 @@ it("shows local rows before the directory, appends outside rows, and reuses sett
     <MentionCompletion {...props} query={{ start: 0, end: 3, query: "La" }} />,
   );
   expect(labels()).toEqual(["Larkin", "Lara", "Larry Outside"]);
-  expect(last()?.status).toBe("Narrow your search to see more members.");
+  expect(last()?.status).toBeUndefined();
   await act(() => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS));
   expect(people).toHaveBeenCalledTimes(2);
 });
@@ -2015,7 +2458,7 @@ it("retains button rows while disabling an archived member, then hides it on reo
     />,
   );
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
-  const row = screen.getByRole("button", { name: `Member ${"a".repeat(64)}` });
+  const row = screen.getByRole("button", { name: rowName("Member") });
   act(() => {
     archive = { ...archive, archived: ["a".repeat(64)] };
     for (const fn of listeners) fn();
@@ -2026,7 +2469,7 @@ it("retains button rows while disabling an archived member, then hides it on reo
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
   expect(
-    screen.queryByRole("button", { name: `Member ${"a".repeat(64)}` }),
+    screen.queryByRole("button", { name: /^Member/ }),
   ).not.toBeInTheDocument();
   test.library.dispose();
 });
@@ -2061,7 +2504,7 @@ it("offers usable partial agent choices without waiting for another source", asy
     .click(screen.getByRole("button", { name: "Mention a member" }));
   expect(
     await screen.findByRole("button", {
-      name: `Ready Agent ${"f".repeat(64)}`,
+      name: rowName("Ready Agent", "Adds to channel when you send"),
     }),
   ).toBeEnabled();
   view.unmount();
@@ -2123,7 +2566,14 @@ it("closes prose after an unknown name without status or recovery, and skips sea
   const session = {
     ...t.session,
     directMessages: { ...t.session.directMessages, people },
-    profiles: { ...t.session.profiles, snapshot: () => uncached },
+    // A failed names read offers recovery for prose to retire.
+    profiles: {
+      ...t.session.profiles,
+      snapshot: () => uncached,
+      ensure: async () => {
+        throw new Error("relay unavailable");
+      },
+    },
   };
   const publish = vi.fn();
   const last = () => publish.mock.lastCall?.[0] as CompletionResult | undefined;
@@ -2277,7 +2727,7 @@ it("still searches a longer query when the page read for its prefix was truncate
   const { last, complete } = directoryCompletion(people);
   const view = render(complete("Mar"));
   await act(() => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS));
-  expect(last()?.status).toBe("Narrow your search to see more members.");
+  expect(last()?.status).toBeUndefined();
   // A truncated page may have left a match out: it answers only its own query.
   view.rerender(complete("Mary J"));
   expect(last()?.status).toBe("Searching community…");
@@ -2408,7 +2858,7 @@ it("scopes a retry to its query: later queries derive from a cached prefix page 
   expect(last()?.items.map((item) => item.label)).toEqual(["Mira Everly"]);
 });
 
-it("an empty partial-key search does not refute an exact-key lookup, and keys still match no choice", async () => {
+it("an empty partial-key search does not refute an exact-key lookup, which lists only the key's owner", async () => {
   const key = "9".repeat(64);
   const people = vi.fn(async (query: string) => ({
     people: query === key ? [{ pubkey: key, name: "Keyholder" }] : [],
@@ -2423,8 +2873,10 @@ it("an empty partial-key search does not refute an exact-key lookup, and keys st
   await waitFor(() =>
     expect(people).toHaveBeenLastCalledWith(key, 1, expect.any(AbortSignal)),
   );
-  // Choices still match names only, never public keys.
-  await waitFor(() => expect(last()?.items).toEqual([]));
+  // A complete key matches its owner; the partial key above matched no one.
+  await waitFor(() =>
+    expect(last()?.items.map((item) => item.label)).toEqual(["Keyholder"]),
+  );
 });
 
 it("a failed multi-word directory search keeps its error and retry", async () => {
@@ -2548,17 +3000,11 @@ it("uses base matches and visible lexical ties for Fizz in both chooser surfaces
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
   await user.type(screen.getByRole("searchbox"), "fizz");
-  expect(
-    screen
-      .getAllByRole("button")
-      .map((button) => button.getAttribute("aria-label"))
-      .filter((label) => rows.some((row) => label?.endsWith(row.key)))
-      .map((label) => label?.slice(0, -65)),
-  ).toEqual(expected);
+  expect(rowsInOrder(rows.map((row) => row.label))).toEqual(expected);
   test.library.dispose();
 });
 
-it("does not complete public keys in either menu", async () => {
+it("completes a full public key only to its owner in either menu, never a partial key", async () => {
   const test = setup();
   const key =
     "150b20bdf6130418df9239dd1bd082c71612c8d653b47c277200365b9be215dc";
@@ -2597,7 +3043,7 @@ it("does not complete public keys in either menu", async () => {
   view.rerender(
     <MentionCompletion {...props} query={{ start: 0, end: 65, query: key }} />,
   );
-  expect(ids()).toEqual([]);
+  expect(ids()).toEqual([key]);
   view.rerender(
     <MentionCompletion {...props} query={{ start: 0, end: 4, query: "eee" }} />,
   );
@@ -2615,11 +3061,14 @@ it("does not complete public keys in either menu", async () => {
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "Mention a member" }));
   await user.type(screen.getByRole("searchbox"), "h");
-  expect(screen.queryByRole("button", { name: `Bad Janet ${key}` })).toBeNull();
-  expect(screen.getByRole("button", { name: `Honey ${honey}` })).toBeVisible();
+  expect(screen.queryByRole("button", { name: /^Bad Janet/ })).toBeNull();
+  expect(screen.getByRole("button", { name: rowName("Honey") })).toBeVisible();
   await user.clear(screen.getByRole("searchbox"));
   await user.type(screen.getByRole("searchbox"), key);
-  expect(screen.queryByRole("button", { name: `Bad Janet ${key}` })).toBeNull();
+  expect(
+    screen.getByRole("button", { name: rowName("Bad Janet") }),
+  ).toBeVisible();
+  expect(screen.queryByRole("button", { name: rowName("Honey") })).toBeNull();
   test.library.dispose();
 });
 
@@ -2763,7 +3212,7 @@ it("the persistent toolbar picker reads an empty search again after close and re
   expect(people).toHaveBeenLastCalledWith("Zed", 1, expect.any(AbortSignal));
   await waitFor(() =>
     expect(
-      screen.getByRole("button", { name: `Zed ${"9".repeat(64)}` }),
+      screen.getByRole("button", { name: rowName("Zed", "Not in channel") }),
     ).toBeTruthy(),
   );
   t.library.dispose();
@@ -2816,9 +3265,9 @@ it("names the choice set only while the picker is shown, and qualifies namesakes
   await userEvent
     .setup()
     .click(screen.getByRole("button", { name: "Mention a member" }));
-  for (const [index, key] of [member, namesake].entries())
+  for (const label of labels)
     expect(
-      await screen.findByRole("button", { name: `${labels[index]} ${key}` }),
+      await screen.findByRole("button", { name: rowName(label) }),
     ).toBeInTheDocument();
   view.rerender(picker(true));
   scope.mockClear();
@@ -2888,9 +3337,7 @@ it.each([false, true])(
         .setup()
         .click(screen.getByRole("button", { name: "Mention a member" }));
       if (warm) {
-        await screen.findByRole("button", {
-          name: `Outside agent ${test.key}`,
-        });
+        await outsideRow();
         held = true;
         act(() => {
           void session.agentChoices.refresh();
@@ -2900,13 +3347,13 @@ it.each([false, true])(
       expect(session.agentChoices.snapshot().status).toBe("loading");
       if (warm) {
         expect(
-          screen.getByRole("button", { name: `Member ${test.member}` }),
+          screen.getByRole("button", { name: rowName("Member") }),
         ).toBeVisible();
         expect(screen.queryByText("Loading agents…")).not.toBeInTheDocument();
       } else {
         // A cold agent read does not hide the already-known channel member.
         expect(
-          screen.getByRole("button", { name: `Member ${test.member}` }),
+          screen.getByRole("button", { name: rowName("Member") }),
         ).toBeVisible();
         expect(screen.queryByText("Loading agents…")).not.toBeInTheDocument();
       }
@@ -2914,9 +3361,7 @@ it.each([false, true])(
       await waitFor(() =>
         expect(session.agentChoices.snapshot().status).toBe("ready"),
       );
-      expect(
-        screen.getByRole("button", { name: `Outside agent ${test.key}` }),
-      ).toBeEnabled();
+      expect(await outsideRow()).toBeEnabled();
       expect(screen.queryByText("Loading agents…")).not.toBeInTheDocument();
     } finally {
       await act(async () => release());
@@ -3036,6 +3481,11 @@ it("saved teams resolve exact keys, block automatic Space and revoke a changed c
       ]),
     );
     expect(h.result()?.spaceId).toBeUndefined();
+    // The team's longer name blocks every key that ends the typed name.
+    const member = h.result()?.items.find((item) => item.id === h.member);
+    expect(member?.canSelect?.("Enter")).toBe(true);
+    for (const key of [" ", ",", "'", "’", ")"])
+      expect(member?.canSelect?.(key), key).toBe(false);
     const selected = h.choice();
     if (!selected) throw new Error("Team missing");
     expect(selected.canSelect?.("Enter")).toBe(true);
@@ -3099,7 +3549,7 @@ it.each(["loading", "error"] as const)(
 it("team loading has no Retry action and never replaces a people status", async () => {
   const loading = teamFixture(undefined, { status: "loading" });
   await waitFor(() =>
-    expect(loading.result()?.status).toBe("Loading saved teams…"),
+    expect(loading.result()?.status).toBe("Loading legacy teams…"),
   );
   expect(loading.result()?.retry).toBeUndefined();
   loading.view.unmount();
@@ -3144,7 +3594,7 @@ it.each([
   { options: { dm: true }, detail: "1 not in DM · Will not be notified" },
   {
     options: {},
-    detail: "1 not in channel · Choose whether to add when you send",
+    detail: "1 not in channel",
   },
 ])(
   "team choice explains destination consequences: $detail",
@@ -3166,7 +3616,7 @@ type DirectoryPage = {
 function spaceFixture(
   memberName: string,
   others: Record<string, string | null> = {},
-  options: { query?: string; dm?: boolean } = {},
+  options: { query?: string; dm?: boolean; teams?: readonly string[] } = {},
 ) {
   const h = setup();
   h.profiles.set(h.member, { name: memberName });
@@ -3200,9 +3650,39 @@ function spaceFixture(
   const publish = vi.fn();
   const result = () =>
     publish.mock.lastCall?.[0] as CompletionResult | undefined;
+  // Legacy catalog teams with these names, each of the member alone.
+  const catalog = {
+    status: "ready" as const,
+    entries: (options.teams ?? []).map((name, index) => ({
+      eventId: `team-${index}`,
+      createdAt: 1,
+      record: {
+        version: 1 as const,
+        community: "fixture",
+        deleted: false,
+        value: {
+          type: "team" as const,
+          id: `team-${index}`,
+          name,
+          agents: [h.member],
+        },
+      },
+    })),
+  };
+  const channelKit: NonNullable<RelaySession["channelKit"]> = {
+    available: true,
+    snapshot: () => catalog,
+    subscribe: () => () => {},
+    ensure() {},
+    async refresh() {},
+    async save() {
+      return "head";
+    },
+  };
   const session = {
     ...h.session,
     names,
+    ...(options.teams ? { channelKit } : {}),
     channels: { ...h.session.channels, list: () => list },
     directMessages: { ...h.session.directMessages, people },
   } as unknown as RelaySession;
@@ -3311,6 +3791,66 @@ it("Space keeps a member's name when an identically named outside namesake is qu
     expect(h.result()?.spaceId).toBe(h.member);
     expect(h.canSpace(h.member)).toBe(true);
     expect(h.canSpace(outsideJose)).toBe(false);
+  } finally {
+    h.dispose();
+  }
+});
+it("Space selects a member by a pasted npub beside a namesake, without waiting for the directory", async () => {
+  const query = npubEncode("a".repeat(64));
+  const h = spaceFixture("Jose", { [otherMember]: "Jose" }, { query });
+  try {
+    await waitFor(() =>
+      expect(h.people).toHaveBeenCalledWith(query, 1, expect.anything()),
+    );
+    // A key has no namesakes: only its owner is listed, and Space selects it.
+    await waitFor(() =>
+      expect(h.result()?.items.map((item) => item.id)).toEqual([h.member]),
+    );
+    expect(h.result()?.spaceId).toBe(h.member);
+    expect(h.canSpace(h.member)).toBe(true);
+  } finally {
+    h.dispose();
+  }
+});
+it.each([
+  { case: "that name", suffix: "" },
+  { case: "a longer name", suffix: " Crew" },
+])(
+  "Space selects a member by a pasted npub beside a saved team with $case",
+  async ({ suffix }) => {
+    const query = npubEncode("a".repeat(64));
+    const h = spaceFixture("Jose", {}, { query, teams: [query + suffix] });
+    try {
+      await waitFor(() =>
+        expect(h.people).toHaveBeenCalledWith(query, 1, expect.anything()),
+      );
+      // A key is not a name: the team neither matches it nor declines Space.
+      await waitFor(() => expect(h.result()?.spaceId).toBe(h.member));
+      expect(h.result()?.items.map((item) => item.id)).toEqual([h.member]);
+      expect(h.canSpace(h.member)).toBe(true);
+    } finally {
+      h.dispose();
+    }
+  },
+);
+it("Space selects someone outside the channel by a pasted npub once the directory finds them", async () => {
+  const query = npubEncode(outsideJose);
+  const h = spaceFixture("Jose", {}, { query });
+  try {
+    await waitFor(() =>
+      expect(h.people).toHaveBeenCalledWith(query, 1, expect.anything()),
+    );
+    expect(h.result()?.items.some((item) => item.id === outsideJose)).toBe(
+      false,
+    );
+    expect(h.result()?.spaceId).toBeUndefined();
+    await h.finish({
+      people: [{ pubkey: outsideJose, name: "Jose" }],
+      hasMore: false,
+    });
+    await waitFor(() => expect(h.result()?.spaceId).toBe(outsideJose));
+    expect(h.result()?.items.map((item) => item.id)).toEqual([outsideJose]);
+    expect(h.canSpace(outsideJose)).toBe(true);
   } finally {
     h.dispose();
   }
@@ -3635,6 +4175,24 @@ it.each([
     }
   },
 );
+it("the resolver leaves a one-character outside name unread and unselected", async () => {
+  const h = spaceFixture("Member");
+  try {
+    await waitFor(() => expect(h.people).toHaveBeenCalledTimes(1));
+    const calls = h.people.mock.calls.length;
+    await expect(
+      resolveSpaceMention(
+        h.session,
+        { channelId: "parent", selected: [] },
+        "q",
+        new AbortController().signal,
+      ),
+    ).resolves.toBeNull();
+    expect(h.people).toHaveBeenCalledTimes(calls);
+  } finally {
+    h.dispose();
+  }
+});
 /** A resolution for assertions: the recipient, null, or the continuing names. */
 const outcomeOf = (outcome: SpaceMentionResolution | undefined) =>
   outcome && "continued" in outcome
@@ -3947,6 +4505,162 @@ it("Space keeps waiting after a member's profile read fails until a retry settle
     await act(async () => h.reads[1]?.resolve([]));
     await waitFor(() => expect(h.result()?.spaceId).toBe(h.member));
     expect(h.canSpace(h.member)).toBe(true);
+  } finally {
+    h.dispose();
+  }
+});
+
+function rosterFixture(
+  members: readonly string[],
+  second: readonly string[] = [],
+  answer: (authors: readonly string[]) => RelayEvent[] = () => [],
+) {
+  const h = setup();
+  const reads: { authors: readonly string[] }[] = [];
+  const directory = createProfileDirectory({
+    read: async (filters) => {
+      const authors = filters[0]?.authors ?? [];
+      reads.push({ authors });
+      return answer(authors);
+    },
+  });
+  const list = {
+    status: "ready" as const,
+    channels: [
+      { id: "parent", channelType: "stream" as const, members },
+      { id: "second", channelType: "stream" as const, members: second },
+    ],
+  };
+  const names = bindNames(
+    { profiles: directory.queries, agentLibrary: h.library.queries },
+    { snapshot: () => [createAgentDirectory()], subscribe: () => () => {} },
+  );
+  const session = {
+    ...h.session,
+    profiles: directory.queries,
+    names,
+    channels: { ...h.session.channels, list: () => list },
+    directMessages: {
+      ...h.session.directMessages,
+      people: () => new Promise<DirectoryPage>(() => {}),
+    },
+  } as unknown as RelaySession;
+  const mount = (channelId = "parent") =>
+    render(
+      <MentionCompletion
+        session={session}
+        scope="space-test"
+        channelId={channelId}
+        observation={{ revision: 1, text: "@jo", start: 3, end: 3 }}
+        query={{ start: 0, end: 3, query: "jo" }}
+        publish={vi.fn()}
+      />,
+    );
+  return {
+    reads,
+    directory,
+    mount,
+    requested: () => new Set(reads.flatMap((read) => read.authors)),
+    dispose() {
+      names.dispose();
+      directory.dispose();
+      h.library.dispose();
+    },
+  };
+}
+
+it("loads an open channel's whole roster when it reserves room past the base", async () => {
+  const roster = unsignedProfiles(1100).map((event) => event.pubkey);
+  const h = rosterFixture(roster);
+  const release = h.directory.queries.reserve?.(roster.length);
+  try {
+    const view = h.mount();
+    await waitFor(() => expect(h.requested().size).toBe(1100));
+    view.unmount();
+  } finally {
+    release?.();
+    h.dispose();
+  }
+});
+
+it("keeps the base cache for other names when a roster passes the cap", async () => {
+  const roster = unsignedProfiles(11_000, "M");
+  const byKey = new Map(roster.map((event) => [event.pubkey, event]));
+  const h = rosterFixture(
+    roster.map((event) => event.pubkey),
+    [],
+    (authors) => authors.flatMap((id) => byKey.get(id) ?? []),
+  );
+  const others = unsignedProfiles(PROFILE_CACHE_BASE, "O");
+  h.directory.accept(others);
+  const release = h.directory.queries.reserve?.(roster.length);
+  try {
+    expect(h.directory.queries.limit?.()).toBe(PROFILE_CACHE_MAX);
+    const view = h.mount();
+    await waitFor(() =>
+      expect(h.requested().size).toBe(PROFILE_CACHE_MAX - PROFILE_CACHE_BASE),
+    );
+    await waitFor(() =>
+      expect(h.directory.queries.snapshot().size).toBe(PROFILE_CACHE_MAX),
+    );
+    // The roster used only its reserved room: no other name was evicted.
+    expect(
+      others.every((event) => h.directory.queries.snapshot().has(event.pubkey)),
+    ).toBe(true);
+    view.unmount();
+  } finally {
+    release?.();
+    h.dispose();
+  }
+});
+
+it("loads a second large channel's whole roster after the first one's", async () => {
+  const first = unsignedProfiles(1500, "A").map((event) => event.pubkey);
+  const second = unsignedProfiles(1500, "B").map((event) => event.pubkey);
+  const h = rosterFixture(first, second);
+  let release = h.directory.queries.reserve?.(first.length);
+  try {
+    let view = h.mount();
+    await waitFor(() => expect(h.requested().size).toBe(1500));
+    view.unmount();
+    // Navigating swaps one equal reservation for the other: nothing shrinks
+    // or evicts, so only this roster's own requests may use its allowance.
+    release?.();
+    release = h.directory.queries.reserve?.(second.length);
+    view = h.mount("second");
+    await waitFor(() =>
+      expect(second.every((id) => h.requested().has(id))).toBe(true),
+    );
+    view.unmount();
+  } finally {
+    release?.();
+    h.dispose();
+  }
+});
+
+it("asks again for a member's name after the cache evicted it, but not for a known-unnamed one", async () => {
+  const member = keypair();
+  const ghost = keypair();
+  const h = rosterFixture([member.pubkey, ghost.pubkey]);
+  try {
+    h.directory.accept([profile(member, { name: "Jo" })]);
+    let view = h.mount();
+    // The read finds no profile for the ghost, so it is known unnamed.
+    await waitFor(() =>
+      expect(h.directory.queries.unnamed?.().has(ghost.pubkey)).toBe(true),
+    );
+    view.unmount();
+    expect(h.requested().has(member.pubkey)).toBe(false);
+    expect(h.reads).toHaveLength(1);
+    // Unrelated profiles push the member out of the 1,024-entry base.
+    h.directory.accept(unsignedProfiles(1024, "Other "));
+    expect(h.directory.queries.snapshot().has(member.pubkey)).toBe(false);
+    view = h.mount();
+    await waitFor(() => expect(h.requested().has(member.pubkey)).toBe(true));
+    view.unmount();
+    expect(
+      h.reads.filter((read) => read.authors.includes(ghost.pubkey)),
+    ).toHaveLength(1);
   } finally {
     h.dispose();
   }

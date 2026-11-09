@@ -31,12 +31,6 @@
   display: grid;
   gap: var(--space-1);
 }
-.mentionChoices code {
-  font-size: var(--text-caption);
-  line-height: var(--text-caption--line-height);
-  letter-spacing: var(--text-caption--letter-spacing);
-  overflow-wrap: anywhere;
-}
 .mentionContent p {
   color: var(--text-subtle);
 }
@@ -45,4 +39,12 @@
   padding: 0;
   margin: 0;
   min-width: 0;
+}
+/* Inside the name, so the row keeps one text baseline (as message bylines). */
+.agentMark {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  margin-inline-start: var(--space-1);
+  vertical-align: -0.125em;
 }

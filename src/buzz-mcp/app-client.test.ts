@@ -3,6 +3,7 @@ import type { AgentHandle } from "../features/agents/service";
 import type { AgentProtection } from "../features/agent-protection/service";
 import { appClient, readFile } from "./app-client";
 import type { Host } from "../features/host/service";
+import { pngChunks } from "../features/messages/image-metadata";
 
 function gate<T>() {
   let resolve!: (value: T) => void;
@@ -209,4 +210,248 @@ it("refuses creation after the calling turn ends and surfaces native failures", 
     client.createAgent?.({ type: "codex/codex", name: "Child" }),
   ).rejects.toThrow("Turn ended");
   expect(createAgent).toHaveBeenCalledOnce();
+});
+
+/** A PNG carrying a location in a text chunk. */
+function metadataPng() {
+  const chunk = (kind: string, payload: number[] | string = []) => {
+    const data =
+      typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
+    return [
+      ...[0, 0, 0, data.length],
+      ...new TextEncoder().encode(kind),
+      ...data,
+      ...[0, 0, 0, 0],
+    ];
+  };
+  return new Uint8Array([
+    137,
+    80,
+    78,
+    71,
+    13,
+    10,
+    26,
+    10,
+    ...chunk("IHDR", Array(13).fill(0)),
+    ...chunk("tEXt", "GPS\u000051.5,-0.12"),
+    ...chunk("IDAT", [1, 2]),
+    ...chunk("IEND"),
+  ]);
+}
+
+it("strips a proposed picture's metadata before uploading it as the agent", async () => {
+  const png = metadataPng();
+  const upload = vi.fn(async (_data: string, type: string) => ({
+    url: "https://relay/media/x.png",
+    sha256: "ab",
+    size: 1,
+    type,
+  }));
+  const client = appClient(
+    { pubkey: "agent", upload } as unknown as AgentHandle,
+    {
+      read: vi.fn(),
+      memories: async () => ({ entries: [], partial: false }),
+    },
+  );
+  await expect(client.uploadPicture?.(png, "image/png")).resolves.toMatchObject(
+    {
+      url: "https://relay/media/x.png",
+    },
+  );
+  const [data, type] = upload.mock.calls[0] ?? [];
+  expect(type).toBe("image/png");
+  const sent = Uint8Array.from(atob(data ?? ""), (c) => c.charCodeAt(0));
+  expect(pngChunks(sent).map((c) => c.kind)).toEqual(["IHDR", "IDAT", "IEND"]);
+});
+
+it("refuses a proposed picture its preparation does not recognize", async () => {
+  const upload = vi.fn();
+  const client = appClient(
+    { pubkey: "agent", upload } as unknown as AgentHandle,
+    {
+      read: vi.fn(),
+      memories: async () => ({ entries: [], partial: false }),
+    },
+  );
+  await expect(
+    client.uploadPicture?.(
+      new TextEncoder().encode("GIF8x metadata"),
+      "image/gif",
+    ),
+  ).rejects.toThrow("PNG, JPEG, GIF or WebP");
+  expect(upload).not.toHaveBeenCalled();
+});
+
+it("proposes no picture for a turn stopped during its upload", async () => {
+  let release = () => {};
+  const upload = vi.fn(
+    () =>
+      new Promise((resolve) => {
+        release = () =>
+          resolve({ url: "https://relay/media/x.png", sha256: "ab", size: 1 });
+      }),
+  );
+  const controller = new AbortController();
+  const client = appClient(
+    { pubkey: "agent", upload } as unknown as AgentHandle,
+    {
+      read: vi.fn(),
+      signal: controller.signal,
+      memories: async () => ({ entries: [], partial: false }),
+    },
+  );
+  const picture = client.uploadPicture?.(metadataPng(), "image/png");
+  await vi.waitFor(() => expect(upload).toHaveBeenCalledOnce());
+  controller.abort(new Error("Turn ended"));
+  release();
+  await expect(picture).rejects.toThrow("Turn ended");
+});
+
+it("refuses plugin calls after the calling turn ends", async () => {
+  const plugins = {
+    list: vi.fn(async () => ({ plugins: [] })),
+    discover: vi.fn(),
+    disable: vi.fn(),
+    request: vi.fn(),
+    status: vi.fn(),
+  };
+  const controller = new AbortController();
+  const client = appClient({ plugins } as unknown as AgentHandle, {
+    read: vi.fn(),
+    signal: controller.signal,
+    memories: async () => ({ entries: [], partial: false }),
+  });
+  expect(await client.plugins?.list()).toEqual({ plugins: [] });
+  controller.abort(new Error("Turn ended"));
+  await expect(async () => client.plugins?.list()).rejects.toThrow(
+    "Turn ended",
+  );
+  expect(() => client.plugins?.status("r")).toThrow("Turn ended");
+  expect(plugins.list).toHaveBeenCalledOnce();
+  expect(
+    appClient({} as AgentHandle, {
+      read: vi.fn(),
+      memories: async () => ({ entries: [], partial: false }),
+    }).plugins,
+  ).toBeUndefined();
+});
+
+it("offers the handle's settings, checking the turn before each call", () => {
+  const settings = {
+    list: vi.fn(() => []),
+    get: vi.fn(),
+    set: vi.fn(() => ({ key: "example.mood" }) as never),
+  };
+  const agent = { pubkey: "agent", settings } as unknown as AgentHandle;
+  const memories = async () => ({ entries: [], partial: false });
+  expect(
+    appClient({ pubkey: "agent" } as unknown as AgentHandle, {
+      read: vi.fn(),
+      memories,
+    }).settings,
+  ).toBeUndefined();
+  let ended = false;
+  const controller = new AbortController();
+  const client = appClient(agent, {
+    read: vi.fn(),
+    memories,
+    signal: controller.signal,
+    check: () => {
+      if (ended) throw new Error("The turn has ended");
+    },
+  });
+  client.settings?.set("example.mood", "busy");
+  expect(settings.set).toHaveBeenCalledExactlyOnceWith("example.mood", "busy");
+  ended = true;
+  expect(() => client.settings?.set("example.mood", "calm")).toThrow("ended");
+  expect(() => client.settings?.list()).toThrow("ended");
+  ended = false;
+  controller.abort(new Error("Turn stopped"));
+  expect(() => client.settings?.get("example.mood")).toThrow("Turn stopped");
+  expect(settings.set).toHaveBeenCalledOnce();
+  expect(settings.list).not.toHaveBeenCalled();
+  expect(settings.get).not.toHaveBeenCalled();
+});
+
+it("offers the handle's owner reads with the turn's signal, withholding answers once the turn ends", async () => {
+  const memories = async () => ({ entries: [], partial: false });
+  expect(
+    appClient({ pubkey: "agent" } as unknown as AgentHandle, {
+      read: vi.fn(),
+      memories,
+    }).ownerAccess,
+  ).toBeUndefined();
+  const held = gate<void>();
+  const answer = { execution: {}, channels: [], partial: false } as never;
+  const ownerAccess = {
+    channels: vi.fn(async () => answer),
+    channel: vi.fn(async () => {
+      await held.promise;
+      return answer;
+    }),
+    members: vi.fn(async () => answer),
+    messages: vi.fn(async () => answer),
+    canvas: vi.fn(async () => answer),
+    canvasHistory: vi.fn(async () => answer),
+    held: vi.fn(),
+  };
+  let ended = false;
+  const controller = new AbortController();
+  const client = appClient(
+    { pubkey: "agent", ownerAccess } as unknown as AgentHandle,
+    {
+      read: vi.fn(),
+      memories,
+      signal: controller.signal,
+      check: () => {
+        if (ended) throw new Error("The turn has ended");
+      },
+    },
+  );
+  await expect(client.ownerAccess?.channels()).resolves.toBe(answer);
+  expect(ownerAccess.channels).toHaveBeenCalledExactlyOnceWith(
+    controller.signal,
+  );
+  await client.ownerAccess?.members("c", { offset: 2, limit: 5 });
+  expect(ownerAccess.members).toHaveBeenCalledExactlyOnceWith(
+    "c",
+    { offset: 2, limit: 5 },
+    controller.signal,
+  );
+  // Each read runs with the turn's signal.
+  await client.ownerAccess?.messages({ channel: "c", limit: 5 });
+  expect(ownerAccess.messages).toHaveBeenCalledExactlyOnceWith(
+    { channel: "c", limit: 5 },
+    controller.signal,
+  );
+  await client.ownerAccess?.canvas("c", "r");
+  expect(ownerAccess.canvas).toHaveBeenCalledExactlyOnceWith(
+    "c",
+    "r",
+    controller.signal,
+  );
+  await client.ownerAccess?.canvasHistory("c", { before: 1 });
+  expect(ownerAccess.canvasHistory).toHaveBeenCalledExactlyOnceWith(
+    "c",
+    { before: 1 },
+    controller.signal,
+  );
+  const execution = { agent: "agent", owner: "owner", community: "c" };
+  client.ownerAccess?.held(execution);
+  expect(ownerAccess.held).toHaveBeenCalledExactlyOnceWith(execution);
+  const pending = client.ownerAccess?.channel("c");
+  ended = true;
+  held.resolve();
+  await expect(pending).rejects.toThrow("ended");
+  await expect(client.ownerAccess?.channels()).rejects.toThrow("ended");
+  await expect(
+    client.ownerAccess?.messages({ channel: "c", limit: 5 }),
+  ).rejects.toThrow("ended");
+  expect(ownerAccess.channels).toHaveBeenCalledOnce();
+  expect(ownerAccess.messages).toHaveBeenCalledOnce();
+  // An answer read before the turn ended is not released after it.
+  expect(() => client.ownerAccess?.held(execution)).toThrow("ended");
+  expect(ownerAccess.held).toHaveBeenCalledOnce();
 });

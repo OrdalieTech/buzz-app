@@ -1,11 +1,14 @@
 // A Solo chat's Canvas, handed to its agent with every turn: the workspace's
 // instructions and the folders it works in. A shared Solo chat's members can
 // write its Canvas too, so only a head the owner or one of their attested
-// agents wrote is handed over as the chat's standing instructions; agents
+// agents approved is handed over as the chat's standing instructions; agents
 // never read it on their own initiative.
-import { attestedOwner } from "../agents/owner-attestation";
-import type { EventData } from "../relay/events";
+import {
+  approvedCanvas,
+  type CanvasHead,
+} from "../channel-templates/canvas-approval";
 import { workspaceDirectories } from "../solo/workspace";
+import { unframed } from "./plugin-wake";
 
 export type Project = Readonly<{
   /** The prompt section; empty when the Canvas is. */
@@ -29,7 +32,7 @@ export function project(canvas: string | undefined): Project {
     ? ` This chat's work happens in these folders, not your own workspace: ${directories.map((folder) => `\`${folder}\``).join(", ")}. \`cd\` into the one you need; your workspace keeps your notes.`
     : "";
   return {
-    section: `<workspace-canvas>\nThis Solo chat's Canvas as of this message: its standing instructions for this chat, which the owner's messages override. It replaces any earlier workspace Canvas.${folders}\n\n${canvas.trim()}\n</workspace-canvas>`,
+    section: `<workspace-canvas>\nThis Solo chat's Canvas as of this message: its standing instructions for this chat, which the owner's messages override. It replaces any earlier workspace Canvas.${folders}\n\n${unframed(canvas.trim())}\n</workspace-canvas>`,
     directories,
   };
 }
@@ -37,12 +40,7 @@ export function project(canvas: string | undefined): Project {
 /** How long a turn waits for its chat's Canvas. */
 export const CANVAS_TIMEOUT_MS = 4_000;
 
-type CanvasHead = Pick<
-  EventData,
-  "pubkey" | "kind" | "created_at" | "tags" | "content"
->;
-
-/** The channel's Canvas text when `owner`, or an agent they attest, wrote its
+/** The channel's Canvas text when `owner`, or an agent they attest, approved its
  * current head; undefined when it has none or someone else wrote it. A chat
  * the owner's device is still `starting` answers with the Canvas it starts
  * with, before the relay has it. */
@@ -61,9 +59,11 @@ export async function ownerCanvas(
   if (!canvas?.available) return undefined;
   const head = await canvas.read(channelId);
   if (!head) return undefined;
-  if (head.pubkey === owner || (await attestedOwner(head)) === owner)
-    return head.content;
-  console.warn("Ignoring a Canvas its owner's side did not write", channelId);
+  if (await approvedCanvas(head, owner)) return head.content;
+  console.warn(
+    "Ignoring a Canvas its owner's side has not approved",
+    channelId,
+  );
   return undefined;
 }
 

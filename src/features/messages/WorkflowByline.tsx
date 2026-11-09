@@ -1,4 +1,3 @@
-import { npubEncode } from "nostr-tools/nip19";
 import { Button } from "../../shared/design-system/ui/Button";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
 import { InfoIcon } from "../../shared/design-system/icons";
@@ -15,13 +14,11 @@ import styles from "./Messages.module.css";
 export function WorkflowByline({
   ownerId,
   ownerName,
-  signer,
   canOpenLink,
   onOpenLink,
 }: {
   ownerId: string;
   ownerName: string;
-  signer: string;
   canOpenLink?: ((url: string) => boolean) | undefined;
   onOpenLink(url: string): boolean;
 }) {
@@ -46,6 +43,7 @@ export function WorkflowByline({
       </span>
       <PopoverRoot>
         <PopoverTrigger
+          openOnHover="preview"
           render={
             <IconButton
               size="xs"
@@ -58,20 +56,9 @@ export function WorkflowByline({
         <PopoverPopup size="compact">
           <PopoverTitle>Workflow message</PopoverTitle>
           <PopoverDescription>
-            Sent automatically. This community’s relay attributes the workflow
-            to this owner; the owner did not sign this message.
+            Sent automatically by a workflow. Its owner set it up but didn’t
+            send this message personally.
           </PopoverDescription>
-          <dl className={styles.workflowDetails}>
-            <dt>Workflow owner</dt>
-            <dd>{ownerName}</dd>
-            <dt>Owner public key</dt>
-            <dd>{npubEncode(ownerId)}</dd>
-            <dt>Signed by the relay</dt>
-            <dd>{npubEncode(signer)}</dd>
-          </dl>
-          <p className="text-body-sm text-tertiary">
-            Workflow and run details are not included in this message.
-          </p>
         </PopoverPopup>
       </PopoverRoot>
     </span>

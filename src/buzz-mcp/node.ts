@@ -12,6 +12,7 @@ import { decode } from "nostr-tools/nip19";
 import { decrypt, encrypt, getConversationKey } from "nostr-tools/nip44";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import { hexToBytes } from "nostr-tools/utils";
+import { CANVAS_MAX_EVENT_BYTES } from "../features/channel-templates/canvas-limits.ts";
 import { eventsDto } from "../features/relay/events";
 import type {
   BuzzClient,
@@ -181,7 +182,15 @@ export function nodeClient(
       if (tags.some((tag) => tag[0] === "h"))
         tags.push(["ms", String(Date.now() % 1000)]);
       if (auth) tags.push(auth);
-      return post(sign({ ...event, tags }));
+      const signed = sign({ ...event, tags });
+      // Escaping can carry Canvas content within its limit past the frame.
+      if (
+        signed.kind === 40100 &&
+        new TextEncoder().encode(JSON.stringify(signed)).length >
+          CANVAS_MAX_EVENT_BYTES
+      )
+        throw new Error("The canvas event is too large to publish.");
+      return post(signed);
     },
     async upload(data, mime) {
       const hash = sha256(data);
@@ -218,7 +227,7 @@ export function nodeClient(
       const name = input.trim().startsWith(prefix)
         ? input.trim().slice(prefix.length)
         : input.trim();
-      if (!/^[0-9a-f]{64}(\.[a-z0-9]{1,8}|\.thumb\.jpg)?$/.test(name))
+      if (!/^[0-9a-f]{64}(\.[a-z0-9]{1,8}|\.thumb\.(?:jpg|webp))?$/.test(name))
         throw new Error("Agents fetch only their community's media");
       const blossom = sign({
         kind: 24242,
@@ -282,7 +291,7 @@ export function nodeClient(
           createWriteStream(partial),
         );
         if (
-          !name.endsWith(".thumb.jpg") &&
+          !/\.thumb\.(?:jpg|webp)$/.test(name) &&
           hash.digest("hex") !== name.slice(0, 64)
         )
           throw new Error("Media did not match its SHA-256");

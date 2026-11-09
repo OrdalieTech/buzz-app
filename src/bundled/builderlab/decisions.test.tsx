@@ -1,19 +1,21 @@
 // @vitest-environment jsdom
+import { createTestSession } from "./test-helpers";
 import "@testing-library/jest-dom/vitest";
 import { Context } from "@deepseek-ai/cordis";
-import { expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { DecisionsService } from "../../features/decisions/service";
 import { flush } from "../../features/relay/testing";
 import {
   builderlabProvider,
+  nativeBuilderlabDecide,
   offerBuilderlabDecisions,
   type BuilderlabDecide,
 } from "./decisions";
-import type { Credential } from "./oauth/browser";
-import { createOAuthSession } from "./oauth/session";
+import type { Credential } from "./session";
+import type { BuilderlabSession } from "./session";
 
-const credential = (value: string): Credential => ({
-  value,
+const credential = (revision: string): Credential => ({
+  revision,
   account: {
     subject: "user",
     email: "a@example.com",
@@ -27,9 +29,28 @@ const request = {
   timeoutMs: 30_000,
 };
 const signal = new AbortController().signal;
+const tauri = vi.hoisted(() => ({
+  isTauri: vi.fn(() => false),
+  invoke: vi.fn(async () => ({})),
+}));
+vi.mock("@tauri-apps/api/core", () => tauri);
+afterEach(() => {
+  vi.unstubAllEnvs();
+  tauri.isTauri.mockReturnValue(false);
+});
+
+it("names the native session by its revision, never a token", async () => {
+  tauri.isTauri.mockReturnValue(true);
+  await nativeBuilderlabDecide()?.(request, credential("fi-revision"));
+  expect(tauri.invoke).toHaveBeenLastCalledWith("decide", {
+    backend: "builderlab",
+    request,
+    federated: "fi-revision",
+  });
+});
 
 it("needs a sign-in, then sends it to native with each call", async () => {
-  const session = createOAuthSession(async () => credential("first"));
+  const session = createTestSession(async () => credential("first"));
   const decide = vi.fn<BuilderlabDecide>(async () => ({
     outcome: "answered",
     backend: "builderlab",
@@ -50,47 +71,36 @@ it("needs a sign-in, then sends it to native with each call", async () => {
     model: "builderlab-1",
     answers: { a: { type: "yes_no", probability: 0.7 } },
   });
-  expect(decide).toHaveBeenCalledWith(request, "first");
+  expect(decide).toHaveBeenCalledWith(request, session.credential());
 });
 
-it("signs out only the sign-in Builderlab refused", async () => {
-  let next = "first";
-  const session = createOAuthSession(async () => credential(next));
-  await session.signIn();
-  let reply!: (value: unknown) => void;
-  const provider = builderlabProvider(
-    session,
-    true,
-    () => new Promise((resolve) => (reply = resolve)),
-  );
-  const expired = {
+it("never ends an FI session for a decisions 401", async () => {
+  const signOut = vi.fn();
+  const fi = {
+    revision: "fi-revision",
+    storage: "",
+    account: credential("x").account,
+  };
+  const session = {
+    snapshot: () => ({ status: "signed-in", account: fi.account }),
+    subscribe: () => () => {},
+    credential: () => fi,
+    signOut,
+  } as unknown as BuilderlabSession;
+  const provider = builderlabProvider(session, true, async () => ({
     outcome: "failed",
     backend: "builderlab",
     reason: "session_expired",
-  };
-  // A newer sign-in replaces the refused one while the call is out.
-  const refusedOld = provider.decide(request, { signal });
-  next = "second";
-  session.signOut();
-  await session.signIn();
-  reply(expired);
-  await expect(refusedOld).resolves.toEqual({
+  }));
+  await expect(provider.decide(request, { signal })).resolves.toEqual({
     outcome: "failed",
     reason: "unauthorized",
   });
-  expect(session.snapshot().status).toBe("signed-in");
-  const refused = provider.decide(request, { signal });
-  reply(expired);
-  await expect(refused).resolves.toEqual({
-    outcome: "failed",
-    reason: "unauthorized",
-  });
-  expect(session.snapshot().status).toBe("signed-out");
-  expect(provider.status()).toBe("needs-setup");
+  expect(signOut).not.toHaveBeenCalled();
 });
 
 it("keeps the shared sign-in when only decisions are refused", async () => {
-  const session = createOAuthSession(async () => credential("first"));
+  const session = createTestSession(async () => credential("first"));
   await session.signIn();
   const provider = builderlabProvider(session, true, async () => ({
     outcome: "failed",
@@ -108,7 +118,7 @@ it.each([
   ["invalid args `request` for command `decide`", "invalid_request"],
   ["decide not allowed", "service_error"],
 ])("reports a native rejection (%s) as %s", async (message, reason) => {
-  const session = createOAuthSession(async () => credential("first"));
+  const session = createTestSession(async () => credential("first"));
   await session.signIn();
   const provider = builderlabProvider(session, true, async () => {
     throw message;
@@ -120,7 +130,7 @@ it.each([
 });
 
 it("is unavailable outside the desktop app", async () => {
-  const session = createOAuthSession(async () => credential("first"));
+  const session = createTestSession(async () => credential("first"));
   await session.signIn();
   const provider = builderlabProvider(session, false, undefined);
   expect(provider.status()).toBe("needs-setup");
@@ -131,8 +141,8 @@ it("is unavailable outside the desktop app", async () => {
 });
 
 it("sends nothing to Builderlab unless the account may use decisions", async () => {
-  const session = createOAuthSession(async () => ({
-    value: "first",
+  const session = createTestSession(async () => ({
+    revision: "first",
     account: {
       subject: "user",
       email: "a@example.com",
@@ -159,7 +169,7 @@ it("offers Builderlab only while the signed-in account may use decisions", async
   });
   const decisions = new DecisionsService(root, undefined);
   let allowed = false;
-  const session = createOAuthSession(async () => ({
+  const session = createTestSession(async () => ({
     ...credential("first"),
     account: {
       ...credential("first").account,

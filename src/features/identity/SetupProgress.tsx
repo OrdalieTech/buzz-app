@@ -1,27 +1,19 @@
-import { CircleNotchIcon } from "../../shared/design-system/icons/index";
+import styles from "./IdentitySetup.module.css";
 
-/** The "Setting up Buzz" page: the current step's label beside a spinner. */
 export function SetupProgress({ label }: { label: string }) {
   return (
-    <>
+    <div className={styles.progress}>
+      <span className={styles.loadingBee} aria-hidden="true" />
       <h1
         id="welcome-title"
         tabIndex={-1}
         className="text-heading text-standard"
       >
-        Setting up Buzz
+        Getting ready
       </h1>
-      <p
-        role="status"
-        className="flex items-center gap-2 text-body text-subtle"
-      >
-        <CircleNotchIcon
-          size={18}
-          aria-hidden="true"
-          className="motion-safe:animate-spin"
-        />
+      <span role="status" className="sr-only">
         {label}
-      </p>
-    </>
+      </span>
+    </div>
   );
 }

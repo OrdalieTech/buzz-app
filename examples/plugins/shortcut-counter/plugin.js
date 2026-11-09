@@ -11,7 +11,7 @@ export function apply(ctx) {
   ctx.shortcuts.register({
     id: "increment",
     title: "Increment shortcut counter",
-    binding: { key: "k", mod: true, shift: true },
+    binding: { key: "g", mod: true, shift: true },
     // Settings order within the Shortcut counter category.
     order: 10,
     run: increment,
@@ -45,7 +45,7 @@ export function apply(ctx) {
         React.createElement(
           "p",
           null,
-          "Press Command+Shift+K (Control+Shift+K on other platforms). Typing fields and modal dialogs are excluded by default. Disable the plugin to remove its shortcut.",
+          "Press Command+Shift+G (Control+Shift+G on other platforms). Typing fields and modal dialogs are excluded by default. Disable the plugin to remove its shortcut.",
         ),
         React.createElement("input", {
           "aria-label": "Shortcut typing guard",

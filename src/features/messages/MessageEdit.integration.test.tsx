@@ -405,7 +405,7 @@ it.each(["reject", "commit"] as const)(
       const input = screen.getByRole<ComposerInputElement>("textbox", {
         name: "Reply to thread",
       });
-      fireEvent.keyDown(input, { key: "ArrowUp" });
+      fireEvent.keyDown(input, { key: "ArrowUp", metaKey: true });
       act(() => {
         input.value = "Keep my revision";
         input.setSelectionRange(16, 16);
@@ -521,7 +521,7 @@ it.each(["thread", "exact"])(
       const input = screen.getByRole<ComposerInputElement>("textbox", {
         name: "Reply to thread",
       });
-      fireEvent.keyDown(input, { key: "ArrowUp" });
+      fireEvent.keyDown(input, { key: "ArrowUp", metaKey: true });
       expect(input).toHaveValue(edit.content);
       const content = `New caption\n\n![image](${url})`;
       act(() => {

@@ -8,10 +8,231 @@ import {
 } from "./navigation.mjs";
 import { test, expect } from "./fixture.mjs";
 import { open } from "./timeline.mjs";
+import { createServer } from "./vite-server.mjs";
 const button = (page, name) => page.getByRole("button", { name, exact: true });
 test.use({
+  enabledPlugins: ["buzz.workflows"],
   largeSidebar: true,
   historyCounts: { alpha: 1, beta: 1 },
+});
+
+// Selection motion and cancellation during window resize need real CSS layout
+// and animation timelines, which a DOM emulator cannot exercise.
+test("segmented selections slide but window resizing follows the selected tab immediately", async ({
+  page,
+}) => {
+  const server = await createServer({
+    configFile: false,
+    envFile: false,
+    logLevel: "error",
+    server: { host: "127.0.0.1", port: 0, open: false },
+  });
+  try {
+    await server.listen();
+    await page.goto(
+      `http://127.0.0.1:${server.httpServer.address().port}/tests/fixtures/design-system.html#/design/components/tabs`,
+    );
+    for (const label of [
+      "Segmented filters",
+      "Small segmented filters",
+      "Icon segmented filters",
+    ]) {
+      await page.setViewportSize({ width: 1280, height: 900 });
+      const list = page.getByRole("tablist", { name: label, exact: true });
+      await list.getByRole("tab").first().click();
+      await list.locator(".buzz-tabs-indicator").evaluate(async (element) => {
+        await Promise.all(
+          element.getAnimations().map((animation) => animation.finished),
+        );
+      });
+      const capture = await list.evaluateHandle((list) => {
+        const indicator = list.querySelector(".buzz-tabs-indicator");
+        if (!indicator) throw new Error("Missing segmented indicator");
+        const start = indicator.getBoundingClientRect().left;
+        const state = {
+          progress: undefined,
+          resizeError: undefined,
+        };
+        let targetWidth;
+        const observer = new MutationObserver(() => {
+          const selected = list
+            .querySelector('[aria-selected="true"]')
+            ?.getBoundingClientRect();
+          if (!selected) throw new Error("Missing selected tab");
+          if (state.progress === undefined) {
+            const animation = indicator
+              .getAnimations()
+              .find(
+                (animation) =>
+                  animation instanceof CSSTransition &&
+                  animation.transitionProperty === "transform",
+              );
+            if (!animation?.effect || selected.left === start) return;
+            // Hold an actual intermediate frame, independent of runner speed.
+            animation.pause();
+            animation.currentTime =
+              Number(animation.effect.getTiming().duration) / 2;
+            state.progress =
+              (indicator.getBoundingClientRect().left - start) /
+              (selected.left - start);
+            targetWidth = selected.width;
+          } else if (Math.abs(selected.width - targetWidth) > 1) {
+            const pill = indicator.getBoundingClientRect();
+            state.resizeError = Math.max(
+              Math.abs(pill.left - selected.left),
+              Math.abs(pill.right - selected.right),
+            );
+          }
+        });
+        observer.observe(indicator, {
+          attributes: true,
+          attributeFilter: ["style"],
+        });
+        return {
+          state,
+          dispose() {
+            observer.disconnect();
+            indicator.getAnimations().forEach((animation) => {
+              animation.finish();
+            });
+          },
+        };
+      });
+      try {
+        await list.getByRole("tab").last().click();
+        await expect
+          .poll(() => capture.evaluate(({ state }) => state.progress))
+          .toBeDefined();
+        const progress = await capture.evaluate(({ state }) => state.progress);
+        expect(
+          progress,
+          `${label} travels from its previous selection`,
+        ).toBeGreaterThan(0);
+        expect(
+          progress,
+          `${label} has not jumped to its destination`,
+        ).toBeLessThan(1);
+        // Window resizing must also cancel a slide already in progress.
+        await page.setViewportSize({ width: 640, height: 900 });
+        await expect
+          .poll(() => capture.evaluate(({ state }) => state.resizeError))
+          .toBeDefined();
+        expect(
+          await capture.evaluate(({ state }) => state.resizeError),
+          label,
+        ).toBeLessThan(1);
+      } finally {
+        await capture.evaluate(({ dispose }) => dispose());
+        await capture.dispose();
+      }
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test.describe("scope indicator", () => {
+  test.use({ largeSidebar: false });
+
+  // Only browser layout can compare the indicator's measured target with its
+  // rendered box during resize; jsdom cannot exercise flex sizing or transitions.
+  test("scope selection follows sidebar resize at normal and enlarged text", async ({
+    page,
+    app,
+  }) => {
+    await open(page, app);
+    const scope = page.getByRole("tablist", { name: "Navigation scope" });
+    const handle = page.getByRole("separator", { name: "Resize sidebar" });
+    const aligned = () =>
+      scope.evaluate((list) => {
+        const tab = list
+          .querySelector('[aria-selected="true"]')
+          .getBoundingClientRect();
+        const pill = list
+          .querySelector(".buzz-tabs-indicator")
+          .getBoundingClientRect();
+        return Math.max(
+          Math.abs(tab.left - pill.left),
+          Math.abs(tab.right - pill.right),
+        );
+      });
+
+    for (const scale of [1, 2]) {
+      await page.evaluate((scale) => {
+        document.documentElement.style.setProperty(
+          "--buzz-text-scale",
+          String(scale),
+        );
+      }, scale);
+      for (const label of ["All", "Solo", "Team"]) {
+        await handle.press("Home");
+        await scope.getByRole("tab", { name: label, exact: true }).click();
+        await expect.poll(aligned).toBeLessThan(1);
+        const capture = await scope.evaluateHandle((list) => {
+          const indicator = list.querySelector(".buzz-tabs-indicator");
+          const initialWidth = indicator.getBoundingClientRect().width;
+          const state = { sample: undefined };
+          const observer = new MutationObserver(() => {
+            const tab = list
+              .querySelector('[aria-selected="true"]')
+              .getBoundingClientRect();
+            const target = Number.parseFloat(
+              indicator.style.getPropertyValue("--active-tab-width"),
+            );
+            if (
+              Math.abs(target - initialWidth) < 1 ||
+              Math.abs(target - tab.width) > 1
+            )
+              return;
+            // Read at the measurement update, before a CSS transition can settle.
+            // A later retrying geometry assertion would miss resize lag entirely.
+            const pill = indicator.getBoundingClientRect();
+            state.sample = {
+              left: Math.abs(tab.left - pill.left),
+              right: Math.abs(tab.right - pill.right),
+            };
+            observer.disconnect();
+          });
+          observer.observe(indicator, {
+            attributes: true,
+            attributeFilter: ["style"],
+          });
+          return { state, dispose: () => observer.disconnect() };
+        });
+        try {
+          const grip = await handle.boundingBox();
+          await page.mouse.move(
+            grip.x + grip.width / 2,
+            grip.y + grip.height / 2,
+          );
+          await page.mouse.down();
+          await page.mouse.move(
+            grip.x + grip.width / 2 + 180,
+            grip.y + grip.height / 2,
+          );
+          await expect
+            .poll(() => capture.evaluate(({ state }) => state.sample))
+            .toBeDefined();
+          const sample = await capture.evaluate(({ state }) => state.sample);
+          expect(
+            sample.left,
+            `${label} left edge at ${scale * 100}%`,
+          ).toBeLessThan(1);
+          expect(
+            sample.right,
+            `${label} right edge at ${scale * 100}%`,
+          ).toBeLessThan(1);
+        } finally {
+          await page.mouse.up();
+          await capture.evaluate(({ dispose }) => dispose());
+          await capture.dispose();
+        }
+        await expect(
+          scope.getByRole("tab", { name: label, exact: true }),
+        ).toHaveAttribute("aria-selected", "true");
+      }
+    }
+  });
 });
 
 test("channel sidebar resizes from the full gutter and persists", async ({
@@ -74,21 +295,19 @@ test("channel sidebar resizes from the full gutter and persists", async ({
   const conversation = await page
     .locator("#main-content > .panel")
     .boundingBox();
-  expect(geometry.panelGap).toBe(geometry.panelGapToken);
+  expect(geometry.panelGap).toBe(0);
   expect(conversation).not.toBeNull();
   expect(conversation.x - (before.x + before.width)).toBeCloseTo(
     geometry.panelGap,
     0,
   );
-  expect(grip.x + grip.width / 2).toBeCloseTo(
-    before.x + before.width + geometry.panelGap / 2,
-    0,
-  );
-  expect(grip.width).toBeGreaterThanOrEqual(16);
+  // The resize target begins at the seam, outside sidebar action targets.
+  expect(grip.x).toBeCloseTo(before.x + before.width, 0);
+  expect(grip.width).toBe(8);
   expect(grip.height).toBeGreaterThan(500);
-  // Preserve the 2px scrollbar inset plus the panel’s reserved 1px border.
+  // Joined regions retain the 2px scrollbar inset without an inner panel border.
   expect(before.x + before.width - (listBox.x + listBox.width)).toBeCloseTo(
-    3,
+    2,
     0,
   );
   await expect(handle).not.toHaveAttribute("title");
@@ -226,10 +445,6 @@ creationSidebar(
     await openPage(page, "Messages");
     await expect(page.locator('[data-channel-id="alpha"]')).toBeVisible();
 
-    await openPage(page, "Workflows");
-    await expect(
-      page.getByRole("heading", { name: "Workflows", exact: true }),
-    ).toBeVisible();
     const channels = page
       .getByRole("navigation", { name: "Subscribed channels" })
       .locator("details")
@@ -241,14 +456,17 @@ creationSidebar(
     await summary.hover();
     await expect(createContainer).toHaveCSS("opacity", "1");
     await expect(create).toHaveAttribute("data-icon-shape", "control");
-    const [summaryBox, createBox] = await Promise.all([
-      summary.boundingBox(),
-      create.boundingBox(),
-    ]);
-    expect(summaryBox.x + summaryBox.width).toBeCloseTo(
-      createBox.x + createBox.width + 4,
-      0,
-    );
+    // The button sits in the heading row's actions, after the title, ending
+    // one trailing inset before the row's edge; nothing floats over the title.
+    const placement = await create.evaluate((button) => {
+      const row = button.closest(".navigation-section-heading");
+      const title = row.querySelector("summary").getBoundingClientRect();
+      const rowEnd = row.getBoundingClientRect().right;
+      const { left, right } = button.getBoundingClientRect();
+      return { afterTitle: left >= title.right - 0.5, inset: rowEnd - right };
+    });
+    expect(placement.afterTitle).toBe(true);
+    expect(placement.inset).toBeCloseTo(4, 0);
     await create.click();
 
     const dialog = page.getByRole("dialog", { name: "Create a channel" });
@@ -268,12 +486,9 @@ creationSidebar(
       .click();
     await expect(page.getByRole("dialog")).toHaveCount(0);
     await expect(create).toBeFocused();
-    await expect(
-      page.getByRole("heading", { name: "Workflows", exact: true }),
-    ).toBeVisible();
-    await openPage(page, "Messages");
-    const conversation = page.getByRole("article", { name: "Conversation" });
-    await conversation.click({ position: { x: 20, y: 20 } });
+    await page
+      .getByRole("textbox", { name: "Message #Alpha", exact: true })
+      .click();
     await expect(create).not.toBeFocused();
     await expect(createContainer).toHaveCSS("opacity", "0");
   },
@@ -289,17 +504,16 @@ test("hovering a sidebar row inks only that row, not its siblings", async ({
     document.documentElement.dataset.colorMode = "light";
     document.documentElement.dataset.colorLevel = "high";
   });
-  const pages = page.getByRole("navigation", { name: "Pages", exact: true });
-  const inbox = pages.getByRole("button", { name: "Inbox", exact: true });
-  // The fixture registers one sidebar page; real communities list several
-  // as siblings in this list. Add an inert sibling row with the same markup.
-  const sibling = pages.locator("[data-sibling-probe]");
+  const pages = page.getByRole("navigation", {
+    name: "Subscribed channels",
+    exact: true,
+  });
+  const inbox = pages.getByRole("button", { name: "Beta", exact: true });
+  const sibling = pages.getByRole("button", {
+    name: "Alpha",
+    exact: true,
+  });
   const [hoverInk, restInk] = await inbox.evaluate((row) => {
-    const copy = row.cloneNode(true);
-    copy.setAttribute("data-sibling-probe", "");
-    copy.setAttribute("tabindex", "-1");
-    copy.setAttribute("aria-hidden", "true");
-    row.after(copy);
     const probe = (color) => {
       const span = document.createElement("span");
       span.style.color = color;
@@ -313,10 +527,12 @@ test("hovering a sidebar row inks only that row, not its siblings", async ({
   expect(hoverInk).not.toBe(restInk);
   // Rows transition into the new level's ink; settle before hovering.
   await expect(inbox).toHaveCSS("color", restInk);
-  await expect(sibling).toHaveCSS("color", restInk);
+  const siblingInk = await sibling.evaluate(
+    (element) => getComputedStyle(element).color,
+  );
   await inbox.hover();
   await expect(inbox).toHaveCSS("color", hoverInk);
-  await expect(sibling).toHaveCSS("color", restInk);
+  await expect(sibling).toHaveCSS("color", siblingInk);
 });
 
 test("channel navigation preserves sidebar DOM and group state", async ({
@@ -364,7 +580,7 @@ test("navigation reveals the current sidebar entry without moving a visible one"
     });
   const alpha = sidebar.locator('[data-channel-id="alpha"]');
   const projects = page
-    .getByRole("navigation", { name: "Topbar pages" })
+    .getByRole("navigation", { name: "Apps dock" })
     .getByRole("tab", { name: "Workflows", exact: true });
   const group = sidebar
     .locator("details")
@@ -376,8 +592,7 @@ test("navigation reveals the current sidebar entry without moving a visible one"
   await openPage(page, "Workflows");
   await expect(projects).toHaveAttribute("aria-selected", "true");
   await expect(projects).toBeInViewport({ ratio: 1 });
-  // History navigation reveals a channel row.
-  await toBottom();
+  // History navigation restores the sidebar and reveals its channel row.
   await button(page, "Go back").click();
   await expect(
     page.getByRole("textbox", { name: "Message #Alpha", exact: true }),
@@ -436,7 +651,6 @@ test("a reveal while the narrow drawer is closed runs when the drawer opens", as
   const alpha = page.locator(
     'nav[aria-label="Subscribed channels"] [data-channel-id="alpha"]',
   );
-  await openPage(page, "Workflows");
   await button(page, "Show navigation").click();
   await expect(sidebar).toBeVisible();
   const bottom = await sidebar.evaluate((element) => {
@@ -446,6 +660,7 @@ test("a reveal while the narrow drawer is closed runs when the drawer opens", as
   expect(bottom).toBeGreaterThan(100);
   await button(page, "Hide navigation").click();
   await expect(sidebar).toBeHidden();
+  await openPage(page, "Workflows");
   await button(page, "Go back").click();
   await expect(
     page.getByRole("textbox", { name: "Message #Alpha", exact: true }),
@@ -474,13 +689,9 @@ for (const destination of ["Workflows", "Settings", "Back/Forward"]) {
         return element.scrollTop;
       });
     const pageEntry = (name) =>
-      ["Inbox", "Bestie"].includes(name)
-        ? page
-            .getByRole("navigation", { name: "Pages" })
-            .getByRole("button", { name, exact: true })
-        : page
-            .getByRole("navigation", { name: "Topbar pages" })
-            .getByRole("tab", { name, exact: true });
+      page
+        .getByRole("navigation", { name: "Apps dock" })
+        .getByRole("tab", { name, exact: true });
     const leave = async () => {
       if (destination === "Settings") {
         await openSettings(page);
@@ -502,14 +713,13 @@ for (const destination of ["Workflows", "Settings", "Back/Forward"]) {
           ),
         ).toBe(true);
       } else {
-        await expect(sidebar).toBeVisible();
+        await expect(sidebar).toHaveCount(0);
         expect(await node.evaluate((element) => element.isConnected)).toBe(
           true,
         );
         await expect(
           pageEntry(destination === "Back/Forward" ? "Workflows" : destination),
         ).toBeInViewport({ ratio: 1 });
-        await toBottom();
       }
       await expect(
         page.getByRole("region", { name: "Channel message history" }),
@@ -534,13 +744,12 @@ for (const destination of ["Workflows", "Settings", "Back/Forward"]) {
     else await expect(group.locator("summary")).toBeInViewport({ ratio: 1 });
     if (destination === "Back/Forward") {
       await button(page, "Go forward").click();
-      await expect(sidebar).toBeVisible();
+      await expect(sidebar).toHaveCount(0);
       expect(await node.evaluate((element) => element.isConnected)).toBe(true);
       await expect(
         page.getByRole("region", { name: "Channel message history" }),
       ).toHaveCount(0);
       await expect(pageEntry("Workflows")).toBeInViewport({ ratio: 1 });
-      await toBottom();
       await button(page, "Go back").click();
       await expect(group).not.toHaveAttribute("open");
       await expect(group.locator("summary")).toBeInViewport({ ratio: 1 });

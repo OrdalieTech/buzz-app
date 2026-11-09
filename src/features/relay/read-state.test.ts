@@ -6,7 +6,8 @@ import {
   type ReadJournal,
   type ReadStateStorage,
 } from "./read-state-storage";
-import { keypair } from "./testing";
+import { keypair, scriptedTransport } from "./testing";
+import { createRelayReader } from "./reader";
 import { eventDto, type RelayEvent } from "./events";
 // Test the real host codec with ephemeral identities, never a bypass signer.
 import {
@@ -17,16 +18,19 @@ import {
 import {
   ReadStateTimestampRejected,
   READ_STATE_TIMESTAMP_REFUSAL,
+  READ_SNAPSHOT_BYTES,
+  READ_SNAPSHOT_EVENTS,
   type ReadStateSigning,
 } from "./read-state-host";
 import { acceptReadStatePublish } from "./transport";
+import vectors from "../../../tests/fixtures/read-state-vectors.json";
 
 const owners: ReturnType<typeof createReadState>[] = [];
 afterEach(() => {
   for (const owner of owners.splice(0)) owner.dispose();
   vi.useRealTimers();
 });
-function fixture() {
+function fixture(now = 100) {
   const key = keypair();
   let journal: ReadJournal | undefined;
   const storage: Required<ReadStateStorage> = {
@@ -43,10 +47,12 @@ function fixture() {
       decodeReadState(events, key.secret),
     ),
     sign: vi.fn(async (intent: ReadStateSigning) =>
-      signReadState(intent, key.secret, 100),
+      signReadState(intent, key.secret, now),
     ),
+    // A relay keeps the newest event at each coordinate.
     publish: vi.fn(async (event: RelayEvent) => {
-      remote = [event];
+      const d = (item: RelayEvent) => item.tags.find(([n]) => n === "d")?.[1];
+      remote = [...remote.filter((item) => d(item) !== d(event)), event];
     }),
   };
   const reader = { read: vi.fn(async () => remote) };
@@ -56,7 +62,7 @@ function fixture() {
     reader,
     storage,
     lock: async (_signal: AbortSignal, work: () => Promise<void>) => work(),
-    now: () => 100,
+    now: () => now,
     debounceMs: 60000,
   };
   const make = (
@@ -72,6 +78,31 @@ function fixture() {
     reader,
     storage,
     make,
+    /** Every context the relay holds across this device's blobs. */
+    published: (): Record<string, number> =>
+      Object.assign(
+        {},
+        ...decodeReadState(remote, key.secret).map(
+          (item: { blob: { contexts: Record<string, number> } }) =>
+            item.blob.contexts,
+        ),
+      ),
+    /** This device's own published contexts, by slot. */
+    own: (): Record<string, Record<string, number>> => {
+      const d = (item: RelayEvent) => item.tags.find(([n]) => n === "d")?.[1];
+      const slots = [journal?.slot, ...(journal?.spill ?? [])];
+      return Object.fromEntries(
+        remote
+          .filter((item) => slots.includes(d(item)?.slice(11)))
+          .map((item) => [
+            d(item)?.slice(11),
+            decodeReadState([item], key.secret)[0].blob.contexts,
+          ]),
+      );
+    },
+    setNow: (value: number) => {
+      now = value;
+    },
     journal: () => journal,
     setJournal: (value: ReadJournal | undefined) => {
       journal = value;
@@ -466,6 +497,26 @@ describe("durable read-state owner", () => {
     );
     expect(owner.state().frontiers.room).toBe(12);
   });
+  it("a quiet save in one window leaves another window's intent revision", async () => {
+    const f = fixture();
+    const options = { broadcastName: `read-quiet:${crypto.randomUUID()}` };
+    const a = f.make(options),
+      b = f.make(options);
+    await Promise.all([a.ready, b.ready]);
+    await b.read("room", 5, () => true);
+    const before = b.intentRevision();
+    await a.readMessages(
+      [{ key: "seen:room", timestamp: 12, channelId: "room" }],
+      undefined,
+      () => true,
+      true,
+    );
+    // Real BroadcastChannel delivery to the other window.
+    await expect.poll(() => b.state().frontiers["seen:room"]).toBe(12);
+    expect(b.revision()).toBe(before + 1);
+    expect(b.intentRevision()).toBe(before);
+    expect(f.journal()?.quiet).toBe(1);
+  });
   it("merges concurrent local windows against the latest transactional journal", async () => {
     const f = fixture();
     const a = f.make(),
@@ -786,7 +837,7 @@ describe("durable read-state owner", () => {
     await owner.read("room", 12, () => true, true);
     expect(owner.localUnread("room")).toBeUndefined();
   });
-  it("keeps an evicted message receipt locally across publication and restart", async () => {
+  it("keeps an evicted message receipt locally and never publishes message marks", async () => {
     const f = fixture();
     const owner = f.make();
     const old = `msg:${"a".repeat(64)}`;
@@ -805,19 +856,43 @@ describe("durable read-state owner", () => {
     expect(owner.state().frontiers[old]).toBe(1);
     await owner.flush();
     expect(owner.snapshot().status).toBe("reconciled");
-    const blob = decodeReadState(
-      [f.host.publish.mock.calls.at(-1)?.[0]],
-      f.key.secret,
-    )[0].blob;
-    expect(blob.contexts[old]).toBeUndefined();
-    expect(
-      new TextEncoder().encode(JSON.stringify(blob)).length,
-    ).toBeLessThanOrEqual(40 * 1024);
+    expect(f.host.publish).not.toHaveBeenCalled();
     owner.dispose();
     const restarted = f.make();
     await restarted.ready;
     expect(restarted.state().frontiers[old]).toBe(1);
     expect(restarted.state().frontiers["msg:unseen"]).toBeUndefined();
+  });
+  it("raises a local floor over marks the reserve drops, keeps it after restart and never publishes it", async () => {
+    const f = fixture();
+    const owner = f.make();
+    const old = `msg:${"a".repeat(64)}`;
+    await owner.ready;
+    await owner.read(old, 1, () => true);
+    const marks = Array.from({ length: 7000 }, (_, n) => ({
+      key: `msg:${n.toString(16).padStart(64, "0")}`,
+      timestamp: 10 + n,
+      channelId: "elsewhere",
+    }));
+    await owner.readMessages(marks, undefined, () => true);
+    const floor = owner.floor();
+    expect(floor).toBeGreaterThan(10);
+    expect(owner.state().frontiers[old]).toBeUndefined();
+    for (const { key, timestamp } of [{ key: old, timestamp: 1 }, ...marks])
+      expect(
+        (owner.state().frontiers[key] ?? -1) >= timestamp || timestamp <= floor,
+      ).toBe(true);
+    expect(owner.state().frontiers[marks.at(-1)?.key ?? ""]).toBe(7009);
+    // A channel mark below the local floor still publishes: publication keeps
+    // only the retention window.
+    await owner.read("room", 5, () => true);
+    expect(owner.state().frontiers.room).toBe(5);
+    await owner.flush();
+    expect(f.published()).toEqual({ room: 5 });
+    owner.dispose();
+    const restarted = f.make();
+    await restarted.ready;
+    expect(restarted.floor()).toBe(floor);
   });
   it("preserves the reserve through remote replay, local unread and concurrent mutations", async () => {
     const f = fixture();
@@ -880,6 +955,13 @@ describe("durable read-state owner", () => {
   });
   it("validates optional reserve data without replacing corrupt saved intent", () => {
     const f = fixture();
+    expect(
+      readJournal({ ...newReadJournal(), floor: 7 }, f.key.pubkey).floor,
+    ).toBe(7);
+    for (const floor of [-1, 1.5, "7"])
+      expect(() =>
+        readJournal({ ...newReadJournal(), floor }, f.key.pubkey),
+      ).toThrow("floor");
     expect(readJournal(newReadJournal(), f.key.pubkey).reserve).toEqual({});
     for (const reserve of [
       [],
@@ -910,35 +992,51 @@ describe("durable read-state owner", () => {
       ),
     ).toThrow("reserve");
   });
-  it("keeps ordinary reads publishing across growth, old-history reads and restart", async () => {
+  it("publishes every frontier across further blobs, rewriting only changed ones", async () => {
     const f = fixture(),
       first = f.make();
     await first.ready;
-    const id = (n: number) => `msg:${n.toString(16).padStart(64, "0")}`;
-    for (let n = 0; n < 700; n++) await first.read(id(n), 50 + n, () => true);
+    const id = (n: number) => `thread:${n.toString(16).padStart(64, "0")}`;
+    await first.readMessages(
+      Array.from({ length: 1600 }, (_, n) => ({
+        key: id(n),
+        timestamp: 50 + n,
+        channelId: "room",
+      })),
+      undefined,
+      () => true,
+    );
+    await first.read(`msg:${"a".repeat(64)}`, 60, () => true);
     await first.flush();
     expect(first.snapshot().status).toBe("reconciled");
-    expect(f.host.publish).toHaveBeenCalledTimes(1);
-    const published = () =>
-      decodeReadState([f.host.publish.mock.calls.at(-1)?.[0]], f.key.secret)[0]
-        .blob.contexts;
-    expect(Object.keys(published()).length).toBeLessThan(600);
-    expect(published()[id(699)]).toBe(749);
-    expect(f.journal()?.state.frontiers[id(0)]).toBe(50); // Larger local cache than the wire.
+    const blobs = f.host.publish.mock.calls.length;
+    expect(blobs).toBeGreaterThan(1);
+    // Full-state readers reject duplicate coordinates, so each blob is distinct.
+    const coordinates = f.host.publish.mock.calls.map(
+      ([event]) => event.tags.find(([name]) => name === "d")?.[1],
+    );
+    expect(new Set(coordinates).size).toBe(blobs);
+    for (const [event] of f.host.publish.mock.calls) {
+      const blob = decodeReadState([event], f.key.secret)[0].blob;
+      expect(
+        new TextEncoder().encode(JSON.stringify(blob)).length,
+      ).toBeLessThanOrEqual(40 * 1024);
+    }
+    const published = f.published();
+    for (let n = 0; n < 1600; n++) expect(published[id(n)]).toBe(50 + n);
+    expect(Object.keys(published).some((key) => key.startsWith("msg:"))).toBe(
+      false,
+    );
+    expect(f.journal()?.spill).toHaveLength(blobs - 1);
     first.dispose();
     const second = f.make();
     await second.ready;
-    await second.read(id(800), 1, () => true); // Old history, newly read.
+    await second.read(id(1599), 5000, () => true);
     await second.flush();
     expect(second.snapshot().status).toBe("reconciled");
-    expect(published()[id(800)]).toBe(1);
-    expect(published()[id(699)]).toBe(749);
-    for (let n = 801; n < 1600; n++) await second.read(id(n), 1, () => true);
-    await second.flush();
-    expect(second.snapshot().status).toBe("reconciled");
-    expect(f.journal()?.state.frontiers[id(1599)]).toBe(1);
-    expect(f.journal()?.state.frontiers[id(0)]).toBeUndefined();
-    expect(published()[id(1599)]).toBe(1);
+    expect(f.host.publish).toHaveBeenCalledTimes(blobs + 1);
+    expect(f.published()[id(1599)]).toBe(5000);
+    expect(f.published()[id(0)]).toBe(50);
   }, 15000);
   it("a fresh read stays read, locally and published, when a peer's thread mark covers it", async () => {
     const hex = (prefix: string, n: number) =>
@@ -988,11 +1086,7 @@ describe("durable read-state owner", () => {
         (marks[read] ?? 0) >= 50 || (marks[cover] ?? 0) >= 50;
       expect(stillRead(f.journal()?.state.frontiers ?? {})).toBe(true);
       await owner.flush();
-      const published = decodeReadState(
-        [f.host.publish.mock.calls.at(-1)?.[0]],
-        f.key.secret,
-      )[0].blob.contexts;
-      expect(stillRead(published)).toBe(true);
+      expect(stillRead(f.published())).toBe(true);
     }
   }, 15000);
   it("keeps saved mark channels only for messages a kept mark names", () => {
@@ -1092,6 +1186,569 @@ it.each([false, true])(
   },
 );
 
+/** The owner half of the shared NIP-RS vectors (pure halves live in
+ * read-state-vectors.test.ts). */
+describe("NIP-RS shared vectors: owner", () => {
+  const T = vectors.now;
+  const peer = (
+    secret: Uint8Array,
+    contexts: Record<string, number>,
+    createdAt = T,
+  ) =>
+    signReadState(
+      {
+        slot: "f".repeat(32),
+        createdAt,
+        blob: { v: 1, client_id: "peer", contexts },
+      },
+      secret,
+      createdAt,
+    );
+  const merged = (owned: Record<string, Record<string, number>>) =>
+    Object.assign({}, ...Object.values(owned));
+  const thread = (n: number) => `thread:${n.toString(16).padStart(64, "0")}`;
+  const many = (count: number, at: (n: number) => number, from = 0) =>
+    Array.from({ length: count }, (_, n) => ({
+      key: thread(from + n),
+      timestamp: at(from + n),
+      channelId: "room",
+    }));
+
+  it.each(vectors.ownership)("ownership $id", async (v) => {
+    const f = fixture(T);
+    const owner = f.make();
+    await owner.ready;
+    for (const [key, at] of Object.entries(v.local))
+      await owner.read(key, at, () => true);
+    await owner.flush();
+    for (const contexts of v.remote)
+      await f.host.publish(peer(f.key.secret, contexts));
+    await owner.refresh();
+    for (const [key, at] of Object.entries(v.localAdvance ?? {}))
+      await owner.read(key, at, () => true);
+    await owner.flush();
+    expect(owner.state().frontiers).toEqual(v.expectedMerged);
+    expect(merged(f.own())).toEqual(v.expectedPublished);
+  });
+  it.each(vectors.pruning)("pruning $id", async (v) => {
+    const f = fixture(T);
+    const owner = f.make();
+    await owner.ready;
+    for (const [key, at] of Object.entries(v.frontiers))
+      await owner.read(key, at, () => true);
+    await owner.flush();
+    const published = merged(f.own());
+    for (const key of v.expectedRequiredKeys)
+      expect(published).toHaveProperty(key);
+    for (const key of v.expectedAbsentKeys)
+      expect(published).not.toHaveProperty(key);
+  });
+  it.each(vectors.writePolicy)("writePolicy $id", async (v) => {
+    const f = fixture(T);
+    const owner = f.make();
+    await owner.ready;
+    for (const [key, at] of Object.entries(v.localObserved))
+      await owner.read(key, at, () => true);
+    await owner.flush();
+    expect(merged(f.own())).toEqual(v.expectedPublished);
+  });
+  it("lifecycle partial-publish-restart", async () => {
+    const f = fixture(T);
+    const first = f.make();
+    await first.ready;
+    await first.readMessages(
+      many(600, (n) => T - n),
+      undefined,
+      () => true,
+    );
+    const publish = f.host.publish.getMockImplementation();
+    f.host.publish.mockImplementationOnce(async (event) => publish?.(event));
+    f.host.publish.mockRejectedValueOnce(new Error("response lost"));
+    await first.flush();
+    const unknown = f.journal()?.pending?.event;
+    expect(unknown).toBeDefined();
+    expect(Object.keys(f.own())).toHaveLength(1);
+    // Accepting the first coordinate does not acknowledge the revision.
+    expect(f.journal()?.acceptedRevision).toBeLessThan(
+      f.journal()?.revision ?? 0,
+    );
+    first.dispose();
+    const second = f.make();
+    await second.ready;
+    for (let n = 0; n < 600; n++)
+      expect(second.state().frontiers[thread(n)]).toBe(T - n);
+    await second.flush();
+    expect(f.host.publish.mock.calls[2]?.[0]).toEqual(unknown);
+    expect(f.host.publish).toHaveBeenCalledTimes(3);
+    expect(ownerStatus(second)).toBe("reconciled");
+    const published = merged(f.own());
+    for (let n = 0; n < 600; n++) expect(published[thread(n)]).toBe(T - n);
+  }, 15000);
+  it("lifecycle shrink-and-slot-reuse", async () => {
+    const f = fixture(T);
+    const first = f.make();
+    await first.ready;
+    // Some of the first blob's keys stay fresh; all of the second's fall
+    // below the floor.
+    const old = T - vectors.retentionSeconds + 60;
+    await first.readMessages(
+      many(600, (n) => (n < 400 ? T : old)),
+      undefined,
+      () => true,
+    );
+    await first.flush();
+    const slots = [f.journal()?.slot, ...(f.journal()?.spill ?? [])];
+    expect(slots).toHaveLength(2);
+    const second = f.own()[slots[1] ?? ""];
+    first.dispose();
+    const later = T + 120;
+    f.setNow(later);
+    const owner = f.make();
+    await owner.ready;
+    await owner.read("room", later, () => true);
+    await owner.flush();
+    expect(f.host.publish).toHaveBeenCalledTimes(3);
+    // The inert old blob is left alone, not retired: another device may
+    // still hold nothing newer for its keys.
+    expect(f.own()[slots[1] ?? ""]).toEqual(second);
+    await owner.readMessages(
+      many(200, () => later, 600),
+      undefined,
+      () => true,
+    );
+    await owner.flush();
+    expect([f.journal()?.slot, ...(f.journal()?.spill ?? [])]).toEqual(slots);
+    expect(Object.keys(f.own()).sort()).toEqual([...slots].sort());
+    expect(f.own()[slots[1] ?? ""]?.[thread(799)]).toBe(later);
+    expect(ownerStatus(owner)).toBe("reconciled");
+  }, 15000);
+  it("lifecycle old-event-new-frontier", async () => {
+    const v = vectors.lifecycle.find(
+      ({ id }) => id === "old-event-new-frontier",
+    );
+    const f = fixture(T);
+    await f.host.publish(
+      peer(
+        f.key.secret,
+        { ...v?.frontiers, "ov_c:side": 7 },
+        v?.eventCreatedAt,
+      ),
+    );
+    const owner = f.make();
+    await owner.ready;
+    await owner.refresh();
+    expect(owner.state().frontiers).toEqual(v?.frontiers);
+    expect(owner.state().overrides.side).toBeDefined();
+    // Full-state loads never use `since`: an old carrier is still current.
+    for (const [filters] of f.reader.read.mock.calls as unknown as [
+      Record<string, unknown>[],
+    ][])
+      for (const filter of filters) expect(filter).not.toHaveProperty("since");
+  });
+});
+
+describe("publication fences", () => {
+  const T = 1800000000;
+  const thread = (n: number) => `thread:${n.toString(16).padStart(64, "0")}`;
+  /** Another device's coordinate, opaque to this one (decode is stubbed). */
+  const foreignAt = (pubkey: string, n: number, content = ""): RelayEvent => {
+    const id = n.toString(16).padStart(32, "0");
+    return {
+      id: id.padStart(64, "0"),
+      pubkey,
+      kind: 30078,
+      created_at: T,
+      tags: [
+        ["d", `read-state:${id}`],
+        ["t", "read-state"],
+      ],
+      content: `peer:${content}`,
+      sig: "0".repeat(128),
+    } as RelayEvent;
+  };
+  const foreign = (pubkey: string, count: number) =>
+    Array.from({ length: count }, (_, n) => foreignAt(pubkey, n));
+  /** A complete-snapshot owner over a relay already holding `peers`. */
+  function snapshotted(f: ReturnType<typeof fixture>, peers: RelayEvent[]) {
+    const decode = f.host.decode.getMockImplementation();
+    f.host.decode.mockImplementation(async (events) =>
+      (
+        await Promise.all(
+          events.map(async (event) =>
+            event.content.startsWith("peer:")
+              ? [
+                  {
+                    eventId: event.id,
+                    blob: { v: 1, client_id: "peer", contexts: {} },
+                  },
+                ]
+              : ((await decode?.([event])) ?? []),
+          ),
+        )
+      ).flat(),
+    );
+    for (const peer of peers) void f.host.publish(peer);
+    f.host.publish.mockClear();
+    return (overrides: Parameters<typeof f.make>[0] = {}) =>
+      f.make({
+        host: { ...f.host, communityId: "test-community" },
+        reader: { ...f.reader, readStateSnapshot: () => f.reader.read() },
+        ...overrides,
+      });
+  }
+
+  it("acknowledges only the revision a plan was packed from", async () => {
+    const f = fixture(T);
+    const owner = f.make();
+    await owner.ready;
+    await owner.readMessages(
+      Array.from({ length: 600 }, (_, n) => ({
+        key: thread(n),
+        timestamp: T,
+        channelId: "room",
+      })),
+      undefined,
+      () => true,
+    );
+    // Another window commits a newer frontier while new slots are being owned.
+    const update = vi.mocked(f.storage.update).getMockImplementation();
+    const other = thread(9999);
+    let raced = false;
+    vi.mocked(f.storage.update).mockImplementation(async (change) => {
+      const current = f.journal();
+      if (
+        !raced &&
+        current &&
+        (change(current).spill?.length ?? 0) > (current.spill?.length ?? 0)
+      ) {
+        raced = true;
+        f.setJournal({
+          ...current,
+          revision: current.revision + 1,
+          own: { ...current.own, [other]: T },
+          state: {
+            ...current.state,
+            frontiers: { ...current.state.frontiers, [other]: T },
+          },
+        });
+      }
+      if (!update) throw new Error("Missing fixture storage");
+      return update(change);
+    });
+    await owner.flush();
+    expect(raced).toBe(true);
+    expect(f.published()[other]).toBeUndefined();
+    expect(f.journal()?.acceptedRevision).toBeLessThan(
+      f.journal()?.revision ?? 0,
+    );
+    expect(ownerStatus(owner)).toBe("pending");
+    await owner.flush();
+    expect(f.published()[other]).toBe(T);
+    expect(f.journal()?.acceptedRevision).toBe(f.journal()?.revision);
+    expect(ownerStatus(owner)).toBe("reconciled");
+  }, 15000);
+
+  it.each([
+    ["events", 0],
+    ["events", 1],
+    ["bytes", 0],
+    ["bytes", 1],
+  ] as const)(
+    "replays a pending event only within snapshot capacity (%s, over by %i)",
+    async (limit, over) => {
+      const f = fixture(T);
+      // The original packet never arrived; its exact bytes stay pending.
+      const first = f.make();
+      await first.ready;
+      await first.read("room", T, () => true);
+      f.host.publish.mockRejectedValueOnce(new Error("packet never arrived"));
+      await first.flush();
+      const pending = f.journal()?.pending?.event;
+      if (!pending) throw new Error("Missing pending event");
+      first.dispose();
+      // Fill the relay so the replay lands exactly at, or one past, a limit.
+      const size = (event: RelayEvent) =>
+        new TextEncoder().encode(JSON.stringify(event)).byteLength;
+      const a = foreignAt(f.key.pubkey, 0);
+      const b = foreignAt(f.key.pubkey, 1);
+      const pad =
+        READ_SNAPSHOT_BYTES +
+        over -
+        (2 + 2 + size(a) + size(b) + size(pending));
+      const peers =
+        limit === "events"
+          ? foreign(f.key.pubkey, READ_SNAPSHOT_EVENTS - 1 + over)
+          : [foreignAt(f.key.pubkey, 0, "x".repeat(pad)), b];
+      const owner = snapshotted(f, peers)();
+      await owner.ready;
+      await owner.refresh();
+      await owner.flush();
+      if (over) {
+        expect(f.host.publish).not.toHaveBeenCalled();
+        expect(f.journal()?.pending?.event).toEqual(pending);
+        expect(owner.snapshot().error).toContain("capacity reached");
+      } else {
+        expect(f.host.publish).toHaveBeenCalledTimes(1);
+        expect(f.host.publish.mock.calls[0]?.[0]).toEqual(pending);
+        expect(owner.snapshot()).toMatchObject({
+          status: "reconciled",
+          error: undefined,
+        });
+      }
+    },
+    30000,
+  );
+
+  it("recovers its own slots' newer values after a restored or cloned journal", async () => {
+    const f = fixture(T);
+    const first = f.make();
+    await first.ready;
+    await first.read("room-a", T - 500, () => true);
+    await first.flush();
+    const backup = f.journal();
+    await first.read("room-a", T - 100, () => true);
+    await first.flush();
+    first.dispose();
+    // The restored journal is behind what its own slot already carries.
+    f.setJournal(backup);
+    const restored = f.make();
+    await restored.ready;
+    await restored.read("room-b", T - 50, () => true);
+    await restored.flush();
+    expect(ownerStatus(restored)).toBe("reconciled");
+    expect(f.published()).toEqual({ "room-a": T - 100, "room-b": T - 50 });
+    expect(f.journal()?.own).toEqual({ "room-a": T - 100, "room-b": T - 50 });
+  });
+
+  it("sends nothing when the first blob would exceed the snapshot before a later one shrinks it", async () => {
+    const W = vectors.retentionSeconds;
+    const size = (event: RelayEvent) =>
+      new TextEncoder().encode(JSON.stringify(event)).byteLength;
+    const keys = (from: number, count: number, at: number) =>
+      Array.from({ length: count }, (_, n) => ({
+        key: thread(from + n),
+        timestamp: at,
+        channelId: "room",
+      }));
+    // Blob A expires and keeps one key; then A grows while B, which goes
+    // last because it drops expired keys, shrinks by more than A grows.
+    async function run(pad?: (a: number, b: number) => number) {
+      const f = fixture(T);
+      const first = f.make();
+      await first.ready;
+      await first.readMessages(
+        [...keys(0, 400, T - W + 60), ...keys(400, 199, T - W + 500)],
+        undefined,
+        () => true,
+      );
+      await first.read(thread(599), T, () => true);
+      await first.flush();
+      f.setNow(T + 90);
+      await first.read(thread(1000), T + 90, () => true);
+      await first.flush();
+      first.dispose();
+      const [a, b] = (await f.reader.read()).map(size) as [number, number];
+      f.setNow(T + 600);
+      const extra = pad?.(a, b);
+      const owner = snapshotted(
+        f,
+        extra === undefined
+          ? []
+          : [foreignAt(f.key.pubkey, 0, "x".repeat(extra))],
+      )();
+      await owner.ready;
+      await owner.readMessages(keys(2000, 150, T + 600), undefined, () => true);
+      await owner.read(thread(599), T + 600, () => true);
+      await owner.flush();
+      return { f, owner, a, b };
+    }
+    const free = await run();
+    const [grown, shrunk] = free.f.host.publish.mock.calls
+      .slice(-2)
+      .map(([event]) => size(event)) as [number, number];
+    const growth = grown - free.a;
+    expect(growth).toBeGreaterThan(0);
+    expect(free.b - shrunk).toBeGreaterThan(growth);
+    // The final map fits; the snapshot after A alone is one byte over.
+    const over = await run(
+      (a, b) =>
+        READ_SNAPSHOT_BYTES +
+        1 -
+        (2 + 2 + a + growth + b + size(foreignAt(free.f.key.pubkey, 0))),
+    );
+    expect(over.f.host.publish).not.toHaveBeenCalled();
+    expect(over.owner.snapshot().error).toContain("capacity reached");
+  }, 30000);
+
+  it("counts coordinates observed live after the snapshot", async () => {
+    const f = fixture(T);
+    const owner = snapshotted(
+      f,
+      foreign(f.key.pubkey, READ_SNAPSHOT_EVENTS - 1),
+    )();
+    await owner.ready;
+    await owner.refresh();
+    const late = foreignAt(f.key.pubkey, READ_SNAPSHOT_EVENTS - 1);
+    void f.host.publish(late);
+    f.host.publish.mockClear();
+    owner.accept([late]);
+    await owner.read("room", T, () => true);
+    await owner.flush();
+    expect(f.host.publish).not.toHaveBeenCalled();
+    expect(owner.snapshot().error).toContain("capacity reached");
+  }, 30000);
+
+  it("takes a complete snapshot before the first send, and again after a gap", async () => {
+    const f = fixture(T);
+    const full = snapshotted(f, foreign(f.key.pubkey, READ_SNAPSHOT_EVENTS))();
+    await full.ready;
+    await full.read("room", T, () => true);
+    // No refresh: flush itself must fetch the basis that refuses this send.
+    await full.flush();
+    expect(f.host.publish).not.toHaveBeenCalled();
+    expect(full.snapshot().error).toContain("capacity reached");
+    full.dispose();
+
+    const g = fixture(T);
+    const snapshots = vi.fn(() => g.reader.read());
+    const owner = snapshotted(
+      g,
+      [],
+    )({
+      reader: { ...g.reader, readStateSnapshot: snapshots },
+    });
+    await owner.ready;
+    await owner.read("room", T, () => true);
+    await owner.flush();
+    await owner.read("room", T + 1, () => true);
+    await owner.flush();
+    expect(g.host.publish).toHaveBeenCalledTimes(2);
+    expect(snapshots).toHaveBeenCalledTimes(1);
+    // A gap invalidates the basis; the next send takes a fresh snapshot.
+    owner.stale();
+    await owner.read("room", T + 2, () => true);
+    await owner.flush();
+    expect(snapshots).toHaveBeenCalledTimes(2);
+    expect(g.host.publish).toHaveBeenCalledTimes(3);
+    expect(ownerStatus(owner)).toBe("reconciled");
+  }, 30000);
+
+  it("lets a slow complete snapshot finish on refresh and before a send", async () => {
+    vi.useFakeTimers();
+    // Node's native AbortSignal timer is not driven by Vitest's clock.
+    const timeout = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockImplementation((milliseconds) => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), milliseconds);
+        return controller.signal;
+      });
+    const f = fixture(T);
+    // The real reader, with a snapshot that takes longer than its ordinary
+    // ten-second deadline to download.
+    const snapshots = vi.fn(
+      (signal: AbortSignal) =>
+        new Promise<RelayEvent[]>((resolve, reject) => {
+          const timer = setTimeout(
+            () => void f.reader.read().then(resolve),
+            25_000,
+          );
+          signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(signal.reason);
+          });
+        }),
+    );
+    const relay = createRelayReader({
+      ...scriptedTransport(f.key.pubkey, "relay").transport,
+      query: async () => f.reader.read(),
+      readStateSnapshot: snapshots,
+    });
+    // A publisher lock that holds the flush until the test opens it.
+    let entered!: () => void;
+    let open!: () => void;
+    const entry = new Promise<void>((resolve) => (entered = resolve));
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    const owner = snapshotted(
+      f,
+      [],
+    )({
+      reader: relay.reader,
+      lock: async (_signal, work) => {
+        entered();
+        await gate;
+        return work();
+      },
+    });
+    await owner.ready;
+    const refreshed = owner.refresh();
+    await vi.advanceTimersByTimeAsync(25_000);
+    await refreshed;
+    expect(owner.snapshot()).toMatchObject({
+      status: "reconciled",
+      completeness: "snapshot",
+    });
+    // A gap while the send waits for the lock drops the capacity basis it
+    // started with, so it reads a snapshot first.
+    await owner.read("room", T, () => true);
+    const flushed = owner.flush();
+    await entry;
+    owner.stale();
+    open();
+    await vi.advanceTimersByTimeAsync(25_000);
+    await flushed;
+    expect(snapshots).toHaveBeenCalledTimes(2);
+    expect(f.host.publish).toHaveBeenCalledOnce();
+    expect(ownerStatus(owner)).toBe("reconciled");
+    relay.dispose();
+    timeout.mockRestore();
+  });
+
+  it("refuses a send whose basis a gap dropped while signing or saving", async () => {
+    for (const gapIn of ["sign", "save"] as const) {
+      const f = fixture(T);
+      const snapshots = vi.fn(() => f.reader.read());
+      let gaps = 1;
+      const gap = () => gaps-- > 0 && owner.stale();
+      const owner = snapshotted(
+        f,
+        [],
+      )({
+        host: {
+          ...f.host,
+          communityId: "test-community",
+          sign: async (intent: ReadStateSigning) => {
+            const event = await f.host.sign(intent);
+            if (gapIn === "sign") gap();
+            return event;
+          },
+        },
+        reader: { ...f.reader, readStateSnapshot: snapshots },
+        storage: {
+          ...f.storage,
+          update: async (change) => {
+            const saved = await f.storage.update(change);
+            if (gapIn === "save" && saved.pending) gap();
+            return saved;
+          },
+        },
+      });
+      await owner.ready;
+      await owner.read("room", T, () => true);
+      await owner.flush();
+      expect(f.host.publish, gapIn).not.toHaveBeenCalled();
+      expect(owner.snapshot().error, gapIn).toContain("capacity basis lost");
+      expect(!!f.journal()?.pending, gapIn).toBe(gapIn === "save");
+      // The retained intent goes out only on a fresh complete snapshot.
+      await owner.flush();
+      expect(snapshots, gapIn).toHaveBeenCalledTimes(2);
+      expect(f.host.publish, gapIn).toHaveBeenCalledTimes(1);
+      expect(ownerStatus(owner), gapIn).toBe("reconciled");
+      owner.dispose();
+    }
+  }, 30000);
+});
+
 /** A marker another device of the same viewer published for "room". */
 async function otherDeviceMarker(f: ReturnType<typeof fixture>) {
   let other: ReadJournal | undefined;
@@ -1158,6 +1815,28 @@ describe("resume after a continuous membership replay", () => {
     await owner.resume();
     expect(f.reader.read).toHaveBeenCalledTimes(2);
     expect(owner.snapshot().status).toBe("reconciled");
+  });
+
+  it("owes a snapshot read after a drop or a marker that failed to apply, until a read or resume succeeds", async () => {
+    const f = fixture();
+    const owner = f.make();
+    await owner.ready;
+    await owner.refresh();
+    expect(owner.owed()).toBe(false);
+    const marker = await otherDeviceMarker(f);
+    // A live marker that cannot be decoded.
+    f.host.decode.mockRejectedValueOnce(new Error("undecodable"));
+    owner.accept([marker]);
+    await vi.waitFor(() => expect(owner.snapshot().status).toBe("error"));
+    expect(owner.owed()).toBe(true);
+    await owner.refresh();
+    expect(owner.owed()).toBe(false);
+    // A drop owes it; a resume from a continuous replay pays it.
+    owner.stale();
+    expect(owner.owed()).toBe(true);
+    await owner.resume();
+    expect(owner.owed()).toBe(false);
+    expect(f.reader.read).toHaveBeenCalledTimes(2);
   });
 
   it("reads the snapshot again when a drop cancelled a live marker still being ingested", async () => {

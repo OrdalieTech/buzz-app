@@ -133,6 +133,26 @@ export function profile(
   });
 }
 
+/** Unsigned kind 0s named `${label}${index}` for large rosters. The profile
+ * directory folds without checking signatures, and signing thousands of
+ * profiles makes a test slow under a loaded run. Use only where nothing
+ * checks the signature. */
+export function unsignedProfiles(count: number, label = "P"): RelayEvent[] {
+  return Array.from({ length: count }, (_, index) => {
+    const tag = [...label].map((c) => c.charCodeAt(0).toString(16)).join("");
+    const pubkey = tag.padEnd(32, "0") + index.toString(16).padStart(32, "0");
+    return {
+      id: pubkey,
+      pubkey,
+      kind: 0,
+      created_at: 1_700_000_000,
+      tags: [],
+      content: JSON.stringify({ name: `${label}${index}` }),
+      sig: "0".repeat(128),
+    } as unknown as RelayEvent;
+  });
+}
+
 export type Scripted = {
   filters: readonly ReadFilter[];
   respond: (events: RelayEvent[]) => void;

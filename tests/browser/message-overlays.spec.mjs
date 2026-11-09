@@ -706,8 +706,18 @@ test("comment actions revealed while the drawer slides realign when it settles",
 test("a grouped reaction toggles my contribution while its preview is open", async ({
   page,
 }) => {
+  await page.route("**/emoji-media/**", (route) =>
+    route.fulfill({
+      contentType: "image/svg+xml",
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22"/>',
+    }),
+  );
   await page.goto("/tests/fixtures/emoji.html?reactions&repeated");
   const row = page.locator("[data-message-id]").first();
+  // Failed emoji retries rewrap the prose and move reactions off a still pointer.
+  await expect(
+    row.locator('p img[data-copy-emoji=":party:"]'),
+  ).toHaveJSProperty("naturalWidth", 22);
   const button = row.locator('button[data-reaction="😂"]');
   const matching = row.locator('button[data-reaction="😂"]');
   await expect(button).toHaveCount(1);
@@ -715,6 +725,8 @@ test("a grouped reaction toggles my contribution while its preview is open", asy
   await expect(button).toHaveAccessibleName("😂: 2 people");
   for (let cycle = 0; cycle < 2; cycle++) {
     await page.mouse.move(0, 0);
+    // Each cycle starts after the previous click-dismissed preview has exited.
+    await expect(page.locator(".buzz-preview-card")).toHaveCount(0);
     await button.hover();
     const preview = page.locator(".buzz-preview-card[data-open]");
     await expect(preview).toBeVisible();
@@ -737,8 +749,18 @@ test("a grouped reaction toggles my contribution while its preview is open", asy
 test("clicking a grouped reaction during preview handoff toggles it", async ({
   page,
 }) => {
+  await page.route("**/emoji-media/**", (route) =>
+    route.fulfill({
+      contentType: "image/svg+xml",
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22"/>',
+    }),
+  );
   await page.goto("/tests/fixtures/emoji.html?reactions&wrap&repeated&narrow");
   const row = page.locator("[data-message-id]").first();
+  // Failed emoji retries rewrap the prose and move reactions off a still pointer.
+  await expect(
+    row.locator('p img[data-copy-emoji=":party:"]'),
+  ).toHaveJSProperty("naturalWidth", 22);
   const button = row.locator('button[data-reaction="😂"]');
   const matching = row.locator('button[data-reaction="😂"]');
   await expect(button).toHaveCount(1);

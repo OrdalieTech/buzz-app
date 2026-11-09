@@ -138,3 +138,10 @@ html[data-keyboard-navigation] .soloLink:focus-visible {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.hint {
+  font-size: var(--text-body-sm);
+  line-height: var(--text-body-sm--line-height);
+  letter-spacing: var(--text-body-sm--letter-spacing);
+  font-weight: var(--text-body-sm--font-weight);
+  color: var(--text-subtle);
+}

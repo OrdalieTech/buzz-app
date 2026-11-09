@@ -9,9 +9,11 @@ import { ContributionBoundary, contributionKey } from "./ContributionBoundary";
 
 export function ComposerAccessories({
   registry,
+  placement,
   ...props
 }: ComposerAccessoryProps & {
   registry: ContributionReader<ComposerAccessory>;
+  placement?: ComposerAccessory["placement"];
 }) {
   const entries = useSyncExternalStore(
     registry.subscribe,
@@ -21,7 +23,11 @@ export function ComposerAccessories({
   const order = (entry: ComposerAccessory) =>
     Number.isFinite(entry.order) ? (entry.order ?? 0) : 0;
   const ordered = entries
-    .filter((entry) => (entry.placement === "message") === !!props.message)
+    .filter(
+      (entry) =>
+        (entry.placement ?? "composer") ===
+        (placement ?? (props.message ? "message" : "composer")),
+    )
     .sort(
       (a, b) =>
         order(a) - order(b) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0),

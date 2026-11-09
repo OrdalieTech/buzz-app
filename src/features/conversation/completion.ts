@@ -115,6 +115,7 @@ export function completionResult(result: CompletionResult): CompletionResult {
         label: item.label,
         ...(typeof item.detail === "string" ? { detail: item.detail } : {}),
         preview: item.preview,
+        ...(item.agent === true ? { agent: true } : {}),
         ...(typeof item.disabled === "string"
           ? { disabled: item.disabled }
           : {}),

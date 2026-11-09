@@ -6,10 +6,17 @@ import { CLAUDE_HOOK_EVENTS, type ClaudeHook } from "./hooks";
 // same pipe, as the SDK serves an in-process MCP server, so the process holds
 // no Buzz key.
 import { MESSAGE_TOOLS } from "../../buzz-mcp/session-tools";
+import { limited } from "../../features/agents/session-usage";
 import type {
   HostProcess,
   HostProcessOptions,
 } from "../../features/host/service";
+import {
+  PROTECTED_CLAUDE_ROOT,
+  protectedRuntime,
+  protectionSources,
+  type ClaudeProtection,
+} from "./security";
 
 export type ActivityReceipt = Readonly<{
   /** Presentation destination; channel-shared sessions may handle several threads. */
@@ -25,11 +32,24 @@ export type Spawn = (
 ) => Promise<HostProcess>;
 
 export type ClaudeLaunch = Readonly<{
+  protection?: ClaudeProtection;
   cwd: string;
   /** Folders besides `cwd` that the session may work in and stay in. */
   directories?: readonly string[];
   /** Read-only catalog probe, without workspace customizations or tools. */
   discovery?: boolean;
+  /** Runs the protected release, as the host verified it, without protection
+   * hooks: a temporary review. A protected launch always does. */
+  pinned?: boolean;
+  /** Native validation for a temporary review's structured result. */
+  outputSchema?: Readonly<Record<string, unknown>>;
+  /** A security review's own Claude folder (absolute), in place of
+   * `~/.claude`, which contained agents can write, and the environment it
+   * authenticates with (`ClaudeAuth.review`). */
+  review?: Readonly<{
+    home: string;
+    env: Readonly<Record<string, string | null>>;
+  }>;
   /** Appended to Claude's own system prompt. */
   systemPrompt: string;
   model?: string;
@@ -42,6 +62,8 @@ export type ClaudeLaunch = Readonly<{
   /** The in-process MCP server's tools. */
   tools?: ToolServer;
   hook?: ClaudeHook;
+  /** The agent it works for: the `buzz` it runs acts as that agent. */
+  agent?: Readonly<{ pubkey: string; relay: string }>;
 }>;
 
 /** Answers the in-process server's JSON-RPC for the conversation a process
@@ -49,6 +71,8 @@ export type ClaudeLaunch = Readonly<{
 export type ToolServer = (
   conversation: string | undefined,
   message: unknown,
+  /** Aborts when the process stops, so a stopped turn's tool does not act. */
+  signal: AbortSignal,
 ) => Promise<unknown>;
 /** Its tools are `mcp__buzz__<name>`. */
 export const TOOL_SERVER = "buzz";
@@ -85,15 +109,15 @@ export type Settled = Readonly<{
 
 const STDERR_LIMIT = 4_000;
 /** What `claude` is started with: as the SDK starts it, reporting when it is
- * idle, signed in as `claude auth login` left it, and never as part of a
- * Claude session that started the app. */
+ * idle, and never as part of a Claude session that started the app. Its
+ * credentials come from `ClaudeAuth`. */
 export const ENV: Readonly<Record<string, string | null>> = {
   CLAUDE_CODE_ENTRYPOINT: "sdk-ts",
   CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
   // Buzz keeps its own copy current; Claude must not install itself elsewhere.
   DISABLE_AUTOUPDATER: "1",
-  // A key in the shell that launched the app would outrank the sign-in; the
-  // interactive CLI asks before using one, but stream-json mode uses it silently.
+  // Only `ClaudeAuth` gives a key: one in the shell that launched the app
+  // would outrank it, and stream-json mode uses it without asking.
   ANTHROPIC_API_KEY: null,
   CLAUDECODE: null,
   CLAUDE_CODE_SESSION_ID: null,
@@ -106,6 +130,28 @@ export const ENV: Readonly<Record<string, string | null>> = {
 };
 
 export class ClaudeProcess {
+  private protection: ClaudeProtection | undefined;
+  private protectionLifetime = new AbortController();
+  private protectedInstructions = "";
+  private protectedHistory: unknown = [];
+  private readonly protectedEvents: Message[] = [];
+  private resuming = false;
+  private reviewText = "";
+  private reviewOutput: unknown;
+  get result() {
+    return this.reviewText;
+  }
+  get structuredResult() {
+    if (this.reviewOutput === undefined)
+      throw new Error("The security model returned no structured result");
+    return JSON.stringify(this.reviewOutput);
+  }
+  protectionContext() {
+    return structuredClone({
+      transcript: this.protectedHistory,
+      events: this.protectedEvents,
+    });
+  }
   /** Its session, known once the first turn starts (or at once when resuming). */
   sessionId: string | undefined;
   /** The conversation it serves, set when a spare is put to use. */
@@ -128,6 +174,14 @@ export class ClaudeProcess {
   private stopping = false;
   /** Claude ended a turn aborted while the owner was stopping it. */
   private stopped = false;
+  /** Aborts when the owner stops the work. The next turn, sent or its own,
+   * starts anew, so a stopped turn's tool calls stay stopped. */
+  private workLifetime = new AbortController();
+  /** The owner's Stop awaiting Claude's answer, for the work it stopped;
+   * another Stop of that work shares it. */
+  private stopRequest:
+    | Readonly<{ work: AbortController; done: Promise<void> }>
+    | undefined;
   /** It reports idle; an older `claude` that does not is settled per result. */
   private reportsState = false;
   /** It runs a turn of its own, such as one a finished background task starts. */
@@ -161,6 +215,7 @@ export class ClaudeProcess {
   ) {
     this.sessionId = resume;
     this.exited = process.exited.then((code) => {
+      this.protectionLifetime.abort();
       this.alive = false;
       for (const resolve of this.calls.values())
         resolve({ subtype: "error", error: "Claude exited" });
@@ -169,7 +224,11 @@ export class ClaudeProcess {
         this.lastError ??
         (this.stderr.trim().split("\n").at(-1) ||
           `Claude exited (${code ?? "signal"})`);
-      this.settle({ ok: false, error });
+      this.settle(
+        this.stopped && !this.lastError
+          ? { ok: true, stopped: true }
+          : { ok: false, error },
+      );
       return code;
     });
   }
@@ -183,11 +242,18 @@ export class ClaudeProcess {
   /** Starts `claude` without its prompt. This is most of what a start costs,
    * and fixes nothing about the agent it serves but its folder, model and
    * effort. */
-  static async spawn(spawn: Spawn, launch: Omit<ClaudeLaunch, "systemPrompt">) {
+  static async spawn(
+    spawn: Spawn,
+    launch: Omit<ClaudeLaunch, "systemPrompt"> & { systemPrompt?: string },
+  ) {
+    launch.protection?.gate.assertAvailable();
+    const security = launch.protection;
+    const pinned =
+      security || launch.pinned ? await protectedRuntime(spawn) : undefined;
     let claude: ClaudeProcess | undefined;
     const early: string[] = [];
     const earlyErrors: string[] = [];
-    const process = await spawn("claude", {
+    const process = await spawn(pinned ?? "claude", {
       args: [
         "--output-format",
         "stream-json",
@@ -198,6 +264,19 @@ export class ClaudeProcess {
         // Recent models return empty thinking unless asked for summaries.
         "--thinking-display",
         "summarized",
+        // Settings files can set env, hooks and apiKeyHelper, and a contained
+        // worker can write them: no pinned launch reads them. Claude still
+        // reads its folder's sign-in and cached managed settings: a review's
+        // own folder (`review`), and `~/.claude` for protected runs.
+        ...(pinned ? ["--setting-sources", ""] : []),
+        ...(security
+          ? [
+              "--system-prompt",
+              launch.systemPrompt ?? "",
+              "--strict-mcp-config",
+              "--disable-slash-commands",
+            ]
+          : []),
         ...(launch.discovery
           ? [
               "--safe-mode",
@@ -212,6 +291,9 @@ export class ClaudeProcess {
           folder,
         ]),
         ...(launch.model ? ["--model", launch.model] : []),
+        ...(launch.outputSchema
+          ? ["--json-schema", JSON.stringify(launch.outputSchema)]
+          : []),
         ...(launch.effort ? ["--effort", launch.effort] : []),
         ...(launch.resume ? ["--resume", launch.resume] : []),
         ...(!launch.resume && launch.sessionId
@@ -231,7 +313,78 @@ export class ClaudeProcess {
           : []),
       ],
       cwd: launch.cwd,
-      env: ENV,
+      // A spare is started before the agent it serves is known.
+      agentCredential: !launch.discovery,
+      env: {
+        ...ENV,
+        ...(launch.discovery
+          ? {
+              CLAUDE_CODE_DISABLE_FILE_MENTIONS: "1",
+              CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+              CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
+              CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
+            }
+          : {}),
+        ...(security
+          ? {
+              CLAUDE_CODE_EAGER_FLUSH: "1",
+              DISABLE_COMPACT: "1",
+              CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
+              ANTHROPIC_BETAS: null,
+              CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK: "1",
+              CLAUDE_CODE_DISABLE_REFUSAL_RETRY: "1",
+              CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: "1",
+              CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
+              CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+              CLAUDE_CODE_DISABLE_FILE_MENTIONS: "1",
+              CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
+              CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+              CLAUDE_CODE_DISABLE_CRON: "1",
+              BASH_ENV: null,
+              ENV: null,
+              DYLD_INSERT_LIBRARIES: null,
+              DYLD_LIBRARY_PATH: null,
+              DYLD_FRAMEWORK_PATH: null,
+              LD_PRELOAD: null,
+              LD_LIBRARY_PATH: null,
+            }
+          : {}),
+        ...(launch.review
+          ? {
+              CLAUDE_CONFIG_DIR: launch.review.home,
+              // What would pick other credentials or an endpoint over them:
+              // the pinned release's variables as read from 2.1.312's
+              // strings, as hygiene for the person's own environment. Never
+              // set CLAUDE_CODE_SIMPLE, which ignores an OAuth token.
+              ANTHROPIC_AUTH_TOKEN: null,
+              ANTHROPIC_BASE_URL: null,
+              CLAUDE_CODE_API_BASE_URL: null,
+              CLAUDE_CODE_SIMPLE: null,
+              ANTHROPIC_UNIX_SOCKET: null,
+              CLAUDE_CODE_REMOTE_SESSION_ID: null,
+              CLAUDE_CODE_USE_BEDROCK: null,
+              CLAUDE_CODE_USE_VERTEX: null,
+              CLAUDE_CODE_USE_FOUNDRY: null,
+              CLAUDE_CODE_USE_GATEWAY: null,
+              CLAUDE_CODE_USE_MANTLE: null,
+              CLAUDE_CODE_USE_ANTHROPIC_AWS: null,
+              CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: null,
+              ...launch.review.env,
+            }
+          : {}),
+      },
+      // Contained, so the host runs its verified copy, never the folder's.
+      ...(pinned
+        ? {
+            protection: {
+              readOnlyPaths: [
+                ...(security?.gate.processProtection.readOnlyPaths ?? []),
+                PROTECTED_CLAUDE_ROOT,
+              ],
+              hiddenPaths: security?.gate.processProtection.hiddenPaths ?? [],
+            },
+          }
+        : {}),
       onStdout: (data) => (claude ? claude.read(data) : early.push(data)),
       onStderr: (data) =>
         claude ? claude.readError(data) : earlyErrors.push(data),
@@ -243,6 +396,9 @@ export class ClaudeProcess {
       launch.model,
       launch.hook,
     );
+    claude.protection = launch.protection;
+    claude.resuming = !!launch.resume;
+    claude.protectedInstructions = launch.systemPrompt ?? "";
     for (const data of earlyErrors) claude.readError(data);
     for (const data of early) claude.read(data);
     return claude;
@@ -251,40 +407,107 @@ export class ClaudeProcess {
   /** Gives a started process its prompt, and its tools to whoever it now
    * works for. Loads settings and tools now rather than on the first message. */
   async initialize(
-    launch: Pick<ClaudeLaunch, "systemPrompt" | "tools" | "hook">,
+    launch: Pick<
+      ClaudeLaunch,
+      "systemPrompt" | "tools" | "protection" | "hook" | "agent"
+    >,
   ) {
-    if (launch.tools) this.tools = launch.tools;
-    this.hook = launch.hook;
-    const { written, answer } = this.request({
-      subtype: "initialize",
-      appendSystemPrompt: launch.systemPrompt,
-      ...(launch.tools
-        ? {
-            sdkMcpServers: [TOOL_SERVER],
-            hooks: {
-              ...Object.fromEntries(
-                CLAUDE_HOOK_EVENTS.map((event) => [
-                  event,
-                  [{ hookCallbackIds: [`buzz:${event}`] }],
-                ]),
-              ),
-              PostToolUse: [
-                { hookCallbackIds: ["buzz:PostToolUse"] },
-                { matcher: FINAL_TOOL, hookCallbackIds: ["final"] },
-              ],
-            },
-          }
-        : {}),
-    });
-    await written;
-    this.listed = answer.then((response) => {
-      const models = (response.response as Message | undefined)?.models;
-      return Array.isArray(models)
-        ? models.filter(
-            (model): model is ClaudeModel => typeof model?.value === "string",
-          )
-        : [];
-    });
+    if (launch.agent)
+      // An inherited token that acts for nobody fails every `buzz` call, so a
+      // process that cannot act as its agent is stopped, as other harnesses do.
+      await this.process.actAs?.(launch.agent).catch((error: unknown) => {
+        void this.kill();
+        throw error;
+      });
+    try {
+      if (launch.tools) this.tools = launch.tools;
+      this.hook = launch.protection ? undefined : launch.hook;
+      const { written, answer } = this.request({
+        subtype: "initialize",
+        ...(!launch.protection
+          ? { appendSystemPrompt: launch.systemPrompt }
+          : {}),
+        ...(launch.tools || launch.protection
+          ? {
+              ...(launch.tools ? { sdkMcpServers: [TOOL_SERVER] } : {}),
+              hooks: {
+                ...(launch.protection
+                  ? {
+                      PreToolUse: [
+                        { hookCallbackIds: ["security-tool"], timeout: 600 },
+                      ],
+                      PreCompact: [
+                        {
+                          hookCallbackIds: ["security-incomplete"],
+                          timeout: 600,
+                        },
+                      ],
+                      SessionStart: [
+                        { hookCallbackIds: ["security-session"], timeout: 600 },
+                      ],
+                      UserPromptSubmit: [
+                        {
+                          hookCallbackIds: ["security-incoming"],
+                          timeout: 600,
+                        },
+                      ],
+                      PostToolBatch: [
+                        {
+                          hookCallbackIds: ["security-incoming"],
+                          timeout: 600,
+                        },
+                      ],
+                      PostToolUseFailure: [
+                        {
+                          hookCallbackIds: ["security-incoming"],
+                          timeout: 600,
+                        },
+                      ],
+                    }
+                  : Object.fromEntries(
+                      CLAUDE_HOOK_EVENTS.map((event) => [
+                        event,
+                        [{ hookCallbackIds: [`buzz:${event}`] }],
+                      ]),
+                    )),
+                PostToolUse: [
+                  ...(launch.protection
+                    ? [{ hookCallbackIds: ["security-incoming"], timeout: 600 }]
+                    : [{ hookCallbackIds: ["buzz:PostToolUse"] }]),
+                  ...(launch.tools
+                    ? [{ matcher: FINAL_TOOL, hookCallbackIds: ["final"] }]
+                    : []),
+                ],
+              },
+            }
+          : {}),
+      });
+      await written;
+      if (launch.protection) {
+        const timer = setTimeout(() => void this.kill(), 15_000);
+        try {
+          const response = await answer;
+          if (response.subtype !== "success")
+            throw new Error(
+              `Claude did not register protection hooks: ${String(response.error)}`,
+            );
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      this.listed = answer.then((response) => {
+        const models = (response.response as Message | undefined)?.models;
+        return Array.isArray(models)
+          ? models.filter(
+              (model): model is ClaudeModel => typeof model?.value === "string",
+            )
+          : [];
+      });
+    } catch (error) {
+      await this.kill();
+      await this.exited;
+      throw error;
+    }
   }
 
   get running() {
@@ -340,6 +563,8 @@ export class ClaudeProcess {
     // The model first: effort applies to whichever model runs.
     this.setModel(model !== undefined || !this.busy ? model : this.pickedModel);
     this.setEffort(effort !== undefined || !this.busy ? effort : this.effort);
+    // A message folded into a running turn shares its lifetime.
+    if (!this.busy && !this.working) this.renew();
     const uuid = crypto.randomUUID();
     this.receipts.set(uuid, activity);
     this.pending++;
@@ -364,17 +589,48 @@ export class ClaudeProcess {
 
   /** Stops the running turn, as the SDK's `interrupt` does; messages folded
    * into it end with it. The turn then settles as Claude ends it. */
-  async interrupt() {
+  interrupt() {
+    // One answer for every Stop of the same work, so one's failure cannot
+    // revive work another stopped; newer work is stopped anew.
+    const work = this.workLifetime;
+    if (this.stopRequest?.work === work) return this.stopRequest.done;
+    const done: Promise<void> = this.stop().finally(() => {
+      if (this.stopRequest?.done === done) this.stopRequest = undefined;
+    });
+    this.stopRequest = { work, done };
+    return done;
+  }
+  private async stop() {
     if (!this.alive || !this.active) return;
     this.stopping = true;
+    const work = this.workLifetime;
+    const fresh = !work.signal.aborted;
+    work.abort(new Error("The owner stopped the turn"));
+    if (this.protection) {
+      this.protectionLifetime.abort();
+      this.stopped = true;
+      await this.process.kill();
+      await this.exited;
+      return;
+    }
     const answer = await this.call({ subtype: "interrupt" });
+    // The turn goes on, and so do its calls, unless an earlier Stop stopped it.
     if (answer.subtype === "error" && this.alive) {
-      this.stopping = false;
+      if (fresh && this.workLifetime === work) {
+        this.stopping = false;
+        this.workLifetime = new AbortController();
+      }
       throw new Error(`Claude did not stop: ${String(answer.error)}`);
     }
   }
 
+  private renew() {
+    if (this.workLifetime.signal.aborted)
+      this.workLifetime = new AbortController();
+  }
+
   kill() {
+    this.protectionLifetime.abort();
     return this.process.kill();
   }
 
@@ -487,6 +743,14 @@ export class ClaudeProcess {
   private readonly receipts = new Map<string, ActivityReceipt>();
   private readonly activeReceipts = new Map<string, ActivityReceipt>();
   private handle(message: Message) {
+    // The CLI may emit a tool callback before its asynchronous transcript write.
+    // Keep native protocol evidence alongside persisted history, without replacing it.
+    if (this.protection && ["user", "assistant"].includes(String(message.type)))
+      this.protectedEvents.push(structuredClone(message));
+    if (message.type === "result") {
+      this.reviewOutput = message.structured_output;
+      if (typeof message.result === "string") this.reviewText = message.result;
+    }
     if (typeof message.session_id === "string" && message.session_id)
       this.sessionId = message.session_id;
     if (message.type === "system" && message.subtype === "init") {
@@ -512,7 +776,10 @@ export class ClaudeProcess {
     ) {
       this.reportsState = true;
       const active = this.active;
+      const starts = !this.working && !this.busy && message.state !== "idle";
       this.working = message.state !== "idle";
+      // A turn of its own, such as a background task's, is new work.
+      if (starts) this.renew();
       if (!this.working && this.pending) this.done();
       if (!this.active) this.stopping = false;
       if (active !== this.active) this.onActivity?.();
@@ -621,15 +888,175 @@ export class ClaudeProcess {
         mcp_response: await this.tools(
           this.conversation,
           request.message,
+          AbortSignal.any([
+            this.protectionLifetime.signal,
+            this.workLifetime.signal,
+          ]),
         ).catch((error) => ({
           jsonrpc: "2.0",
           id: (request.message as Message | undefined)?.id ?? 0,
           error: { code: -32603, message: String(error?.message ?? error) },
         })),
       });
-    else if (request.subtype === "can_use_tool")
+    else if (
+      request.subtype === "hook_callback" &&
+      this.protection &&
+      [
+        "security-tool",
+        "security-incoming",
+        "security-incomplete",
+        "security-session",
+      ].includes(String(request.callback_id))
+    ) {
+      try {
+        const input = request.input as Message;
+        if (
+          request.callback_id === "security-incomplete" ||
+          (request.callback_id === "security-session" &&
+            !["startup", "resume"].includes(String(input.source)))
+        )
+          throw new Error(
+            "Protected Claude cannot rewrite its reviewed conversation; start a new conversation",
+          );
+        if (
+          request.callback_id === "security-session" &&
+          input.source === "startup" &&
+          !this.resuming
+        )
+          return this.write({
+            type: "control_response",
+            response: success({}),
+          });
+        const tool = request.callback_id === "security-tool";
+        const kind = tool
+          ? "tool"
+          : ["UserPromptSubmit", "SessionStart"].includes(
+                String(input.hook_event_name),
+              )
+            ? "context"
+            : "tool-result";
+        if (tool && ["Agent", "Task"].includes(String(input.tool_name)))
+          throw new Error(
+            "Protected Claude does not delegate outside its reviewed conversation",
+          );
+        if (this.protection.gate.phases?.[kind] === false) {
+          this.protectionLifetime.signal.throwIfAborted();
+          this.protection.gate.assertAvailable();
+          return this.write({
+            type: "control_response",
+            response: success(
+              tool
+                ? {
+                    hookSpecificOutput: {
+                      hookEventName: "PreToolUse",
+                      permissionDecision: "allow",
+                    },
+                  }
+                : {},
+            ),
+          });
+        }
+        if (typeof input.transcript_path !== "string")
+          throw new Error("Claude omitted the protected conversation");
+        const history = await this.protection
+          .history(input.transcript_path, this.protectionLifetime.signal)
+          .catch((error) => {
+            if (
+              input.hook_event_name === "UserPromptSubmit" &&
+              !this.resuming &&
+              !this.began &&
+              /no such file/i.test(String(error))
+            )
+              return [];
+            throw error;
+          });
+        this.protectedHistory = structuredClone(history);
+        const content = {
+          ...(tool
+            ? { title: input.tool_name, arguments: input.tool_input }
+            : {}),
+          instructions: this.protectedInstructions,
+          conversation: history,
+          events: structuredClone(this.protectedEvents),
+          input,
+        };
+        // Tool authority needs the combined conversation. Injection detection
+        // inspects native sources individually, without duplicating the envelope.
+        const incoming = { ...input };
+        for (const key of [
+          "session_id",
+          "transcript_path",
+          "cwd",
+          "permission_mode",
+          "hook_event_name",
+        ])
+          delete incoming[key]; // Native transport metadata is not model content.
+        const sources = tool
+          ? [{ kind: "tool" as const, content }]
+          : [
+              {
+                kind: "context" as const,
+                content: {
+                  source: "instructions",
+                  value: this.protectedInstructions,
+                },
+              },
+              ...[
+                ...(Array.isArray(history) ? history : [history]),
+                ...this.protectedEvents,
+              ].flatMap((value) => protectionSources(value)),
+              ...protectionSources(
+                incoming,
+                "hook",
+                kind === "tool-result" ? "tool-result" : "context",
+              ),
+            ];
+        // One hook must answer within the native watchdog, so check sources
+        // together, below the provider's limit of 16 in-flight checks. The
+        // first denial cancels the rest before another can start.
+        const session = this.sessionId ?? "initial";
+        const denied = new AbortController();
+        const signal = AbortSignal.any([
+          this.protectionLifetime.signal,
+          denied.signal,
+        ]);
+        const { gate } = this.protection;
+        const slot = limited(4);
+        await Promise.all(
+          sources.map((source) =>
+            slot(async () => {
+              signal.throwIfAborted();
+              try {
+                await gate.check({ ...source, session }, signal);
+              } catch (error) {
+                denied.abort();
+                throw error;
+              }
+            }),
+          ),
+        );
+        this.protectionLifetime.signal.throwIfAborted();
+        response = success(
+          tool
+            ? {
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse",
+                  permissionDecision: "allow",
+                },
+              }
+            : {},
+        );
+      } catch (error) {
+        this.protectionLifetime.abort();
+        this.lastError =
+          error instanceof Error ? error.message : "Security review failed";
+        await this.process.kill();
+        await this.exited;
+        return;
+      }
+    } else if (request.subtype === "can_use_tool")
       response = success({
-        behavior: "allow",
+        behavior: this.protection ? "deny" : "allow",
         updatedInput: request.input ?? {},
       });
     else if (request.subtype === "hook_callback") {

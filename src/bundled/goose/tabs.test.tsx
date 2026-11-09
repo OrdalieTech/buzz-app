@@ -23,6 +23,12 @@ import { type Config, DEFAULT_CONFIG, type GooseRuntime } from "./runtime";
 import { GooseSetup } from "./setup";
 import { createTabs } from "./tabs";
 import { GooseHistory } from "./transcript";
+import { localSessions } from "./sessions";
+import {
+  PROMPTS_PREFIX,
+  sessionPrompts,
+} from "../../features/agents/session-prompts";
+import { localStore } from "../../features/agents/store";
 
 /** New agent's fields read no sessions. */
 const unused = {
@@ -30,7 +36,10 @@ const unused = {
   history: new GooseHistory(undefined),
 };
 
-vi.mock("@tauri-apps/api/core", () => ({ isTauri: () => true }));
+vi.mock("@tauri-apps/api/core", () => ({
+  isTauri: () => true,
+  invoke: async () => null,
+}));
 
 beforeEach(() => {
   // jsdom has no layout observers; the model picker sizes itself with one.
@@ -83,6 +92,7 @@ function created(
     reply?: string;
     spawn?: (fake: ReturnType<typeof fakeSpawn>) => GooseSetup;
     modelAppearance?: "glass-ghost";
+    onReadyChange?: (ready: boolean) => void;
     config?: Config;
     /** Fields goose already holds, beyond Databricks' host. */
     saved?: Readonly<Record<string, readonly string[]>>;
@@ -110,8 +120,9 @@ function created(
       },
     },
   });
+  const setup = options.spawn?.(fake) ?? new GooseSetup(fake);
   const { Create, CreateModel } = createTabs({
-    setup: options.spawn?.(fake) ?? new GooseSetup(fake),
+    setup,
     ...unused,
   });
   if (!CreateModel) throw new Error("no model field");
@@ -128,6 +139,9 @@ function created(
       <>
         <Create config={config} disabled={false} onChange={onChange} />
         <CreateModel
+          {...(options.onReadyChange && {
+            onReadyChange: options.onReadyChange,
+          })}
           config={config}
           disabled={false}
           onChange={onChange}
@@ -139,7 +153,7 @@ function created(
     );
   }
   render(<Harness />);
-  return { fake, saved, changes };
+  return { fake, saved, changes, setup };
 }
 
 async function choose(label: string, option: string) {
@@ -456,6 +470,127 @@ it("saves a thinking level goose lists for the model, and marks one it does not"
   );
 });
 
+it("offers Create agent a Thinking row with goose's levels for the chosen model", async () => {
+  const fake = fakeSpawn({
+    providers: PROVIDERS,
+    defaults: { providerId: "databricks", modelId: "goose-claude" },
+    thinking: {
+      "": { current: "medium", levels: ["low", "medium", "high"] },
+      "plain-model": { current: "off", levels: ["off"] },
+    },
+  });
+  const { CreateThinking } = createTabs({
+    setup: new GooseSetup(fake),
+    ...unused,
+  });
+  if (!CreateThinking) throw new Error("no Thinking field");
+  const changes: Config[] = [];
+  const { rerender } = render(
+    <CreateThinking
+      config={DEFAULT_CONFIG}
+      disabled={false}
+      onChange={(next) => changes.push(next)}
+    />,
+  );
+  const user = userEvent.setup();
+  const thinking = screen.getByRole("combobox", { name: "Thinking" });
+  await waitFor(() => expect(thinking).toHaveTextContent("Medium · Default"));
+  await user.click(thinking);
+  await user.click(await screen.findByRole("option", { name: "High" }));
+  expect(changes.at(-1)).toEqual({ ...DEFAULT_CONFIG, effort: "high" });
+
+  // Another model reads its own levels.
+  rerender(
+    <CreateThinking
+      config={{ ...DEFAULT_CONFIG, model: "plain-model" }}
+      disabled={false}
+      onChange={(next) => changes.push(next)}
+    />,
+  );
+  await waitFor(() =>
+    expect(
+      screen.getByRole("combobox", { name: "Thinking" }),
+    ).toHaveTextContent("Off · Default"),
+  );
+});
+
+it("says when Create agent's Thinking cannot read goose's levels, and tries again", async () => {
+  let fail = true;
+  const fake = fakeSpawn({
+    providers: PROVIDERS,
+    defaults: { providerId: "databricks", modelId: "goose-claude" },
+    thinking: { "": { current: "medium", levels: ["low", "medium"] } },
+  });
+  const setup = new GooseSetup(fake);
+  const efforts = setup.efforts.bind(setup);
+  vi.spyOn(setup, "efforts").mockImplementation((choice) =>
+    fail ? Promise.reject(new Error("goose is busy")) : efforts(choice),
+  );
+  const { CreateThinking } = createTabs({ setup, ...unused });
+  if (!CreateThinking) throw new Error("no Thinking field");
+  render(
+    <CreateThinking
+      config={DEFAULT_CONFIG}
+      disabled={false}
+      onChange={() => undefined}
+    />,
+  );
+  const user = userEvent.setup();
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Could not read goose's levels: goose is busy",
+  );
+  fail = false;
+  await user.click(screen.getByRole("button", { name: "Try again" }));
+  await waitFor(() =>
+    expect(
+      screen.getByRole("combobox", { name: "Thinking" }),
+    ).toHaveTextContent("Medium · Default"),
+  );
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Try again" }),
+  ).not.toBeInTheDocument();
+});
+
+it("reads Create agent's Thinking levels again when a setup check recovers", async () => {
+  let fail = true;
+  const fake = fakeSpawn({
+    providers: PROVIDERS,
+    defaults: { providerId: "databricks", modelId: "goose-claude" },
+    thinking: { "": { current: "medium", levels: ["low", "medium"] } },
+  });
+  const setup = new GooseSetup(fake);
+  const efforts = setup.efforts.bind(setup);
+  const reads = vi
+    .spyOn(setup, "efforts")
+    .mockImplementation((choice) =>
+      fail ? Promise.reject(new Error("goose is busy")) : efforts(choice),
+    );
+  const { CreateThinking } = createTabs({ setup, ...unused });
+  if (!CreateThinking) throw new Error("no Thinking field");
+  render(
+    <CreateThinking
+      config={DEFAULT_CONFIG}
+      disabled={false}
+      onChange={() => undefined}
+    />,
+  );
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Could not read goose's levels: goose is busy",
+  );
+  const failedReads = reads.mock.calls.length;
+  fail = false;
+  // As the model field's Try again does.
+  await act(() => setup.check());
+  await waitFor(() =>
+    expect(
+      screen.getByRole("combobox", { name: "Thinking" }),
+    ).toHaveTextContent("Medium · Default"),
+  );
+  expect(reads.mock.calls.length).toBeGreaterThan(failedReads);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
 it("splits Settings as the profile does: choices under Identity, the rest apart", async () => {
   const fake = fakeSpawn({
     providers: PROVIDERS,
@@ -674,221 +809,404 @@ it("says when the bundled goose-acp is missing, and tries again", async () => {
   );
 });
 
-it("lists the agent's goose sessions and shows one's transcript", async () => {
-  const agent = "c".repeat(64);
+const ROOT = "1".repeat(64);
+const GANDER = "c".repeat(64);
+
+/** goose's history with sessions Gander ran in #general's thread, each
+ * sending `Hi from goose` (s1) or `Hi from <id>`. */
+function gooseHistory(ids: readonly string[] = ["s1"], page?: number) {
   const context = [
     "<context>",
     "Scope: thread",
     "Session scope: thread",
     "Channel: general (#chan)",
-    `Thread root: ${"1".repeat(64)}`,
-    `Agent: ${agent}`,
+    `Thread root: ${ROOT}`,
+    `Agent: ${GANDER}`,
     "</context>",
     "",
     '<buzz-event type="@mention">',
     "Content: @Gander what's up?",
     "</buzz-event>",
   ].join("\n");
-  const fake = fakeSpawn({
+  return fakeSpawn({
     home: "/home/test",
-    history: [
-      {
-        sessionId: "s1",
-        title: "Gander · #general · 11111111",
-        cwd: "/home/test/.buzz",
-        updatedAt: "2027-01-15T08:00:00Z",
-        conversation: [
-          {
-            role: "user",
-            created: 1_800_000_000,
-            content: [{ type: "text", text: context }],
-            metadata: { userVisible: true },
-          },
-          {
-            role: "assistant",
-            created: 1_800_000_001,
-            content: [
-              {
-                type: "toolRequest",
-                id: "t1",
-                toolCall: {
-                  status: "success",
-                  value: {
-                    name: "buzz__send",
-                    arguments: { text: "Hi from goose", final: true },
+    ...(page ? { page } : {}),
+    history: ids.map((sessionId) => ({
+      sessionId,
+      title: `Gander · #general · ${sessionId}`,
+      cwd: "/home/test/.buzz",
+      updatedAt: "2027-01-15T08:00:00Z",
+      conversation: [
+        {
+          role: "user",
+          created: 1_800_000_000,
+          content: [{ type: "text", text: context }],
+          metadata: { userVisible: true },
+        },
+        {
+          role: "assistant",
+          created: 1_800_000_001,
+          content: [
+            {
+              type: "toolRequest",
+              id: "t1",
+              toolCall: {
+                status: "success",
+                value: {
+                  name: "buzz__send",
+                  arguments: {
+                    text: `Hi from ${sessionId === "s1" ? "goose" : sessionId}`,
+                    final: true,
                   },
                 },
               },
-            ],
-          },
-        ],
-      },
-    ],
+            },
+          ],
+        },
+      ],
+    })),
   });
+}
+
+/** What the fake runtime holds for Gander; `change` shows its update. */
+type World = {
+  saved: ReturnType<GooseRuntime["conversations"]>;
+  live?: ReturnType<GooseRuntime["sessions"]>;
+  /** Every session kept with its prompt, oldest first, and how it started
+   * when that was kept. */
+  ids?: (
+    | string
+    | { id: string; at: number; title: string; conversation?: string | null }
+  )[];
+  names?: Record<string, string>;
+  scope?: Config["scope"];
+  /** Replaces parts of the fake runtime. */
+  runtime?: Partial<Record<keyof GooseRuntime, unknown>>;
+};
+
+/** Gander's Activity tab over `world`. */
+function activity(
+  fake: ReturnType<typeof fakeSpawn>,
+  world: World,
+  history = new GooseHistory(fake),
+  props: Partial<
+    Parameters<ReturnType<typeof createTabs>["ActivityTab"]>[0]
+  > = {},
+) {
+  const listeners = new Set<() => void>();
   // The runtime keeps one snapshot until its sessions change.
-  const none: never[] = [];
+  let live = world.live ?? [];
   const runtime = {
-    subscribe: () => () => {},
-    sessions: () => none,
-  } as unknown as GooseRuntime;
-  const { ActivityTab } = createTabs({
-    setup: new GooseSetup(fake),
-    runtime,
-    history: new GooseHistory(fake),
-  });
-  render(
-    <ActivityTab
-      agent={
-        {
-          key: agent,
-          pubkey: agent,
-          name: "Gander",
-          type: "buzz.goose/goose",
-          owner: "a".repeat(64),
-          config: DEFAULT_CONFIG,
-        } as Agent<Config>
-      }
-    />,
-  );
-  const user = userEvent.setup();
-  expect(await screen.findByText("#general · 11111111")).toBeInTheDocument();
-  await user.click(
-    screen.getByRole("button", {
-      name: "View transcript: #general · 11111111",
+    subscribe: (listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    sessions: () => live,
+    conversations: () => world.saved,
+    channelLabel: (_: string, id: string) =>
+      world.names?.[id] ? { name: world.names[id], kind: "stream" } : undefined,
+    prompts: () => ({
+      shown: (turns: unknown) => turns,
+      sessions: () =>
+        (world.ids ?? []).map((id) =>
+          typeof id === "string" ? { id } : { conversation: null, ...id },
+        ),
     }),
-  );
-  expect(await screen.findByText("Hi from goose")).toBeInTheDocument();
-  expect(screen.getAllByText(/@Gander what's up\?/).length).toBeGreaterThan(0);
-});
-
-it("opens a session transcript its history lookup finds after the profile shows", async () => {
-  // No running session knows the thread, so goose's history finds it only
-  // after the profile is shown.
-  const agent = "c".repeat(64);
-  const context = [
-    "<context>",
-    "Scope: thread",
-    "Session scope: thread",
-    "Channel: general (#chan)",
-    `Thread root: ${"1".repeat(64)}`,
-    `Agent: ${agent}`,
-    "</context>",
-    "",
-    '<buzz-event type="@mention">',
-    "Content: @Gander what's up?",
-    "</buzz-event>",
-  ].join("\n");
-  const fake = fakeSpawn({
-    home: "/home/test",
-    history: [
-      {
-        sessionId: "s1",
-        title: "Gander · #general · 11111111",
-        cwd: "/home/test/.buzz",
-        updatedAt: "2027-01-15T08:00:00Z",
-        conversation: [
-          {
-            role: "user",
-            created: 1_800_000_000,
-            content: [{ type: "text", text: context }],
-            metadata: { userVisible: true },
-          },
-          {
-            role: "assistant",
-            created: 1_800_000_001,
-            content: [
-              {
-                type: "toolRequest",
-                id: "t1",
-                toolCall: {
-                  status: "success",
-                  value: {
-                    name: "buzz__send",
-                    arguments: { text: "Hi from goose", final: true },
-                  },
-                },
-              },
-            ],
-          },
-        ],
-      },
-    ],
-  });
-  // The runtime keeps one snapshot until its sessions change.
-  const none: never[] = [];
-  const runtime = {
-    subscribe: () => () => {},
-    sessions: () => none,
-  } as unknown as GooseRuntime;
-  const { ActivityTab } = createTabs({
-    setup: new GooseSetup(fake),
-    runtime,
-    history: new GooseHistory(fake),
-  });
-  const done = vi.fn();
-  render(
-    <ActivityTab
-      agent={
-        {
-          key: agent,
-          pubkey: agent,
-          name: "Gander",
-          type: "buzz.goose/goose",
-          owner: "a".repeat(64),
-          config: DEFAULT_CONFIG,
-        } as Agent<Config>
-      }
-      conversation={{ channelId: "chan", rootId: "1".repeat(64) }}
-      initialTranscript={{ opening: 1, done }}
-    />,
-  );
-  expect(await screen.findByText("Hi from goose")).toBeInTheDocument();
-  expect(done).toHaveBeenCalledTimes(1);
-});
-
-it("says it is reading goose's sessions until the list arrives", async () => {
-  const fake = fakeSpawn({ home: "/home/test" });
-  const history = new GooseHistory(fake);
-  let release: (rows: never[]) => void = () => {};
-  const recent = vi
-    .spyOn(history, "recent")
-    .mockReturnValue(new Promise((resolve) => (release = resolve)));
-  const none: never[] = [];
-  const runtime = {
-    subscribe: () => () => {},
-    sessions: () => none,
+    ...world.runtime,
   } as unknown as GooseRuntime;
   const { ActivityTab } = createTabs({
     setup: new GooseSetup(fake),
     runtime,
     history,
   });
-  render(
+  const rendered = render(
     <ActivityTab
       agent={
         {
-          key: "c".repeat(64),
-          pubkey: "c".repeat(64),
+          key: GANDER,
+          pubkey: GANDER,
           name: "Gander",
           type: "buzz.goose/goose",
           owner: "a".repeat(64),
-          config: DEFAULT_CONFIG,
+          config: { ...DEFAULT_CONFIG, scope: world.scope ?? "thread" },
         } as Agent<Config>
       }
+      {...props}
     />,
   );
-  try {
-    await waitFor(() => expect(recent).toHaveBeenCalled());
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Reading goose's sessions…",
-    );
-  } finally {
-    release([]);
-  }
+  return {
+    ...rendered,
+    change(next: Partial<World>) {
+      Object.assign(world, next);
+      live = [...(world.live ?? [])];
+      act(() => {
+        for (const listener of listeners) listener();
+      });
+    },
+  };
+}
+
+const searches = (fake: ReturnType<typeof fakeSpawn>) =>
+  fake.geese
+    .flatMap((goose) => goose.received)
+    .filter((message) => message.method === "session/list");
+/** goose's keyword searches, which read every session's messages. */
+const keyword = (fake: ReturnType<typeof fakeSpawn>) =>
+  searches(fake).filter(
+    (message) =>
+      (message.params as { _meta?: { query?: string } })._meta?.query,
+  );
+
+it("lists the agent's saved conversations and reads one's transcript by id, without searching goose", async () => {
+  const fake = gooseHistory();
+  activity(fake, { saved: [{ key: `chan/${ROOT}`, at: 1, sessions: ["s1"] }] });
+  const user = userEvent.setup();
+  await user.click(
+    screen.getByRole("button", {
+      name: "View transcript: chan · thread 11111111",
+    }),
+  );
   expect(
-    await screen.findByText(/^None\. A conversation's session starts/),
+    await screen.findByText("Hi from goose", { selector: "summary span" }),
   ).toBeInTheDocument();
-  expect(screen.queryByText("Reading goose's sessions…")).toBeNull();
+  expect(screen.getAllByText(/@Gander what's up\?/).length).toBeGreaterThan(0);
+  expect(searches(fake)).toEqual([]);
+});
+
+it("searches goose's history for a conversation with no saved session only when asked", async () => {
+  const fake = gooseHistory();
+  const done = vi.fn();
+  activity(fake, { saved: [] }, undefined, {
+    conversation: { channelId: "chan", rootId: ROOT },
+    initialTranscript: { opening: 1, done },
+  });
+  const search = await screen.findByRole("button", {
+    name: "Search older sessions",
+  });
+  expect(done).toHaveBeenCalledTimes(1);
+  expect(searches(fake)).toEqual([]);
+  await userEvent.setup().click(search);
+  expect(
+    await screen.findByText("Hi from goose", { selector: "summary span" }),
+  ).toBeInTheDocument();
+  expect(searches(fake)).toHaveLength(1);
+});
+
+it("cancels reading goose's history when Activity is left", async () => {
+  const fake = gooseHistory();
+  const history = new GooseHistory(fake);
+  let signal: AbortSignal | undefined;
+  const transcript = vi
+    .spyOn(history, "transcript")
+    .mockImplementation((_, given) => {
+      signal = given;
+      return new Promise(() => {});
+    });
+  const { unmount } = activity(
+    fake,
+    { saved: [{ key: `chan/${ROOT}`, at: 1, sessions: ["s1"] }] },
+    history,
+  );
+  await userEvent.setup().click(
+    screen.getByRole("button", {
+      name: "View transcript: chan · thread 11111111",
+    }),
+  );
+  await waitFor(() => expect(transcript).toHaveBeenCalled());
+  expect(signal?.aborted).toBe(false);
+  unmount();
+  expect(signal?.aborted).toBe(true);
+});
+
+it("lists conversations by channel name, with running and standalone sessions, one row each", async () => {
+  const fake = gooseHistory(["s1", "timer"]);
+  const old = (key: string, at: number) => ({ key, at, sessions: [] });
+  const world: World = {
+    saved: [old("a", 3), old("b", 2), old("c", 1)],
+    live: [{ key: "running", busy: true, sessionId: "live", at: 4 }],
+    ids: [
+      // Started for a conversation: never a standalone row.
+      { id: "s1", at: 1, title: "Gander · #b", conversation: "b" },
+      { id: "timer", at: 1, title: "Gander · timer/t" },
+      // Kept before where a session started was: never a standalone row.
+      "live",
+    ],
+    names: { a: "general" },
+  };
+  activity(fake, world);
+  const items = () =>
+    screen.getAllByRole("listitem").map((item) => item.textContent);
+  await waitFor(() => expect(items()).toHaveLength(5));
+  expect(screen.getByText("general · channel")).toBeInTheDocument();
+  expect(screen.getByText("running · channel")).toBeInTheDocument();
+  await userEvent
+    .setup()
+    .click(screen.getByRole("button", { name: "View transcript: timer/t" }));
+  expect(
+    await screen.findByText("Hi from timer", { selector: "summary span" }),
+  ).toBeInTheDocument();
+  expect(keyword(fake)).toEqual([]);
+});
+
+it("lists a conversation with more than ten sessions once", () => {
+  const ids = Array.from({ length: 12 }, (_, i) => `s${i}`);
+  activity(gooseHistory(), {
+    saved: [{ key: "chan", at: 20, sessions: ids.slice(0, 10) }],
+    ids: [
+      ...ids.slice(10).map((id, at) => ({
+        id,
+        at,
+        title: "Gander · #chan",
+        conversation: "chan",
+      })),
+      "legacy",
+    ],
+  });
+  expect(
+    screen
+      .getAllByRole("listitem")
+      .map((item) =>
+        within(item).getByRole("button").getAttribute("aria-label"),
+      ),
+  ).toEqual(["View transcript: chan · channel"]);
+});
+it("follows the open conversation's newest session on Refresh", async () => {
+  const fake = gooseHistory(["s1", "s2"]);
+  const world: World = {
+    saved: [{ key: `chan/${ROOT}`, at: 1, sessions: ["s1"] }],
+  };
+  const { change } = activity(fake, world);
+  const user = userEvent.setup();
+  await user.click(
+    screen.getByRole("button", {
+      name: "View transcript: chan · thread 11111111",
+    }),
+  );
+  expect(
+    await screen.findByText("Hi from goose", { selector: "summary span" }),
+  ).toBeInTheDocument();
+  change({ saved: [{ key: `chan/${ROOT}`, at: 2, sessions: ["s2", "s1"] }] });
+  expect(
+    await screen.findByText("Hi from s2", { selector: "summary span" }),
+  ).toBeInTheDocument();
+  expect(searches(fake)).toEqual([]);
+});
+
+it("finds a thread's conversation in its channel's saved session", async () => {
+  const fake = gooseHistory();
+  activity(
+    fake,
+    { saved: [{ key: "chan", at: 1, sessions: ["s1"] }] },
+    undefined,
+    {
+      conversation: { channelId: "chan", rootId: ROOT },
+      initialTranscript: { opening: 1, done: vi.fn() },
+    },
+  );
+  expect(
+    await screen.findByText("Hi from goose", { selector: "summary span" }),
+  ).toBeInTheDocument();
+  expect(searches(fake)).toEqual([]);
+});
+
+it("opens a channel-scoped agent's channel from a thread, following its first save", async () => {
+  const fake = gooseHistory();
+  const { change } = activity(
+    fake,
+    { saved: [], scope: "channel" },
+    undefined,
+    {
+      conversation: { channelId: "chan", rootId: ROOT },
+      initialTranscript: { opening: 1, done: vi.fn() },
+    },
+  );
+  expect(
+    await screen.findByText(/Buzz saved no goose session/),
+  ).toBeInTheDocument();
+  change({ saved: [{ key: "chan", at: 1, sessions: ["s1"] }] });
+  expect(
+    await screen.findByText("Hi from goose", { selector: "summary span" }),
+  ).toBeInTheDocument();
+  expect(searches(fake)).toEqual([]);
+});
+
+it("searches a thread-scoped agent's thread past an empty saved channel record", async () => {
+  const fake = gooseHistory();
+  activity(fake, { saved: [{ key: "chan", at: 1, sessions: [] }] }, undefined, {
+    conversation: { channelId: "chan", rootId: ROOT },
+    initialTranscript: { opening: 1, done: vi.fn() },
+  });
+  await userEvent
+    .setup()
+    .click(
+      await screen.findByRole("button", { name: "Search older sessions" }),
+    );
+  expect(
+    await screen.findByText("Hi from goose", { selector: "summary span" }),
+  ).toBeInTheDocument();
+});
+
+it("keeps a standalone run listed past a full page of saved conversations", () => {
+  activity(gooseHistory(), {
+    saved: Array.from({ length: 30 }, (_, at) => ({
+      key: `chan${at}`,
+      at,
+      sessions: [`c${at}`],
+    })),
+    ids: [{ id: "timer1", at: 0, title: "Gander · timer/nightly" }],
+  });
+  expect(
+    screen.getByRole("button", { name: "View transcript: timer/nightly" }),
+  ).toBeInTheDocument();
+});
+
+it("lists the opened conversation's channel first, then every session newest first", () => {
+  activity(
+    gooseHistory(),
+    {
+      saved: [
+        { key: "a", at: 4, sessions: ["a1"] },
+        { key: "here/t1", at: 1, sessions: ["h1"] },
+        { key: "b", at: 2, sessions: ["b1"] },
+      ],
+      ids: [
+        { id: "x", at: 3, title: "Gander · timer/x" },
+        { id: "y", at: 5, title: "Gander · timer/y" },
+      ],
+      names: { a: "a", b: "b", here: "here" },
+    },
+    undefined,
+    { conversation: { channelId: "here", rootId: "t2" } },
+  );
+  expect(
+    screen
+      .getAllByRole("listitem")
+      .map((item) =>
+        within(item).getByRole("button").getAttribute("aria-label"),
+      ),
+  ).toEqual([
+    "View transcript: here · thread t1",
+    "View transcript: timer/y",
+    "View transcript: a · channel",
+    "View transcript: timer/x",
+    "View transcript: b · channel",
+  ]);
+});
+
+it("says when goose no longer has a conversation's saved sessions", async () => {
+  const fake = gooseHistory([]);
+  activity(fake, { saved: [{ key: "chan", at: 1, sessions: ["gone"] }] });
+  await userEvent
+    .setup()
+    .click(
+      screen.getByRole("button", { name: "View transcript: chan · channel" }),
+    );
+  expect(
+    await screen.findByText(/goose no longer has the sessions Buzz saved/),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Search older sessions" }),
+  ).toBeInTheDocument();
 });
 
 it("edits Goose device defaults without creating an agent override", async () => {
@@ -1348,5 +1666,104 @@ it.each([false, true])(
       await screen.findByRole("menuitem", { name: "OpenAI" }),
     ).toBeVisible();
     expect(screen.queryByRole("menuitem", { name: "Claude" })).toBeNull();
+  },
+);
+
+it("shows the good saved records when others are damaged", () => {
+  const data = new Map<string, string>([
+    [
+      "buzz.goose.sessions.v1",
+      JSON.stringify({
+        [GANDER]: {
+          chan: { at: 2, sessions: ["s1", 7, "s1"] },
+          broken: { at: 3, sessions: { not: "a list" } },
+          nulled: null,
+          stringy: { at: 4, sessions: "s9" },
+          other: { at: "soon" },
+          far: { at: 1e20, sessions: ["s8"] },
+        },
+      }),
+    ],
+  ]);
+  const storage = {
+    getItem: (key: string) => data.get(key) ?? null,
+    setItem: (key: string, value: string) => void data.set(key, value),
+  } as Storage;
+  const items = new Map<string, string>([
+    [
+      `${PROMPTS_PREFIX}goose:${GANDER}`,
+      JSON.stringify({
+        version: 1,
+        texts: [],
+        sessions: [
+          [
+            "timer1",
+            [],
+            { at: 5, title: "Gander · timer/nightly", conversation: null },
+          ],
+          ["bad", [], { at: 6, title: 42 }],
+          [
+            "far",
+            [],
+            { at: 1e20, title: "Gander · timer/far", conversation: null },
+          ],
+          [null, []],
+          "junk",
+        ],
+      }),
+    ],
+  ]);
+  const prompts = sessionPrompts(
+    localStore({
+      get length() {
+        return items.size;
+      },
+      key: (index: number) => [...items.keys()][index] ?? null,
+      getItem: (key: string) => items.get(key) ?? null,
+      setItem: (key: string, value: string) => void items.set(key, value),
+      removeItem: (key: string) => void items.delete(key),
+      clear: () => items.clear(),
+    }),
+    "goose",
+    GANDER,
+  );
+  activity(gooseHistory(), {
+    saved: [],
+    runtime: {
+      conversations: () =>
+        localSessions(storage, GANDER)
+          .list()
+          .map(([key, { at, sessions = [] }]) => ({ key, at, sessions })),
+      prompts: () => prompts,
+    },
+  });
+  expect(
+    screen
+      .getAllByRole("listitem")
+      .map((item) =>
+        within(item).getByRole("button").getAttribute("aria-label"),
+      ),
+  ).toEqual([
+    "View transcript: timer/nightly",
+    "View transcript: chan · channel",
+  ]);
+});
+
+it.each([
+  [{ providerId: "", modelId: "" }, false],
+  [{ providerId: "databricks", modelId: "" }, false],
+  [{ providerId: "", modelId: "goose-claude" }, false],
+  [{ providerId: "databricks", modelId: "goose-claude" }, true],
+] as const)(
+  "reports Goose connection readiness from resolved defaults %j",
+  async (defaults, expected) => {
+    const onReadyChange = vi.fn();
+    const { setup } = created({ defaults, onReadyChange });
+    await act(async () => {
+      await setup.providers();
+    });
+    await waitFor(() =>
+      expect(onReadyChange).toHaveBeenLastCalledWith(expected),
+    );
   },
 );

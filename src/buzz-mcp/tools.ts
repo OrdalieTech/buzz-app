@@ -1,8 +1,10 @@
+import { messageAuthor } from "../features/relay/fold";
 // The Buzz tools: what an agent does in Buzz, in the wire formats the `buzz`
 // CLI writes. Names, arguments and descriptions are kept short because every
 // session pays for them in context. Each tool answers in plain text.
 import { decode, npubEncode } from "nostr-tools/nip19";
 import buzzHelp from "../../docs/buzz-help.md?raw";
+import { CANVAS_HISTORY_PAGE } from "../features/channel-templates/canvas-limits";
 import {
   canonicalDetailsName,
   detailsDraftErrors,
@@ -27,8 +29,17 @@ import {
   referencedEmoji,
 } from "../features/relay/emoji";
 import { newer } from "../features/relay/events";
-import { CANVAS_BYTES } from "../features/channel-templates/model";
+import {
+  VERIFIED_PROFILE_BATCH,
+  type VerifiedProfile,
+  verifiedProfile,
+  verifiedProfileFilter,
+  verifiedProfileSubject,
+} from "../features/relay/verified-profile";
+import { imageType } from "../features/relay/attachment-limits";
+import { LIVE_CANVAS_BYTES } from "../features/channel-templates/model";
 import { threadReference } from "../features/relay/thread-reference";
+import { parseBuzzLink } from "../features/navigation/buzz-links";
 import { soloChannelMetadata } from "../features/relay/discovery";
 import { channelLabelTags } from "../features/relay/channel-labels";
 import { SOLO_LABEL, SOLO_NAMED_LABEL } from "../features/solo/labels";
@@ -97,6 +108,11 @@ export async function captureToolBody(
   name: string,
   args: Record<string, unknown>,
 ) {
+  if (
+    (name === "agent_create" || name === "agent_update") &&
+    text(args.picture)
+  )
+    throw new Error("Protected picture uploads are not supported.");
   const message = name === "send" || name === "reply_in_subthread";
   if (
     !message &&
@@ -130,15 +146,31 @@ export const TOOLS: readonly Tool[] = [
   ),
   tool(
     "agent_create",
-    "Submit an unsaved agent-creation draft for your owner to review. Nothing is created until they save it. Use a type key from agent_types.",
-    { type: str, name: str },
+    "Submit an unsaved agent-creation draft for your owner to review. Nothing is created until they save it. Use a type key from agent_types; instructions are optional; picture is a local image file for its avatar.",
+    { type: str, name: str, instructions: str, picture: str },
     ["type", "name"],
   ),
   tool(
     "agent_update",
-    "Submit an unsaved draft of changes to one of your owner's agents for them to review. agent is its pubkey or exact name; type is a key from agent_types. Nothing changes until they save it.",
-    { agent: str, name: str, type: str, instructions: str },
+    "Submit an unsaved draft of changes to one of your owner's agents, yourself included, for them to review. agent is its pubkey or exact name; type is a key from agent_types; picture is a local image file for its avatar. Nothing changes until they save it.",
+    { agent: str, name: str, type: str, instructions: str, picture: str },
     ["agent"],
+  ),
+  tool(
+    "agent_read",
+    "Read one of your owner's agents here, yourself included: name, type, instructions, whether they sync and their current revision; a hosted agent or one on another device says its config is unavailable when it can't be read here. agent is its pubkey or exact name; without it, lists them all.",
+    { agent: str },
+  ),
+  tool(
+    "team_read",
+    "Read one of your owner's teams here: name, instructions, members, whether it syncs and its current revision. team is its id or exact name; without it, lists them all.",
+    { team: str },
+  ),
+  tool(
+    "team_update",
+    "Submit an unsaved draft of a new name or instructions for one of your owner's teams, for them to review. team is its id or exact name. Members never change this way. Nothing changes until they save it.",
+    { team: str, name: str, instructions: str },
+    ["team"],
   ),
   tool(
     "send",
@@ -195,6 +227,10 @@ export const TOOLS: readonly Tool[] = [
     {
       channel: str,
       thread: str,
+      message_url: {
+        type: "string",
+        description: "Buzz message link; replaces channel and thread.",
+      },
       q: str,
       author: {
         type: "string",
@@ -326,11 +362,15 @@ export const TOOLS: readonly Tool[] = [
   ),
   tool("notes_rm", "Delete your note.", { name: str }, ["name"]),
   tool("canvas_get", "Read a channel's canvas.", { channel: str }),
-  tool("canvas_set", "Replace a channel's canvas.", {
-    channel: str,
-    content: str,
-    path: str,
-  }),
+  tool(
+    "canvas_set",
+    `Replace a channel's canvas (at most ${LIVE_CANVAS_BYTES / 1024} KiB).`,
+    {
+      channel: str,
+      content: str,
+      path: str,
+    },
+  ),
   tool(
     "canvas_history",
     "A channel's canvas revisions, newest first: each one's id, time, author, size and first line. The first page starts with the canvas's version.",
@@ -379,12 +419,10 @@ export const TOOLS: readonly Tool[] = [
 ];
 
 /** Message kinds as the CLI reads them. */
-const MESSAGES = [9, 40002, 40008, 45001, 45003];
-const THREAD = [9, 40002, 40008, 45003];
-const SEARCH = [9, 40002, 45001, 45003];
-const HEX = /^[0-9a-f]{64}$/;
-/** Canvas revisions per history page, as the app shows them. */
-const CANVAS_PAGE = 25;
+export const MESSAGES = [9, 40002, 40008, 45001, 45003];
+export const THREAD = [9, 40002, 40008, 45003];
+export const SEARCH = [9, 40002, 45001, 45003];
+export const HEX = /^[0-9a-f]{64}$/;
 /** A NIP-23 long-form note, as `buzz notes` writes it. */
 const NOTE = 30023;
 /** A repository name the community accepts. */
@@ -449,7 +487,16 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     const type = text(args.type)?.trim();
     const name = text(args.name)?.trim();
     if (!type || !name) throw new Error("type and name are required");
-    return JSON.stringify(await client.createAgent({ type, name }));
+    const instructions = text(args.instructions);
+    const picture = proposedPicture(client, args.picture);
+    return JSON.stringify(
+      await client.createAgent({
+        type,
+        name,
+        ...(instructions && { instructions }),
+        ...(picture && { picture }),
+      }),
+    );
   },
   async self_handoff(tools, args) {
     const { client, context } = tools;
@@ -498,11 +545,39 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     const type = text(args.type);
     // Empty instructions propose clearing them.
     const { instructions } = args;
+    const picture = proposedPicture(client, args.picture);
     return JSON.stringify(
       await client.updateAgent({
         agent,
         ...(name && { name }),
         ...(type && { type }),
+        ...(typeof instructions === "string" && { instructions }),
+        ...(picture && { picture }),
+      }),
+    );
+  },
+  async agent_read({ client }, args) {
+    if (!client.readAgents)
+      throw new Error("Agent reads are unavailable on this host");
+    return JSON.stringify(await client.readAgents(text(args.agent)));
+  },
+  async team_read({ client }, args) {
+    if (!client.readTeams)
+      throw new Error("Team reads are unavailable on this host");
+    return JSON.stringify(await client.readTeams(text(args.team)));
+  },
+  async team_update({ client }, args) {
+    if (!client.updateTeam)
+      throw new Error("Team changes are unavailable on this host");
+    const team = text(args.team);
+    if (!team) throw new Error("team is required");
+    const name = text(args.name);
+    // Empty instructions propose clearing them.
+    const { instructions } = args;
+    return JSON.stringify(
+      await client.updateTeam({
+        team,
+        ...(name && { name }),
         ...(typeof instructions === "string" && { instructions }),
       }),
     );
@@ -603,7 +678,21 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     const id = required(args, "id");
     const emoji = required(args, "emoji");
     if (args.off !== true) {
-      await client.publish({ kind: 7, content: emoji, tags: [["e", id]] });
+      const target = await tools.event(id);
+      await client.publish({
+        kind: 7,
+        content: emoji,
+        tags: [
+          ["e", id],
+          [
+            "p",
+            messageAuthor(
+              { ...target, tags: target.tags.map((tag) => [...tag]) },
+              client.signingAuthority,
+            ),
+          ],
+        ],
+      });
       return "reacted";
     }
     const mine = await client.query([
@@ -617,6 +706,19 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
 
   async read(tools, args) {
     const { client, context } = tools;
+    if (args.message_url !== undefined) {
+      if (args.channel !== undefined || args.thread !== undefined)
+        throw new Error(
+          "message_url cannot be combined with channel or thread.",
+        );
+      const link =
+        typeof args.message_url === "string"
+          ? parseBuzzLink(args.message_url)
+          : null;
+      if (link?.format !== "legacy" || !link.messageId)
+        throw new Error("message_url must be a Buzz message link.");
+      args = { ...args, channel: link.channelId, thread: link.messageId };
+    }
     const limit = typeof args.limit === "number" ? args.limit : undefined;
     const before = unixTime(args, "before");
     const since = unixTime(args, "since");
@@ -802,6 +904,7 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
                 tag(event, "t") === "stream" ? "" : tag(event, "t"),
                 has(event, "private") ? "private" : "",
                 has(event, "archived") ? "archived" : "",
+                has(event, "auto_join") ? "auto-join" : "",
                 ids.has(id)
                   ? ""
                   : membershipsComplete
@@ -1229,6 +1332,10 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     const channel = text(args.channel) ?? context.channel;
     if (!channel) throw new Error("channel is required here.");
     const content = (await tools.body(args, true, "content")) as string;
+    if (new TextEncoder().encode(content).length > LIVE_CANVAS_BYTES)
+      throw new Error(
+        `The canvas is over its limit of ${LIVE_CANVAS_BYTES} bytes.`,
+      );
     const head = await canvas(tools, channel);
     // The newest canvas wins, so a write must be dated after the current one.
     const after = head ? (head.created_at + 1) * 1000 : 0;
@@ -1257,7 +1364,7 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
       {
         kinds: [40100],
         "#h": [channel],
-        limit: CANVAS_PAGE,
+        limit: CANVAS_HISTORY_PAGE,
         ...(before === undefined
           ? { consistency: "strong" as const }
           : { until: before }),
@@ -1275,7 +1382,7 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
       return `${row.id} ${time(row.created_at)} ${row.pubkey} ${bytes}B ${first.slice(0, 80)}`;
     });
     const last = rows.at(-1);
-    if (last && rows.length >= CANVAS_PAGE)
+    if (last && rows.length >= CANVAS_HISTORY_PAGE)
       lines.push(
         `Older revisions may remain; continue with ${JSON.stringify({ channel, before: last.created_at, before_id: last.id })}`,
       );
@@ -1305,9 +1412,9 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
       throw new Error(
         `No canvas revision ${id} in ${channel}; canvas_history lists them.`,
       );
-    if (new TextEncoder().encode(revision.content).length > CANVAS_BYTES)
+    if (new TextEncoder().encode(revision.content).length > LIVE_CANVAS_BYTES)
       throw new Error(
-        `Revision ${id} is over the canvas limit of ${CANVAS_BYTES} bytes, so it cannot be restored.`,
+        `Revision ${id} is over the canvas limit of ${LIVE_CANVAS_BYTES} bytes, so it cannot be restored.`,
       );
     const current = await head();
     // Guard the version the agent saw, never one that replaced it since.
@@ -1584,6 +1691,7 @@ class Tools {
       soloChannelMetadata(metadata as RelayEvent) ? "solo" : "",
       has(metadata, "private") ? "private" : "open",
       has(metadata, "archived") ? "archived" : "",
+      has(metadata, "auto_join") ? "auto-join" : "",
       tag(metadata, "ttl")
         ? `archives after ${tag(metadata, "ttl")}s idle`
         : "",
@@ -1908,6 +2016,76 @@ class Tools {
     return names;
   }
 
+  /** Every name `send` accepts after `@` for each of `pubkeys`, with its
+   * weight: lower wins when people share a name. A relay-verified name
+   * outranks a name someone gave their own profile, so a profile cannot take
+   * a verified person's name. */
+  async aliases(pubkeys: readonly string[]) {
+    const wanted = [...new Set(pubkeys)];
+    const aliases = new Map<string, Map<string, number>>();
+    const add = (pubkey: string, name: unknown, weight: number) => {
+      if (typeof name !== "string" || !name.trim()) return;
+      const lower = name.trim().toLowerCase();
+      const names = aliases.get(lower) ?? new Map<string, number>();
+      names.set(pubkey, Math.min(names.get(pubkey) ?? weight, weight));
+      aliases.set(lower, names);
+    };
+    if (!wanted.length) return aliases;
+    const profiles = await this.client.query([
+      { kinds: [0], authors: wanted, limit: wanted.length },
+    ]);
+    for (const event of newest(profiles)) {
+      const profile = parse(event.content);
+      add(event.pubkey, profile.display_name, NAME_WEIGHT.displayName);
+      add(event.pubkey, profile.name, NAME_WEIGHT.name);
+    }
+    for (const [pubkey, verified] of await this.verifiedNames(wanted)) {
+      add(pubkey, verified.displayName, NAME_WEIGHT.verifiedDisplayName);
+      add(pubkey, verified.username, NAME_WEIGHT.verifiedUsername);
+      add(pubkey, verified.fullName, NAME_WEIGHT.verifiedFullName);
+    }
+    return aliases;
+  }
+
+  /** The relay's verified names (kind 30382) for `pubkeys`, read as the app
+   * reads them, so `send` and the app agree on who is verified. None without
+   * the connection's relay key. */
+  async verifiedNames(pubkeys: readonly string[]) {
+    const names = new Map<string, VerifiedProfile>();
+    const relay = this.client.relayAuthor;
+    if (!relay || !HEX_KEY.test(relay)) return names;
+    const authority = { pubkey: relay, multipleIssuers: false };
+    const subjects = [...new Set(pubkeys)].filter((key) => HEX_KEY.test(key));
+    const batches: string[][] = [];
+    for (let at = 0; at < subjects.length; at += VERIFIED_PROFILE_BATCH)
+      batches.push(subjects.slice(at, at + VERIFIED_PROFILE_BATCH));
+    const found = (
+      await Promise.all(
+        batches.map((batch) =>
+          this.client
+            .query([verifiedProfileFilter(relay, batch)])
+            .catch(() => []),
+        ),
+      )
+    ).flat();
+    // The newest event at each address decides; a newer malformed or
+    // retracted one leaves the person unverified, as in the app.
+    const latest = new Map<string, RelayEvent>();
+    for (const item of found) {
+      // Queries admit the events whose signatures they checked; the app's
+      // projection takes only those.
+      const event = item as unknown as RelayEvent;
+      const subject = verifiedProfileSubject(event, authority);
+      if (!subject || !subjects.includes(subject)) continue;
+      latest.set(subject, newer(latest.get(subject), event));
+    }
+    for (const [subject, event] of latest) {
+      const verified = verifiedProfile(event, authority, true);
+      if (verified) names.set(subject, verified);
+    }
+    return names;
+  }
+
   /** Messages oldest first with their latest edits, a line each: its ID,
    * author and its claimed (unverified) agent owner, channel and thread,
    * omitting what `scope` names. Other agent read surfaces trim the same
@@ -1924,27 +2102,9 @@ class Tools {
       : [];
     const messages = edited([...events, ...edits]);
     const names = await this.names(messages.map((event) => event.pubkey));
-    return messages.map((event) => {
-      const name = names.get(event.pubkey);
-      const channel = tag(event, "h");
-      const owner = tag(event, "auth");
-      const reference = threadReference(event);
-      const thread = reference?.rootId;
-      return [
-        event.id,
-        `from ${event.pubkey}`,
-        name && JSON.stringify(name),
-        owner && `claimed owner ${owner}`,
-        channel && channel !== scope.channel && `in ${channel}`,
-        thread && thread !== scope.root && `re ${thread}`,
-        reference &&
-          reference.parentId !== thread &&
-          `reply_to ${reference.parentId}`,
-        `at ${time(event.created_at)}: ${event.content}`,
-      ]
-        .filter(Boolean)
-        .join(" ");
-    });
+    return messages.map((event) =>
+      messageLine(event, names.get(event.pubkey), scope),
+    );
   }
 
   /** NIP-30 tags for the community emoji `content` uses, as the composer
@@ -1975,13 +2135,7 @@ class Tools {
     if (!prose.includes("@") && !keys.size) return [];
     const members = await this.members(channel);
     if (prose.includes("@")) {
-      const byName = new Map<string, string[]>();
-      for (const [key, name] of await this.names(
-        members.map((member) => member.pubkey),
-      )) {
-        const lower = name.toLowerCase();
-        byName.set(lower, [...(byName.get(lower) ?? []), key]);
-      }
+      const byName = await this.aliases(members.map((member) => member.pubkey));
       const longest = [...byName.keys()].sort((a, b) => b.length - a.length);
       const unknown: string[] = [];
       for (const match of prose.matchAll(/(^|\s)@/g)) {
@@ -1993,7 +2147,7 @@ class Tools {
             rest.startsWith(candidate) &&
             /^($|[\s,;.!?:)\]}])/.test(rest.slice(candidate.length)),
         );
-        const found = name ? (byName.get(name) ?? []) : [];
+        const found = name ? bestNamed(byName.get(name)) : [];
         if (found.length === 1) keys.add(found[0] as string);
         else {
           const token = name ?? rest.match(/^[a-z0-9._-]+/)?.[0];
@@ -2033,8 +2187,34 @@ class Tools {
   }
 }
 
+/** A message's line in a read, omitting what `scope` names. */
+export function messageLine(
+  event: BuzzEvent,
+  name: string | undefined,
+  scope: Readonly<{ channel?: string; root?: string }>,
+) {
+  const channel = tag(event, "h");
+  const owner = tag(event, "auth");
+  const reference = threadReference(event);
+  const thread = reference?.rootId;
+  return [
+    event.id,
+    `from ${event.pubkey}`,
+    name && JSON.stringify(name),
+    owner && `claimed owner ${owner}`,
+    channel && channel !== scope.channel && `in ${channel}`,
+    thread && thread !== scope.root && `re ${thread}`,
+    reference &&
+      reference.parentId !== thread &&
+      `reply_to ${reference.parentId}`,
+    `at ${time(event.created_at)}: ${event.content}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 /** The root of the thread `event` is in, by its NIP-10 markers. */
-function rootOf(event: BuzzEvent) {
+export function rootOf(event: BuzzEvent) {
   const tags = event.tags.filter(
     (t) => t[0] === "e" && t.length >= 4 && HEX.test(t[1] ?? ""),
   );
@@ -2043,23 +2223,39 @@ function rootOf(event: BuzzEvent) {
   return ((root && reply ? root : reply)?.[1] ?? event.id) as string;
 }
 
-/** Messages oldest first, each showing its author's latest edit. */
-function edited(events: readonly BuzzEvent[]) {
+/** Messages oldest first, each showing its latest eligible edit: its
+ * author's, or in its channel its verified owner's (`ownerOf`), as the app
+ * folds a chat message or forum post. */
+export function edited(
+  events: readonly BuzzEvent[],
+  ownerOf?: (author: string) => string | undefined,
+) {
+  const messages = events.filter((event) => event.kind !== 40003);
+  const byId = new Map(messages.map((event) => [event.id, event]));
+  const eligible = (edit: BuzzEvent, message: BuzzEvent) =>
+    edit.pubkey === message.pubkey ||
+    ([9, 40002].includes(message.kind) &&
+      tag(edit, "h") === tag(message, "h") &&
+      edit.pubkey === ownerOf?.(message.pubkey));
   const edits = new Map<string, BuzzEvent>();
   for (const event of events)
     if (event.kind === 40003) {
       const target = tag(event, "e");
+      const message = target && byId.get(target);
       const last = target && edits.get(target);
-      if (target && (!last || last.created_at < event.created_at))
+      // Eligibility first, so an ineligible newer edit hides none.
+      if (
+        target &&
+        message &&
+        eligible(event, message) &&
+        (!last || last.created_at < event.created_at)
+      )
         edits.set(target, event);
     }
-  return events
-    .filter((event) => event.kind !== 40003)
+  return messages
     .map((event) => {
       const edit = edits.get(event.id);
-      return edit && edit.pubkey === event.pubkey
-        ? { ...event, content: edit.content }
-        : event;
+      return edit ? { ...event, content: edit.content } : event;
     })
     .sort((a, b) => a.created_at - b.created_at);
 }
@@ -2086,6 +2282,24 @@ function imeta(upload: Upload) {
       .filter((key) => upload[key] !== undefined)
       .map((key) => `${key} ${upload[key]}`),
   ];
+}
+
+/** A draft's picture: uploads the image at `path` as the agent once the
+ * draft is valid, giving its URL. */
+function proposedPicture(client: BuzzClient, path: unknown) {
+  const file = text(path)?.trim();
+  if (!file) return undefined;
+  const upload = client.uploadPicture?.bind(client);
+  if (!upload)
+    throw new Error("Picture proposals are unavailable on this host");
+  return async () => {
+    const data = await client.read(file);
+    // The preparer's own detector, so it never passes an image through.
+    const type = imageType(data);
+    if (!type)
+      throw new Error("picture must be a PNG, JPEG, GIF or WebP image");
+    return (await upload(data, type)).url;
+  };
 }
 
 /** An image or MP4's type, by the file's leading bytes. */
@@ -2207,13 +2421,35 @@ function latestNotes(events: readonly BuzzEvent[]) {
   return [...latest.values()].sort((a, b) => b.created_at - a.created_at);
 }
 
-function pubkey(value: string) {
+export function pubkey(value: string) {
   if (HEX.test(value.toLowerCase())) return value.toLowerCase();
   try {
     const decoded = decode(value);
     if (decoded.type === "npub") return decoded.data;
   } catch {}
   throw new Error(`Not a pubkey: ${value}`);
+}
+
+/** How strongly each kind of name claims a person for `@`: lower wins. A
+ * verified username comes first, and every name the relay verified outranks
+ * every name a person gave themselves. */
+const NAME_WEIGHT = {
+  verifiedUsername: 0,
+  verifiedDisplayName: 1,
+  verifiedFullName: 2,
+  displayName: 3,
+  name: 4,
+} as const;
+
+const HEX_KEY = /^[0-9a-f]{64}$/;
+
+/** Who a name tags: everyone holding it in its strongest form. */
+function bestNamed(holders: ReadonlyMap<string, number> | undefined) {
+  if (!holders?.size) return [];
+  const best = Math.min(...holders.values());
+  return [...holders]
+    .filter(([, weight]) => weight === best)
+    .map(([key]) => key);
 }
 
 const profileName = (profile: Record<string, unknown>) =>
@@ -2335,7 +2571,7 @@ async function start(tools: Tools, channel: string, name: string) {
   return created;
 }
 
-/** The repository's URL and a Git command with its header. */
+/** The repository's URL and a Git command with its headers, one per line. */
 async function access(
   gitAuth: NonNullable<BuzzClient["gitAuth"]>,
   event: BuzzEvent,
@@ -2343,8 +2579,11 @@ async function access(
   const { url, header } = await gitAuth(event.pubkey, tag(event, "d") ?? "");
   return [
     `${tag(event, "name") ?? tag(event, "d")}: ${url}`,
-    "For the next 60 seconds, pass this header to each git command (call again for a new one; never save it):",
-    `git -c http.${url}.extraHeader='${header}' clone ${url}`,
+    "For the next 60 seconds, pass these headers to each git command (call again for a new one; never save it):",
+    `git ${header
+      .split("\n")
+      .map((line) => `-c http.${url}.extraHeader='${line}' `)
+      .join("")}clone ${url}`,
   ].join("\n");
 }
 
@@ -2484,7 +2723,7 @@ function joinRoleArg(args: Args) {
 }
 
 /** A `since` or `before` argument: a Unix time in seconds, inclusive. */
-function unixTime(args: Args, key: string) {
+export function unixTime(args: Args, key: string) {
   const value = args[key];
   if (value === undefined) return undefined;
   // In milliseconds, a time from this century is past the year 5000.
@@ -2522,7 +2761,10 @@ function required(args: Args, name: string) {
     throw new Error(`${name} is required.`);
   return value;
 }
-const bound = (value: number | undefined, fallback: number, max: number) =>
-  Math.max(1, Math.min(max, Math.floor(value ?? fallback)));
-const time = (seconds: number) =>
+export const bound = (
+  value: number | undefined,
+  fallback: number,
+  max: number,
+) => Math.max(1, Math.min(max, Math.floor(value ?? fallback)));
+export const time = (seconds: number) =>
   `${new Date(seconds * 1000).toISOString().slice(0, 16)}Z`;

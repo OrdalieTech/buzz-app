@@ -10,7 +10,11 @@ import { unsupported } from "./unsupported.ts";
 const lib = readFileSync(
   new URL("../src-tauri/src/lib.rs", import.meta.url),
   "utf8",
-).replace(/#\[[^\]]*\]/g, "");
+)
+  // Its unit tests quote the macro.
+  .split(/\nmod tests \{/, 1)
+  .join("")
+  .replace(/#\[[^\]]*\]/g, "");
 const registered = new Set(
   [...lib.matchAll(/generate_handler!\[([^\]]*)\]/g)].flatMap(([, body]) =>
     (body ?? "")
@@ -62,13 +66,9 @@ test("keeps the upstream anchors the web build relies on", () => {
   expect(read("src/features/navigation/deep-links.ts")).toContain(
     'import.meta.env.VITE_BUZZ_BROWSER_HOST !== "1"',
   );
-  // web/onboarding.tsx replaces these imports, and email sign-in stays hidden.
+  // web/onboarding.tsx replaces these imports.
   const welcome = read("src/features/identity/Welcome.tsx");
-  for (const anchor of [
-    'from "./ConnectChoice"',
-    'from "./KeyImport"',
-    'hidden={import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"}',
-  ])
+  for (const anchor of ['from "./ConnectChoice"', 'from "./KeyImport"'])
     expect(welcome).toContain(anchor);
   // Relay media at the broker's proxy path, served by web/sw.ts.
   expect(read("src/features/messages/attachment-source.ts")).toContain(

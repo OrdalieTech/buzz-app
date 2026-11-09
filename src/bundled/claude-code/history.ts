@@ -97,6 +97,8 @@ const list = (spawn: Spawn, project: string, minutes?: number) =>
 
 const FIELD =
   /^([^/]+\.jsonl):(Session scope|Channel|Thread root|Agent): (.*)$/;
+/** The start or end of a prompt's thread context, which comes before its own. */
+const CONTEXT_TAG = /^([^/]+\.jsonl):<(\/?)(?:thread|conversation)-context>$/;
 
 /** Records where each of the session files at `paths` was started, one
  * search for every file: the search stops at a file's first prompt. Returns
@@ -119,7 +121,19 @@ async function search(
   const blamed = paths.filter((name) => errors.includes(`${name}:`));
   const unread = new Set(code === 2 ? (blamed.length ? blamed : paths) : []);
   const fields = new Map<string, Map<string, string>>();
+  const quoting = new Set<string>();
   for (const line of found) {
+    const [, tagged, end] = CONTEXT_TAG.exec(line) ?? [];
+    if (tagged) {
+      // The prompt opens with its thread context, so only a start before any
+      // other match is its own; its end clears the quoted messages' fields.
+      // Later tags are the Canvas's or a message's text.
+      if (!end && !fields.has(tagged)) {
+        fields.set(tagged, new Map());
+        quoting.add(tagged);
+      } else if (end && quoting.delete(tagged)) fields.get(tagged)?.clear();
+      continue;
+    }
     const [, name, field, value] = FIELD.exec(line) ?? [];
     if (!name || !field || value === undefined) continue;
     const named = fields.get(name) ?? new Map<string, string>();

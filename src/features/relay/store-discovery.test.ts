@@ -1405,6 +1405,136 @@ it("orders public matches by the shared ranks, best first", async () => {
   expect(h.pending).toHaveLength(0);
 });
 
+it("checks for any stream or forum in one capped read, skipping Solo chats", async () => {
+  const h = setup();
+  h.channels.ensureList();
+  await h.rosters(0);
+  await h.settled();
+  const id = (n: number) =>
+    `13200000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+  const solo = (n: number) =>
+    metadata(relay, id(n), `solo-${n}`, 1_700_000_000, [
+      ["t", "stream"],
+      ["t", "buzz.solo"],
+    ]);
+  const check = async (events: RelayEvent[]) => {
+    const answer = h.channels.anyChannel?.();
+    const request = await h.next(39000);
+    expect(request.filters).toEqual([
+      {
+        kinds: [39000],
+        authors: [relay.pubkey],
+        "#t": ["forum", "stream"],
+        limit: 20,
+      },
+    ]);
+    request.respond(events);
+    return answer;
+  };
+  // Nothing, or only the owner's Solo chats: a new community.
+  expect(await check([])).toBe(false);
+  expect(await check([solo(0)])).toBe(false);
+  // Any stream or forum, archived included, means it is not new.
+  expect(
+    await check([
+      solo(1),
+      metadata(relay, id(2), "old", 1_700_000_000, [
+        ["t", "stream"],
+        ["archived", "true"],
+      ]),
+    ]),
+  ).toBe(true);
+  // A full batch of Solo chats is not an empty community either.
+  expect(await check(Array.from({ length: 20 }, (_, n) => solo(10 + n)))).toBe(
+    true,
+  );
+  expect(h.pending).toHaveLength(0);
+});
+
+it("reads the open directory for browsing with descriptions, sharing the search read", async () => {
+  const h = setup();
+  h.channels.ensureList();
+  await h.rosters(0);
+  await h.settled();
+  const id = (n: number) =>
+    `13000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+  const page = [
+    metadata(relay, id(0), "design", 1_700_000_000, [
+      ["public"],
+      ["t", "stream"],
+      ["about", "Critiques and crits"],
+    ]),
+    metadata(relay, id(1), "ops", 1_700_000_000, [["public"], ["t", "stream"]]),
+  ];
+  // A caller that stops waiting leaves the read for the next one.
+  const gaveUp = new AbortController();
+  const abandoned = h.channels.readDirectory?.({ signal: gaveUp.signal });
+  assert.exists(abandoned);
+  const request = await h.next(39000);
+  gaveUp.abort();
+  await expect(abandoned).rejects.toThrow();
+  const done = h.channels.readDirectory?.();
+  // A search while it runs joins the same read.
+  const search = h.channels.searchPublic?.("zzz");
+  request.respond(page);
+  expect(await done).toEqual({ partial: false });
+  expect(await search).toEqual({ channels: [], partial: false });
+  expect(h.channels.openDirectory?.()).toEqual([
+    {
+      id: id(0),
+      name: "design",
+      description: "Critiques and crits",
+      channelType: "stream",
+    },
+    { id: id(1), name: "ops", channelType: "stream" },
+  ]);
+  // Within the reuse window, browsing again reads nothing.
+  expect(await h.channels.readDirectory?.()).toEqual({ partial: false });
+  expect(h.pending).toHaveLength(0);
+});
+
+it("shows a first directory read's pages to browsing only, and names them for references once it finishes", async () => {
+  const h = setup({ publicDirectoryPage: 2, maxPublicDirectory: 10 });
+  h.channels.ensureList();
+  await h.rosters(0);
+  await h.settled();
+  const id = (n: number) =>
+    `13100000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+  const open = (n: number, at: number) =>
+    metadata(relay, id(n), `open-${n}`, at, [["public"], ["t", "stream"]]);
+  const list = vi.fn();
+  const pages = vi.fn();
+  const offList = h.channels.subscribeList(list);
+  const offPages = h.channels.subscribeDirectory?.(pages);
+  try {
+    const done = h.channels.readDirectory?.();
+    (await h.next(39000)).respond([
+      open(0, 1_700_000_003),
+      open(1, 1_700_000_002),
+    ]);
+    await vi.waitFor(() => expect(pages).toHaveBeenCalledTimes(1));
+    // Browsing has the first page; references and the list hear nothing yet.
+    expect(h.channels.browseDirectory?.()).toEqual([
+      { id: id(0), name: "open-0", channelType: "stream" },
+      { id: id(1), name: "open-1", channelType: "stream" },
+    ]);
+    expect(h.channels.openDirectory?.()).toEqual([]);
+    expect(list).not.toHaveBeenCalled();
+    (await h.next(39000)).respond([open(2, 1_700_000_001)]);
+    expect(await done).toEqual({ partial: false });
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(pages).toHaveBeenCalledTimes(2);
+    const names = ["open-0", "open-1", "open-2"];
+    expect(h.channels.openDirectory?.().map(({ name }) => name)).toEqual(names);
+    expect(h.channels.browseDirectory?.().map(({ name }) => name)).toEqual(
+      names,
+    );
+  } finally {
+    offList();
+    offPages?.();
+  }
+});
+
 it("names the completed public directory's open channels for references, without reading", async () => {
   const h = setup();
   h.channels.ensureList();
@@ -1938,4 +2068,49 @@ it("finds a labeled system channel whose roster arrived before its metadata", as
   ]);
   names.respond([labeled]);
   expect(found.map((channel) => channel.id)).toEqual([id]);
+});
+
+it("counts members in small side-by-side reads, keeping each read's answers when another fails", async () => {
+  const h = setup();
+  h.channels.ensureList();
+  await h.rosters(0);
+  await h.settled();
+  const ids = Array.from(
+    { length: 12 },
+    (_, n) => `13200000-0000-4000-8000-${String(n).padStart(12, "0")}`,
+  );
+  const counted = h.channels.readMemberCounts?.(ids);
+  const first = await h.next(39002);
+  const second = await h.next(39002);
+  // Ten rosters at most per read, and the second doesn't wait for the first.
+  expect(first.filters[0]?.["#d"]).toEqual(ids.slice(0, 10));
+  expect(second.filters[0]?.["#d"]).toEqual(ids.slice(10));
+  second.fail(new Error("Relay response too large"));
+  first.respond([roster(relay, ids[0] ?? "", [viewer.pubkey, relay.pubkey])]);
+  const result = await counted;
+  expect(result?.counts).toEqual(new Map([[ids[0], 2]]));
+  expect(result?.failed).toEqual(ids.slice(10));
+  // The answered count is kept; only the failed ids read again.
+  const again = h.channels.readMemberCounts?.([ids[0] ?? "", ...ids.slice(10)]);
+  const retry = await h.next(39002);
+  expect(retry.filters[0]?.["#d"]).toEqual(ids.slice(10));
+  retry.respond([]);
+  expect((await again)?.counts).toEqual(new Map([[ids[0], 2]]));
+  expect(h.pending).toHaveLength(0);
+});
+
+it("accepts only a directory page size that divides its budget", () => {
+  for (const options of [
+    { publicDirectoryPage: 0 },
+    { publicDirectoryPage: 501 },
+    { publicDirectoryPage: 2.5 },
+    { publicDirectoryPage: 300, maxPublicDirectory: 1000 },
+  ])
+    expect(() => createRelaySession(null, options)).toThrow(
+      "Invalid public directory capacity",
+    );
+  createRelaySession(null, {
+    publicDirectoryPage: 10,
+    maxPublicDirectory: 20,
+  }).dispose();
 });

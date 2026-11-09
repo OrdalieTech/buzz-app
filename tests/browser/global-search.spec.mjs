@@ -255,7 +255,9 @@ test.describe("public search destination", () => {
       )
       .locator("[data-search-result]")
       .filter({ hasText: /^open/ });
-    await expect(result).toContainText("Public channel · not joined");
+    await expect(result).toContainText(
+      "Public channel · not joined · 3 members",
+    );
     await result.click();
     const composer = page.getByRole("textbox", {
       name: "Message #open",
@@ -451,12 +453,17 @@ test.describe("public search destination", () => {
       "Joining this channel is not allowed",
     );
     expect(await height()).toBeGreaterThan(before);
+    // The notice grows before ResizeObserver updates the spacer and end-follow.
+    await expect
+      .poll(async () => {
+        const [row, overlay] = await Promise.all([
+          last.boundingBox(),
+          notice.boundingBox(),
+        ]);
+        return row.y + row.height - (overlay.y - 20);
+      })
+      .toBeLessThanOrEqual(0);
     await expect.poll(fromEnd).toBeLessThan(1);
-    const [row, overlay] = await Promise.all([
-      last.boundingBox(),
-      notice.boundingBox(),
-    ]);
-    expect(row.y + row.height).toBeLessThanOrEqual(overlay.y - 20);
   });
 });
 
@@ -644,6 +651,39 @@ test.describe("message search operators", () => {
         ),
       )
       .toBe(true);
+    // `me`, a named channel and a month resolve in the same rendered flow.
+    await input.fill("crew-search from:me in:#open during:2023-11");
+    await expect(
+      page
+        .locator("[data-search-result]")
+        .filter({ hasText: /crew-search exact public reply/ }),
+    ).toBeVisible();
+    expect(
+      app.report.queries.find(
+        ({ filter }) =>
+          filter.search === "crew-search" &&
+          filter.since === Date.UTC(2023, 10, 1) / 1000,
+      )?.filter,
+    ).toMatchObject({
+      "#h": [app.openChannelId],
+      authors: [app.searchTarget.pubkey],
+      until: Date.UTC(2023, 11, 1) / 1000 - 1,
+    });
+    // Quoted operators are phrase text, sent whole as a full-text search.
+    const phrase = '"crew-search during:2023-11 from:me"';
+    await input.fill(phrase);
+    await expect
+      .poll(
+        () =>
+          app.report.queries.find(({ filter }) => filter.search === phrase)
+            ?.filter,
+      )
+      .toEqual({
+        kinds: [40002, 40008, 9],
+        search: phrase,
+        search_mode: "fulltext",
+        limit: 20,
+      });
   });
 });
 

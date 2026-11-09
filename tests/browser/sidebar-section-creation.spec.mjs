@@ -57,10 +57,13 @@ test("Channels offers empty-section creation with keyboard focus and confirmed p
         writerReads++;
         if (failWriterRead) {
           failWriterRead = false;
-          app.report.sidebarPreferenceFailures ??= [];
-          app.report.sidebarPreferenceFailures.push(route.request().url());
+          // Relay recovery retries a transient failure such as a 502 about a
+          // second later, which can remove Retry preferences while a slow
+          // click is still landing. A denial leaves the retry to the user.
+          app.report.relayFailures ??= [];
+          app.report.relayFailures.push(route.request().url());
           await route.fulfill({
-            status: 502,
+            status: 403,
             contentType: "application/json",
             body: JSON.stringify({ error: "Preference read unavailable" }),
           });
@@ -162,7 +165,7 @@ test("Channels offers empty-section creation with keyboard focus and confirmed p
   await expect(
     dialog.getByRole("button", { name: "Create", exact: true }),
   ).toBeDisabled();
-  await expect(dialog.getByRole("alert")).not.toContainText("502");
+  await expect(dialog.getByRole("alert")).not.toContainText("403");
   // Recover preferences without replaying creation, then Cancel/reopen.
   await dialog.getByRole("button", { name: "Retry preferences" }).click();
   await expect(field).toBeFocused();

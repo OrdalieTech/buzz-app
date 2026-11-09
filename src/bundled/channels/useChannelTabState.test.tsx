@@ -4,6 +4,14 @@ import { useEffect } from "react";
 import { afterEach, expect, test } from "vitest";
 import type { ChannelSummary } from "../../features/relay/contracts";
 import type { RelaySession } from "../../features/relay/session";
+import { createNavigationController } from "../../features/navigation/controller";
+import { createMemoryHistory } from "../../features/navigation/history";
+import {
+  claimProfileTranscript,
+  openProfileTranscript,
+  profileActivityViewTarget,
+  profileHistoryTarget,
+} from "../../features/profiles/target";
 import type {
   PanelOpening,
   RegisteredPanel,
@@ -14,6 +22,7 @@ import {
   rootOfTab,
   useChannelTabState,
 } from "./useChannelTabState";
+import type { ChannelDrawerOpening } from "./useChannelPanels";
 
 import {
   setThreadPlacementPreference,
@@ -128,7 +137,7 @@ test("closing and reopening settings starts a fresh view while hiding the pane r
   expect(mounted.result.current.settings?.id).not.toBe(opening?.id);
 });
 
-test("channel switches retire each visit's menu opening without copying retained tools", () => {
+test("channel switches keep each channel's menu opening and selection", () => {
   const session = {} as RelaySession;
   const menu = {
     key: "usage",
@@ -145,12 +154,7 @@ test("channel switches retire each visit's menu opening without copying retained
   const alphaUsage = entry("alpha", menu);
   const betaUsage = entry("beta", menu);
   const mounted = renderHook(
-    ({ channel }) => {
-      const state = useChannelTabState(session, channel);
-      // Same lifecycle as ChannelsPage: cleanup closes the departing visit.
-      useEffect(() => state.retireMenuEntries, [state.retireMenuEntries]);
-      return state;
-    },
+    ({ channel }) => useChannelTabState(session, channel),
     { initialProps: { channel: "alpha" } },
   );
   act(() => {
@@ -158,20 +162,17 @@ test("channel switches retire each visit's menu opening without copying retained
     mounted.result.current.select(panelTabId(alphaUsage));
   });
   mounted.rerender({ channel: "beta" });
+  expect(mounted.result.current.entries).toEqual([]);
   act(() => {
     mounted.result.current.setEntries([betaTool, betaUsage]);
-    mounted.result.current.select(panelTabId(betaUsage));
+    mounted.result.current.select(panelTabId(betaTool));
   });
   mounted.rerender({ channel: "alpha" });
-  expect(mounted.result.current.entries).toEqual([alphaTool]);
-  expect(mounted.result.current.selected).toBe("thread");
-  act(() => mounted.result.current.select(panelTabId(alphaTool)));
+  expect(mounted.result.current.entries).toEqual([alphaTool, alphaUsage]);
+  expect(mounted.result.current.selected).toBe(panelTabId(alphaUsage));
   mounted.rerender({ channel: "beta" });
-  expect(mounted.result.current.entries).toEqual([betaTool]);
-  expect(mounted.result.current.selected).toBe("thread");
-  mounted.rerender({ channel: "alpha" });
-  expect(mounted.result.current.entries).toEqual([alphaTool]);
-  expect(mounted.result.current.selected).toBe(panelTabId(alphaTool));
+  expect(mounted.result.current.entries).toEqual([betaTool, betaUsage]);
+  expect(mounted.result.current.selected).toBe(panelTabId(betaTool));
 });
 
 test("Solo and Messages retain independent workspaces for the same conversation", () => {
@@ -193,7 +194,6 @@ test("Solo and Messages retain independent workspaces for the same conversation"
     ]);
     solo.result.current.select("solo-tab");
     solo.result.current.setPaneOpen(false);
-    solo.result.current.retireMenuEntries();
   });
   expect(messages.result.current).toMatchObject({
     selected: "messages-tab",
@@ -476,6 +476,22 @@ test("verified identity takes precedence over a tab's original hint id", () => {
   });
 });
 
+test("Back to a visit whose only side content is a retained drawer shows that drawer", () => {
+  const session = {} as RelaySession;
+  const h = renderHook(() => useChannelTabState(session, "alpha"));
+  const drawer = {
+    panel: { key: "buzz.todos/todos", channelPlacement: "side" },
+    context: { channelId: "alpha" },
+    target: "todos",
+  } as unknown as ChannelDrawerOpening;
+  act(() => h.result.current.enterVisit("first:channel"));
+  act(() => h.result.current.setSideDrawer(drawer));
+  act(() => h.result.current.enterVisit("second:channel"));
+  act(() => h.result.current.enterVisit("first:channel"));
+  expect(h.result.current.sideDrawer).toBe(drawer);
+  expect(h.result.current.paneOpen).toBe(true);
+});
+
 // Back/Forward restore each visit's selected tabs and never close a thread.
 test("explicit close identifies only the thread's addressed visits, not channel visits retaining its tab", () => {
   const session = {} as RelaySession;
@@ -500,6 +516,90 @@ test("explicit close identifies only the thread's addressed visits, not channel 
   expect(h.result.current.threadVisits("alpha", "other")).toEqual(["other"]);
   expect(h.result.current.threadVisits("beta", "root")).toEqual([]);
 });
+
+test.each([
+  ["profile", `buzz:agent-profile:${"a".repeat(64)}`],
+  ["activity", profileActivityViewTarget("a".repeat(64)) as string],
+  ["transcript", profileActivityViewTarget("a".repeat(64)) as string],
+])(
+  "closing %s after Back retires its retained version visit",
+  async (opening, base) => {
+    const scope = {
+      viewer: "b".repeat(64),
+      communityOrigin: "https://relay.example",
+    };
+    const channel = {
+      version: 1,
+      kind: "conversation",
+      scope,
+      channelId: "alpha",
+    } as const;
+    const host = createNavigationController(createMemoryHistory(channel));
+    const session = {} as RelaySession;
+    const h = renderHook(() => useChannelTabState(session, "alpha"));
+    if (opening === "transcript") openProfileTranscript(base, () => true);
+    const list = profileHistoryTarget(base);
+    const selected = profileHistoryTarget(base, {
+      side: "instructions",
+      id: "c".repeat(64),
+    });
+    try {
+      const others = [
+        `${base}#unknown`,
+        `${base}#version=invalid`,
+        profileHistoryTarget(`buzz:agent-profile:${"d".repeat(64)}`),
+        "https://github.com/sample/project/pull/42#versions",
+      ];
+      for (const [index, target] of others.entries()) {
+        act(() =>
+          h.result.current.enterVisit(
+            `other-${index}:detail`,
+            undefined,
+            true,
+            {
+              channelId: "alpha",
+              target,
+            },
+          ),
+        );
+      }
+      for (const target of [list, selected]) {
+        void host.navigation.open({ ...channel, detail: { target } });
+        act(() =>
+          h.result.current.enterVisit(
+            `${host.navigation.snapshot().entry.id}:detail`,
+            undefined,
+            true,
+            { channelId: "alpha", target },
+          ),
+        );
+      }
+      act(() => host.navigation.back());
+      expect(host.navigation.snapshot().entry.target).toEqual({
+        ...channel,
+        detail: { target: list },
+      });
+      // ChannelsPage uses this retirement set when explicitly closing the tab.
+      act(() =>
+        host.navigation.dismiss(
+          h.result.current.detailVisits("alpha", list),
+          channel,
+        ),
+      );
+      act(() => host.navigation.forward());
+      expect(host.navigation.snapshot().entry.target).toEqual(channel);
+      expect(h.result.current.detailVisits("beta", list)).toEqual([]);
+      for (const [index, target] of others.entries()) {
+        expect(h.result.current.detailVisits("alpha", target)).toEqual([
+          `other-${index}`,
+        ]);
+      }
+    } finally {
+      claimProfileTranscript(base);
+      host.dispose();
+    }
+  },
+);
 
 test("dismissal follows verified roots and retains thread visits beyond the layout snapshot limit", () => {
   const session = {} as RelaySession;

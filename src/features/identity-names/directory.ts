@@ -1,4 +1,4 @@
-import type { NamingIdentity } from "./policy";
+import { scopeKeys, type NamingIdentity } from "./policy";
 import type { NameProvider, NameSource, NamingPolicy } from "./service";
 import type { LocalAgents } from "../agents/local";
 import { relayOrigin } from "../communities/destination";
@@ -9,6 +9,23 @@ function sameCommunity(left: string, right: string) {
   } catch {
     return false;
   }
+}
+
+// A frozen candidate array, such as a channel's member list, cannot change, so
+// its normalized scope is kept instead of sorting and joining it per lookup.
+const normalized = new WeakMap<
+  readonly string[],
+  { selected: ReadonlySet<string>; selection: readonly string[]; id: string }
+>();
+function normalize(candidates: readonly string[]) {
+  let scope = normalized.get(candidates);
+  if (!scope) {
+    const selected = new Set(candidates.map((key) => key.toLowerCase()));
+    const selection = [...selected].sort();
+    scope = { selected, selection, id: selection.join(":") };
+    if (Object.isFrozen(candidates)) normalized.set(candidates, scope);
+  }
+  return scope;
 }
 
 /** Local agent names win only in their community. Names never grant control. */
@@ -120,11 +137,26 @@ export function createNameProvider(
       };
     });
     const displayedKeys = new Set(displayed.map((fact) => fact.pubkey));
+    // A scope only labels its selection and its agents' owners. Look those up
+    // instead of passing every cached identity, so a scope costs its own size
+    // rather than the whole profile cache.
+    let rows: Iterable<NamingIdentity> = identities.values();
+    if (selection) {
+      const facts = new Map<string, NamingIdentity[]>();
+      for (const fact of displayed)
+        facts.set(fact.pubkey, [...(facts.get(fact.pubkey) ?? []), fact]);
+      const keys = scopeKeys(selection, (key) => {
+        const row = identities.get(key);
+        return [...(row ? [row] : []), ...(facts.get(key) ?? [])];
+      });
+      rows = [...keys].flatMap((key) => {
+        const row = identities.get(key);
+        return row ? [row] : [];
+      });
+    }
     return policy.resolve(
       [
-        ...[...identities.values()].filter(
-          (row) => !displayedKeys.has(row.pubkey),
-        ),
+        ...[...rows].filter((row) => !displayedKeys.has(row.pubkey)),
         ...displayed,
       ],
       source.viewer,
@@ -157,10 +189,8 @@ export function createNameProvider(
       return source.agentLibrary.retain();
     },
     scope(source, candidates, displayFacts) {
-      const selected =
-        candidates && new Set(candidates.map((key) => key.toLowerCase()));
-      const selection = selected && [...selected].sort();
-      const id = selection?.join(":");
+      const { selected, selection, id } =
+        (candidates && normalize(candidates)) ?? {};
       // Include the requested identity even for historical non-member references.
       const outside = (selected: ReadonlySet<string>, key: string) => {
         const { outsiders } = current(source);

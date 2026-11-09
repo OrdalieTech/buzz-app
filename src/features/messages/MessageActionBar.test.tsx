@@ -22,6 +22,8 @@ import { useKeyboardFocusVisibility } from "../../shared/design-system/useKeyboa
 const render = (ui: ReactElement) => rtlRender(ui, { wrapper: ToastProvider });
 import { MessageActionBar } from "./MessageActionBar";
 import { MenuItem } from "../../shared/design-system/ui/Menu";
+import { PreviewCard } from "../../shared/design-system/ui/PreviewCard";
+import { hoverOpenTiming } from "../../shared/design-system/ui/hoverIntent";
 import { createPortal } from "react-dom";
 import { MessageLink } from "../conversation/MessageLink";
 import { LinkThreadTabContext } from "../conversation/LinkLabelContext";
@@ -30,6 +32,43 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
+
+it.each([true, false])(
+  "offers forwarding in the toolbar and menu with link available=%s",
+  async (available) => {
+    pointerMedia(false);
+    const user = userEvent.setup();
+    const forward = vi.fn();
+    render(
+      <Row
+        copyText={() => "Message"}
+        link={available ? "buzz://message?channel=alpha&id=abc" : undefined}
+        onForward={forward}
+      />,
+    );
+    fireEvent.pointerEnter(screen.getByTestId("message"));
+    const button = await screen.findByRole("button", {
+      name: "Forward message",
+    });
+    expect((button as HTMLButtonElement).disabled).toBe(!available);
+    if (available) {
+      await user.click(button);
+      expect(forward).toHaveBeenCalledTimes(1);
+    }
+    await user.click(
+      screen.getByRole("button", { name: "More message actions" }),
+    );
+    const item = await screen.findByRole("menuitem", {
+      name: "Forward message",
+    });
+    expect(item.hasAttribute("data-disabled")).toBe(!available);
+    if (available) {
+      await user.click(item);
+      await waitFor(() => expect(forward).toHaveBeenCalledTimes(2));
+      expect(screen.queryByRole("menu")).toBeNull();
+    }
+  },
+);
 
 function Row(props: ComponentProps<typeof MessageActionBar>) {
   const rowRef = useRef<HTMLDivElement>(null);
@@ -198,6 +237,145 @@ it("reveals actions only over message content or the toolbar, not the row's empt
   }
   fireEvent.pointerOver(screen.getByText("Message author"));
   expect(row.hasAttribute("data-actions-revealed")).toBe(false);
+});
+
+it("keeps actions under the row's own open preview card until it closes", async () => {
+  pointerMedia();
+  function PreviewRow({ open }: { open: boolean }) {
+    const rowRef = useRef<HTMLDivElement>(null);
+    return (
+      <div ref={rowRef} data-testid="message">
+        <div data-message-action-anchor>
+          <PreviewCard
+            open={open}
+            trigger={<a href="#linked">Linked message</a>}
+            link={<a href="#linked" />}
+            aria-label="Message preview"
+          >
+            Preview body
+          </PreviewCard>
+        </div>
+        <MessageActionBar rowRef={rowRef} copyText={() => "Linked message"} />
+      </div>
+    );
+  }
+  const view = render(<PreviewRow open />);
+  const row = screen.getByTestId("message");
+  const link = screen.getByRole("link", { name: "Linked message" });
+  const card = screen.getByText("Preview body");
+  // An open card keeps only actions that are already shown.
+  expect(row.hasAttribute("data-actions-revealed")).toBe(false);
+  fireEvent.pointerEnter(row);
+  fireEvent.pointerOver(link);
+  expect(row.hasAttribute("data-actions-revealed")).toBe(true);
+  // A card growing over its trigger under a still pointer leaves for a frame.
+  fireEvent.pointerOut(link, { relatedTarget: card });
+  expect(row.hasAttribute("data-actions-revealed")).toBe(true);
+  fireEvent.pointerOver(link, { relatedTarget: card });
+  expect(row.hasAttribute("data-actions-revealed")).toBe(true);
+  // Off the bubble's edge and back while the card is open: hiding here would
+  // show the actions again above the card.
+  fireEvent.pointerOut(link, { relatedTarget: row });
+  fireEvent.pointerOver(row, { relatedTarget: link });
+  expect(row.hasAttribute("data-actions-revealed")).toBe(true);
+  fireEvent.pointerOut(row, { relatedTarget: link });
+  fireEvent.pointerOver(link, { relatedTarget: row });
+  fireEvent.pointerOut(link, { relatedTarget: card });
+  expect(row.hasAttribute("data-actions-revealed")).toBe(true);
+  // The row never hears the pointer leave the portaled card; its close ends it.
+  await act(async () => view.rerender(<PreviewRow open={false} />));
+  expect(row.hasAttribute("data-actions-revealed")).toBe(false);
+  // A closed card holds nothing: the row's empty space hides the actions.
+  fireEvent.pointerOver(link, { relatedTarget: row });
+  expect(row.hasAttribute("data-actions-revealed")).toBe(true);
+  fireEvent.pointerOut(link, { relatedTarget: row });
+  fireEvent.pointerOver(row, { relatedTarget: link });
+  expect(row.hasAttribute("data-actions-revealed")).toBe(false);
+  await act(async () => view.rerender(<PreviewRow open />));
+  expect(row.hasAttribute("data-actions-revealed")).toBe(false);
+});
+
+it("keeps actions under a preview card that reopens during its exit", async () => {
+  pointerMedia();
+  vi.useFakeTimers();
+  const rest = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms));
+  // jsdom has no top layer. Model its order: the last popover shown is on top.
+  const layer: Element[] = [];
+  HTMLElement.prototype.showPopover = function () {
+    if (!layer.includes(this)) layer.push(this);
+  };
+  HTMLElement.prototype.hidePopover = function () {
+    if (layer.includes(this)) layer.splice(layer.indexOf(this), 1);
+  };
+  function PreviewRow() {
+    const rowRef = useRef<HTMLDivElement>(null);
+    return (
+      <div ref={rowRef} data-testid="message">
+        <div data-message-action-anchor>
+          <PreviewCard
+            trigger={<a href="#linked">Linked message</a>}
+            link={<a href="#linked" />}
+            aria-label="Message preview"
+          >
+            Preview body
+          </PreviewCard>
+        </div>
+        <MessageActionBar rowRef={rowRef} copyText={() => "Linked message"} />
+      </div>
+    );
+  }
+  let release = () => {};
+  try {
+    render(<PreviewRow />);
+    const row = screen.getByTestId("message");
+    const link = screen.getByRole("link", { name: "Linked message" });
+    fireEvent.pointerEnter(row);
+    const bar = screen.getByRole("group", { hidden: true });
+    fireEvent.pointerOver(link);
+    fireEvent.mouseEnter(link);
+    fireEvent.mouseMove(link);
+    await rest(hoverOpenTiming.preview.delay);
+    const card = screen.getByRole("link", {
+      name: "Message preview",
+      hidden: true,
+    });
+    const positioner = card.parentElement;
+    expect(layer).toEqual([bar, positioner]);
+    // Hold the card's exit at Base UI's animation boundary.
+    const finished = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const animations = vi.fn(() => [{ finished }]);
+    Object.defineProperty(card, "getAnimations", { value: animations });
+    // Off the bubble's edge into the row's empty space until the card's close
+    // grace ends. Its close releases the hold on the actions.
+    fireEvent.pointerOut(link, { relatedTarget: row });
+    fireEvent.pointerOver(row, { relatedTarget: link });
+    fireEvent.mouseLeave(link, { relatedTarget: row });
+    await rest(hoverOpenTiming.preview.closeDelay);
+    expect(link.hasAttribute("data-popup-open")).toBe(false);
+    // Base UI reads the exit's animations a frame after the close.
+    await rest(16);
+    expect(animations).toHaveBeenCalled();
+    expect(layer).toEqual([positioner]);
+    // Back onto the link while the card is still exiting. One pointer move
+    // shows the actions again and reopens the same card before React commits
+    // either, so the card must join the top layer after that commit.
+    act(() => {
+      fireEvent.pointerOut(row, { relatedTarget: link });
+      fireEvent.pointerOver(link, { relatedTarget: row });
+      fireEvent.mouseEnter(link, { relatedTarget: row });
+    });
+    await rest(0);
+    expect(link.hasAttribute("data-popup-open")).toBe(true);
+    expect(card.isConnected).toBe(true);
+    expect(layer).toEqual([bar, positioner]);
+  } finally {
+    await act(async () => release());
+    vi.useRealTimers();
+    Reflect.deleteProperty(HTMLElement.prototype, "showPopover");
+    Reflect.deleteProperty(HTMLElement.prototype, "hidePopover");
+  }
 });
 
 it("keeps timestamp hover and keyboard focus separate from message actions", () => {
@@ -499,6 +677,7 @@ it("prevents duplicate clipboard writes until the first settles", async () => {
     expect(link.hasAttribute("disabled")).toBe(true);
     fireEvent.click(link);
     expect(write).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith("buzz://link");
     expect(
       screen.getByRole("button", { name: "Reply" }).hasAttribute("disabled"),
     ).toBe(true);

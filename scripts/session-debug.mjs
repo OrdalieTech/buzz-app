@@ -59,7 +59,8 @@ export function ownsThread(records, id) {
     }
     return (
       new RegExp(`^Thread root: ${id}\\s*$`, "m").test(body) ||
-      new RegExp(`^Event ID: ${id}\\s*$`, "m").test(body)
+      new RegExp(`^Event ID: ${id}\\s*$`, "m").test(body) ||
+      new RegExp(`^\\{"id":"${id}"`, "m").test(body)
     );
   });
 }

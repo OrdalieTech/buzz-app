@@ -46,12 +46,14 @@ it("allows hosted DMs only with current owned source evidence, without local man
       name: agent.name,
       managed: false,
       messageable: true,
+      execution: "remote",
     },
     {
       pubkey: "cd".repeat(32),
       name: agent.name,
       managed: false,
       messageable: true,
+      execution: "remote",
     },
   ]);
   expect(choices.snapshot().selectable.filter(canMessageAgent)).toHaveLength(1);
@@ -108,6 +110,7 @@ it("preserves library names and artwork when hosted evidence makes the same key 
       avatar: "https://cdn.example/library.png",
       managed: false,
       messageable: true,
+      execution: "remote",
     },
   ]);
 });
@@ -126,7 +129,8 @@ function archiveFixture(
   const reads: string[] = [];
   const read = async () => {
     reads.push(snapshot.status);
-    snapshot = { status: "ready", archived };
+    // Like the store, each read publishes a new frozen list.
+    snapshot = { status: "ready", archived: Object.freeze([...archived]) };
     for (const listener of listeners) listener();
   };
   return {
@@ -169,13 +173,19 @@ it("merges exact keys, preserves namesakes and keeps local agents to their commu
   });
   await choices.refresh();
   expect(choices.snapshot().identities).toEqual([
-    { ...duplicate, managed: true, managedName: "Calvin" },
+    { ...duplicate, managed: true, managedName: "Calvin", execution: "local" },
     { ...namesake, managed: false },
   ]);
   expect(
     templateAgentChoices(choices.snapshot(), { status: "ready", channels: [] }),
   ).toEqual([
-    { ...duplicate, name: "Calvin", managed: true, managedName: "Calvin" },
+    {
+      ...duplicate,
+      name: "Calvin",
+      managed: true,
+      managedName: "Calvin",
+      execution: "local",
+    },
   ]);
   const elsewhere = createAgentChoices({
     scope: `https://elsewhere.test:${viewer}`,
@@ -388,6 +398,7 @@ it("reads the local list again from Retry and clears its error once a read succe
         name: agent.name,
         managed: true,
         managedName: agent.name,
+        execution: "local",
       },
     ]);
     expect(state.templates).toMatchObject({
@@ -563,4 +574,26 @@ it("hides known-archived agents from selection but keeps them as known agents", 
     lifetime.abort();
     library.dispose();
   }
+});
+
+it("keeps a remotely executing native agent managed without labeling it local", async () => {
+  const lifetime = new AbortController();
+  const library = createAgentLibrary(undefined);
+  const choices = createAgentChoices({
+    scope,
+    library: library.queries,
+    native: localAgentsFixture([{ ...agent, execution: "remote" }]),
+    archives: archiveFixture(),
+    signal: lifetime.signal,
+  });
+  await choices.refresh();
+  expect(choices.snapshot().identities).toEqual([
+    expect.objectContaining({
+      pubkey: agent.pubkey,
+      managed: true,
+      execution: "remote",
+    }),
+  ]);
+  lifetime.abort();
+  library.dispose();
 });

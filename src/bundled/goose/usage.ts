@@ -2,7 +2,10 @@
 // their replies. goose owns the sessions; nothing here writes them. What each
 // session said is kept while the app runs, so a later read exports only the
 // sessions goose updated since.
-import { promptSections } from "../../features/agents/activity-transcript";
+import {
+  promptMessage,
+  promptSections,
+} from "../../features/agents/activity-transcript";
 import type {
   SessionUsage,
   UsageObservation,
@@ -50,10 +53,7 @@ function buzzStart(messages: readonly Message[]) {
   const channelId = field("Channel")?.match(/\(#([^)]+)\)$/)?.[1];
   if (!channelId) return undefined;
   const root = field("Session scope") === "thread" && field("Thread root");
-  const title = sections
-    .find((section) => section.tag === "buzz-event")
-    ?.body.match(/^Content: (.*)$/m)?.[1]
-    ?.trim();
+  const title = promptMessage(sections).text.split("\n", 1)[0]?.trim();
   return {
     channelId,
     ...(root ? { root } : {}),

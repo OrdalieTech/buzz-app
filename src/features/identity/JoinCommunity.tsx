@@ -7,21 +7,24 @@ import { OnboardingScreen } from "./OnboardingScreen";
 /**
  * First-run landing after setup. The community URL is the live action; a
  * linked account's owned communities are offered as rows that take the same
- * path with their address.
+ * path with their address, and, with `onCreate`, Or create a community sits under Continue.
  */
 export function JoinCommunity({
   url,
   onUrlChange,
   onFind,
   owned = [],
+  onCreate,
 }: {
   url: string;
   onUrlChange: (url: string) => void;
   /** Receives the canonical secure origin, and an invite link's code when one was pasted. */
   onFind: (origin: string, code?: string) => void;
   owned?: readonly OwnedCommunity[] | undefined;
+  /** Offers Create a community, where the account may create one. */
+  onCreate?: (() => void) | undefined;
 }) {
-  // The in-app Join a community landing's layout (CommunityLanding).
+  // The in-app Connect to a community landing's layout (CommunityLanding).
   return (
     <OnboardingScreen
       labelledBy="welcome-title"
@@ -32,9 +35,13 @@ export function JoinCommunity({
             tabIndex={-1}
             className="text-heading text-standard"
           >
-            Join a community
+            Connect to a community
           </h1>
-          <div className="mt-4 grid w-full max-w-md gap-4 text-left">
+          <p className="m-0 text-body text-subtle">
+            Communities are where you work with people and agents.
+            {onCreate ? " Join an existing one or create your own." : ""}
+          </p>
+          <div className="mt-10 mb-6 grid w-full max-w-md gap-10 text-left">
             {owned.length > 0 && (
               // min-w-0 keeps a long hostname truncating rather than widening the grid.
               <div className="flex min-w-0 flex-col gap-2">
@@ -52,21 +59,34 @@ export function JoinCommunity({
                         {host}
                       </p>
                       <Button
-                        aria-label={`Join ${host}`}
+                        aria-label={`Connect to ${host}`}
                         onClick={() => onFind(origin)}
                       >
-                        Join
+                        Connect
                       </Button>
                     </li>
                   ))}
                 </ul>
               </div>
             )}
-            <CommunityUrlField
-              url={url}
-              onUrlChange={onUrlChange}
-              onSubmit={onFind}
-            />
+            <div className="grid gap-3">
+              <CommunityUrlField
+                url={url}
+                onUrlChange={onUrlChange}
+                onSubmit={onFind}
+                stacked
+              />
+              {onCreate && (
+                <Button
+                  size="lg"
+                  variant="ghost"
+                  data-return-focus="create"
+                  onClick={onCreate}
+                >
+                  Or create a community
+                </Button>
+              )}
+            </div>
           </div>
         </>
       }

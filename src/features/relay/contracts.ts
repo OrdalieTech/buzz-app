@@ -37,16 +37,22 @@ export type ChannelSummary = Readonly<{
   readOnly?: true;
   /** Downloaded membership is display-only pending current relay confirmation. */
   cached?: true;
+  /** Metadata the relay has not confirmed since it was downloaded or since the
+   * stream last dropped: the channel may have turned private, so its saved
+   * visibility grants no one reading. */
+  metadataCached?: true;
   /** A Solo chat this device is starting; the relay has not confirmed it yet. */
   pending?: true;
   /** Members-only channel omitted from directories (NIP-29 `hidden`), such as a DM. */
   hidden?: true;
   /** Relay-authored metadata; absent while metadata is unavailable. */
   /** `system` (NIP-CL): access control for app data; never in list().
-   * `session`: a private stream with the Solo label (`SOLO_LABEL`). */
+   * `solo`: a stream with the Solo label (`SOLO_LABEL`), regardless of visibility. */
   channelType?: "stream" | "forum" | "dm" | "solo" | "system";
   /** Relay-authored channel visibility; private channels use restricted presentation. */
   private?: true;
+  /** Relay-advertised default: the relay joins new community members here. */
+  autoJoin?: true;
   /** Presentation-only parent from signed channel metadata; never grants access. */
   parentChannelId?: string | undefined;
   /** Marked Huddle room; presented through its parent conversation, not the sidebar. */
@@ -58,6 +64,9 @@ export type ChannelSummary = Readonly<{
   ttlSeconds?: number;
   /** Exact members from the relay-signed roster; absent means unknown. */
   members?: readonly string[];
+  /** Members the signed roster marks as owners. Offers lifecycle actions;
+   * the relay authorizes each command. */
+  owners?: readonly string[];
   /** Relay-published NIP-CL labels. Any channel admin can set them: grouping, never trust. */
   labels?: readonly string[];
   /** Relay-written creator (NIP-CL `P`): the kind:9007 signer. Ownership can move later. */
@@ -101,6 +110,8 @@ export type Attachment = Readonly<{
   /** Signed video poster or media thumbnail URL. */
   previewUrl?: string;
 }>;
+/** Signed URL binding a timecoded reply to one attachment in a media gallery. */
+export const MEDIA_TARGET_TAG = "buzz:media";
 /** Relay-authored membership activity, not a membership grant or user message. */
 export type MembershipChange = Readonly<{
   type: "member_joined" | "member_left" | "member_removed";
@@ -129,6 +140,8 @@ export type ChannelMessage = Readonly<{
   /** Signed `audience` tag of the original event: `agents` is coordination
    * between agents, shown quietly. Absent means everyone; unknown values too. */
   audience?: "agents";
+  /** Signed display metadata for an automatic execution-failure reply. */
+  notice?: "execution-failure";
   /** Original kind 40008. Untrusted display metadata; content stays a raw patch. */
   diff?: Readonly<{
     filePath?: string | undefined;
@@ -138,6 +151,9 @@ export type ChannelMessage = Readonly<{
     truncated: boolean;
   }>;
   membership?: MembershipChange;
+  /** Signed `plugin-request` tag: an agent's plugin change request, by id.
+   * Untrusted display metadata; the device that holds the request decides. */
+  pluginRequest?: Readonly<{ id: string }>;
   huddle?: Readonly<{
     room: string;
     state: "started" | "ended";
@@ -162,6 +178,8 @@ export type ChannelMessage = Readonly<{
   threadRootId?: string | undefined;
   /** Immediate signed reply target; separate from the canonical thread root. */
   replyParentId?: string | undefined;
+  /** Exact signed media target for a timecoded reply. */
+  mediaTargetUrl?: string | undefined;
   sentFromThread?:
     | Readonly<{ rootId: string; excerpt?: string | undefined }>
     | undefined;
@@ -203,20 +221,31 @@ export type ChannelWindow = Readonly<{
   historyLimited?: boolean;
   /** A head read is in flight for these rows; older pages wait for it. */
   refreshing?: boolean | undefined;
+  /** Detached: the rows are a seek segment and newer history is not loaded. */
+  hasNewer?: boolean | undefined;
+  loadingNewer?: boolean | undefined;
 }>;
-/** Post-write discovery opts into writer reads; browsing keeps the default. */
-export type ChannelReadOptions = ReadOptions & Pick<ReadFilter, "consistency">;
+/** Post-write discovery opts into writer reads; browsing keeps the default.
+ * `viewerLookup` marks a lookup the viewer's own action asks for (a name
+ * search, label lookup, mounted link or search read): the channels it finds
+ * become known to the viewer's traffic. Rechecks and agents' lookups leave
+ * that as it was. */
+export type ChannelReadOptions = ReadOptions &
+  Pick<ReadFilter, "consistency"> & { viewerLookup?: boolean };
 export type PublicChannelSearch = Readonly<{
   channels: readonly ChannelSummary[];
   /** The metadata read stopped at its bound, so some channels were not checked. */
   partial: boolean;
 }>;
 /** What a channel-only link may show about a channel the reader may not have
- * joined. `withheld` means a completed lookup found nothing it may show: the
- * relay withholds a private channel's metadata from non-members, so private,
- * deleted and never-valid channels look the same. */
+ * joined. `looking` means a lookup is queued or in flight; `unknown` means
+ * none is, as before the list is ready, during a failure's backoff or in a
+ * cached-only store. `withheld` means a completed lookup found nothing it may
+ * show: the relay withholds a private channel's metadata from non-members, so
+ * private, deleted and never-valid channels look the same. */
 export type ChannelReference =
   | Readonly<{ state: "unknown" }>
+  | Readonly<{ state: "looking" }>
   | Readonly<{ state: "withheld" }>
   | Readonly<{
       state: "found";
@@ -229,6 +258,11 @@ export type ChannelReference =
       joined: boolean;
       /** Only when the viewer may see the roster. */
       members?: number;
+      /** A public channel the viewer left is named by its open metadata, but
+       * its messages stay unreadable until a lookup confirms it is still
+       * open; `looking` while that lookup is queued or in flight. */
+      readable?: false;
+      looking?: true;
     }>;
 /** Reads are side-effect-free; snapshots retain identity until their value changes.
  * Commands are idempotent requests; the store decides whether network work is needed. */
@@ -272,16 +306,53 @@ export interface ChannelQueries {
    * resolves through `refer`. Empty while the directory is cold or in flight. */
   openDirectory?(): readonly Pick<
     ChannelSummary,
-    "id" | "name" | "channelType" | "archived"
+    "id" | "name" | "description" | "channelType" | "archived"
   >[];
+  /** The open channels to browse: a first read's pages so far as they land,
+   * otherwise `openDirectory`'s. Display only, like `openDirectory`. */
+  browseDirectory?(): ReturnType<NonNullable<ChannelQueries["openDirectory"]>>;
+  /** Hears each `browseDirectory` page and finished read. List subscribers
+   * hear only a finished read, so pages never wake the rest of the app. */
+  subscribeDirectory?(listener: () => void): () => void;
+  /** Whether `browseDirectory` names a finished read's channels, rather than
+   * the first read's pages so far or none. */
+  directoryComplete?(): boolean;
+  /** Read the whole open-channel directory for browsing, sharing the
+   * `searchPublic` read; `browseDirectory` names its channels as pages land.
+   * Never grants access: opening a channel resolves it. */
+  readDirectory?(options?: {
+    signal?: AbortSignal | undefined;
+  }): Promise<{ partial: boolean }>;
+  /** Whether the relay holds any stream or forum channel this viewer can
+   * see, open, private or archived; DMs, Solo chats and system channels do
+   * not count, though a full batch of only Solo chats counts as not empty.
+   * One read of a few events. Names no channel, never grants access. */
+  anyChannel?(options?: { signal?: AbortSignal | undefined }): Promise<boolean>;
+  /** Member counts for browsing, from a joined channel's roster or an open
+   * channel's relay-signed one, kept a few minutes. A channel without a
+   * roster is left out of `counts`; `failed` names the ids whose read
+   * failed, while the rest still answer. Display only: never grants access. */
+  readMemberCounts?(
+    channelIds: readonly string[],
+    options?: { signal?: AbortSignal | undefined },
+  ): Promise<{
+    counts: ReadonlyMap<string, number>;
+    failed: readonly string[];
+  }>;
   /** Current reference state from local evidence; never reads. */
   describe?(channelId: string): ChannelReference;
-  /** Demand a background lookup for a reference that isn't `found`, until the
-   * returned release. The store coalesces requests into bounded reads, keeps
+  /** Demand a background lookup for a reference that isn't `found`, or is
+   * found but not `readable`, until the returned release. The store coalesces requests into bounded reads, keeps
    * a `withheld` answer for a few minutes, backs off after failures,
    * rechecks demanded references when either ends, and notifies list
-   * subscribers. */
+   * subscribers once per batch as a lookup starts (unless it only rechecks
+   * withheld answers) and when it ends. Absent when no lookup can run, as in
+   * a cached-only store. */
   refer?(channelId: string): () => void;
+  /** A cached-only store: saved conversations while Buzz can't reach the
+   * relay. It reads nothing, so `loadOlder` adds no rows, until a connected
+   * session replaces it. */
+  readonly cachedOnly?: true;
   /** Exact re-read of one already-listed channel's roster, merged into the
    * ready list. `resolve` admits channels the list lacks; this confirms a
    * membership change on one it already carries, without a full rediscovery.
@@ -310,6 +381,17 @@ export interface ChannelQueries {
   ensureList(): void;
   ensure(channelId: string): void;
   loadOlder(channelId: string): void;
+  /** Detach the window to history at `from` (unix seconds; 0 is the channel
+   * start). Resolves the first message at or after `from`, else the newest. */
+  seek?(
+    channelId: string,
+    from: number,
+    signal: AbortSignal,
+  ): Promise<string | undefined>;
+  /** Read the rows above a detached window; reattaches on reaching the head. */
+  loadNewer?(channelId: string): void;
+  /** Return a detached window to the newest messages. */
+  attach?(channelId: string): void;
   /** Explicit same-scope head revalidation; replaces the bounded head, not a realtime tail. */
   refresh?(channelId: string): void;
   /** Intent warming is optional for fixture-only query implementations. */

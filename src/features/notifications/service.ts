@@ -31,10 +31,19 @@ export type NotificationInput = Readonly<{
   title?: string;
   body?: string;
 }>;
+/** Narrows which targets may alert: banners, sounds and the Dock unread dot. */
+export type NotificationGate = Readonly<{
+  id: string;
+  /** A throwing gate is skipped. */
+  allows(target: OpenTarget): boolean;
+}>;
 export interface Notifications {
   register(
     category: NotificationCategoryDescriptor,
   ): Readonly<{ submit(input: NotificationInput): Promise<boolean> }>;
+  /** While registered, only targets every gate allows may alert. Returns a
+   * remover; disabling the plugin removes it too. */
+  gate(gate: NotificationGate): () => void;
 }
 declare module "@deepseek-ai/cordis" {
   interface Context {
@@ -77,6 +86,7 @@ export type NotificationSnapshot = Readonly<{
 export class NotificationsService extends Service implements Notifications {
   readonly indicator = createUnreadIndicator();
   private readonly contributions;
+  private readonly gates;
   private readonly listeners = new Set<() => void>();
   private readonly pending = new Set<Candidate>();
   // Outstanding audio decisions for submissions awaiting platform acceptance.
@@ -106,6 +116,7 @@ export class NotificationsService extends Service implements Notifications {
     super(ctx, "notifications");
     this.contributions =
       createContributions<NotificationCategoryDescriptor>(ctx);
+    this.gates = createContributions<NotificationGate>(ctx);
     this.state = Object.freeze({
       viewer: undefined,
       ...preferences.snapshot(),
@@ -134,6 +145,7 @@ export class NotificationsService extends Service implements Notifications {
         });
         this.revalidate();
       });
+      const stopGates = this.gates.subscribe(() => this.revalidate());
       const refresh = () => {
         void this.refreshPermission();
       };
@@ -149,6 +161,7 @@ export class NotificationsService extends Service implements Notifications {
         this.seen.clear();
         stopPreferences();
         stopCategories();
+        stopGates();
         preferences.dispose();
         platform.dispose();
         this.listeners.clear();
@@ -240,7 +253,8 @@ export class NotificationsService extends Service implements Notifications {
       item.valid() &&
       this.authorized(item.target) &&
       this.state.preferences.enabled &&
-      this.state.preferences.categories[item.category] !== false
+      this.state.preferences.categories[item.category] !== false &&
+      this.gated(item.target)
     );
   }
   private soundEnabled(category: string) {
@@ -248,6 +262,27 @@ export class NotificationsService extends Service implements Notifications {
       this.state.preferences.sound &&
       resolveCategorySound(this.state.preferences.sounds, category) !== "silent"
     );
+  }
+  /** Whether every registered gate lets this target alert. */
+  gated(target: OpenTarget) {
+    return this.gates.snapshot().every((gate) => {
+      try {
+        return gate.allows(target);
+      } catch {
+        return true;
+      }
+    });
+  }
+  subscribeGates = (listener: () => void) => this.gates.subscribe(listener);
+  gate(gate: NotificationGate) {
+    if (
+      !gate ||
+      typeof gate.id !== "string" ||
+      !/^[a-z0-9][a-z0-9._-]{0,127}$/.test(gate.id) ||
+      typeof gate.allows !== "function"
+    )
+      throw new Error("A notification gate needs an id and allows()");
+    return this.gates.register(this.ctx, gate);
   }
   revalidate() {
     for (const item of this.pending) {

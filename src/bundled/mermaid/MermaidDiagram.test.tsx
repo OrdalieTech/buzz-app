@@ -112,6 +112,19 @@ it("shows the error and source for an invalid diagram, then recovers", async () 
   expect(screen.queryByText(/^flowchart LR/)).toBeNull();
 });
 
+it("shows the source instead of drawing a diagram too large to draw", async () => {
+  // Within Pele's default limits, but far larger than the app draws.
+  const huge = `flowchart LR\n${Array.from({ length: 1000 }, (_, i) => `n${i}`).join("-->")}`;
+  const view = render(<MermaidDiagram code={huge} />);
+  expect(
+    await screen.findByText(/^Diagram output is longer than the limit/),
+  ).toBeVisible();
+  expect(screen.getByText(/^flowchart LR/)).toHaveTextContent(huge, {
+    normalizeWhitespace: false,
+  });
+  expect(view.container.querySelector("svg")).toBeNull();
+});
+
 it("expands the diagram in a dialog that copies its source and restores focus", async () => {
   const user = userEvent.setup();
   const write = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();

@@ -1,11 +1,13 @@
-// Saved catch-up progress for event watches of kind 9 only, as Janet keeps it:
-// one stream for each watch and channel. Each window of missed events is read
-// whole, newest page first, within a bound, and then delivered oldest first.
-// Only the progress is saved, never an event.
+import { interestPaused } from "./attention";
+// Saved catch-up progress for event watches, as Janet keeps it: one stream
+// for each watch and channel, which reads the watch's own kinds. Each window
+// of missed events is read whole, newest page first, within a bound, and then
+// delivered oldest first. Only the progress is saved, never an event.
 import type { Agent } from "./service";
 import type { EventData, ReadFilter } from "../relay/events";
 import type { AgentStore } from "./store";
 import { AGENT_KEY, type AgentKey } from "./membership";
+import { CHANNEL_KINDS, LIVE_RESUME_LAG } from "../relay/live";
 
 export const CATCH_UP_KEY = "buzz.agents.catch-up.v1";
 /** Events in one read, as Janet's catch-up pages are. */
@@ -15,30 +17,49 @@ export const CATCH_UP_PAGE = 16;
 export const CATCH_UP_PAGES = 256;
 export const CATCH_UP_BYTES = 8 * 1024 * 1024;
 
-/** Every kind 9 event of the stream created at or before `through` was
- * delivered or skipped. While a window (`through`, `upper`] is being
- * delivered, `after` is the last event delivered of it, in delivery order:
- * oldest first, ties by id. A restart goes on after it, up to `upper`.
- * `heard` are later ones already heard live, which catch-up skips too.
- * `hidden` marks one moved while no plugin showed Attention: once one does,
- * even after a restart, it starts from then. */
+/** Every event of the stream created at or before `through` was delivered
+ * or skipped. While a window (`through`, `upper`] is being delivered, `after`
+ * is the last event delivered of it, in delivery order: oldest first, ties by
+ * id. A restart goes on after it, up to `upper`. A window read with an
+ * overlap has no `after`: it lists what it delivered as heard, and keeps
+ * `through` as far behind as the relay can still store an event late, so a
+ * later read finds one at any place in that order. `heard` are later ones
+ * already heard live or delivered, which catch-up skips too. `read`, when
+ * later than `through`, is how far the stream was last read: one read again
+ * with an overlap keeps `through` behind it. `hidden` marks one moved while
+ * no plugin showed Attention: once one does, even after a restart, it starts
+ * from then. */
 export type Checkpoint = Readonly<{
   through: number;
   upper?: number;
+  read?: number;
   after?: Readonly<{ created_at: number; id: string }>;
   heard?: readonly Readonly<{ created_at: number; id: string }>[];
   hidden?: true;
 }>;
-/** Live events each stream keeps as heard past its checkpoint. A tick moves
- * the checkpoint past them every few seconds while the app listens; past
- * this, the oldest may be heard again after a restart. */
+/** Events each stream keeps as heard past its checkpoint. A tick moves the
+ * checkpoint past them every few seconds while the app listens; past this,
+ * `heardOf` moves it past the oldest. */
 export const HEARD_LIMIT = 256;
+/** The most heard events a stream keeps while it cannot move past them, as
+ * when its reads fail while live goes on, or while a window read with an
+ * overlap is given: twice the most one window reads. Past it, the oldest go
+ * anyway. */
+export const HEARD_MOST = 2 * CATCH_UP_PAGES * CATCH_UP_PAGE;
+/** Seconds a stream that live does not cover reads again below the top of
+ * its last read: as far as live resumes behind a drop. The relay accepts an
+ * event whose time is up to its drift behind when it stores it, and the
+ * clocks can disagree by a little more, so a later read must still reach it. */
+export const POLL_OVERLAP = LIVE_RESUME_LAG;
 export type Checkpoints = Readonly<Record<string, Checkpoint>>;
 /** One watch's history in one channel, or in every channel it may read. */
 export type Stream = Readonly<{
   key: string;
   slug: string;
   channel?: string;
+  /** The watch's kinds; a watch of every kind reads those live hears, as a
+   * relay read must name its kinds. */
+  kinds: readonly number[];
   since: number;
   enabled: boolean;
 }>;
@@ -51,6 +72,14 @@ const ID = /^[0-9a-f]{64}$/;
 export const oldestFirst = (a: Position, b: Position) =>
   a.created_at - b.created_at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
+/** Whether `event` is of the stream's kinds and of its channel. */
+export const inStream = (
+  stream: Pick<Stream, "kinds" | "channel">,
+  event: Pick<EventData, "kind" | "tags">,
+) =>
+  stream.kinds.includes(event.kind) &&
+  (stream.channel === undefined ||
+    event.tags.some(([key, value]) => key === "h" && value === stream.channel));
 /** The key of a membership's watch's stream in one channel, or in every
  * channel. */
 export const streamKey = (agent: AgentKey, slug: string, channel?: string) =>
@@ -61,6 +90,47 @@ export const undelivered = (checkpoint: Checkpoint, event: Position) =>
   event.created_at > checkpoint.through &&
   (!checkpoint.after || oldestFirst(event, checkpoint.after) > 0) &&
   !checkpoint.heard?.some(({ id }) => id === event.id);
+
+/** `checkpoint` with `heard` as what it heard past it: each once, oldest
+ * first. Past `HEARD_LIMIT` of them the oldest go, and `through` moves up to
+ * the newest of those, so none is given again after a restart; but never
+ * past what was read, nor into the second of a window's last delivered
+ * event, so no event left to read is passed over. Those it cannot move past
+ * stay, up to `HEARD_MOST`: a later read or tick moves past them. */
+export function heardOf(
+  checkpoint: Checkpoint,
+  heard: readonly Position[],
+): Checkpoint {
+  const { heard: _, read, ...rest } = checkpoint;
+  let through = checkpoint.through;
+  const past = (list: readonly Position[]) =>
+    list.filter((event) => event.created_at > through);
+  const done = past([
+    ...new Map(
+      heard.map(({ created_at, id }) => [id, { created_at, id }]),
+    ).values(),
+  ]).sort(oldestFirst);
+  const over = done.length - HEARD_LIMIT;
+  if (over > 0) {
+    const bound =
+      checkpoint.upper === undefined
+        ? Math.max(through, read ?? through)
+        : checkpoint.after
+          ? checkpoint.after.created_at - 1
+          : through;
+    through = Math.max(
+      through,
+      Math.min(bound, (done[over - 1] as Position).created_at),
+    );
+  }
+  const kept = past(done).slice(-HEARD_MOST);
+  return {
+    ...rest,
+    through,
+    ...(read !== undefined && read > through ? { read } : {}),
+    ...(kept.length ? { heard: kept } : {}),
+  };
+}
 
 /** Each agent membership's catch-up progress has its own key, so programs
  * that run different agents and share this storage never write over each
@@ -82,7 +152,8 @@ function ownerOf(key: string): AgentKey | undefined {
 
 /** A valid checkpoint, with its fields in one order; undefined otherwise. */
 function checkpointOf(value: unknown): Checkpoint | undefined {
-  const { through, upper, after, heard, hidden } = (value ?? {}) as Checkpoint;
+  const { through, upper, read, after, heard, hidden } = (value ??
+    {}) as Checkpoint;
   if (
     !time(through) ||
     (upper !== undefined && !(time(upper) && upper > through))
@@ -96,23 +167,24 @@ function checkpointOf(value: unknown): Checkpoint | undefined {
       after.created_at <= upper &&
       ID.test(after.id));
   if (!valid) return undefined;
-  const live = (Array.isArray(heard) ? heard : [])
-    .filter(
-      (event) =>
-        time(event?.created_at) &&
-        event.created_at > through &&
-        typeof event.id === "string" &&
-        ID.test(event.id),
-    )
-    .slice(-HEARD_LIMIT)
-    .map(({ created_at, id }) => ({ created_at, id }));
-  return {
-    through,
-    ...(upper !== undefined ? { upper } : {}),
-    ...(after ? { after: { created_at: after.created_at, id: after.id } } : {}),
-    ...(live.length ? { heard: live } : {}),
-    ...(hidden === true ? { hidden } : {}),
-  };
+  const live = (Array.isArray(heard) ? heard : []).filter(
+    (event) =>
+      time(event?.created_at) &&
+      typeof event.id === "string" &&
+      ID.test(event.id),
+  );
+  return heardOf(
+    {
+      through,
+      ...(upper !== undefined ? { upper } : {}),
+      ...(time(read) && read > through ? { read } : {}),
+      ...(after
+        ? { after: { created_at: after.created_at, id: after.id } }
+        : {}),
+      ...(hidden === true ? { hidden } : {}),
+    },
+    live,
+  );
 }
 
 /** The valid checkpoints of one stored value, of `agent`'s streams only when
@@ -169,13 +241,14 @@ export function readCheckpoints(storage: AgentStore): Checkpoints {
   );
 }
 
-/** Valid checkpoints by agent. */
-function byAgent(checkpoints: Checkpoints) {
+/** Valid checkpoints by agent, of the `only` agents when they are given. */
+function byAgent(checkpoints: Checkpoints, only?: ReadonlySet<string>) {
   const agents = new Map<string, Record<string, Checkpoint>>();
   for (const [key, value] of Object.entries(checkpoints)) {
     const agent = ownerOf(key);
+    if (agent === undefined || (only && !only.has(agent))) continue;
     const checkpoint = checkpointOf(value);
-    if (agent === undefined || !checkpoint) continue;
+    if (!checkpoint) continue;
     const streams = agents.get(agent) ?? {};
     streams[key] = checkpoint;
     agents.set(agent, streams);
@@ -193,8 +266,18 @@ export async function writeCheckpoints(
   checkpoints: Checkpoints,
   saved: Checkpoints,
 ) {
-  const next = byAgent(checkpoints);
-  const last = byAgent(saved);
+  // A stream's checkpoint is replaced, never changed in place, so an
+  // identical one is unchanged and its agent need not be compared.
+  const changed = new Set<string>();
+  for (const key of new Set([
+    ...Object.keys(checkpoints),
+    ...Object.keys(saved),
+  ])) {
+    const agent = checkpoints[key] === saved[key] ? undefined : ownerOf(key);
+    if (agent !== undefined) changed.add(agent);
+  }
+  const next = byAgent(checkpoints, changed);
+  const last = byAgent(saved, changed);
   const writes: Promise<void>[] = [];
   for (const agent of new Set([...next.keys(), ...last.keys()])) {
     const streams = next.get(agent);
@@ -228,14 +311,12 @@ export async function splitLegacyCheckpoints(storage: AgentStore) {
   }
 }
 
-/** The agent's streams: one for each channel of each event watch whose kinds
- * are exactly [9], enabled or not. Other kinds have reconnect replay only, as
- * in Janet. */
+/** The agent's streams: one for each channel of each event watch, enabled or
+ * not. */
 export function streamsOf(agent: Pick<Agent, "key" | "attention">) {
   const streams: Stream[] = [];
   for (const { slug, value } of Object.values(agent.attention)) {
     if (value.type !== "event") continue;
-    if (value.kinds.length !== 1 || value.kinds[0] !== 9) continue;
     for (const channel of value.channels === "all"
       ? [undefined]
       : value.channels)
@@ -243,8 +324,10 @@ export function streamsOf(agent: Pick<Agent, "key" | "attention">) {
         key: streamKey(agent.key, slug, channel),
         slug,
         ...(channel ? { channel } : {}),
+        kinds: value.kinds.length ? value.kinds : CHANNEL_KINDS,
         since: value.since,
-        enabled: value.enabled,
+        enabled:
+          value.enabled && !interestPaused(agent.attention, value.interest_id),
       });
   }
   return streams;
@@ -260,6 +343,8 @@ export type Window<Event extends Position> = Readonly<{
   checkpoint: Checkpoint;
   /** Older missed events were skipped: the window passed its bounds. */
   skipped: boolean;
+  /** Every event read of the window, delivered now or before. */
+  read: readonly Position[];
 }>;
 
 /** Reads the stream's missed events through `upper`, or undefined when there
@@ -280,22 +365,19 @@ export async function readWindow<Event extends Position>(
   const floor = Math.max(stream.since, checkpoint.through + 1);
   const window = checkpoint.upper ?? upper;
   if (floor > window) return undefined;
+  // Read through `upper` already, keeping an overlap open behind it.
+  if (checkpoint.upper === undefined && (checkpoint.read ?? -1) >= upper)
+    return undefined;
   const after = checkpoint.after;
-  const heard = new Set(checkpoint.heard?.map(({ id }) => id));
   const pending = (events: Event[]) =>
-    events
-      .sort(oldestFirst)
-      .filter(
-        (event) =>
-          (!after || oldestFirst(event, after) > 0) && !heard.has(event.id),
-      );
+    events.sort(oldestFirst).filter((event) => undelivered(checkpoint, event));
   const events: Event[] = [];
   let bytes = 0;
   let cursor: Position | undefined;
   for (let pages = 0; ; pages++) {
     const bounded = pages === CATCH_UP_PAGES || bytes > CATCH_UP_BYTES;
     const filter: ReadFilter = {
-      kinds: [9],
+      kinds: [...stream.kinds],
       ...(stream.channel ? { "#h": [stream.channel] } : {}),
       since: floor,
       until: cursor?.created_at ?? window,
@@ -319,6 +401,7 @@ export async function readWindow<Event extends Position>(
       const reached = (cursor as Position).created_at;
       return {
         events: pending(events.filter((event) => event.created_at > reached)),
+        read: events.filter((event) => event.created_at > reached),
         upper: window,
         checkpoint: {
           through: Math.max(reached, checkpoint.through),
@@ -336,6 +419,7 @@ export async function readWindow<Event extends Position>(
   }
   return {
     events: pending(events),
+    read: events,
     upper: window,
     checkpoint: {
       through: checkpoint.through,
@@ -355,4 +439,55 @@ export function delivered(window: number, last?: Position): Checkpoint {
     upper: window,
     after: { created_at: last.created_at, id: last.id },
   };
+}
+
+/** The checkpoint once `given`, the window's events delivered so far, oldest
+ * first, are. One with an `overlap` saves no cursor: it lists them as heard,
+ * with what it `heard` before, and moves `through` only to where the relay
+ * can no longer store an event late, so a read after an interruption still
+ * finds one stored late anywhere among them. */
+export function admitted(
+  window: Window<Position>,
+  given: readonly Position[],
+  heard: readonly Position[] = [],
+  overlap = 0,
+): Checkpoint {
+  const last = given.at(-1);
+  const cursor = delivered(window.upper, last);
+  if (overlap <= 0 || !last) return cursor;
+  // A cursor saved without an overlap passed what it delivered of its
+  // second, and lists none of it: those are listed now, in its place.
+  const { through, after } = window.checkpoint;
+  const passed = after
+    ? window.read.filter(
+        (event) =>
+          event.created_at === after.created_at &&
+          oldestFirst(event, after) <= 0,
+      )
+    : [];
+  return heardOf(
+    {
+      through: Math.max(
+        through,
+        Math.min(last.created_at - 1, window.upper - overlap),
+      ),
+      upper: window.upper,
+    },
+    [...heard, ...passed, ...given],
+  );
+}
+
+/** The checkpoint once all of `window` is delivered, keeping its last
+ * `overlap` seconds open so the next read finds an event the relay stores
+ * late with an older time. Every event read of them, and every one already
+ * `heard`, stays heard, so none is given twice. Past `HEARD_LIMIT` of them,
+ * the overlap shrinks to keep the newest. */
+export function finished(
+  window: Window<Position>,
+  heard: readonly Position[] = [],
+  overlap = 0,
+): Checkpoint {
+  if (overlap <= 0) return { through: window.upper };
+  const through = Math.max(window.checkpoint.through, window.upper - overlap);
+  return heardOf({ through, read: window.upper }, [...heard, ...window.read]);
 }

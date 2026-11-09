@@ -1,19 +1,14 @@
 import { expectTabler } from "./tabler.mjs";
 import { test, expect } from "./playwright-test.mjs";
-import { createServer } from "vite";
+import { createServer } from "./vite-server.mjs";
 import react from "@vitejs/plugin-react";
 import { fileURLToPath } from "node:url";
-import { mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { watchPageErrors } from "./page-errors.mjs";
 
 test("community picker uses keyboard, proxy thumbnails, event-local history and scoped send/reply tags", async ({
   browserName,
   page,
 }) => {
-  // Parallel fixtures must not invalidate each other’s optimized lazy imports.
-  const cacheDir = await mkdtemp(join(tmpdir(), "buzz-emoji-vite-"));
   let server;
   let releaseHistoric;
   const historicFailure = new Promise((resolve) => {
@@ -21,7 +16,6 @@ test("community picker uses keyboard, proxy thumbnails, event-local history and 
   });
   try {
     server = await createServer({
-      cacheDir,
       root: fileURLToPath(new URL("../../", import.meta.url)),
       configFile: false,
       envFile: false,
@@ -1145,10 +1139,6 @@ test("community picker uses keyboard, proxy thumbnails, event-local history and 
     expect(errors.unexplained()).toEqual([]);
   } finally {
     releaseHistoric();
-    try {
-      await server?.close();
-    } finally {
-      await rm(cacheDir, { recursive: true, force: true });
-    }
+    await server?.close();
   }
 });

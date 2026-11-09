@@ -1,3 +1,4 @@
+import { piHookOutput } from "../hook-output";
 // Pi agents: an agent type whose agents run on Pi durable on this computer,
 // with any provider Pi supports. One Pi host runs them all, each with its own
 // storage; each conversation the agent is in is one continuing, durable Pi
@@ -36,11 +37,17 @@ export const apply: PluginModule["apply"] = (ctx) => {
           event,
           input,
           { agent, session },
-          { accepts: (output) => output != null, milliseconds: 25000 },
+          {
+            accepts: (output) => output != null,
+            milliseconds: 25000,
+            compose: (output, pluginId) =>
+              piHookOutput(output, pluginId, input),
+          },
         )) ?? null
       );
     },
     (key, listener) => agents.relay(key)?.subscribe(listener) ?? (() => {}),
+    agents.storage,
   );
   ctx.agentProtection.registerModels({
     label: "Pi",
@@ -92,6 +99,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
     defaults: () => ({ config: DEFAULT_CONFIG }),
     Create,
     CreateModel,
+    createModelReportsReadiness: true,
     importShared: (source) =>
       source.runtime === "pi"
         ? {
@@ -152,6 +160,11 @@ export const apply: PluginModule["apply"] = (ctx) => {
     models: (agent) => runtime.models(agent),
     run: (delivery) => runtime.run(delivery),
     runOnce: (turn) => runtime.runOnce(turn),
+    // Its host reader cannot be stopped once started.
+    readFile: (agent, path, signal) => {
+      signal.throwIfAborted();
+      return runtime.workspaceFile(agent, path);
+    },
     timeoutMs: HANDOVER_MS,
   });
 };

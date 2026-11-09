@@ -421,3 +421,23 @@ it("projects native public community presentation without a join-policy read or 
   expect(requests).toEqual([{ path: "/", body: undefined }]);
   expect(fetch).not.toHaveBeenCalled();
 });
+
+it.each([
+  [1, 42],
+  [1, 42, 43],
+])(
+  "projects membership enforcement from supported NIPs %j",
+  async (...nips) => {
+    vi.mocked(invoke).mockImplementation(async (_command, args) => ({
+      status: 200,
+      headers: {},
+      body: JSON.stringify(
+        (args as { path: string }).path === "/"
+          ? { self: key.pubkey, name: "Native community", supported_nips: nips }
+          : { policy: null },
+      ),
+    }));
+    const info = await communityRequest<CommunityInfo>(community, "info");
+    expect(info.membershipRequired).toBe(nips.includes(43));
+  },
+);

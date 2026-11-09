@@ -1,5 +1,17 @@
 export const OUTBOX_INPUT_MAX_BYTES = 32 * 1024;
 
+/** Profiles kept in memory when no open channel reserves more. */
+export const PROFILE_CACHE_BASE = 1024;
+/** Hard limit while an open channel reserves room for its members. */
+export const PROFILE_CACHE_MAX = 10_240;
+/** The roster profiles a view may load at a cache limit: the room an open
+ * channel reserved, so the base stays free for every other name on screen.
+ * With no reservation a view may still use the base. */
+export const profileRosterRoom = (limit: number) =>
+  limit > PROFILE_CACHE_BASE ? limit - PROFILE_CACHE_BASE : PROFILE_CACHE_BASE;
+/** Byte budget per profile entry; a typical signed kind 0 is 0.5-1 KiB. */
+export const PROFILE_ENTRY_BYTES = 2 * 1024;
+
 /** Deterministic UTF-8 budget, used for both warm data and persisted records. */
 export const byteSize = (value: unknown) =>
   new TextEncoder().encode(JSON.stringify(value)).byteLength;
@@ -25,9 +37,19 @@ export class ByteLru<T> {
   private items = new Map<string, { value: T; bytes: number }>();
   private bytes = 0;
   constructor(
-    readonly maxEntries: number,
-    readonly maxBytes: number,
+    public maxEntries: number,
+    public maxBytes: number,
+    /** Entries eviction takes last; the limits still hold. */
+    private keep?: (key: string) => boolean,
   ) {}
+  /** Change both limits; shrinking evicts least recently used entries now. */
+  resize(maxEntries: number, maxBytes: number) {
+    const before = this.evictions;
+    this.maxEntries = maxEntries;
+    this.maxBytes = maxBytes;
+    this.evict();
+    return this.evictions - before;
+  }
   get(key: string): T | undefined {
     const entry = this.items.get(key);
     if (!entry) return;
@@ -58,12 +80,18 @@ export class ByteLru<T> {
     this.evict();
     return true;
   }
+  /** Entries removed to stay within the limits, over this cache's lifetime. */
+  evictions = 0;
+  /** Least recently used first, kept entries only once no other is left. */
   private evict() {
-    for (const oldest of this.items.keys()) {
-      if (this.items.size <= this.maxEntries && this.bytes <= this.maxBytes)
-        break;
-      this.delete(oldest);
-    }
+    for (const spare of [true, false])
+      for (const oldest of this.items.keys()) {
+        if (this.items.size <= this.maxEntries && this.bytes <= this.maxBytes)
+          return;
+        if (spare && this.keep?.(oldest)) continue;
+        this.delete(oldest);
+        this.evictions++;
+      }
   }
   delete(key: string) {
     const entry = this.items.get(key);

@@ -10,7 +10,6 @@ import {
 } from "@testing-library/react";
 import {
   createOutbox,
-  PublishRejected,
   type Outbox,
   type OutgoingEvent,
 } from "../../features/relay/outbox";
@@ -22,13 +21,10 @@ import {
 } from "../../features/relay/testing";
 import { createRelaySession } from "../../features/relay/session";
 import { matchesEvent } from "../../features/relay/projection";
-import type { RelayEvent } from "../../features/relay/events";
+import { eventDto, type RelayEvent } from "../../features/relay/events";
 import type { RelayWriter } from "../../features/relay/transport";
 import { createRelayProfiler } from "../../features/relay/profiling";
-import {
-  grantSoloChatAccess,
-  soloChatLinkMessage,
-} from "../../features/solo/share";
+import { soloChatLinkMessage } from "../../features/solo/share";
 import { OutboxStatus } from "./OutboxStatus";
 
 afterEach(cleanup);
@@ -44,11 +40,13 @@ const invitation = {
 function show(item: OutgoingEvent) {
   const retry = vi.fn();
   const add = vi.fn(async () => {});
+  const acknowledge = vi.fn(async () => {});
   const items = [item];
   const outbox = {
     snapshot: () => items,
     subscribe: () => () => {},
     retry,
+    acknowledge,
     dismiss: vi.fn(),
   } as unknown as Outbox;
   render(
@@ -59,7 +57,7 @@ function show(item: OutgoingEvent) {
     />,
   );
   fireEvent.click(screen.getByText("Outbox · 1 items"));
-  return { retry, add };
+  return { retry, add, acknowledge };
 }
 
 it("does not offer generic retry for guarded invitations from either profile or composer", () => {
@@ -105,10 +103,32 @@ it("does not show private feedback body or generic retry in the channel outbox",
   expect(retry).not.toHaveBeenCalled();
 });
 
-it("preserves generic retry for legacy unguarded invitations", () => {
-  const { retry } = show(invitation);
+it("routes an unadopted no-role invitation through member verification", async () => {
+  const { retry, add } = show({
+    ...invitation,
+    delivery: "unknown",
+    event: {
+      ...invitation.event,
+      tags: [
+        ["h", "channel"],
+        ["p", "person"],
+      ],
+    },
+  });
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-  expect(retry).toHaveBeenCalledWith("invite");
+  await waitFor(() =>
+    expect(add).toHaveBeenCalledExactlyOnceWith("channel", "person", {
+      retry: true,
+    }),
+  );
+  expect(retry).not.toHaveBeenCalled();
+});
+it("keeps a malformed no-role invitation out of generic replay", async () => {
+  const { retry, add } = show(invitation);
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Reopen Members");
+  expect(retry).not.toHaveBeenCalled();
+  expect(add).not.toHaveBeenCalled();
 });
 
 it("routes an ordinary addition retry through fresh membership checks", async () => {
@@ -126,10 +146,90 @@ it("routes an ordinary addition retry through fresh membership checks", async ()
   });
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
   await waitFor(() =>
-    expect(add).toHaveBeenCalledExactlyOnceWith("channel", "person"),
+    expect(add).toHaveBeenCalledExactlyOnceWith("channel", "person", {
+      retry: true,
+    }),
   );
   expect(retry).not.toHaveBeenCalled();
 });
+
+it("retries a guest addition as a guest", async () => {
+  const { add } = show({
+    ...invitation,
+    event: {
+      ...invitation.event,
+      tags: [
+        ["h", "channel"],
+        ["p", "person"],
+        ["role", "guest"],
+      ],
+    },
+    recovery: { key: "member-add:channel:person", value: "1" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  await waitFor(() =>
+    expect(add).toHaveBeenCalledExactlyOnceWith("channel", "person", {
+      role: "guest",
+      retry: true,
+    }),
+  );
+});
+
+it("retries a guest batch per person as guests, each as a new addition", async () => {
+  const { add } = show({
+    ...invitation,
+    event: {
+      ...invitation.event,
+      tags: [
+        ["h", "channel"],
+        ["p", "one"],
+        ["p", "two"],
+        ["role", "guest"],
+      ],
+    },
+    recovery: { key: "member-add:batch:operation", value: "1" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  await waitFor(() =>
+    expect(add.mock.calls).toEqual([
+      ["channel", "one", { role: "guest" }],
+      ["channel", "two", { role: "guest" }],
+    ]),
+  );
+});
+
+it.each(["failed", "accepted"] as const)(
+  "retries a %s batch addition per person, never resending it",
+  async (delivery) => {
+    const { retry, add, acknowledge } = show({
+      ...invitation,
+      delivery,
+      event: {
+        ...invitation.event,
+        tags: [
+          ["h", "channel"],
+          ["p", "one"],
+          ["p", "two"],
+          ["role", "member"],
+        ],
+      },
+      recovery: { key: "member-add:batch:operation", value: "1" },
+    });
+    expect(screen.getByText(/Add 2 people/)).toBeVisible();
+    add.mockImplementation(async (...args: unknown[]) => {
+      if (args[1] === "two") throw new Error("Could not add two");
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText(/Could not add two/)).toBeVisible();
+    expect(add.mock.calls).toEqual([
+      ["channel", "one", {}],
+      ["channel", "two", {}],
+    ]);
+    // Additions settle the batch once everyone is; Retry never clears it.
+    expect(acknowledge).not.toHaveBeenCalled();
+    expect(retry).not.toHaveBeenCalled();
+  },
+);
 
 it.each(
   (["failed", "unknown", "admitted"] as const).flatMap((failure) =>
@@ -140,23 +240,42 @@ it.each(
   async ({ failure, restart }) => {
     const viewer = keypair(),
       relay = keypair(),
-      agent = keypair();
+      agent = keypair(),
+      freshAgent = keypair();
     const channelId = "11111111-1111-4111-8111-111111111111";
-    let members = [viewer.pubkey];
+    let members =
+      failure === "admitted" ? [viewer.pubkey, agent.pubkey] : [viewer.pubkey];
     let clock = 1_700_000_000;
-    let interrupted = true;
-    let records: readonly OutgoingEvent[] = [];
+    // Released clients could persist this exact Bot grant. Recovery must not
+    // need a live admission bypass to construct or finish that saved state.
+    const legacy = signed(viewer, {
+      kind: 9000,
+      content: "",
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["h", channelId],
+        ["p", agent.pubkey],
+        ["role", "bot"],
+      ],
+    });
+    let records: readonly OutgoingEvent[] = [
+      {
+        event: eventDto(legacy),
+        signed: legacy,
+        recovery: {
+          key: `member-add:${channelId}:${agent.pubkey}`,
+          value: "1",
+        },
+        delivery: failure === "failed" ? "failed" : "unknown",
+        error: failure === "failed" ? "Not committed" : "Receipt lost",
+      },
+    ];
     const sign = vi.fn<RelayWriter["sign"]>(async (template) =>
       signed(viewer, template),
     );
     const publish = vi.fn(async (_event: RelayEvent) => {
-      if (interrupted && failure === "failed")
-        throw new PublishRejected("Not committed");
-      if (!interrupted || failure === "admitted") {
-        members = [viewer.pubkey, agent.pubkey];
-        clock++;
-      }
-      if (interrupted) throw new Error("Receipt lost");
+      members = [viewer.pubkey, agent.pubkey];
+      clock++;
     });
     const create = () =>
       createRelaySession(
@@ -167,7 +286,10 @@ it.each(
           media: () => undefined,
           readAgentLibrary: async () => ({
             definitions: [],
-            identities: [{ pubkey: agent.pubkey, name: "Agent" }],
+            identities: [
+              { pubkey: agent.pubkey, name: "Agent" },
+              { pubkey: freshAgent.pubkey, name: "Fresh agent" },
+            ],
           }),
           writer: { kinds: [9000], sign, publish },
           query: async (filters) =>
@@ -204,20 +326,9 @@ it.each(
       await ready();
       // A new ordinary Solo addition still cannot admit an agent.
       await expect(
-        owner.session.memberAdditions.add(channelId, agent.pubkey),
+        owner.session.memberAdditions.add(channelId, freshAgent.pubkey),
       ).rejects.toThrow(/tagging them/);
       expect(publish).not.toHaveBeenCalled();
-      await expect(
-        grantSoloChatAccess(
-          owner.session,
-          channelId,
-          [agent.pubkey],
-          new Map(),
-          new AbortController().signal,
-          () => {},
-          true,
-        ),
-      ).rejects.toThrow();
       const original = records[0];
       assert.exists(original);
       expect(original).toMatchObject({
@@ -231,7 +342,6 @@ it.each(
         owner = create();
         await ready();
       }
-      interrupted = false;
       const outbox = owner.session.outbox;
       assert.exists(outbox);
       const view = render(
@@ -251,17 +361,15 @@ it.each(
           ).toBe(true),
         );
         expect(publish.mock.calls.map(([event]) => event.id)).toEqual(
-          failure === "admitted"
-            ? [original.event.id]
-            : [original.event.id, original.event.id],
+          failure === "admitted" ? [] : [original.event.id],
         );
-        expect(sign).toHaveBeenCalledOnce();
+        expect(sign).not.toHaveBeenCalled();
         expect(screen.queryByRole("alert")).not.toBeInTheDocument();
         // A completed receipt no longer supplies admission context.
         await expect(
           owner.session.memberAdditions.add(channelId, agent.pubkey),
         ).rejects.toThrow(/tagging them/);
-        expect(publish).toHaveBeenCalledTimes(failure === "admitted" ? 1 : 2);
+        expect(publish).toHaveBeenCalledTimes(failure === "admitted" ? 0 : 1);
       } finally {
         view.unmount();
       }

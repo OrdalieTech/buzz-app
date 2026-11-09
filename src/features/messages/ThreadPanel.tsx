@@ -1,6 +1,19 @@
 // biome-ignore-all lint/a11y/noNoninteractiveTabindex: The thread region supports keyboard scrolling and Escape.
+import { AgentConnectionSetup } from "../agents/AgentConnectionSetup";
+import { TypingIndicator, useLiveConversationAgents } from "./TypingIndicator";
+import { ActivityExpansion } from "./ActivityExpansion";
+import { ActivityGroupPreview } from "./ActivityGroupPreview";
+import {
+  activityPresentation,
+  useChannelActivitySnapshot,
+  useStableRowActivity,
+} from "./activity-presentation";
+import { activityRuns } from "./activity-groups";
+import { DayDivider } from "./MessageTimestamp";
 import { workflowLabel } from "../relay/workflow-attribution";
 import { usePanelTabHost } from "../panels/PanelWorkspace";
+import { moveMessageSelection } from "./message-selection";
+import { MessageSelection } from "./use-message-selection";
 import { MessageEditScope } from "./MessageEditScope";
 import { useMessageSelectionCopy } from "./selection-copy";
 import { ReplySummary } from "./ReplySummary";
@@ -27,11 +40,18 @@ import { XIcon } from "../../shared/design-system/icons/index";
 import type { ConversationExtensions } from "../conversation/contracts";
 import type { ChannelMessage } from "../relay/contracts";
 import type { RelaySession } from "../relay/session";
-import type { ThreadRetarget, ThreadView } from "../relay/threads";
+import {
+  threadFailure,
+  type ThreadRetarget,
+  type ThreadView,
+} from "../relay/threads";
 import { useProfileGeneration, useRowProfiles } from "../relay/react";
 import { rowProfileIds } from "../relay/membership";
 import { MessageRow, type MessageLinkOrigin } from "./MessageRow";
-import { continuesMessageGroup } from "./message-grouping";
+import {
+  continuesMessageGroup,
+  publicMessageNeighbor,
+} from "./message-grouping";
 import { MessageComposer, type MessageComposerProps } from "./MessageComposer";
 import { ChannelJoinNotice } from "./ChannelJoinNotice";
 import { useListedChannel } from "../relay/listed-channel";
@@ -54,7 +74,6 @@ export type ThreadPanelProps = {
   channelId: string;
   /** Solo agents answer at top level, so a Solo thread is read-only. */
   soloConversation?: boolean | undefined;
-  activityClickOpensPanel?: boolean | undefined;
   disabled?: boolean | undefined;
   messageId: string;
   /** Channel workspaces retain the editor across same-thread link navigation. */
@@ -74,12 +93,16 @@ export type ThreadPanelProps = {
   autoFocus?: MessageComposerProps["autoFocus"];
   /** Inline Inbox visit retains and reveals its exact selected message. */
   revealSelected?: boolean | undefined;
+  /** Reveal an inline target without taking focus from its host. */
+  revealFocus?: boolean | undefined;
   /** With revealSelected: each new value reveals the selected message again. */
   revealRequest?: number | undefined;
   headerActions?: ReactNode | undefined;
   /** Saved drafts may compose only against a verified matching root. */
   requireReadyRoot?: boolean | undefined;
   onDraftSaved?: (() => void) | undefined;
+  /** The hosting preview may track delivery of this exact outgoing message. */
+  onSend?: ((id: string) => void) | undefined;
   active?: boolean | undefined;
   navigation?: PageNavigation | undefined;
   /** Omit to embed the thread: no header or Escape dismissal; the owner supplies both. */
@@ -125,6 +148,8 @@ export function ThreadPanel(props: ThreadPanelProps) {
         // Portalled viewers bubble here through React but own their Escape.
         if (
           event.key === "Escape" &&
+          !event.shiftKey &&
+          !event.defaultPrevented &&
           !tabbed &&
           close &&
           event.currentTarget.contains(event.target as Node)
@@ -392,15 +417,16 @@ function OwnedThreadPanel({
   onOpenMediaReview,
   canOpenLink,
   soloConversation,
-  activityClickOpensPanel,
   disabled,
   replyRequest,
   focusRequest,
   autoFocus,
   active = true,
   revealSelected,
+  revealFocus,
   requireReadyRoot,
   onDraftSaved,
+  onSend,
 }: ThreadPanelProps) {
   const [view, setView] = useState<ThreadView>();
   const [error, setError] = useState<string>();
@@ -457,7 +483,6 @@ function OwnedThreadPanel({
   ) : view ? (
     <ThreadMessages
       soloConversation={soloConversation}
-      activityClickOpensPanel={activityClickOpensPanel}
       disabled={disabled}
       extensions={extensions}
       session={session}
@@ -472,8 +497,10 @@ function OwnedThreadPanel({
       autoFocus={autoFocus}
       active={active}
       revealSelected={revealSelected}
+      revealFocus={revealFocus}
       requireReadyRoot={requireReadyRoot}
       onDraftSaved={onDraftSaved}
+      onSend={onSend}
       onOpenLink={onOpenLink}
       onOpenMediaReview={onOpenMediaReview}
       canOpenLink={canOpenLink}
@@ -495,16 +522,17 @@ function ThreadMessages({
   onOpenMediaReview,
   canOpenLink,
   soloConversation,
-  activityClickOpensPanel,
   disabled,
   replyRequest,
   focusRequest,
   autoFocus,
   active,
   revealSelected,
+  revealFocus,
   revealRequest,
   requireReadyRoot,
   onDraftSaved,
+  onSend,
   selectionFailure,
   onResolvedRoot,
   routePending,
@@ -518,7 +546,6 @@ function ThreadMessages({
   selectionFailure?: SelectionFailure | undefined;
   /** Solo agents answer at top level, so a Solo thread is read-only. */
   soloConversation?: boolean | undefined;
-  activityClickOpensPanel?: boolean | undefined;
   disabled?: boolean | undefined;
   extensions?: ConversationExtensions | undefined;
   session: RelaySession;
@@ -532,9 +559,12 @@ function ThreadMessages({
   autoFocus?: ThreadPanelProps["autoFocus"];
   active?: boolean | undefined;
   revealSelected?: boolean | undefined;
+  /** Reveal an inline target without taking focus from its host. */
+  revealFocus?: boolean | undefined;
   revealRequest?: number | undefined;
   requireReadyRoot?: boolean | undefined;
   onDraftSaved?: ThreadPanelProps["onDraftSaved"];
+  onSend?: ThreadPanelProps["onSend"];
   navigation?: PageNavigation | undefined;
   onOpenLink(url: string, origin?: MessageLinkOrigin): boolean;
   onOpenMediaReview?: ThreadPanelProps["onOpenMediaReview"];
@@ -549,7 +579,8 @@ function ThreadMessages({
       if (channel?.viewerRole === "guest") return "guest";
       if (channel?.readOnly && !channel.cached) {
         return channel.channelType === "stream" ||
-          channel.channelType === "forum"
+          channel.channelType === "forum" ||
+          (channel.channelType === "solo" && channel.joinRole === "guest")
           ? "joinable"
           : "preview";
       }
@@ -566,11 +597,6 @@ function ThreadMessages({
     channelId,
     (listed) => (listed ?? session.channels?.get?.(channelId))?.joinRole,
   );
-  const cached = useListedChannel(
-    session.channels,
-    channelId,
-    (listed) => !!listed?.cached,
-  );
   const [joinNoticeHeight, setJoinNoticeHeight] = useState(0);
   const [joining, setJoining] = useState(false);
   const snapshot = useSyncExternalStore(
@@ -578,6 +604,12 @@ function ThreadMessages({
     view.snapshot,
     view.snapshot,
   );
+  const threadChannels = useMemo(() => new Set([channelId]), [channelId]);
+  const activitySnapshot = useChannelActivitySnapshot(
+    session.agentActivity,
+    threadChannels,
+  );
+  const stableActivity = useStableRowActivity();
   const resolvedRoot = snapshot.root?.id;
   const reportRoot = useRef(onResolvedRoot);
   reportRoot.current = onResolvedRoot;
@@ -622,6 +654,25 @@ function ThreadMessages({
     [session.unread, channelId, snapshot.root?.id, messageId],
   );
   useSyncExternalStore(subscribeUnread, unreadSnapshot, unreadSnapshot);
+  const [expandedActivity, setExpandedActivity] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
+  const activityVisit = useRef<unknown[]>([]);
+  useLayoutEffect(() => {
+    const request = [messageId, navigation?.signal, revealRequest];
+    if (
+      !messageId ||
+      request.every((part, index) => part === activityVisit.current[index]) ||
+      !snapshot.replies.some((row) => row.id === messageId)
+    )
+      return;
+    activityVisit.current = request;
+    const group = [...tree.children.values()]
+      .flatMap((rows) => activityRuns(rows))
+      .find((group) => group.some((row) => row.id === messageId));
+    const first = group?.[0]?.id;
+    if (first) setExpandedActivity((current) => new Set([...current, first]));
+  }, [messageId, navigation?.signal, revealRequest, snapshot.replies, tree]);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const [replyParent, setReplyParent] = useState<string>();
   const resolveName = useChannelIdentityNames(session, channelId);
@@ -751,7 +802,7 @@ function ThreadMessages({
   // within this commit/layout expansion; a later user expansion must not restore it.
   const selectedBranchRef = useMemo(() => {
     let restore = false;
-    return (branch: HTMLLIElement | null) => {
+    return (branch: HTMLElement | null) => {
       if (!branch) return;
       const row = branch.querySelector<HTMLElement>("[data-message-id]");
       if (
@@ -892,7 +943,13 @@ function ThreadMessages({
     inlineReveal ?? (positionedVisit ? undefined : navigation?.signal);
   const revealed = useMessageReveal({
     scroller,
-    focus: !(
+    focus:
+      revealFocus !== false &&
+      !(
+        navigation?.target.kind === "conversation" &&
+        navigation.target.panel === "members"
+      ),
+    mark: !(
       navigation?.target.kind === "conversation" &&
       navigation.target.panel === "members"
     ),
@@ -947,28 +1004,12 @@ function ThreadMessages({
       withdrawn.current = record;
     };
   }, [navigation, active, returning, rootTarget, revealed]);
+  const failure = threadFailure(snapshot, rootTarget);
   useEffect(() => {
-    if (!navigation || navigation.signal.aborted) return;
+    if (!navigation || navigation.signal.aborted || !failure) return;
     // Each failure is shown in the thread, next to its own Try again.
-    if (rootTarget && snapshot.status === "error")
-      navigation.complete({
-        status: "failed",
-        reason: "unavailable",
-        presented: true,
-      });
-    else if (snapshot.targetStatus === "unavailable")
-      navigation.complete({
-        status: "failed",
-        reason: "not-found",
-        presented: true,
-      });
-    else if (snapshot.targetStatus === "error")
-      navigation.complete({
-        status: "failed",
-        reason: "unavailable",
-        presented: true,
-      });
-  }, [navigation, rootTarget, snapshot.status, snapshot.targetStatus]);
+    navigation.complete({ status: "failed", reason: failure, presented: true });
+  }, [navigation, failure]);
   const [sent, setSent] = useState<string>();
   const [replyFocus, setReplyFocus] = useState(0);
   useEffect(() => {
@@ -1001,6 +1042,38 @@ function ThreadMessages({
     request: number;
   }>();
   const rootId = snapshot.root?.id;
+  const rootPresentation = useMemo(
+    () =>
+      activityPresentation(
+        snapshot.root?.audience === "agents"
+          ? [snapshot.root, ...snapshot.replies]
+          : snapshot.replies,
+        activitySnapshot,
+        agentPubkeys,
+        rootId,
+      ),
+    [snapshot.root, snapshot.replies, activitySnapshot, agentPubkeys, rootId],
+  );
+  const rootActivity = rootId ? rootPresentation.byRow.get(rootId) : undefined;
+  // A stopped note may follow only a reply that is always shown: collapsed
+  // branches do not mount their rows.
+  const rootReplies = useMemo(
+    () =>
+      activityPresentation(
+        tree.children.get(undefined) ?? [],
+        activitySnapshot,
+        agentPubkeys,
+        rootId,
+      ),
+    [tree, activitySnapshot, agentPubkeys, rootId],
+  );
+  const liveAgents = useLiveConversationAgents(session, channelId, rootId);
+  const lastMessage = publicMessageNeighbor(rows, rows.length, -1);
+  const joinsLive =
+    !!lastMessage &&
+    !lastMessage.membership &&
+    lastMessage.audience !== "agents" &&
+    lastMessage.authorId === liveAgents[0];
   const hasMediaComments =
     (snapshot.root?.replyCount ?? 0) > 0 ||
     snapshot.replies.length > 0 ||
@@ -1395,14 +1468,51 @@ function ThreadMessages({
     ? new Date(snapshot.root.createdAt * 1000).toDateString()
     : undefined;
   function renderReplies(parent: string | undefined, depth = 0): ReactNode {
-    const siblings = tree.children.get(parent) ?? [];
+    const chronologicalSiblings = tree.children.get(parent) ?? [];
+    // Outcome captions stay within one displayed level, so a collapsed branch
+    // cannot hide the reply that owns a request's outcome.
+    const requestRows = new Map(
+      chronologicalSiblings.map((row) => [row.id, row]),
+    );
+    if (parent === undefined && snapshot.root)
+      requestRows.set(snapshot.root.id, snapshot.root);
+    const presentation = activityPresentation(
+      chronologicalSiblings,
+      activitySnapshot,
+      agentPubkeys,
+      parent ?? rootId,
+      // A failure with replies needs its own visible branch controls.
+      (failure) => !tree.children.get(failure.id)?.length,
+    );
+    const groups = presentation.groups.filter((group) =>
+      group.ids.every((id) => !tree.children.get(id)?.length),
+    );
+    const siblings = chronologicalSiblings;
+    const groupsByFirst = new Map(groups.map((group) => [group.ids[0], group]));
+    const groupedIds = new Set(groups.flatMap((group) => group.ids));
+    const hidden = new Set(
+      groups.flatMap((group) =>
+        expandedActivity.has(group.ids[0] ?? "") ? [] : group.ids,
+      ),
+    );
     return siblings.map((row, index) => {
-      const nextRow = siblings[index + 1];
+      const group = groupsByFirst.get(row.id);
+      if (hidden.has(row.id) && !group) return null;
+      const nextRow =
+        row.audience === "agents"
+          ? siblings[index + 1]
+          : publicMessageNeighbor(siblings, index, 1);
       const children = tree.children.get(row.id);
       const continuation =
+        !!previousReply &&
         previousReply !== snapshot.root &&
         previousParent === parent &&
-        continuesMessageGroup(previousReply, row);
+        continuesMessageGroup(
+          row.audience === "agents"
+            ? previousReply
+            : publicMessageNeighbor(siblings, index, -1),
+          row,
+        );
       // A collapsed branch breaks bubble grouping, not calendar continuity.
       const currentDay = new Date(row.createdAt * 1000).toDateString();
       const day = previousDay !== currentDay;
@@ -1417,50 +1527,123 @@ function ThreadMessages({
       const unreadLabel = unreadCount
         ? `${unreadCount} new in available replies`
         : undefined;
+      const renderMessage = (row: ChannelMessage, inside = false) => {
+        const recordedActivity = presentation.byRow.get(row.id);
+        const requestId = presentation.replyRequests.get(row.id);
+        return (
+          <MessageRow
+            representedAgents={stableActivity.agents(
+              row.id,
+              presentation.representedAgents.get(row.id),
+            )}
+            repliedAgents={stableActivity.agents(
+              `replied:${row.id}`,
+              presentation.repliedAgents.get(row.id),
+            )}
+            stoppedRequest={requestId ? requestRows.get(requestId) : undefined}
+            recordedActivity={stableActivity.activity(
+              row.id,
+              recordedActivity,
+              groupedIds.has(row.id) ? "history" : recordedActivity?.container,
+            )}
+            viewer={session.viewer}
+            extensions={extensions}
+            session={session}
+            scope={scope}
+            onReply={
+              snapshot.root && !soloConversation ? targetReply : undefined
+            }
+            row={row}
+            getThreadRoot={getThreadRoot}
+            stackPrevious={inside || continuation}
+            stackNext={
+              inside ||
+              presentation.bubbleAnchors.has(row.id) ||
+              (joinsLive && row.id === lastMessage?.id) ||
+              (!!nextRow &&
+                continuesMessageGroup(row, nextRow) &&
+                !children?.length)
+            }
+            profile={profiles.get(row.authorId)}
+            participantProfiles={profiles}
+            agentPubkeys={agentPubkeys}
+            media={session.media}
+            onOpenLink={onOpenLink}
+            canOpenLink={canOpenLink}
+            day={!inside && day}
+            layout={continuation ? "continuation" : "thread"}
+            compactAvatar={depth > 0}
+            retry={session.messages.retry}
+            {...(canSeekVideo ? { onMediaTime: handleMediaTime } : {})}
+            {...(onOpenMediaReview && rootId
+              ? { onOpenMediaReview: openRootMedia }
+              : {})}
+          />
+        );
+      };
       const message = (
-        <MessageRow
-          viewer={session.viewer}
-          extensions={extensions}
-          session={session}
-          scope={scope}
-          onReply={snapshot.root && !soloConversation ? targetReply : undefined}
-          row={row}
-          getThreadRoot={getThreadRoot}
-          stackPrevious={continuation}
-          stackNext={
-            !!nextRow &&
-            continuesMessageGroup(row, nextRow) &&
-            !children?.length
-          }
-          profile={profiles.get(row.authorId)}
-          participantProfiles={profiles}
-          agentPubkeys={agentPubkeys}
-          media={session.media}
-          onOpenLink={onOpenLink}
-          canOpenLink={canOpenLink}
-          day={day}
-          layout={continuation ? "continuation" : "thread"}
-          compactAvatar={depth > 0}
-          retry={session.messages.retry}
-          {...(canSeekVideo ? { onMediaTime: handleMediaTime } : {})}
-          {...(onOpenMediaReview && rootId
-            ? { onOpenMediaReview: openRootMedia }
-            : {})}
-        />
+        <ActivityExpansion
+          open={!hidden.has(row.id) && !groupedIds.has(row.id)}
+          enabled={row.audience === "agents"}
+        >
+          {renderMessage(row)}
+        </ActivityExpansion>
       );
       return (
         <li
           key={row.id}
-          ref={row.id === messageId ? selectedBranchRef : undefined}
+          ref={
+            row.id === messageId && !groupedIds.has(row.id)
+              ? selectedBranchRef
+              : undefined
+          }
           className={styles.replyItem}
           data-layout={continuation ? "continuation" : "thread"}
         >
-          {!parent && row.replyParentId && row.replyParentId !== rootId && (
-            <p className={styles.threadNote}>
-              Earlier reply unavailable in loaded history.
-            </p>
-          )}
+          {!parent &&
+            row.replyParentId &&
+            row.replyParentId !== rootId &&
+            !requestRows.has(row.replyParentId) && (
+              <p className={styles.threadNote}>
+                Earlier reply unavailable in loaded history.
+              </p>
+            )}
 
+          {group && (
+            <>
+              {day && hidden.has(row.id) && (
+                <DayDivider createdAt={row.createdAt} />
+              )}
+              <ActivityGroupPreview
+                session={session}
+                group={group}
+                openActivity={onOpenLink}
+                canOpenActivity={canOpenLink}
+                renderHistory={(entry) => (
+                  <div
+                    ref={entry.id === messageId ? selectedBranchRef : undefined}
+                  >
+                    {renderMessage(entry, true)}
+                  </div>
+                )}
+                profiles={profiles}
+                media={session.media}
+                layout="thread"
+                expanded={expandedActivity.has(group.ids[0] ?? "")}
+                onToggle={() => {
+                  follow.current = false;
+                  targetAnchor.current = undefined;
+                  setExpandedActivity((current) => {
+                    const next = new Set(current);
+                    const first = group.ids[0] ?? row.id;
+                    if (next.has(first)) next.delete(first);
+                    else next.add(first);
+                    return next;
+                  });
+                }}
+              />
+            </>
+          )}
           <ReplyBranch
             message={message}
             hasReplies={!!children?.length}
@@ -1578,7 +1761,10 @@ function ThreadMessages({
         channelId={channelId}
         scroller={scroller}
         settled={readingSettled}
-        rootId={snapshot.root?.id}
+        // The thread opened bounds DM reads even before its root resolves. An
+        // exact reply under an unavailable original shows alone, so it, not
+        // its signed root, is the thread: its hidden siblings stay unread.
+        rootId={snapshot.root?.id ?? messageId}
         // A visible exact reply can outlive its unavailable root. Until resolved,
         // observe rows individually; an absent root must not mean channel catch-up.
         latestMessageId={
@@ -1646,6 +1832,8 @@ function ThreadMessages({
         }}
         onPointerDown={keepReadingPosition}
         onKeyDown={(event) => {
+          moveMessageSelection(event);
+          if (event.defaultPrevented) return;
           if (
             [
               "ArrowUp",
@@ -1671,13 +1859,12 @@ function ThreadMessages({
           visible={showJumpToLatest}
           newMessageCount={newMessageCount}
           onClick={jumpToLatest}
-          activityLane={
-            composerRoot && !cached
-              ? { session, channelId, threadRootId: composerRoot.id }
-              : undefined
-          }
         />
-        <div data-thread-rows="" inert={positioning}>
+        <div
+          data-thread-rows=""
+          data-activity-history-scope=""
+          inert={positioning}
+        >
           {snapshot.root ? (
             <MessageRow
               viewer={session.viewer}
@@ -1685,7 +1872,21 @@ function ThreadMessages({
               session={session}
               scope={scope}
               onReply={soloConversation ? undefined : focusReply}
+              stackNext={joinsLive && snapshot.root.id === lastMessage?.id}
               row={snapshot.root}
+              representedAgents={stableActivity.agents(
+                snapshot.root.id,
+                rootPresentation.representedAgents.get(snapshot.root.id),
+              )}
+              repliedAgents={stableActivity.agents(
+                `replied:${snapshot.root.id}`,
+                rootReplies.repliedAgents.get(snapshot.root.id),
+              )}
+              recordedActivity={stableActivity.activity(
+                snapshot.root.id,
+                rootActivity,
+                "history",
+              )}
               profile={profiles.get(snapshot.root.authorId)}
               participantProfiles={profiles}
               agentPubkeys={agentPubkeys}
@@ -1732,6 +1933,26 @@ function ThreadMessages({
             )}
             {renderReplies(undefined)}
           </ol>
+          {!preview && !positioning && composerRoot && (
+            <AgentConnectionSetup
+              key={`${channelId}:${rootId}`}
+              session={session}
+              channel={session.channels?.get?.(channelId)}
+              rows={rows}
+            />
+          )}
+          {!positioning && rootId && (
+            <TypingIndicator
+              audience="agents"
+              inFlow
+              session={session}
+              channelId={channelId}
+              threadRootId={rootId}
+              previousAuthor={joinsLive ? lastMessage?.authorId : undefined}
+              openActivity={onOpenLink}
+              canOpenActivity={canOpenLink}
+            />
+          )}
         </div>
         {requireReadyRoot &&
           snapshot.root &&
@@ -1782,6 +2003,8 @@ function ThreadMessages({
           aria-hidden="true"
         />
       </section>
+      {/* After the scroller, so its ref is attached when this registers. */}
+      <MessageSelection list={scroller} rows={rows} session={session} />
       {preview && (
         <ChannelJoinNotice
           ready={
@@ -1803,7 +2026,6 @@ function ThreadMessages({
       )}
       {composerRoot && (
         <MessageComposer
-          activityClickOpensPanel={activityClickOpensPanel}
           onFocusedRemoval={focusArchivedHistory}
           key={`${scope}:${channelId}:${composerRoot.id}`}
           extensions={extensions}
@@ -1862,6 +2084,7 @@ function ThreadMessages({
           canOpenLink={canOpenLink}
           onDraftSaved={onDraftSaved}
           onSend={(id) => {
+            onSend?.(id);
             targetAnchor.current = undefined;
             positioned.current = true;
             follow.current = !selectedParent;

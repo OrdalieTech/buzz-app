@@ -64,7 +64,7 @@ it("loads models and their effort levels asynchronously before an agent runs", a
   ]);
 });
 
-it("offers nothing for a single model without effort levels", async () => {
+it("loads a single model without effort levels for saved-choice validation", async () => {
   const agents = ["fixed", "tunable"].map(
     (pubkey) => ({ pubkey, type: pubkey, name: pubkey }) as Agent,
   );
@@ -92,7 +92,10 @@ it("offers nothing for a single model without effort levels", async () => {
   });
   // Both lookups settle together, so the tunable one is the barrier.
   await waitFor(() =>
-    expect(result.current.map((choice) => choice.pubkey)).toEqual(["tunable"]),
+    expect(result.current.map((choice) => choice.current)).toEqual([
+      "only",
+      "Tunable",
+    ]),
   );
 });
 

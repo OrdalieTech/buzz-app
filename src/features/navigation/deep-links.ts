@@ -6,10 +6,15 @@ import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import { parseInviteLink, type InviteLink } from "../communities/invite-link";
 import { communityDestination } from "../communities/destination";
 import type { ClientSnapshot } from "../communities/service";
-import { parseBuzzLink } from "./buzz-links";
+import { agentCardTarget, parseBuzzLink, settingsTarget } from "./buzz-links";
 import { entityTarget } from "../repos/routes";
 import type { Navigation, OpenFailure, OpenResult } from "./controller";
 import { parseOpenTarget, type OpenTarget } from "./targets";
+import {
+  parseExternalAuthorization,
+  type ExternalAuthorization,
+} from "../agents/external-connection";
+import { isSignInLink, requestSignIn } from "../identity/sign-in-requests";
 
 export type DeepLinkStep =
   | Readonly<{ open: OpenTarget }>
@@ -34,13 +39,16 @@ export type DeepLinkHost = Readonly<{
   }>;
   /** Invite presentation belongs to the community switcher, not navigation. */
   invite?: (invite: InviteLink, viewer: string) => void;
+  authorize?: (request: ExternalAuthorization, viewer: string) => void;
 }>;
 type Client = Pick<ClientSnapshot, "status" | "viewer" | "selected">;
 
 // Require the canonical scheme here. The native URL parser may already have
 // normalized its case before this bridge receives it. Every address outside the
-// Buzz link grammar, unknown hosts included, parses to null; the app has no link
-// form of its own beyond the Buzz ones.
+// Buzz link grammar, unknown hosts included, parses to null. Beyond the Buzz
+// forms, the app answers only bare `buzz://` and `buzz://sign-in`, and only at
+// OS ingress (`bindDeepLinks`); they parse to null too, so content keeps them as
+// plain text.
 const buzzLink = (url: unknown) =>
   typeof url === "string" && url.startsWith("buzz:")
     ? parseBuzzLink(url)
@@ -67,6 +75,7 @@ export function deepLinkStep(
           pluginImport: link.source,
         }),
       };
+    if (link.format === "settings") return { open: settingsTarget(link) };
     if (!client.viewer || !client.selected) return { fail: "unavailable" };
     if (link.format === "removed")
       return {
@@ -80,6 +89,13 @@ export function deepLinkStep(
             communityOrigin: communityDestination(client.selected).url,
           },
         },
+      };
+    if (link.format === "agent-card")
+      return {
+        open: agentCardTarget(link.card, {
+          viewer: client.viewer,
+          communityOrigin: communityDestination(client.selected).url,
+        }),
       };
     if (link.format === "entity")
       return {
@@ -105,6 +121,10 @@ export function deepLinkStep(
   }
 }
 
+// Bare `buzz://`, with Windows' optional root path; any query or fragment is
+// ignored, as unknown parameters are on Buzz links.
+const OPEN_APP_LINK = /^buzz:\/\/\/?(?:[?#].*)?$/;
+
 /** Latest intent wins, as with a user's navigation. At most one unbound URL is
  * retained. Once bound, the ordinary controller owns presentation and retry. */
 export function bindDeepLinks(
@@ -121,6 +141,7 @@ export function bindDeepLinks(
     | {
         url: string;
         invite: InviteLink | null;
+        authorization: ExternalAuthorization | null;
         plugin: boolean;
         /** Names no destination, so no account or community binds it. */
         invalid: boolean;
@@ -179,6 +200,7 @@ export function bindDeepLinks(
       !incoming.plugin &&
       ((incoming.viewer && incoming.viewer !== client.viewer) ||
         (!incoming.invite &&
+          !incoming.authorization &&
           incoming.selected &&
           incoming.selected !== client.selected))
     ) {
@@ -189,6 +211,13 @@ export function bindDeepLinks(
     if (client.status === "loading")
       return Promise.resolve({ status: "failed", reason: "unavailable" });
     const invite = incoming.invite;
+    if (incoming.authorization) {
+      if (!client.viewer || client.status !== "ready")
+        return Promise.resolve({ status: "failed", reason: "unavailable" });
+      held = undefined;
+      host.authorize?.(incoming.authorization, client.viewer);
+      return Promise.resolve({ status: "cancelled" });
+    }
     if (invite && (!client.viewer || client.status !== "ready")) {
       // Retain the invite through identity setup and client restoration.
       return Promise.resolve({ status: "failed", reason: "unavailable" });
@@ -219,7 +248,10 @@ export function bindDeepLinks(
       !held.invalid &&
       !held.plugin &&
       ((held.viewer && held.viewer !== client.viewer) ||
-        (!held.invite && held.selected && held.selected !== client.selected))
+        (!held.invite &&
+          !held.authorization &&
+          held.selected &&
+          held.selected !== client.selected))
     ) {
       held = undefined;
       host.fail("denied");
@@ -250,24 +282,39 @@ export function bindDeepLinks(
         }
         if (closed || started.id !== host.navigation.snapshot().attempt.id)
           continue;
+        // Two ingress-only links name no destination; neither is held, bound
+        // or rejected, and they follow different selection rules:
+        // - Bare `buzz://` (Builderlab's "Open Buzz app") only asks for the
+        //   app, which native has already brought forward. Selection skips it,
+        //   so it never displaces a real link, in this batch or already held.
+        // - `buzz://sign-in` (the account pages' "Open Buzz") wins selection
+        //   like any other latest link, so earlier links in this batch are
+        //   dropped, then asks first-run to sign in again
+        //   (`identity/sign-in-requests.ts`). A link already held stays held.
         let url: string | undefined;
         for (let index = urls.length - 1; index >= 0; index--) {
           const candidate = urls[index];
-          if (typeof candidate === "string") {
+          if (typeof candidate === "string" && !OPEN_APP_LINK.test(candidate)) {
             url = candidate;
             break;
           }
         }
         if (url === undefined) continue;
+        if (isSignInLink(url)) {
+          requestSignIn();
+          continue;
+        }
         const plugin = parseBuzzLink(url)?.format === "plugin-install";
         if (epoch !== clientEpoch && !plugin) continue;
         const client = communities.snapshot();
         const invite = parseInviteLink(url);
+        const authorization = parseExternalAuthorization(url);
         held = {
           url,
           invite,
+          authorization,
           plugin,
-          invalid: !invite && !buzzLink(url),
+          invalid: !invite && !authorization && !buzzLink(url),
           launch,
           viewer: client.viewer,
           selected: client.selected,
@@ -286,7 +333,10 @@ export function bindDeepLinks(
     const next = communities.snapshot();
     if (
       (client.viewer && client.viewer !== next.viewer) ||
-      (client.selected && client.selected !== next.selected && !held?.invite)
+      (client.selected &&
+        client.selected !== next.selected &&
+        !held?.invite &&
+        !held?.authorization)
     )
       clientEpoch++;
     client = next;

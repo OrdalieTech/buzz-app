@@ -200,6 +200,14 @@ export function ButtonSpecimen() {
           Message
         </Button>
       </ExamplePreview>
+      <div className="buzz-compact-controls">
+        <Button size="caption" variant="plain">
+          Compact action
+        </Button>
+        <Button size="sm" shape="icon" variant="plain" aria-label="Add">
+          <PlusIcon />
+        </Button>
+      </div>
       <Button size="caption" variant="subtle-muted">
         Send
       </Button>

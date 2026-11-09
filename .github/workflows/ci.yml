@@ -21,13 +21,16 @@ env:
 jobs:
   javascript:
     if: github.event_name != 'workflow_dispatch'
-    name: JavaScript (${{ matrix.shard }}/4)
+    name: JavaScript (${{ matrix.shard }}/6)
     runs-on: ubuntu-24.04
+    # Vitest shards by path hash and equal file count, not duration, so slow
+    # files can share one. Six keeps the slowest well inside this deadline on
+    # slower runners; five barely moves it, and seven is slower than six.
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -42,7 +45,7 @@ jobs:
         env:
           # Bound contention between suites that sign and verify large fixtures.
           BUZZ_TEST_WORKERS: "2"
-        run: ./bin/node scripts/ci-test-report.mjs kind=vitest report=test-results/ci/vitest.json evidence=test-results/ci/vitest-timing.json title="Vitest shard ${{ matrix.shard }}/4" -- ./bin/pnpm exec vitest run --shard=${{ matrix.shard }}/4 --reporter=default --reporter=json --outputFile=test-results/ci/vitest.json
+        run: ./bin/node scripts/ci-test-report.mjs kind=vitest report=test-results/ci/vitest.json evidence=test-results/ci/vitest-timing.json title="Vitest shard ${{ matrix.shard }}/6" -- ./bin/pnpm exec vitest run --shard=${{ matrix.shard }}/6 --reporter=default --reporter=json --outputFile=test-results/ci/vitest.json
       - name: Vitest timing evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -75,6 +78,13 @@ jobs:
         with:
           key: agent-protection
           save-if: ${{ github.event_name == 'push' }}
+      - name: Install exact protected Claude fixture
+        run: ./bin/node scripts/install-protected-claude-test.mjs
+      - name: Native Claude protection boundary
+        env:
+          BUZZ_TEST_WORKERS: "2"
+          CLAUDE_PROTECTION_BIN: ${{ github.workspace }}/target/protected-claude-test/claude
+        run: ./bin/node scripts/ci-test-report.mjs kind=vitest report=test-results/protection/native-vitest.json evidence=test-results/protection/native-timing.json title="Native security hooks" -- ./bin/pnpm exec vitest run src/bundled/claude-code/protection.live.test.ts --reporter=default --reporter=json --outputFile=test-results/protection/native-vitest.json
       - name: Native approval-state containment
         run: |
           mkdir -p test-results/protection
@@ -92,7 +102,9 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     name: Rust and tool integration
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # A Cargo.lock change rebuilds most crates from a cold cache, and only a
+    # finished main push saves a warm one, so leave room for that cold run.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -122,12 +134,20 @@ jobs:
       - name: FI Builderlab build and grant tests
         env:
           # Fixture authority only; never use a release's real configuration.
+          # It is added before the built-in server, as an internal build's is.
           BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG: '{"version":1,"id":"ci-fi","identityOrigin":"https://identity.example.test","communityHosts":["relay.example.test"],"adapterBase":"https://identity.example.test/api/goose/nip-fa","apiBasePath":"/api/goose/"}'
           BUZZ_BUILDERLAB_URL: ""
         run: |
           ./bin/cargo test -p buzzodz-plugins --lib --locked
           ./bin/cargo test -p Buzz --lib --locked host_request
           ./bin/pnpm exec vite build
+      - name: FI opt-out build and grant tests
+        env:
+          # An empty value opts out of every sign-in server, the built-in one too.
+          BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG: ""
+        run: |
+          ./bin/cargo test -p buzzodz-plugins --lib --locked
+          ./bin/cargo test -p Buzz --lib --locked host_request
       - name: Scheduled agent command identity
         run: ./bin/node scripts/test-agent-command.mjs
       - name: Bundled buzz CLI
@@ -159,9 +179,9 @@ jobs:
           key: windows-native
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Native lint including Windows backend
-        run: cargo clippy -p Buzz -p buzz-agent-controller -p buzz-credential-store --locked --all-targets -- -D warnings
+        run: cargo clippy -p Buzz -p buzz-agent-controller -p buzz-credential-store -p buzz-mesh-compute --locked --all-targets -- -D warnings
       - name: All native package tests
-        run: cargo test -p Buzz -p buzz-agent-controller -p buzz-credential-store --locked --no-fail-fast
+        run: cargo test -p Buzz -p buzz-agent-controller -p buzz-credential-store -p buzz-mesh-compute --locked --no-fail-fast
 
   measurements:
     if: github.event_name != 'workflow_dispatch'

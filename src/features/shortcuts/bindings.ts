@@ -17,6 +17,8 @@ export type Shortcut = Readonly<{
   when?: () => boolean;
   allowInEditable?: boolean;
   allowInModal?: boolean;
+  /** Also run when the topmost modal is its own navigation visit (Settings, Members). */
+  allowInVisit?: boolean;
   /** Held keys are consumed but run only once unless opted in. */
   repeat?: boolean;
   /** Lower values appear first within this owner's Settings category; defaults to zero. */
@@ -36,9 +38,12 @@ export function normalizeShortcut(shortcut: Shortcut): NormalizedShortcut {
     !shortcut.title.trim() ||
     typeof shortcut.run !== "function" ||
     (shortcut.when !== undefined && typeof shortcut.when !== "function") ||
-    [shortcut.allowInEditable, shortcut.allowInModal, shortcut.repeat].some(
-      (value) => value !== undefined && typeof value !== "boolean",
-    ) ||
+    [
+      shortcut.allowInEditable,
+      shortcut.allowInModal,
+      shortcut.allowInVisit,
+      shortcut.repeat,
+    ].some((value) => value !== undefined && typeof value !== "boolean") ||
     (shortcut.order !== undefined && typeof shortcut.order !== "number")
   )
     throw new Error("A shortcut needs an id, title, binding and run function");

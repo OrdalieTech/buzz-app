@@ -20,12 +20,15 @@ import type {
   RegisteredPanel,
 } from "../../features/panels/service";
 import type { PageNavigation } from "../../features/navigation/service";
+import type { OpenTarget } from "../../features/navigation/targets";
+import { soloDraftTarget } from "../../features/channel-navigation/routes";
 import {
   createRelaySession,
   type RelaySession,
 } from "../../features/relay/session";
 import type { RelayData } from "../../features/relay/service";
 import { matchesEvent } from "../../features/relay/projection";
+import type { RelayEvent } from "../../features/relay/events";
 import {
   keypair,
   metadata,
@@ -39,6 +42,7 @@ import { setThreadPlacementPreference } from "../../features/messages/thread-pre
 import { SOLO_LABEL } from "../../features/solo/labels";
 import { composerDOMFixture } from "../../features/messages/composer-testing";
 import { ChannelsPage } from "./ChannelsPage";
+import type { CommunityMembership } from "../moderation/membership";
 import { ToastProvider } from "../../shared/design-system/ui/Toast";
 import { BrowserHostView } from "../../features/browser/BrowserHostView";
 import { BrowserSessions } from "../../features/browser/sessions";
@@ -47,6 +51,8 @@ import type { BrowserPlatform } from "../../features/browser/platform";
 composerDOMFixture();
 
 const owners: ReturnType<typeof createRelaySession>[] = [];
+const visitSnapshot = { entry: { id: "visit" }, attempt: {} };
+const threadVisitSnapshot = { entry: { id: "thread-visit" }, attempt: {} };
 beforeEach(() => {
   // jsdom has no layout/ResizeObserver. Only geometry is substituted; the page,
   // composer, session, tab store and menu interaction are production owners.
@@ -217,6 +223,7 @@ async function page(
         },
         resolve: () => true,
         complete: () => true,
+        passThrough: () => () => {},
       }
     : undefined;
   render(
@@ -260,7 +267,7 @@ it.each(["side", "main"] as const)(
       "stream",
       {
         open,
-        snapshot: () => ({ entry: { id: "thread-visit" }, attempt: {} }),
+        snapshot: () => threadVisitSnapshot,
       } as unknown as Navigation,
       true,
     );
@@ -294,6 +301,245 @@ it.each(["side", "main"] as const)(
   },
 );
 
+/** A page over `events` with no saved selection and no registered panels. */
+function workspace(
+  events: RelayEvent[],
+  viewer = keypair(),
+  authority = keypair(),
+  {
+    membership,
+    lifecycle,
+  }: {
+    membership?: CommunityMembership;
+    lifecycle?: (event: RelayEvent) => Promise<void>;
+  } = {},
+) {
+  const owner = createRelaySession(
+    {
+      viewer: viewer.pubkey,
+      relayAuthor: authority.pubkey,
+      media: () => undefined,
+      query: async (filters) =>
+        events.filter((event) =>
+          filters.some((filter) => matchesEvent(event, filter)),
+        ),
+      writer: {
+        sign: async (template) => signed(viewer, template),
+        publish: async () => {},
+      },
+      ...(lifecycle && {
+        channelLifecycle: {
+          sign: async (template) => signed(viewer, template),
+          publish: lifecycle,
+        },
+      }),
+    },
+    { outboxStorage: { load: () => [], save: () => {} } },
+  );
+  owners.push(owner);
+  const snapshot = {
+    status: "ready" as const,
+    generation: 1,
+    scope: `https://relay.test:${viewer.pubkey}`,
+    viewer: viewer.pubkey,
+    session: owner.session,
+  };
+  const relay: RelayData = {
+    snapshot: () => snapshot,
+    subscribe: () => () => {},
+    retry() {},
+    disconnect() {},
+    clearCache: async () => {},
+  };
+  const none: RegisteredPanel[] = [];
+  const panels: Panels = {
+    snapshot: () => none,
+    subscribe: () => () => {},
+    resolve: () => undefined,
+    register() {},
+    requestOpen: () => false,
+    handleOpenRequests: () => () => {},
+  };
+  const navigator = createNavigationController(
+    createMemoryHistory(),
+  ).navigation;
+  const page = (navigation?: PageNavigation) => (
+    <ToastProvider>
+      <ChannelsPage
+        relay={relay}
+        panels={panels}
+        navigator={navigator}
+        navigation={navigation}
+        membership={membership}
+      />
+    </ToastProvider>
+  );
+  const { rerender } = render(page());
+  /** Re-route the mounted page; `undefined` returns to the unrouted workspace. */
+  const visit = (target?: OpenTarget) =>
+    rerender(
+      page(
+        target && {
+          entryId: "visit",
+          target,
+          signal: new AbortController().signal,
+          position: () => undefined,
+          savePosition() {},
+          passThrough: () => () => {},
+          forSession() {
+            return this;
+          },
+          resolve: () => true,
+          complete: () => true,
+        },
+      ),
+    );
+  return { owner, viewer, authority, scope: snapshot.scope, visit };
+}
+
+it("opens the community's auto-join channel first when nothing is saved", async () => {
+  const viewer = keypair(),
+    authority = keypair();
+  workspace(
+    [
+      roster(authority, "alpha", [viewer.pubkey]),
+      metadata(authority, "alpha", "Alpha", undefined, [["t", "stream"]]),
+      roster(authority, "beta", [viewer.pubkey]),
+      metadata(authority, "beta", "Beta", undefined, [
+        ["t", "stream"],
+        ["auto_join"],
+      ]),
+    ],
+    viewer,
+    authority,
+  );
+  await screen.findByRole("textbox", { name: "Message #Beta" });
+});
+
+it("hands the community roster to Channel settings and follows the republished flag", async () => {
+  const viewer = keypair(),
+    authority = keypair();
+  const id = "11111111-1111-4111-8111-111111111111";
+  const open = (at: number, extra: string[][] = []) =>
+    metadata(authority, id, "Alpha", at, [
+      ["t", "stream"],
+      ["public"],
+      ...extra,
+    ]);
+  const events = [roster(authority, id, [viewer.pubkey]), open(1_700_000_000)];
+  const ensure = vi.fn(() => () => {});
+  workspace(events, viewer, authority, {
+    membership: {
+      snapshot: () => ({
+        status: "ready",
+        members: [],
+        role: "owner",
+        refreshing: false,
+      }),
+      subscribe: () => () => true,
+      ensure,
+      refresh: async () => {},
+      dispose: () => {},
+    },
+    // The relay applies the accepted 9002 and republishes its metadata.
+    lifecycle: async (event) => {
+      if (event.kind === 9002)
+        events.push(open(1_700_000_100, [["auto_join"]]));
+    },
+  });
+  await screen.findByRole("textbox", { name: "Message #Alpha" });
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Channel actions" }));
+  await user.click(
+    await screen.findByRole("menuitem", { name: "View channel details" }),
+  );
+  const control = await screen.findByRole("switch", {
+    name: "Starter channel for new members",
+  });
+  expect(ensure).toHaveBeenCalledOnce();
+  expect(control).not.toBeChecked();
+  await user.click(control);
+  await vi.waitFor(() => expect(control).toBeChecked());
+  expect(control).not.toHaveAttribute("aria-busy");
+  expect(control.closest("dd")?.querySelector("[role=alert]")).toBeNull();
+});
+
+it("selects a default channel the relay adds after the page opened", async () => {
+  const events: RelayEvent[] = [];
+  const { owner, viewer, authority } = workspace(events);
+  await vi.waitFor(() =>
+    expect(owner.session.channels.list().status).toBe("ready"),
+  );
+  expect(screen.queryByRole("textbox")).toBeNull();
+  // A 44100 membership hint resolves the channel through the same store entry.
+  events.push(
+    roster(authority, "beta", [viewer.pubkey]),
+    metadata(authority, "beta", "Beta", undefined, [
+      ["t", "stream"],
+      ["auto_join"],
+    ]),
+  );
+  await act(() => owner.session.channels.resolve?.(["beta"]));
+  await screen.findByRole("textbox", { name: "Message #Beta" });
+});
+
+it("keeps the channel being read when a default channel arrives later", async () => {
+  const viewer = keypair(),
+    authority = keypair();
+  const events: RelayEvent[] = [
+    roster(authority, "alpha", [viewer.pubkey]),
+    metadata(authority, "alpha", "Alpha", undefined, [["t", "stream"]]),
+  ];
+  const { owner } = workspace(events, viewer, authority);
+  await screen.findByRole("textbox", { name: "Message #Alpha" });
+  events.push(
+    roster(authority, "beta", [viewer.pubkey]),
+    metadata(authority, "beta", "Beta", undefined, [
+      ["t", "stream"],
+      ["auto_join"],
+    ]),
+  );
+  await act(() => owner.session.channels.resolve?.(["beta"]));
+  await vi.waitFor(() =>
+    expect(
+      owner.session.channels.list().channels.map(({ id }) => id),
+    ).toContain("beta"),
+  );
+  expect(screen.getByRole("textbox", { name: "Message #Alpha" })).toBeVisible();
+  expect(screen.queryByRole("textbox", { name: "Message #Beta" })).toBeNull();
+});
+
+it("keeps the computed channel across a New chat draft opened and closed meanwhile", async () => {
+  const viewer = keypair(),
+    authority = keypair();
+  const events: RelayEvent[] = [
+    roster(authority, "alpha", [viewer.pubkey]),
+    metadata(authority, "alpha", "Alpha", undefined, [["t", "stream"]]),
+  ];
+  const { owner, scope, visit } = workspace(events, viewer, authority);
+  await screen.findByRole("textbox", { name: "Message #Alpha" });
+  visit(soloDraftTarget(scope));
+  await screen.findByRole("region", { name: "New chat" });
+  events.push(
+    roster(authority, "beta", [viewer.pubkey]),
+    metadata(authority, "beta", "Beta", undefined, [
+      ["t", "stream"],
+      ["auto_join"],
+    ]),
+  );
+  await act(() => owner.session.channels.resolve?.(["beta"]));
+  await vi.waitFor(() =>
+    expect(
+      owner.session.channels.list().channels.map(({ id }) => id),
+    ).toContain("beta"),
+  );
+  visit();
+  expect(
+    await screen.findByRole("textbox", { name: "Message #Alpha" }),
+  ).toBeVisible();
+  expect(screen.queryByRole("textbox", { name: "Message #Beta" })).toBeNull();
+});
+
 it("moving the last side app adopts its guest before the dock exit finishes", async () => {
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
     new DOMRect(0, 0, 800, 500),
@@ -322,7 +568,9 @@ it("moving the last side app adopts its guest before the dock exit finishes", as
     available: true,
     attach: attached,
     detach: detached,
+    openExternal: vi.fn(async () => {}),
     setBounds: async () => {},
+    setMediaSuspended: async () => {},
     navigate: async (id, url) => {
       pages.set(id, url);
     },
@@ -449,6 +697,25 @@ it("solo composer retains side-tab cycling and close focus", async () => {
   expect(thread).toHaveFocus();
 });
 
+it("leaves Shift+Escape (Mark all as read) to a side thread, closing it on Escape", async () => {
+  const h = await page();
+  const tabs = renderHook(() => useChannelTabState(h.session, "alpha"));
+  const root = "c".repeat(64);
+  act(() =>
+    tabs.result.current.openThreadTab("alpha", root, root, undefined, "side"),
+  );
+  const thread = await screen.findByRole("tab", { name: "Thread · Alpha" });
+  expect(thread).toHaveAttribute("aria-selected", "true");
+  const content = document.querySelector(
+    `[id="${thread.getAttribute("aria-controls")}"] *`,
+  );
+  if (!content) throw new Error("The side thread has no content");
+  fireEvent.keyDown(content, { key: "Escape", shiftKey: true });
+  expect(thread).toBeInTheDocument();
+  fireEvent.keyDown(content, { key: "Escape" });
+  expect(thread).not.toBeInTheDocument();
+});
+
 it.each(["stream", "solo"] as const)(
   "the real %s page closes its side tabs by shortcut, preserves typing, and handles an empty repeat",
   async (type) => {
@@ -503,17 +770,19 @@ it.each(["stream", "solo"] as const)(
       }),
     ).not.toBeInTheDocument();
     if (type === "stream")
-      expect(screen.getByRole("tab", { name: "Alpha" })).toHaveFocus();
+      expect(
+        screen.getByRole("button", { name: "Manage members of Alpha" }),
+      ).toHaveFocus();
     else
       expect(screen.getByRole("region", { name: "Chat Alpha" })).toHaveFocus();
   },
 );
 
-it("an empty tab menu returns keyboard focus to its surviving tab", async () => {
+it("an empty tab menu returns keyboard focus to the conversation identity", async () => {
   const h = await page();
-  const channel = within(
-    screen.getByRole("tablist", { name: "Channel tabs" }),
-  ).getByRole("tab", { name: "Alpha" });
+  const channel = screen.getByRole("button", {
+    name: "Manage members of Alpha",
+  });
   channel.focus();
   await h.user.keyboard("{Shift>}{F10}{/Shift}");
   const action = await screen.findByRole("menuitem", {
@@ -521,16 +790,18 @@ it("an empty tab menu returns keyboard focus to its surviving tab", async () => 
   });
   action.focus();
   await h.user.keyboard("{Enter}");
-  expect(await screen.findByRole("tab", { name: "Alpha" })).toHaveFocus();
-  expect(screen.getAllByRole("tab")).toHaveLength(1);
+  expect(
+    await screen.findByRole("button", { name: "Manage members of Alpha" }),
+  ).toHaveFocus();
+  expect(screen.queryAllByRole("tab")).toHaveLength(0);
 });
 
-it("the main tab's menu clears the real page's side tabs too", async () => {
+it("the conversation identity menu clears the page's side tabs too", async () => {
   const h = await page();
   await h.open();
-  const channel = within(
-    screen.getByRole("tablist", { name: "Channel tabs" }),
-  ).getByRole("tab", { name: "Alpha" });
+  const channel = screen.getByRole("button", {
+    name: "Manage members of Alpha",
+  });
   await h.user.pointer({ target: channel, keys: "[MouseRight]" });
   await h.user.click(
     await screen.findByRole("menuitem", { name: "Close all tabs" }),
@@ -552,8 +823,10 @@ it("close-all works while a main-pane thread covers the channel conversation", a
     ),
   ).toHaveLength(2);
   expect(closeTabs()).toBe(true);
-  expect(screen.getAllByRole("tab")).toHaveLength(1);
-  expect(screen.getByRole("tab", { name: "Alpha" })).toHaveFocus();
+  expect(screen.queryAllByRole("tab")).toHaveLength(0);
+  expect(
+    screen.getByRole("button", { name: "Manage members of Alpha" }),
+  ).toHaveFocus();
 });
 
 it.each([false, true])(
@@ -611,7 +884,7 @@ it.each(["side", "main"] as const)(
     await h.user.click(
       await screen.findByRole("menuitem", { name: "Close other tabs" }),
     );
-    expect(screen.getAllByRole("tab")).toHaveLength(2);
+    expect(screen.getAllByRole("tab")).toHaveLength(kept === "side" ? 1 : 2);
     expect(target).toBeInTheDocument();
     expect(target).toHaveAttribute("aria-selected", "true");
     expect(target).toHaveFocus();
@@ -622,7 +895,7 @@ it("gives a Solo chat's side tab its own header actions, opening it in the main 
   const open = vi.fn(async () => ({ status: "opened" as const }));
   const h = await page("stream", {
     open,
-    snapshot: () => ({ entry: { id: "visit" }, attempt: {} }),
+    snapshot: () => visitSnapshot,
   } as unknown as Navigation);
   const tabs = renderHook(() => useChannelTabState(h.session, "alpha"));
   act(() =>
@@ -697,7 +970,7 @@ it("keeps a side tab's failed move recoverable after switching tabs", async () =
     "stream",
     {
       open: vi.fn(async () => ({ status: "opened" as const })),
-      snapshot: () => ({ entry: { id: "visit" }, attempt: {} }),
+      snapshot: () => visitSnapshot,
     } as unknown as Navigation,
     false,
     undefined,
@@ -792,7 +1065,7 @@ it("keeps a newer header move recoverable after an earlier one succeeds", async 
     "stream",
     {
       open: vi.fn(async () => ({ status: "opened" as const })),
-      snapshot: () => ({ entry: { id: "visit" }, attempt: {} }),
+      snapshot: () => visitSnapshot,
     } as unknown as Navigation,
     false,
     undefined,
@@ -847,7 +1120,7 @@ it("opens another conversation's tab in its channel, but not the current channel
   const open = vi.fn(async () => ({ status: "opened" as const }));
   const h = await page("stream", {
     open,
-    snapshot: () => ({ entry: { id: "visit" }, attempt: {} }),
+    snapshot: () => visitSnapshot,
   } as unknown as Navigation);
   const tabs = renderHook(() => useChannelTabState(h.session, "alpha"));
   const root = "d".repeat(64);
@@ -912,6 +1185,7 @@ it("opens another conversation's tab in its channel, but not the current channel
       channelId: "beta",
       messageId: other,
       threadRootId: other,
+      context: "channel",
     }),
   );
 });

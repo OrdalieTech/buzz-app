@@ -36,6 +36,59 @@ export const emptyHistory: History = {
   failed: false,
 };
 
+/** Preserve the open agent's two loaded tracks across presentation remounts.
+ * The reader is session-scoped; changed heads or redaction versions never reuse
+ * old pages. Keeping only two artifacts bounds retention to one agent's feed. */
+type LoadedHistory = {
+  channel: string;
+  d: string;
+  head: string | undefined;
+  version: number | undefined;
+  history: History;
+};
+const loadedHistories = new WeakMap<SnapshotRead, LoadedHistory[]>();
+export function recalledHistory(
+  read: SnapshotRead,
+  expected: Expected,
+  head: RelayEvent | undefined,
+  version?: number,
+) {
+  return loadedHistories
+    .get(read)
+    ?.find(
+      (value) =>
+        value.channel === expected.channel &&
+        value.d === expected.d &&
+        value.head === head?.id &&
+        value.version === version,
+    )?.history;
+}
+export function rememberHistory(
+  read: SnapshotRead,
+  expected: Expected,
+  head: RelayEvent | undefined,
+  version: number | undefined,
+  history: History,
+) {
+  if (!history.next) return;
+  const others = (loadedHistories.get(read) ?? []).filter(
+    (value) => value.channel !== expected.channel || value.d !== expected.d,
+  );
+  loadedHistories.set(
+    read,
+    [
+      {
+        channel: expected.channel,
+        d: expected.d,
+        head: head?.id,
+        version,
+        history,
+      },
+      ...others,
+    ].slice(0, 2),
+  );
+}
+
 /** Reads the next page. Revisions accepted since the last page shift offsets,
  * so repeats are dropped by event ID. A failed page keeps what was loaded.
  * Every page names the channel in `#h`: the relay leaves system channels out

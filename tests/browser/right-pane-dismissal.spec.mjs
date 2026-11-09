@@ -117,7 +117,13 @@ test("GitHub visits restore through native history and reload; X skips their ret
   });
   const target = "https://github.com/sample/project/pull/42";
   app.append("primary", "alpha", `Review ${target}`);
-  await activate(page.getByRole("link", { name: target, exact: true }));
+  // A pasted pull request link is named for it, with the title read.
+  await activate(
+    page.getByRole("link", {
+      name: "project#42 · Fixture change",
+      exact: true,
+    }),
+  );
   await expect(
     panel.getByRole("heading", { name: "Fixture change #42", exact: true }),
   ).toBeVisible();
@@ -373,7 +379,13 @@ async function openGitHub(page, app) {
   );
   const target = "https://github.com/sample/project/pull/43";
   app.append("primary", "alpha", `Review ${target}`);
-  await activate(page.getByRole("link", { name: target, exact: true }));
+  // A pasted pull request link is named for it, with the title read.
+  await activate(
+    page.getByRole("link", {
+      name: "project#43 · Bulk close fixture",
+      exact: true,
+    }),
+  );
   await expect(
     page.getByRole("heading", { name: "Bulk close fixture #43", exact: true }),
   ).toBeVisible();
@@ -432,7 +444,10 @@ test("Close all retires mixed active and inactive content visits", async ({
   await openThread(0);
   await openThread(1);
   await openGitHub(page, app);
-  const channel = page.getByRole("tab", { name: "Alpha", exact: true });
+  const channel = page.getByRole("button", {
+    name: "Manage members of Alpha",
+    exact: true,
+  });
   await channel.click({ button: "right" });
   await page
     .getByRole("menuitem", { name: "Close all tabs", exact: true })

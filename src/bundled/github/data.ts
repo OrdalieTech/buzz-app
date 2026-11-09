@@ -8,6 +8,11 @@ export type GitHubDetails = {
   body: string;
   bodyHtml?: string | undefined;
   state: string;
+  /** Why an issue was closed, as GitHub gives it, such as `not_planned`. */
+  stateReason?: string | undefined;
+  /** Read as an issue, it is a pull request: GitHub numbers both alike, and
+   * its issues answer for either. */
+  pullRequest?: true | undefined;
   author: string;
   headSha?: string | undefined;
   authorUrl?: string | undefined;
@@ -39,6 +44,8 @@ type ResponseData = {
   body?: string | null;
   body_html?: string | null;
   state?: string;
+  state_reason?: string | null;
+  pull_request?: object | null;
   draft?: boolean;
   merged?: boolean;
   merged_at?: string | null;
@@ -162,6 +169,8 @@ export async function loadGitHubDetails(
         : data.draft
           ? "Draft"
           : (data.state ?? ""),
+    stateReason: data.state_reason ?? undefined,
+    pullRequest: data.pull_request ? true : undefined,
     author:
       data.user?.login ??
       data.author?.login ??

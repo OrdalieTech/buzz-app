@@ -24,10 +24,13 @@ export function StatusExpiration({
   value,
   onChange,
   disabled,
+  label = "Status expiration",
 }: {
   value: Date;
   onChange(value: Date): void;
   disabled: boolean;
+  /** Names the date and time controls, e.g. "Focus end". */
+  label?: string;
 }) {
   const [calendarOpen, setCalendarOpen] = useState(false);
   const today = new Date();
@@ -40,7 +43,7 @@ export function StatusExpiration({
         <Popover.Root open={calendarOpen} onOpenChange={setCalendarOpen}>
           <Popover.Trigger
             disabled={disabled}
-            render={<FieldButton aria-label="Status expiration date" />}
+            render={<FieldButton aria-label={`${label} date`} />}
           >
             {value.toLocaleDateString([], {
               month: "short",
@@ -85,7 +88,7 @@ export function StatusExpiration({
         <MenuRoot>
           <MenuTrigger
             disabled={disabled}
-            render={<FieldButton aria-label="Status expiration time" />}
+            render={<FieldButton aria-label={`${label} time`} />}
           >
             {times.find((option) => option.value === time)?.label ??
               value.toLocaleTimeString([], {

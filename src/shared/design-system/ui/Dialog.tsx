@@ -56,6 +56,8 @@ export type DialogProps = {
   size?: "compact" | "default" | "wide" | "expanded";
   /** Keep frequent surfaces such as search palettes immediate. */
   motion?: "default" | "none";
+  /** An addressable dialog: its own navigation visit, so Back closes it. */
+  visit?: boolean;
   /** A pending operation can prevent all user dismissal paths. */
   preventClose?: boolean;
   initialFocus?: PopupProps["initialFocus"];
@@ -86,6 +88,7 @@ export function Dialog({
   dismissOnOutsideClick = true,
   closeLabel = "Close",
   size = "default",
+  visit = false,
   preventClose = false,
   motion = "default",
   height = "content",
@@ -212,10 +215,14 @@ export function Dialog({
             edge="bottom"
             className="buzz-dialog-bar-material"
           />
-          {leadingActions && (
-            <div className="buzz-dialog-leading-actions">{leadingActions}</div>
-          )}
-          {actions}
+          <div className="buzz-dialog-action-row">
+            {leadingActions && (
+              <div className="buzz-dialog-leading-actions">
+                {leadingActions}
+              </div>
+            )}
+            {actions}
+          </div>
         </footer>
       )}
     </>
@@ -266,6 +273,7 @@ export function Dialog({
           data-stepped={step ? "" : undefined}
           data-size={navigation ? "expanded" : size}
           data-navigation={navigation ? "" : undefined}
+          data-navigation-visit={visit ? "" : undefined}
           data-contained={container ? "" : undefined}
           data-motion={transition}
           aria-modal="true"

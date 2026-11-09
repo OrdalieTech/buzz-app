@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { test, expect } from "./fixture.mjs";
 import {
   activate,
+  clickRow,
   expectAnchor,
   open,
   settle,
@@ -17,6 +18,7 @@ const closeRequest = `{ const tabEvent = "buzz:close-active-tab";\n${readFileSyn
 )}\n}`;
 
 test.use({
+  enabledPlugins: ["buzz.workflows"],
   productionBroker: true,
   readState: true,
   threadUnread: true,
@@ -342,10 +344,12 @@ test("choosing a thread tab resumes typing where its reply was left", async ({
     exact: true,
   });
   for (const [index, root] of roots.slice(0, 2).entries()) {
-    await page
-      .locator(`[data-channel-timeline] [data-message-id="${root.id}"]`)
-      .getByRole("button", { name: /^View thread:/ })
-      .click();
+    // Opening the pane rewraps the timeline; setup must survive its pointer hold.
+    await activate(
+      page
+        .locator(`[data-channel-timeline] [data-message-id="${root.id}"]`)
+        .getByRole("button", { name: /^View thread:/ }),
+    );
     await expect(
       panel.getByText(`Thread root ${index}`, { exact: true }),
     ).toBeVisible();
@@ -422,10 +426,12 @@ test("dragging thread tabs reorders and crosses panes without losing the reply",
     .get("primary/alpha")
     .filter((row) => row.content.startsWith("Thread root"));
   for (const root of roots.slice(0, 2)) {
-    await page
-      .locator(`[data-channel-timeline] [data-message-id="${root.id}"]`)
-      .getByRole("button", { name: /^View thread:/ })
-      .click();
+    await clickRow(
+      page,
+      page
+        .locator(`[data-channel-timeline] [data-message-id="${root.id}"]`)
+        .getByRole("button", { name: /^View thread:/ }),
+    );
     await expect(
       page.getByRole("complementary", { name: "Thread", exact: true }),
     ).toBeVisible();
@@ -574,10 +580,12 @@ for (const scenario of ["narrow overlay", "same-channel history"]) {
     const tabs = (host) =>
       host.locator('[role="tab"][data-tab-value^="thread:"]');
     for (const root of roots.slice(0, 2)) {
-      await page
-        .locator(`[data-channel-timeline] [data-message-id="${root.id}"]`)
-        .getByRole("button", { name: /^View thread:/ })
-        .click();
+      await clickRow(
+        page,
+        page
+          .locator(`[data-channel-timeline] [data-message-id="${root.id}"]`)
+          .getByRole("button", { name: /^View thread:/ }),
+      );
       await expect(
         side.getByRole("complementary", { name: "Thread", exact: true }),
       ).toBeVisible();
@@ -656,11 +664,18 @@ test("closing an active thread highlights its visible channel origin without scr
   const origin = item.locator(":scope > [data-layout]");
   // Keep another side tab open so closing does not change the channel width
   // and rewrap the history independently of the highlight.
-  await timeline
-    .locator(`[data-message-id="${roots[1].id}"]`)
-    .getByRole("button", { name: /^View thread:/ })
-    .click();
-  await item.getByRole("button", { name: /^View thread:/ }).click();
+  await clickRow(
+    page,
+    timeline
+      .locator(`[data-message-id="${roots[1].id}"]`)
+      .getByRole("button", { name: /^View thread:/ }),
+    timeline,
+  );
+  await clickRow(
+    page,
+    item.getByRole("button", { name: /^View thread:/ }),
+    timeline,
+  );
   const side = page.locator("[data-panel-workspace]");
   await expect(
     side.locator('[role="tab"][data-tab-value^="thread:"]'),
@@ -877,15 +892,13 @@ test("header openings keep focus while a main-pane thread is retained", async ({
     .get("primary/alpha")
     .find((row) => row.content.startsWith("Thread root"));
   const main = page.locator("[data-main-workspace]");
-  const topbar = page.getByRole("navigation", { name: "Topbar pages" });
+  const topbar = page.getByRole("navigation", { name: "Apps dock" });
   const messages = topbar.getByRole("tab", {
     name: "Messages",
     exact: true,
   });
   const projects = topbar.getByRole("tab", { name: "Workflows", exact: true });
-  const inbox = page
-    .getByRole("navigation", { name: "Pages" })
-    .getByRole("button", { name: "Inbox", exact: true });
+  const inbox = topbar.getByRole("tab", { name: "Activity", exact: true });
   for (const leave of [inbox, projects]) {
     await page
       .locator(`[data-channel-timeline="alpha"] [data-message-id="${root.id}"]`)

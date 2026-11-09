@@ -3,7 +3,9 @@ import type { ComposerSession } from "../../features/messages/composer-session";
 import type { ChannelSummary } from "../../features/relay/contracts";
 import { allowsOutsideMentions } from "../../features/messages/mention-admission";
 import { matchPerson } from "../../features/search/person-match";
+import { verifiedName } from "../../features/profiles/useVerifiedNames";
 import { searchDebounce, searchable } from "../../shared/search-debounce";
+import { typedPublicKey } from "../../shared/identity/public-key";
 
 type Person = Awaited<
   ReturnType<ComposerSession["directMessages"]["people"]>
@@ -13,7 +15,7 @@ type Page = MentionDirectoryPage;
 const empty: readonly Person[] = [];
 const CACHE_LIMIT = 100;
 // An exact key is an author lookup, which name-prefix evidence cannot refute.
-const exactKey = (query: string) => /^[0-9a-f]{64}$/.test(query.trim());
+const exactKey = (query: string) => typedPublicKey(query) !== undefined;
 
 // Successful non-empty first pages, per session (community/viewer) and query.
 // Session lifetime bounds staleness; errors are not cached, so Retry reads
@@ -61,9 +63,16 @@ function prefixPage(session: ComposerSession, query: string) {
       best = [key, page];
   return best?.[1];
 }
-/** The page for `query` read out of a complete page for its prefix. */
-const derive = (page: Page, query: string): Page => ({
-  people: page.people.filter((person) => matchPerson(person.name, query)),
+/** The page for `query` read out of a complete page for its prefix. A person
+ * the community verified also matches by their verified names, so refining
+ * `fake` to `fake n` keeps Fake Name. */
+const derive = (session: ComposerSession, page: Page, query: string): Page => ({
+  people: page.people.filter((person) => {
+    const verified = verifiedName(session.profiles, person.pubkey);
+    return [person.name, verified?.displayName, verified?.fullName].some(
+      (name) => name !== undefined && matchPerson(name, query),
+    );
+  }),
   more: false,
 });
 // The last settled page per chooser lifetime. Inline completion remounts its
@@ -103,7 +112,7 @@ export async function fetchMentionDirectoryPage(
   const hit = cached(session, query);
   if (hit) return hit;
   const source = fresh ? undefined : prefixPage(session, query);
-  if (source) return derive(source, query);
+  if (source) return derive(session, source, query);
   exhausted.delete(session);
   const { people, hasMore } = await session.directMessages.people(
     query,
@@ -175,8 +184,8 @@ export function useMentionDirectory(
   const source =
     active && !exact && attempt === 0 ? prefixPage(session, query) : undefined;
   const derived = useMemo(
-    () => (source ? derive(source, query) : undefined),
-    [source, query],
+    () => (source ? derive(session, source, query) : undefined),
+    [session, source, query],
   );
   const hit = active
     ? (exact ?? own?.page ?? derived ?? (refuted ? refutedPage : undefined))

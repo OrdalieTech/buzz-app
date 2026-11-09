@@ -6,7 +6,7 @@ import { profileMentionParts } from "../messages/profile-mentions";
 import { profileKey } from "../profiles/target";
 import type { DraftRecipient } from "../messages/mention-draft";
 import { ownSolo, SOLO_NAMED_LABEL } from "../solo/labels";
-import { startingChatTitle } from "../solo/chat-title";
+import { isStartingChatTitle } from "../solo/chat-title";
 
 /**
  * Names the owner's Solo chat with an agent harness's own title, once. Only a
@@ -119,14 +119,13 @@ export async function nameSoloChat(
       });
     offset += part.text.length;
   }
-  const initial = startingChatTitle({ text: original.content, recipients });
   const base = await details.load(channel);
   if (!current()) return skip("connection changed");
   if (!base.canEdit) return skip("owner can't edit the chat");
   if (
     base.labels?.includes(SOLO_NAMED_LABEL) ||
     base.name === name ||
-    canonicalDetailsName(base.name) !== initial
+    !isStartingChatTitle(base.name, { text: original.content, recipients })
   )
     return skip("chat already renamed");
   await details.save(base, { ...base, name });

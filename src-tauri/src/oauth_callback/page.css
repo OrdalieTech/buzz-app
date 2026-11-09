@@ -139,6 +139,11 @@ p:empty {
   position: absolute;
   inset-block-start: 1.09375rem;
   inset-inline-start: 3rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-weight: 500;
+  line-height: 1.5;
 }
 
 .brand svg {
@@ -149,6 +154,11 @@ p:empty {
 
 .brand svg > path {
   fill: currentColor;
+}
+
+/* Keep the federated card readable with enlarged text in a narrow window. */
+[data-provider="Buzz"] main {
+  padding: min(var(--space-panel-inset), 4vw);
 }
 
 h1 {

@@ -3,12 +3,19 @@ import { afterEach, expect, it, vi } from "vitest";
 import { createRelaySession } from "../relay/session";
 import { createChannelKit } from "./capability";
 import {
+  CANVAS_HISTORY_PAGE,
+  CANVAS_MAX_EVENT_BYTES,
+  CANVAS_READ_BYTES,
+} from "./canvas-limits";
+import { byteSize } from "../relay/budget";
+import { createRelayReader, RELAY_READ_BYTES } from "../relay/reader";
+import {
   coordinate,
   KIT_TAG,
   type KitRecord,
   type PayloadRecord,
 } from "./model";
-import { keypair, metadata, roster, signed } from "../relay/testing";
+import { flush, keypair, metadata, roster, signed } from "../relay/testing";
 import { matchesEvent } from "../relay/projection";
 import type { ReadFilter, RelayEvent } from "../relay/events";
 import { ReadError } from "../relay/errors";
@@ -45,6 +52,7 @@ function fixture() {
     observeDismiss: () => () => {},
     observeSend: () => () => {},
     ready: async () => {},
+    recovery: async () => undefined,
     recover: async () => {},
     acknowledge: async () => {},
     supports: () => true,
@@ -168,6 +176,75 @@ it.each(["head read", "encryption"] as const)(
     }
   },
 );
+const other: KitRecord = {
+  ...record,
+  value: { type: "team", id: "other", name: "Other", agents: [] },
+};
+it("saves another record during a save, never the same record twice", async () => {
+  const f = fixture();
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let preparing = false;
+  f.host.prepare.mockImplementationOnce(async (value) => {
+    preparing = true;
+    await gate;
+    return JSON.stringify(value);
+  });
+  const first = f.capability.save(record.value, undefined);
+  try {
+    await vi.waitFor(() => expect(preparing).toBe(true));
+    await expect(f.capability.save(record.value, undefined)).rejects.toThrow(
+      "already in progress",
+    );
+    const id = await f.capability.save(other.value, undefined);
+    expect(f.capability.snapshot().entries.map((e) => e.eventId)).toEqual([id]);
+  } finally {
+    release();
+  }
+  await first;
+  expect(f.outbox.send).toHaveBeenCalledTimes(2);
+});
+it("reads a save back after a catalog read that began before its confirmation", async () => {
+  const f = fixture();
+  const read = vi.mocked(f.reader.read);
+  const answer = read.getMockImplementation();
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let held = false;
+  read.mockImplementation(async (filters, options) => {
+    const events = (await answer?.(filters, options)) ?? [];
+    if (!held && filters.some((filter) => filter["#t"])) {
+      held = true;
+      await gate; // Answer with the catalog as it was when the read began.
+    }
+    return events;
+  });
+  const first = f.capability.save(record.value, undefined);
+  try {
+    await vi.waitFor(() => expect(held).toBe(true));
+    const second = f.capability.save(other.value, undefined);
+    // The final head read precedes the trailing catalog refresh.
+    await vi.waitFor(() =>
+      expect(
+        read.mock.calls.filter(
+          ([filters]) => filters[0]?.["#d"]?.[0] === coordinate(other),
+        ),
+      ).toHaveLength(2),
+    );
+    await flush();
+    release();
+    const ids = await Promise.all([first, second]);
+    expect(f.capability.snapshot().entries.map((e) => e.eventId)).toEqual(
+      expect.arrayContaining(ids),
+    );
+  } finally {
+    release();
+  }
+});
 it("caller cancellation after enqueue does not retract or interrupt durable delivery", async () => {
   const f = fixture();
   const operation = new AbortController();
@@ -415,6 +492,59 @@ it("keeps display-only Canvas reads replica-eligible without weakening editor re
     { signal: f.controller.signal, fresh: true },
   );
 });
+
+it.each<[string, number, string[][]]>([
+  ["wrong kind", 9, [["h", channel]]],
+  ["wrong channel", 40100, [["h", "22222222-2222-4222-8222-222222222222"]]],
+  ["missing channel", 40100, []],
+  ["missing channel value", 40100, [["h"]]],
+  [
+    "duplicate channel",
+    40100,
+    [
+      ["h", channel],
+      ["h", channel],
+    ],
+  ],
+  [
+    "ambiguous channel",
+    40100,
+    [
+      ["h", channel],
+      ["h", "elsewhere"],
+    ],
+  ],
+  ["channel tag extra field", 40100, [["h", channel, "extra"]]],
+])(
+  "ignores %s as a Canvas head and rejects it in history",
+  async (_problem, kind, tags) => {
+    const f = fixture();
+    const valid = signed(viewer, {
+      kind: 40100,
+      tags: [
+        ["h", channel],
+        ["client-id", "canvas"],
+      ],
+      content: "Current Canvas",
+      created_at: 100,
+    });
+    const unrelated = signed(viewer, {
+      kind,
+      tags,
+      content: "Unrelated owner-signed text",
+      created_at: 101,
+    });
+    // A relay may return authentic events outside the requested coordinates.
+    vi.mocked(f.reader.read).mockResolvedValueOnce([unrelated]);
+    expect(await f.canvas.read(channel)).toBeUndefined();
+    vi.mocked(f.reader.read).mockResolvedValueOnce([valid, unrelated]);
+    expect(await f.canvas.read(channel)).toEqual(valid);
+    vi.mocked(f.reader.read).mockResolvedValueOnce([unrelated]);
+    await expect(f.canvas.history(channel)).rejects.toThrow(
+      /invalid or non-advancing/,
+    );
+  },
+);
 
 it.each([false, true])(
   "carries a strong-read revision precondition for existing=%s",
@@ -669,7 +799,8 @@ it("retains an uncertain Canvas after lost ACK and CAS-refused exact retry, bloc
 
 it("pages retained Canvas history across equal timestamps without changing the strong head contract", async () => {
   const f = fixture();
-  for (let i = 0; i < 52; i++)
+  const total = 2 * CANVAS_HISTORY_PAGE + 2;
+  for (let i = 0; i < total; i++)
     f.events.push(
       signed(viewer, {
         kind: 40100,
@@ -693,13 +824,13 @@ it("pages retained Canvas history across equal timestamps without changing the s
     first.revisions.length,
     second.revisions.length,
     third.revisions.length,
-  ]).toEqual([25, 25, 2]);
+  ]).toEqual([CANVAS_HISTORY_PAGE, CANVAS_HISTORY_PAGE, 2]);
   const revisions = [
     ...first.revisions,
     ...second.revisions,
     ...third.revisions,
   ];
-  expect(new Set(revisions.map((row) => row.id)).size).toBe(52);
+  expect(new Set(revisions.map((row) => row.id)).size).toBe(total);
   expect(revisions).toEqual(
     [...f.events].sort(
       (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
@@ -709,7 +840,14 @@ it("pages retained Canvas history across equal timestamps without changing the s
   expect(third.next).toBeUndefined();
   expect(f.reader.read).toHaveBeenNthCalledWith(
     1,
-    [{ kinds: [40100], "#h": [channel], limit: 25, consistency: "strong" }],
+    [
+      {
+        kinds: [40100],
+        "#h": [channel],
+        limit: CANVAS_HISTORY_PAGE,
+        consistency: "strong",
+      },
+    ],
     { signal: f.controller.signal, fresh: true },
   );
   expect(f.reader.read).toHaveBeenNthCalledWith(
@@ -718,9 +856,9 @@ it("pages retained Canvas history across equal timestamps without changing the s
       {
         kinds: [40100],
         "#h": [channel],
-        limit: 25,
-        until: first.revisions[24]?.created_at,
-        before_id: first.revisions[24]?.id,
+        limit: CANVAS_HISTORY_PAGE,
+        until: first.revisions.at(-1)?.created_at,
+        before_id: first.revisions.at(-1)?.id,
       },
     ],
     { signal: f.controller.signal, fresh: true },
@@ -728,7 +866,44 @@ it("pages retained Canvas history across equal timestamps without changing the s
   expect(await f.canvas.read(channel)).toEqual(first.revisions[0]);
   expect(f.outbox.send).not.toHaveBeenCalled();
 });
-it.each(["wrong kind", "wrong channel", "repeated cursor", "newer timestamp"])(
+it("reads a full History page of the largest escaped Canvas events within the read budget", async () => {
+  const f = fixture();
+  const largest = (i: number) => {
+    const base = {
+      kind: 40100,
+      tags: [["h", channel]],
+      created_at: 1700000000 - i,
+    };
+    const overhead = byteSize(signed(viewer, { ...base, content: "" }));
+    // Each quote serializes as two bytes.
+    const quotes = Math.floor((CANVAS_MAX_EVENT_BYTES - overhead) / 2);
+    return signed(viewer, { ...base, content: '"'.repeat(quotes) });
+  };
+  const page = Array.from({ length: CANVAS_HISTORY_PAGE }, (_, i) =>
+    largest(i),
+  );
+  expect(byteSize(page[0])).toBeGreaterThan(CANVAS_MAX_EVENT_BYTES - 2);
+  expect(byteSize(page[0])).toBeLessThanOrEqual(CANVAS_MAX_EVENT_BYTES);
+  expect(CANVAS_READ_BYTES).toBe(RELAY_READ_BYTES);
+  const relay = createRelayReader({
+    viewer: viewer.pubkey,
+    relayAuthor: keypair().pubkey,
+    media: () => undefined,
+    query: async () => page,
+  });
+  vi.mocked(f.reader.read).mockImplementation(relay.reader.read);
+  try {
+    const history = await f.canvas.history(channel);
+    expect(history.revisions).toHaveLength(CANVAS_HISTORY_PAGE);
+    expect(history.next).toEqual({
+      until: page.at(-1)?.created_at,
+      before_id: page.at(-1)?.id,
+    });
+  } finally {
+    relay.dispose();
+  }
+});
+it.each(["repeated cursor", "newer timestamp"])(
   "rejects %s history rows without exposing them",
   async (problem) => {
     const f = fixture();
@@ -742,21 +917,14 @@ it.each(["wrong kind", "wrong channel", "repeated cursor", "newer timestamp"])(
     vi.mocked(f.reader.read).mockResolvedValueOnce([
       {
         ...row,
-        ...(problem === "wrong kind" ? { kind: 9 } : {}),
-        ...(problem === "wrong channel" ? { tags: [["h", "elsewhere"]] } : {}),
         ...(problem === "newer timestamp"
           ? { created_at: row.created_at + 1 }
           : {}),
       },
     ]);
-    await expect(
-      f.canvas.history(
-        channel,
-        problem === "repeated cursor" || problem === "newer timestamp"
-          ? cursor
-          : undefined,
-      ),
-    ).rejects.toThrow(/invalid or non-advancing/);
+    await expect(f.canvas.history(channel, cursor)).rejects.toThrow(
+      /invalid or non-advancing/,
+    );
   },
 );
 it("fences Canvas history after access loss or session retirement, including during a read", async () => {

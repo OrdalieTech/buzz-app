@@ -2,6 +2,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { AgentType } from "../../features/agents/service";
 import { GooseRuntime } from "./runtime";
+import { GooseSetup } from "./setup";
 import { apply } from "./index";
 
 vi.mock("@tauri-apps/api/core", () => ({ isTauri: () => true }));
@@ -10,9 +11,9 @@ afterEach(() => vi.restoreAllMocks());
 it("observes saved conversations with the status of open sessions", () => {
   vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
   vi.spyOn(GooseRuntime.prototype, "conversations").mockReturnValue([
-    { key: "room/r", at: 3 },
-    { key: "dm", at: 2 },
-    { key: "old", at: 1 },
+    { key: "room/r", at: 3, sessions: [] },
+    { key: "dm", at: 2, sessions: [] },
+    { key: "old", at: 1, sessions: [] },
   ]);
   vi.spyOn(GooseRuntime.prototype, "sessions").mockReturnValue([
     { key: "room/r", busy: true, sessionId: "s1", at: 3 },
@@ -26,6 +27,7 @@ it("observes saved conversations with the status of open sessions", () => {
   apply({
     pluginOwner: { id: "buzz.goose", revision: "r1" },
     host: { request: vi.fn() },
+    agentProtection: { registerModels: vi.fn() },
     agents: {
       register: (registered: AgentType) => {
         type = registered;
@@ -59,5 +61,62 @@ it("observes saved conversations with the status of open sessions", () => {
     { channelId: "dm", at: 2, status: "Idle" },
     // A conversation whose session closed is unobserved, not idle.
     { channelId: "old", at: 1 },
+  ]);
+});
+
+it("lists the models of the providers that answer when another's list fails", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+  vi.spyOn(GooseSetup.prototype, "providers").mockResolvedValue({
+    providers: [
+      { id: "openai", name: "OpenAI", configured: true },
+      { id: "broken", name: "Broken", configured: true },
+      { id: "unset", name: "Unset", configured: false },
+    ],
+  } as unknown as Awaited<ReturnType<GooseSetup["providers"]>>);
+  vi.spyOn(GooseSetup.prototype, "models").mockImplementation(async (id) => {
+    if (id === "broken") throw new Error("provider is down");
+    return [{ id: "gpt-5", label: "GPT-5" }] as Awaited<
+      ReturnType<GooseSetup["models"]>
+    >;
+  });
+  const registerModels = vi.fn();
+  apply({
+    pluginOwner: { id: "buzz.goose", revision: "r1" },
+    host: { request: vi.fn() },
+    agentProtection: { registerModels },
+    agents: { register: vi.fn(), relay: () => undefined },
+    effect: vi.fn(),
+  } as never);
+  const [registered] = registerModels.mock.calls[0] as [
+    { models(): Promise<unknown> },
+  ];
+  await expect(registered.models()).resolves.toEqual([
+    { provider: "openai", id: "gpt-5", label: "OpenAI · GPT-5" },
+  ]);
+});
+
+it("lists no review models for the providers Goose reviews refuse", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+  vi.spyOn(GooseSetup.prototype, "providers").mockResolvedValue({
+    providers: ["openai", "github_copilot", "codex", "cursor-agent"].map(
+      (id) => ({ id, name: id, configured: true }),
+    ),
+  } as unknown as Awaited<ReturnType<GooseSetup["providers"]>>);
+  vi.spyOn(GooseSetup.prototype, "models").mockResolvedValue([
+    { id: "model", label: "Model" },
+  ] as Awaited<ReturnType<GooseSetup["models"]>>);
+  const registerModels = vi.fn();
+  apply({
+    pluginOwner: { id: "buzz.goose", revision: "r1" },
+    host: { request: vi.fn() },
+    agentProtection: { registerModels },
+    agents: { register: vi.fn(), relay: () => undefined },
+    effect: vi.fn(),
+  } as never);
+  const [registered] = registerModels.mock.calls[0] as [
+    { models(): Promise<unknown> },
+  ];
+  await expect(registered.models()).resolves.toEqual([
+    { provider: "openai", id: "model", label: "openai · Model" },
   ]);
 });

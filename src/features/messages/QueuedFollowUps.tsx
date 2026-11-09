@@ -7,11 +7,16 @@ import {
 } from "react";
 import type { RelaySession } from "../relay/session";
 import { motion, useReducedMotion } from "motion/react";
-import { Button, type ButtonProps } from "../../shared/design-system/ui/Button";
+import type { ButtonProps } from "../../shared/design-system/ui/Button";
+import { accentButtonStyle } from "../../shared/theme/accent";
 import { AgentsContext, useSessionState } from "../agents/react";
 import { Tooltip } from "../../shared/design-system/ui/Tooltip";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
-import { TrashIcon } from "../../shared/design-system/icons";
+import {
+  ArrowUpIcon,
+  XIcon,
+  PencilSimpleIcon,
+} from "../../shared/design-system/icons";
 import { followUpQueue } from "./follow-up-queue";
 import styles from "./QueuedFollowUps.module.css";
 
@@ -20,19 +25,25 @@ export function QueuedFollowUps({
   channelId,
   disabled,
   focusComposer,
+  onEdit,
 }: {
   session: RelaySession;
   channelId: string;
   disabled: boolean;
   focusComposer(): void;
+  onEdit?(id: string): void;
 }) {
   const queue = followUpQueue(session);
   const entries = useSyncExternalStore(queue.subscribe, queue.snapshot).filter(
     (entry) => entry.channelId === channelId,
   );
+  const storageError = useSyncExternalStore(
+    queue.subscribe,
+    queue.storageError,
+  );
   const section = useRef<HTMLElement>(null);
   const focused = useRef<
-    { id: string; action: "send" | "remove" | "preview" } | undefined
+    { id: string; action: "send" | "remove" | "preview" | "edit" } | undefined
   >(undefined);
   useLayoutEffect(() => {
     if (
@@ -51,13 +62,18 @@ export function QueuedFollowUps({
     if (next) next.focus();
     else focusComposer();
   }, [entries, focusComposer]);
-  if (!entries.length) return null;
+  if (!entries.length && !storageError) return null;
   return (
     <section
       ref={section}
       className={styles.queue}
       aria-label="Queued follow-ups"
     >
+      {storageError && (
+        <p role="alert" className="text-body-sm text-danger">
+          {storageError}
+        </p>
+      )}
       <ol className={styles.list}>
         {entries.map((entry) => (
           <li key={entry.id} className={styles.row}>
@@ -68,6 +84,16 @@ export function QueuedFollowUps({
                   focused.current = { id: entry.id, action: "preview" };
                 }}
               />
+              {entry.sending && !entry.error && (
+                <p className="text-caption">Sending…</p>
+              )}
+              {entry.restored && !entry.sending && !entry.error && (
+                <p className="text-caption">
+                  {entry.predecessorRemoved
+                    ? "Paused because an earlier message was handled in another window. Send when ready."
+                    : "Saved before restart. Send when ready."}
+                </p>
+              )}
               {entry.error && (
                 <p role="alert" className="text-body-sm text-danger">
                   {entry.error}
@@ -80,16 +106,30 @@ export function QueuedFollowUps({
                 onFocus={() => {
                   focused.current = { id: entry.id, action: "remove" };
                 }}
-                data-remove-action
-                style={{ width: "var(--space-6)", height: "var(--space-6)" }}
-                variant="destructive-quiet"
-                shape="inset"
-                size="sm"
+                disabled={disabled || entry.sending}
+                variant="subtle"
+                shape="round"
+                size="xs"
                 aria-label="Remove queued message"
-                icon={<TrashIcon size={16} strokeWidth={1.5} />}
+                icon={<XIcon size={12} strokeWidth={2} />}
                 onClick={() => {
                   queue.remove(entry.id);
                 }}
+              />
+              <IconButton
+                data-queue-action="edit"
+                onFocus={() => {
+                  focused.current = { id: entry.id, action: "edit" };
+                }}
+                aria-label="Edit queued message"
+                variant="subtle"
+                size="xs"
+                shape="round"
+                disabled={
+                  disabled || entry.sending || !entry.message || !onEdit
+                }
+                icon={<PencilSimpleIcon size={12} strokeWidth={2.5} />}
+                onClick={() => onEdit?.(entry.id)}
               />
               <QueuedSend
                 channelId={channelId}
@@ -98,9 +138,7 @@ export function QueuedFollowUps({
                   focused.current = { id: entry.id, action: "send" };
                 }}
                 disabled={disabled}
-                onClick={() => {
-                  queue.sendNow(entry.id);
-                }}
+                send={(check) => queue.sendNow(entry.id, check)}
               />
             </div>
           </li>
@@ -152,7 +190,7 @@ function QueuePreview({ text, onFocus }: { text: string; onFocus(): void }) {
       }}
       type="button"
       data-queue-action="preview"
-      className={`text-caption ${styles.preview}`}
+      className={`text-message ${styles.preview}`}
       aria-label={text}
       aria-expanded={canExpand ? expanded : undefined}
       aria-disabled={!canExpand || undefined}
@@ -198,12 +236,15 @@ function QueuePreview({ text, onFocus }: { text: string; onFocus(): void }) {
 function QueuedSend({
   recipients,
   channelId,
+  send,
   ...props
-}: Pick<ButtonProps, "disabled" | "onClick" | "onFocus"> & {
+}: Pick<ButtonProps, "disabled" | "onFocus"> & {
+  send(check: () => void): void;
   recipients: readonly string[];
   channelId: string;
 }) {
-  const state = useSessionState(useContext(AgentsContext), recipients, {
+  const agents = useContext(AgentsContext);
+  const state = useSessionState(agents, recipients, {
     channelId,
   });
   const compacting = state === "compacting";
@@ -213,19 +254,34 @@ function QueuedSend({
       {...(!compacting ? { open: false } : {})}
       disableHoverablePopup
     >
-      <Button
+      <IconButton
         {...props}
         data-queue-action="send"
-        variant="subtle-muted"
+        onClick={() =>
+          send(() => {
+            if (
+              recipients.some((pubkey) => {
+                const key = agents?.find(pubkey)?.key;
+                return (
+                  key &&
+                  agents?.sessionState(key, { channelId }) === "compacting"
+                );
+              })
+            )
+              throw new Error(
+                "Wait for compaction to finish, or interrupt it.",
+              );
+          })
+        }
+        variant="prominent"
         size="xs"
-        style={{
-          padding: "var(--space-1) var(--space-2)",
-        }}
+        shape="round"
+        style={accentButtonStyle}
+        aria-label="Send"
+        icon={<ArrowUpIcon size={12} strokeWidth={2.5} />}
         disabled={props.disabled || compacting}
         focusableWhenDisabled={compacting || undefined}
-      >
-        Send
-      </Button>
+      />
     </Tooltip>
   );
 }

@@ -43,7 +43,9 @@ export type ComposerSession = Pick<
   typing: Pick<RelaySession["typing"], "snapshot" | "subscribe"> &
     Partial<Pick<RelaySession["typing"], "send">>;
   presence?: Pick<NonNullable<RelaySession["presence"]>, "status"> | undefined;
-  directMessages: Pick<RelaySession["directMessages"], "people">;
+  /** `verified` names searched people; a bridge without it shows shared names only. */
+  directMessages: Pick<RelaySession["directMessages"], "people"> &
+    Partial<Pick<RelaySession["directMessages"], "verified">>;
   memberAdditions: Pick<RelaySession["memberAdditions"], "add">;
   channelWrites: Pick<
     RelaySession["channelWrites"],

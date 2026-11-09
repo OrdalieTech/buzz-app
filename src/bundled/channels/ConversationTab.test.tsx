@@ -49,13 +49,11 @@ const threadOpeners = vi.hoisted(
 );
 vi.mock("./ChannelBody", () => ({
   ChannelBody: ({
-    activityLane,
     holding,
     inlineTarget,
     marksRead,
     onOpenThread,
   }: {
-    activityLane?: boolean;
     holding?: boolean;
     inlineTarget?: { messageId: string };
     marksRead?: boolean;
@@ -64,7 +62,6 @@ vi.mock("./ChannelBody", () => ({
     threadOpeners.push(onOpenThread);
     return (
       <div
-        data-activity-lane={activityLane}
         data-holding={holding}
         data-target={inlineTarget?.messageId}
         data-marks-read={marksRead}
@@ -87,6 +84,11 @@ vi.mock("../../features/messages/MessageComposer", () => ({
     </div>
   ),
 }));
+const unreadEvidence = {
+  setChannelActive: vi.fn(),
+  revision: () => 0,
+  sync: () => ({ capability: "unsupported" }),
+};
 const owners: ReturnType<typeof createOutbox>[] = [];
 afterEach(() => {
   cleanup();
@@ -141,8 +143,13 @@ it.each(["thread", "conversation"] as const)(
     // Only management consumes this session; independent child views above are
     // stubbed. These writable tabs have static eligibility/profile evidence.
     const session = {
+      unread: unreadEvidence,
       outbox: owner.outbox,
-      channels: { list: () => channels, subscribeList: () => () => {} },
+      channels: {
+        window: () => ({ rows: [] }),
+        list: () => channels,
+        subscribeList: () => () => {},
+      },
       profiles: { subscribe: () => () => {} },
       messages: { canRetry: () => true },
     } as unknown as RelaySession;
@@ -204,8 +211,13 @@ it.each(["thread", "conversation"] as const)(
     const leaveChannel = vi.fn();
     const session = {
       viewer: "viewer",
-      channels: { list: () => snapshot, subscribeList: () => () => {} },
-      unread: { enterChannel, leaveChannel },
+      channels: {
+        window: () => ({ rows: [] }),
+        list: () => snapshot,
+        subscribeList: () => () => {},
+      },
+      profiles: {},
+      unread: { ...unreadEvidence, enterChannel, leaveChannel },
     } as unknown as RelaySession;
     const props = {
       tab: {
@@ -231,7 +243,10 @@ it.each(["thread", "conversation"] as const)(
         "false",
       );
     mounted.rerender(<ConversationTab {...props} active />);
-    expect(enterChannel).toHaveBeenCalledExactlyOnceWith("beta");
+    expect(enterChannel).toHaveBeenCalledExactlyOnceWith(
+      "beta",
+      document.hasFocus(),
+    );
     if (kind === "thread")
       expect(screen.getByText("Thread content")).toHaveAttribute(
         "data-active",
@@ -255,8 +270,13 @@ it.each(["thread", "conversation"] as const)(
     const enterChannel = vi.fn(async () => {});
     const session = {
       viewer: "viewer",
-      channels: { list: () => snapshot, subscribeList: () => () => {} },
-      unread: { enterChannel, leaveChannel: vi.fn() },
+      channels: {
+        window: () => ({ rows: [] }),
+        list: () => snapshot,
+        subscribeList: () => () => {},
+      },
+      profiles: {},
+      unread: { ...unreadEvidence, enterChannel, leaveChannel: vi.fn() },
     } as unknown as RelaySession;
     render(
       <ConversationTab
@@ -295,7 +315,12 @@ it.each([false, true])(
     const channel = { id: "beta", name: "Beta" };
     const snapshot = { status: "ready", channels: [channel] };
     const session = {
-      channels: { list: () => snapshot, subscribeList: () => () => {} },
+      unread: unreadEvidence,
+      channels: {
+        window: () => ({ rows: [] }),
+        list: () => snapshot,
+        subscribeList: () => () => {},
+      },
     } as unknown as RelaySession;
     const tab = {
       id: "thread",
@@ -341,7 +366,12 @@ it("a tab mounted later in its visit treats the visit's requests as restored", (
   const channel = { id: "beta", name: "Beta" };
   const snapshot = { status: "ready", channels: [channel] };
   const session = {
-    channels: { list: () => snapshot, subscribeList: () => () => {} },
+    unread: unreadEvidence,
+    channels: {
+      window: () => ({ rows: [] }),
+      list: () => snapshot,
+      subscribeList: () => () => {},
+    },
   } as unknown as RelaySession;
   const tab: Tab = {
     id: "thread",
@@ -391,7 +421,12 @@ it.each([
     const channel = { id: "beta", name: "Beta" };
     const snapshot = { status: "ready", channels: [channel] };
     const session = {
-      channels: { list: () => snapshot, subscribeList: () => () => {} },
+      unread: unreadEvidence,
+      channels: {
+        window: () => ({ rows: [] }),
+        list: () => snapshot,
+        subscribeList: () => () => {},
+      },
     } as unknown as RelaySession;
     const tab: Tab =
       kind === "thread"
@@ -435,7 +470,12 @@ it.each(["pointerDown", "keyDown"] as const)(
     const channel = { id: "beta", name: "Beta" };
     const snapshot = { status: "ready", channels: [channel] };
     const session = {
-      channels: { list: () => snapshot, subscribeList: () => () => {} },
+      unread: unreadEvidence,
+      channels: {
+        window: () => ({ rows: [] }),
+        list: () => snapshot,
+        subscribeList: () => () => {},
+      },
     } as unknown as RelaySession;
     const tab: Tab = {
       id: "thread",
@@ -470,39 +510,6 @@ it.each(["pointerDown", "keyDown"] as const)(
   },
 );
 
-it.each([false, true])(
-  "conversation tabs reserve the jump button's activity lane only for a live channel (cached=%s)",
-  (cached) => {
-    const channel = {
-      id: "beta",
-      name: "Beta",
-      ...(cached ? { cached: true as const } : {}),
-    };
-    const snapshot = { status: "ready", channels: [channel] };
-    const session = {
-      channels: { list: () => snapshot, subscribeList: () => () => {} },
-    } as unknown as RelaySession;
-    render(
-      <ConversationTab
-        tab={{ id: "beta-tab", kind: "conversation", channelId: "beta" }}
-        channel={channel}
-        session={session}
-        scope="lane-test"
-        active
-        openLink={() => false}
-        canOpenLink={() => false}
-        openThread={() => {}}
-        close={() => {}}
-      />,
-    );
-    // The composer below the body mounts TypingIndicator only when live.
-    expect(screen.getByText("Conversation content")).toHaveAttribute(
-      "data-activity-lane",
-      String(!cached),
-    );
-  },
-);
-
 function openingAt(rows: { id: string; threadRootId?: string }[]) {
   const channel = { id: "beta", name: "Beta" };
   const snapshot = { status: "ready", channels: [channel] };
@@ -516,6 +523,7 @@ function openingAt(rows: { id: string; threadRootId?: string }[]) {
   };
   const listeners = new Set<() => void>();
   const session = {
+    unread: unreadEvidence,
     channels: {
       list: () => snapshot,
       subscribeList: () => () => {},
@@ -675,7 +683,12 @@ it("lets the tab supply Solo chat identity without repeating a visible heading",
   const idle = () => () => {};
   const profiles = new Map();
   const session = {
-    channels: { list: () => snapshot, subscribeList: idle },
+    unread: unreadEvidence,
+    channels: {
+      window: () => ({ rows: [] }),
+      list: () => snapshot,
+      subscribeList: idle,
+    },
     profiles: { snapshot: () => profiles, subscribe: idle },
     agentChoices: { snapshot: () => undefined, subscribe: idle },
   } as unknown as RelaySession;
@@ -709,7 +722,12 @@ it("tells the composer when its tab is shown, apart from whether showing visits"
   const idle = () => () => {};
   const profiles = new Map();
   const session = {
-    channels: { list: () => snapshot, subscribeList: idle },
+    unread: unreadEvidence,
+    channels: {
+      window: () => ({ rows: [] }),
+      list: () => snapshot,
+      subscribeList: idle,
+    },
     profiles: { snapshot: () => profiles, subscribe: idle },
     agentChoices: { snapshot: () => undefined, subscribe: idle },
   } as unknown as RelaySession;

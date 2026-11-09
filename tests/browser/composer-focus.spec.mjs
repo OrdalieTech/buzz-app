@@ -203,7 +203,8 @@ test.describe("retained agent focus", () => {
         .click();
       await page
         .getByRole("dialog", { name: "Mention a member or agent" })
-        .getByRole("button", { name: new RegExp(pubkey) })
+        .getByRole("button")
+        .and(page.locator(`[data-mention-choice="${pubkey}"]`))
         .click();
     }
     await page.keyboard.type("First request");

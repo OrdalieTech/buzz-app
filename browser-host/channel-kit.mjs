@@ -1,6 +1,10 @@
 import { getPublicKey, nip44 } from "nostr-tools";
 import { eventDto } from "../src/features/relay/events.ts";
 import {
+  CANVAS_MAX_EVENT_BYTES,
+  LIVE_CANVAS_BYTES,
+} from "../src/features/channel-templates/canvas-limits.ts";
+import {
   privateCoordinate,
   privateTag,
   parsePrivateRecord,
@@ -81,14 +85,17 @@ export function decodeChannelKit(raw, secret, community) {
     };
   });
 }
+export const canvasEventFits = (event) =>
+  Buffer.byteLength(JSON.stringify(event)) <= CANVAS_MAX_EVENT_BYTES;
 export function validCanvas(event) {
   return (
     event?.kind === 40100 &&
     typeof event.content === "string" &&
-    Buffer.byteLength(event.content) <= 24 * 1024 &&
+    Buffer.byteLength(event.content) <= LIVE_CANVAS_BYTES &&
     Array.isArray(event.tags) &&
     event.tags.filter((t) => t?.[0] === "h").length === 1 &&
     event.tags.filter((t) => t?.[0] === "expected-revision").length <= 1 &&
+    event.tags.filter((t) => t?.[0] === "canvas-instructions").length <= 1 &&
     event.tags.every(
       (t) =>
         Array.isArray(t) &&
@@ -98,9 +105,11 @@ export function validCanvas(event) {
           : t[0] === "expected-revision"
             ? typeof t[1] === "string" &&
               (t[1] === "none" || /^[0-9a-f]{64}$/.test(t[1]))
-            : t[0] === "client-id" &&
-              typeof t[1] === "string" &&
-              t[1].length <= 128),
+            : t[0] === "canvas-instructions"
+              ? t[1] === "unapproved"
+              : t[0] === "client-id" &&
+                typeof t[1] === "string" &&
+                t[1].length <= 128),
     )
   );
 }

@@ -10,12 +10,15 @@ import {
 } from "../../features/agents/activity-transcript";
 import type { AgentKey } from "../../features/agents/membership";
 import { sessionTag, sessionTitle } from "./prompt";
-import { AppServer, type Spawn } from "./rpc";
-import { readFile } from "../../buzz-mcp/app-client";
-import { restoreRecordedTools } from "./recorded-tools";
+import { AppServer, Oversized, type Spawn } from "./rpc";
+import { READ_LIMIT, readFile } from "../../buzz-mcp/app-client";
+import { recordedLines, restoreRecordedTools } from "./recorded-tools";
 
 /** The latest turns shown; earlier ones stay in Codex's own history. */
 export const TURN_LIMIT = 20;
+/** Items per `thread/items/list` request, which fit app-server's frame unless
+ * they average over 80 KiB. */
+const ITEM_PAGE = 50;
 
 type Json = Record<string, unknown>;
 type Turn = {
@@ -111,6 +114,7 @@ function item(
         type: "prompt",
         text: request(raw),
         ...(author ? { author } : {}),
+        ...(from ? { authorPubkey: from } : {}),
         sections,
         steer,
       };
@@ -315,7 +319,10 @@ export async function findConversation(
 ) {
   return withServer(spawn, signal, async (rpc) => {
     for (const thread of await findThreads(rpc, lookup))
-      if (!thread.legacy || startedFor(await turns(rpc, thread.id, 1), lookup))
+      if (
+        !thread.legacy ||
+        startedFor(await turns(rpc, thread.id, 1, signal), lookup)
+      )
         return { threadId: thread.id, at: thread.updatedAt * 1000 };
     return undefined;
   });
@@ -324,31 +331,84 @@ export async function findConversation(
 type Page = { data: Turn[]; nextCursor: string | null };
 
 /** A thread's latest `limit` turns, newest first, and whether it has earlier
- * ones, or undefined when Codex no longer has it. Read a turn per request:
- * app-server's output frame bounds one full turn, not a page of them. */
-async function page(rpc: AppServer, threadId: string, limit: number) {
+ * ones, or undefined when Codex no longer has it. Turns are listed without
+ * their items, which are read a page at a time: app-server's output frame
+ * bounds a page of items, while one long turn can exceed it. */
+async function page(
+  rpc: AppServer,
+  threadId: string,
+  limit: number,
+  signal: AbortSignal,
+) {
   const data: Turn[] = [];
   let cursor: string | null = null;
   try {
     do {
       const next: Page = await rpc.request<Page>("thread/turns/list", {
         threadId,
-        limit: 1,
+        limit: limit - data.length,
         sortDirection: "desc",
-        itemsView: "full",
+        itemsView: "notLoaded",
         ...(cursor ? { cursor } : {}),
       });
       data.push(...next.data);
       cursor = next.data.length ? next.nextCursor : null;
     } while (cursor && data.length < limit);
+    // Each turn's items start at the page size the previous one ended on.
+    let size = ITEM_PAGE;
+    for (const turn of data)
+      [turn.items, size] = await items(rpc, threadId, turn.id, size, signal);
   } catch (error) {
     if (missing(error)) return undefined;
     throw error;
   }
-  return { data: data.slice(0, limit), more: !!cursor };
+  return { data, more: !!cursor };
 }
-const turns = async (rpc: AppServer, threadId: string, limit: number) =>
-  (await page(rpc, threadId, limit))?.data ?? [];
+
+/** A turn's items, oldest first, a page of `limit` per request, and the page
+ * size it ended on. A page over app-server's frame closes the connection, so
+ * it is read again from its cursor on a fresh one, at half the size, as is the
+ * rest of the turn. */
+async function items(
+  rpc: AppServer,
+  threadId: string,
+  turnId: string,
+  limit: number,
+  signal: AbortSignal,
+): Promise<[Json[], number]> {
+  const all: Json[] = [];
+  let cursor: string | null = null;
+  for (;;) {
+    let next: { data: { item: Json }[]; nextCursor: string | null };
+    try {
+      next = await rpc.request("thread/items/list", {
+        threadId,
+        turnId,
+        limit,
+        ...(cursor ? { cursor } : {}),
+      });
+    } catch (error) {
+      if (!(error instanceof Oversized) || limit === 1) throw error;
+      limit = Math.ceil(limit / 2);
+      // An abort while closing opens no fresh connection.
+      await rpc.close();
+      signal.throwIfAborted();
+      await rpc.reopen();
+      // An abort while reopening closed the connection it replaced.
+      signal.throwIfAborted();
+      continue;
+    }
+    all.push(...next.data.map((entry) => entry.item));
+    cursor = next.data.length ? next.nextCursor : null;
+    if (!cursor) return [all, limit];
+  }
+}
+const turns = async (
+  rpc: AppServer,
+  threadId: string,
+  limit: number,
+  signal: AbortSignal,
+) => (await page(rpc, threadId, limit, signal))?.data ?? [];
 
 /** Runs `use` with a short-lived app-server, closed when it ends or `signal`
  * aborts. */
@@ -373,6 +433,58 @@ export async function withServer<T>(
   }
 }
 
+/** Rollouts read before, by path, with the lines restoring tools reads,
+ * so a read parses only what was appended since; Codex only appends. */
+const rollouts = new Map<
+  string,
+  { bytes: number; lines: Json[]; oversized?: boolean }
+>();
+/** Rollouts remembered at most. */
+const ROLLOUT_LIMIT = 2;
+
+/** A rollout's lines restoring tools reads: read whole the first time or
+ * when the file shrank, and then from where the last read ended. */
+async function rollout(
+  spawn: Spawn,
+  directory: string,
+  path: string,
+  signal: AbortSignal,
+) {
+  let known = rollouts.get(path);
+  rollouts.delete(path);
+  let added: Uint8Array;
+  try {
+    added = known
+      ? await readFile(spawn, directory, path, signal, undefined, "read-from", [
+          String(known.bytes + 1),
+        ])
+      : await readFile(spawn, directory, path, signal);
+  } catch (error) {
+    signal.throwIfAborted();
+    if (!known || !/shrank/.test(String(error))) throw error;
+    known = undefined;
+    added = await readFile(spawn, directory, path, signal);
+  }
+  // Remembered lines are held to a full read's limit; past it only the
+  // size is kept, so later reads reject without reading it all again.
+  const total = (known?.bytes ?? 0) + added.length;
+  const oversized = known?.oversized || total > READ_LIMIT;
+  // Only whole lines are kept, so no record or character is split.
+  const end = oversized ? added.length : added.lastIndexOf(10) + 1;
+  const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
+  const lines = oversized
+    ? []
+    : [
+        ...(known?.lines ?? []),
+        ...recordedLines(decode(added.subarray(0, end))),
+      ];
+  rollouts.set(path, { bytes: (known?.bytes ?? 0) + end, lines, oversized });
+  for (const old of rollouts.keys())
+    if (rollouts.size > ROLLOUT_LIMIT) rollouts.delete(old);
+  if (oversized) throw new Error(`${path} is larger than 50 MB`);
+  return [...lines, ...recordedLines(decode(added.subarray(end)))];
+}
+
 /** The latest turns of all the conversation's threads, oldest first, from a
  * short-lived app-server, or undefined when Codex has no history for it on
  * this device. */
@@ -393,27 +505,35 @@ export async function readTranscript(
     let found = false;
     let more = false;
     let working = false;
+    // Any thread in progress keeps the rollouts' cache.
+    let active = false;
+    const paths: string[] = [];
     for (const [threadId, legacy] of threads) {
-      const read = await page(rpc, threadId, TURN_LIMIT);
+      const read = await page(rpc, threadId, TURN_LIMIT, signal);
       if (!read || (legacy && !startedFor(read.data, lookup))) continue;
       found = true;
       more ||= read.more;
       if (threadId === lookup.threadId)
         working = read.data[0]?.status === "inProgress";
+      active ||= read.data[0]?.status === "inProgress";
       const mapped = codexTurns([...read.data].reverse(), lookup, name);
+      for (const turn of mapped) turn.sessionId = threadId;
+      // With no earlier turns, the first read starts the thread.
+      if (mapped[0] && !read.more) mapped[0].newSession = true;
       try {
         const { thread } = await rpc.request<{
           thread?: { path: string | null };
         }>("thread/read", { threadId, includeTurns: false });
         if (!thread?.path)
           throw new Error("The local session file is unavailable.");
+        paths.push(thread.path);
         // Codex supplies the rollout in Buzz's own home. Use its directory:
         // the desktop host rejects a relative process cwd, including ".".
         const directory = thread.path.slice(0, thread.path.lastIndexOf("/"));
-        const file = new TextDecoder().decode(
-          await readFile(spawn, directory, thread.path, signal),
+        restoreRecordedTools(
+          mapped,
+          await rollout(spawn, directory, thread.path, signal),
         );
-        restoreRecordedTools(mapped, file);
       } catch (error) {
         signal.throwIfAborted();
         const latest = mapped.at(-1);
@@ -426,6 +546,8 @@ export async function readTranscript(
       }
       all.push(...mapped);
     }
+    // Once the turn ends, the next read reads its rollouts whole.
+    if (!active) for (const path of paths) rollouts.delete(path);
     if (!found) return undefined;
     all.sort((a, b) => a.startedAt - b.startedAt);
     return {

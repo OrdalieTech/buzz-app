@@ -3,14 +3,23 @@ import type { Communities } from "../communities/service";
 import { createRelaySession } from "../relay/session";
 import type { RelayEvent } from "../relay/events";
 import { readJournal, type ReadJournal } from "../relay/read-state-storage";
+import type {
+  SidebarDecoder,
+  SidebarMuteMutator,
+} from "../relay/sidebar-preferences";
 import { keypair, message, metadata, roster, signed } from "../relay/testing";
-import { bindUnreadIndicator } from "./indicator-unread";
+import { bindUnreadIndicator, type IndicatorGates } from "./indicator-unread";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
   for (const stop of cleanups.splice(0).reverse()) stop();
 });
-function setup() {
+function setup(
+  sidebar?: Readonly<{
+    decode: SidebarDecoder;
+    write: SidebarMuteMutator;
+  }>,
+) {
   const viewer = keypair(),
     peer = keypair(),
     relay = keypair();
@@ -30,12 +39,19 @@ function setup() {
         },
         publish: async () => {},
       },
+      ...(sidebar
+        ? {
+            decodeSidebarPreferences: sidebar.decode,
+            writeSidebarMute: sidebar.write,
+          }
+        : {}),
       subscribe(callbacks) {
         incoming = callbacks.receive;
         return { update() {}, retry() {}, dispose() {} };
       },
     },
     {
+      readStateFloor: () => 0,
       readStateStorage: {
         async update(change) {
           journal = readJournal(change(journal), viewer.pubkey);
@@ -71,8 +87,8 @@ function setup() {
     relay: { snapshot: () => relayState, subscribe },
   } as unknown as Communities;
   const project = vi.fn();
-  const bind = () => {
-    const stop = bindUnreadIndicator(communities, project);
+  const bind = (gates?: IndicatorGates) => {
+    const stop = bindUnreadIndicator(communities, project, gates);
     cleanups.push(stop);
     return stop;
   };
@@ -230,6 +246,53 @@ it.each(["huddle", "metadataPending"] as const)(
   },
 );
 
+it("removes muted channel activity from the Dock indicator without marking it read", async () => {
+  const h = setup({
+    decode: async () => ({
+      sections: [],
+      assignments: {},
+      starred: [],
+      muted: [],
+    }),
+    write: async ({ muted }) => (muted ? ["room"] : []),
+  });
+  h.grant();
+  await h.session.sidebarPreferences.ensure();
+  h.bind();
+  const row = message(h.peer, "room", "arrival", 11);
+  h.emit([row]);
+  expect(h.project).toHaveBeenLastCalledWith(true);
+
+  await h.session.sidebarPreferences.setMute("room", true);
+  expect(h.project).toHaveBeenLastCalledWith(false);
+  expect(h.session.unread.snapshot(target).observedCount).toBe(1);
+
+  await h.session.unread.markThrough(target, row.id);
+  h.emit([message(h.peer, "room", "muted arrival", 12)]);
+  expect(h.session.unread.snapshot(target).observedCount).toBe(1);
+  expect(h.project).toHaveBeenLastCalledWith(false);
+
+  await h.session.unread.markUnreadLocal(target);
+  expect(h.project).toHaveBeenLastCalledWith(false);
+
+  await h.session.sidebarPreferences.setMute("room", false);
+  expect(h.project).toHaveBeenLastCalledWith(true);
+});
+
+it("follows the sidebar row: opening a channel clears the Dock without reading it", () => {
+  const h = setup();
+  h.grant();
+  h.bind();
+  h.emit([message(h.peer, "room", "arrival", 11)]);
+  expect(h.project).toHaveBeenLastCalledWith(true);
+  void h.session.unread.enterChannel("room");
+  expect(h.project).toHaveBeenLastCalledWith(false);
+  expect(h.session.unread.snapshot(target).observedCount).toBe(1);
+  h.session.unread.leaveChannel("room");
+  h.emit([message(h.peer, "room", "later", 12)]);
+  expect(h.project).toHaveBeenLastCalledWith(true);
+});
+
 it("stays off for coordination between agents and lights for the next message to everyone", () => {
   const h = setup();
   h.bind();
@@ -237,5 +300,53 @@ it("stays off for coordination between agents and lights for the next message to
   h.emit([message(h.peer, "room", "Progress", 11, [["audience", "agents"]])]);
   expect(h.project.mock.calls).toEqual([[false]]);
   h.emit([message(h.peer, "room", "Done", 12)]);
+  expect(h.project).toHaveBeenLastCalledWith(true);
+});
+
+it("counts only conversations the notification gates allow and follows gate changes", () => {
+  const h = setup();
+  h.grant();
+  let allowed = new Set<string>();
+  const gateListeners = new Set<() => void>();
+  const seen: unknown[] = [];
+  h.bind({
+    allows(target) {
+      seen.push(target);
+      return target.kind === "conversation" && allowed.has(target.channelId);
+    },
+    subscribe(listener) {
+      gateListeners.add(listener);
+      return () => void gateListeners.delete(listener);
+    },
+  });
+  h.emit([message(h.peer, "room", "held", 11)]);
+  expect(h.project.mock.calls).toEqual([[false]]);
+  expect(seen[0]).toEqual({
+    version: 1,
+    kind: "conversation",
+    scope: { viewer: h.viewer.pubkey, communityOrigin: "https://one.example" },
+    channelId: "room",
+  });
+  allowed = new Set(["room"]);
+  for (const listener of gateListeners) listener();
+  expect(h.project).toHaveBeenLastCalledWith(true);
+  allowed = new Set();
+  for (const listener of gateListeners) listener();
+  expect(h.project).toHaveBeenLastCalledWith(false);
+});
+
+it("relights the Dock projection for attention arriving during a background visit", async () => {
+  const h = setup();
+  h.grant();
+  h.bind();
+  h.emit([message(h.peer, "room", "before", 11)]);
+  await h.session.unread.enterChannel("room");
+  expect(h.project).toHaveBeenLastCalledWith(false);
+  h.session.unread.setChannelActive("room", false);
+  h.emit([
+    message(h.peer, "room", "background mention", 10, [["p", h.viewer.pubkey]]),
+  ]);
+  expect(h.project).toHaveBeenLastCalledWith(true);
+  h.session.unread.leaveChannel("room");
   expect(h.project).toHaveBeenLastCalledWith(true);
 });

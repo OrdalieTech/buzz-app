@@ -11,7 +11,7 @@ export const desktop = isTauri();
 const storageKey = "buzzodz.plugins.v1";
 
 export function createPluginStorage(bundledCatalog: () => Catalog["plugins"]) {
-  function webCatalog(): StorageResult {
+  function webCatalog(reset = false): StorageResult {
     const catalog: Catalog = {
       profile: "browser",
       location: "This browser",
@@ -19,7 +19,14 @@ export function createPluginStorage(bundledCatalog: () => Catalog["plugins"]) {
     };
     try {
       const raw = localStorage.getItem(storageKey);
-      if (raw !== null) {
+      const existing =
+        !reset &&
+        (raw !== null ||
+          Object.keys(localStorage).some((key) =>
+            /^buzz-client\.v1:[a-f0-9]{64}$/.test(key),
+          ));
+      const flags: Record<string, boolean> = {};
+      if (raw !== null && !reset) {
         const value: unknown = JSON.parse(raw);
         if (!value || typeof value !== "object" || !("version" in value))
           throw new Error("Invalid browser plugin settings");
@@ -39,18 +46,21 @@ export function createPluginStorage(bundledCatalog: () => Catalog["plugins"]) {
             (flag) => typeof flag === "boolean",
           )
         ) {
-          const flags = value.enabled as Record<string, boolean>;
+          Object.assign(flags, value.enabled);
           if (value.version === 2) {
             migrateAgentFlag(flags);
-            localStorage.setItem(
-              storageKey,
-              JSON.stringify({ version: 3, enabled: flags }),
-            );
           }
-          for (const plugin of catalog.plugins)
-            plugin.enabled = flags[plugin.manifest.id] ?? plugin.enabled;
         } else throw new Error("Invalid browser plugin settings");
       }
+      for (const plugin of catalog.plugins) {
+        const id = plugin.manifest.id;
+        flags[id] ??=
+          plugin.enabled ||
+          (existing && (id === "buzz.reminders" || id === "buzz.workflows"));
+        plugin.enabled = flags[id];
+      }
+      const saved = JSON.stringify({ version: 3, enabled: flags });
+      if (saved !== raw) localStorage.setItem(storageKey, saved);
     } catch (error) {
       return { status: "recovery", reason: String(error), canReset: true };
     }
@@ -97,8 +107,7 @@ export function createPluginStorage(bundledCatalog: () => Catalog["plugins"]) {
     const raw = localStorage.getItem(storageKey);
     if (raw !== null)
       localStorage.setItem(`${storageKey}.backup.${Date.now()}`, raw);
-    localStorage.removeItem(storageKey);
-    return webCatalog();
+    return webCatalog(true);
   }
   async function readModule(id: string, revision: string): Promise<string> {
     if (!desktop) throw new Error("Local plugins require the desktop app");
@@ -130,6 +139,7 @@ export function createPluginStorage(bundledCatalog: () => Catalog["plugins"]) {
             authorization,
             checkOnly: true,
           }),
+        url: (url, sha256) => invoke("plugin_import_url", { url, sha256 }),
         install: (token, path) =>
           invoke("plugin_import_install", { token, path }),
         discard: (token) => invoke("plugin_import_discard", { token }),

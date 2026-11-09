@@ -11,7 +11,11 @@ function browser(apple = true) {
   let modal = false;
   const host = {
     navigator: { platform: apple ? "MacIntel" : "Linux x86_64" },
-    document: { querySelector: () => (modal ? {} : null) },
+    document: {
+      querySelector: () => (modal ? {} : null),
+      querySelectorAll: () =>
+        modal ? [{ closest: () => null, matches: () => false }] : [],
+    },
     addEventListener: (type: string, fn: (event: KeyboardEvent) => void) =>
       listeners.set(type, fn),
     removeEventListener: (type: string) => listeners.delete(type),

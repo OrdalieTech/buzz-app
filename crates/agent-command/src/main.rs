@@ -2,6 +2,9 @@
 //! No relay credentials or owner-identity fallback. A plugin may also advertise
 //! one of its sessions to the user's other local agents with `--advertise`; they
 //! run this helper without an inherited session and it finds the advertisement.
+#[cfg(unix)]
+mod lifetime;
+
 use http_body_util::{BodyExt, Full};
 use hyper::{
     body::Bytes,
@@ -232,8 +235,11 @@ fn offers(tools: &Value, name: &str) -> bool {
 /// Same-user-private advertisements: the user's own agents may use them, other
 /// users may not, and nothing here is an account key.
 fn advertisements() -> Result<PathBuf> {
+    private_directory("agent-connections")
+}
+fn private_directory(name: &str) -> Result<PathBuf> {
     let home = std::env::home_dir().ok_or("No home directory")?;
-    let directory = home.join(".buzz-foundation").join("agent-connections");
+    let directory = home.join(".buzz-foundation").join(name);
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -491,6 +497,12 @@ fn arguments(args: &[String], catalog: &Value) -> Result<(String, Value)> {
 fn main() {
     let result = (|| -> Result<i32> {
         let args: Vec<_> = std::env::args().collect();
+        #[cfg(unix)]
+        let _lifetime = if args.get(1).is_some_and(|arg| arg == "--launch") {
+            lifetime::watch()?
+        } else {
+            None
+        };
         // App-bundled bootstrap for contained harnesses. Privileged Bash ignores
         // startup files and imported functions; its path never comes from PATH.
         #[cfg(unix)]

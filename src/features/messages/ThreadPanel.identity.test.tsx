@@ -21,6 +21,11 @@ import {
   signed,
 } from "../relay/testing";
 import { ThreadPanel } from "./ThreadPanel";
+import { createAgentActivity } from "../agents/activity";
+import { createLocalAgentActivity } from "../agents/local-activity";
+import { stubAvatarBrowserApis } from "../agents/avatar-testing";
+
+stubAvatarBrowserApis();
 
 vi.mock("./MessageMarkdown", () => ({
   MessageMarkdown: ({ row }: { row: ChannelMessage }) => (
@@ -172,3 +177,65 @@ it.each([false, true])(
     owner.dispose();
   },
 );
+
+it("keeps a standalone activity root subscribed to its request through completion", async () => {
+  const agent = keypair();
+  const root = message(agent, "a", "Checking root activity", 1, [
+    ["audience", "agents"],
+  ]);
+  const wire = scriptedTransport(keypair().pubkey, keypair().pubkey);
+  let traffic!: LiveCallbacks;
+  const owner = createRelaySession({
+    ...wire.transport,
+    subscribe(callbacks) {
+      traffic = callbacks;
+      return { update() {}, retry() {}, dispose() {} };
+    },
+    query(filters, signal) {
+      return filters[0]?.kinds?.includes(30315)
+        ? Promise.resolve([])
+        : wire.transport.query(filters, signal);
+    },
+  });
+  traffic.receive([root]);
+  const local = createLocalAgentActivity();
+  const activity = createAgentActivity(
+    true,
+    () => {},
+    () => true,
+    undefined,
+    undefined,
+    { source: local.reader, scope: "root-test" },
+  );
+  const release = activity.queries.activate();
+  const work = local.begin({
+    scope: "root-test",
+    agent: agent.pubkey,
+    channelId: "a",
+    messageId: root.id,
+    threadRootId: root.id,
+  });
+  work.started();
+  try {
+    render(
+      <ThreadPanel
+        session={{ ...owner.session, agentActivity: activity.queries }}
+        scope="activity-root-test"
+        channelName="A"
+        channelId="a"
+        messageId={root.id}
+        close={() => {}}
+        onOpenLink={() => false}
+      />,
+    );
+    const preview = await screen.findByText("Checking root activity");
+    expect(preview).toHaveAttribute("data-active", "true");
+    act(() => work.finish({ ok: true }));
+    expect(preview).not.toHaveAttribute("data-active");
+  } finally {
+    cleanup();
+    release();
+    activity.dispose();
+    owner.dispose();
+  }
+});

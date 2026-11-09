@@ -169,16 +169,18 @@ export function SoloChatMenuItems({
             {conversionLabel(session, channel.id)}
           </MenuItem>
         )}
-      {onLifecycle && !channel.readOnly && !channel.cached && (
-        <ChannelLifecycleMenu
-          channelId={channel.id}
-          lifecycle={session.channelLifecycle}
-          disabled={!!handoff?.lifecycleDialog}
-          separator
-          noun="chat"
-          choose={onLifecycle}
-        />
-      )}
+      {onLifecycle &&
+        (!channel.readOnly || channel.viewerRole === "guest") &&
+        !channel.cached && (
+          <ChannelLifecycleMenu
+            channel={channel}
+            session={session}
+            disabled={!!handoff?.lifecycleDialog}
+            separator
+            noun="chat"
+            choose={onLifecycle}
+          />
+        )}
     </>
   );
 }

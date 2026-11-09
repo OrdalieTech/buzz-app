@@ -54,6 +54,8 @@ export function visibleHtmlSource(value: string): string {
 
 export const MAX_ATTACHMENT_NAME_LENGTH = 256;
 export const RELAY_HASH_BASENAME = /^[0-9a-f]{64}(?:\.[^./?#]+)?$/i;
+/** `imeta dim` as senders write and receivers read it: `WxH`. */
+export const IMETA_DIM = /^(\d{1,6})x(\d{1,6})$/;
 
 export function relayHashBasename(value: string): boolean {
   return RELAY_HASH_BASENAME.test(value);

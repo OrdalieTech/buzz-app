@@ -6,7 +6,7 @@ export function TypingDots({
   size = "default",
 }: {
   state?: "waiting" | "working";
-  size?: "default" | "small";
+  size?: "default" | "small" | "message";
 }) {
   return (
     <span

@@ -108,6 +108,7 @@ html[data-keyboard-navigation] .preview:focus-visible {
 .error {
   margin: 0;
   font-size: var(--text-caption);
+  font-weight: var(--text-caption--font-weight);
   line-height: var(--text-caption--line-height);
   letter-spacing: var(--text-caption--letter-spacing);
   color: var(--text-subtle);
@@ -118,7 +119,7 @@ html[data-keyboard-navigation] .preview:focus-visible {
   text-overflow: ellipsis;
 }
 .error {
-  color: var(--text-error);
+  color: var(--text-danger);
   overflow-wrap: anywhere;
 }
 .actions {
@@ -164,6 +165,28 @@ html[data-keyboard-navigation] .preview:focus-visible {
   top: var(--space-1);
   right: var(--space-1);
   gap: var(--space-1);
+}
+
+.item[data-upload-error] {
+  /* Fit the strip when possible, but never squeeze the recovery controls. */
+  min-width: min-content;
+  flex-wrap: wrap;
+  column-gap: var(--space-2);
+  row-gap: var(--space-1);
+  padding-inline-end: calc(var(--space-5) / 2);
+}
+.item[data-upload-error] .error {
+  flex-basis: 100%;
+}
+.item[data-upload-error] .details {
+  /* Ellipsized filenames must not determine the card's minimum width. */
+  contain: inline-size;
+}
+.item[data-upload-error] .actions {
+  position: static;
+  flex-basis: 100%;
+  flex-wrap: wrap;
+  min-width: min-content;
 }
 
 .list[data-compact-media] .item[data-media] {

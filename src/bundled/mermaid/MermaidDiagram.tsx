@@ -6,7 +6,16 @@ import styles from "./Mermaid.module.css";
 // conversation and no network fetches. Pele's zoom buttons would bypass the
 // shared controls, so the inline diagram scales to fit and the expanded one
 // zooms by gesture and keyboard only.
-const inline: MountOptions = { links: false, images: false, zoom: false };
+// Drawing runs on the main thread, and Pele's 4M-character output default
+// admits SVGs with tens of thousands of elements. Only the output length
+// bounds what gets drawn, so cap it well above real diagrams: a 150-node
+// flowchart draws about 80k characters.
+const inline: MountOptions = {
+  links: false,
+  images: false,
+  zoom: false,
+  outputLimit: 250_000,
+};
 const expandedOptions: MountOptions = {
   ...inline,
   zoom: { always: true, controls: false },

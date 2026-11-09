@@ -9,7 +9,7 @@ import { WireframePanel } from "./Wireframe";
 
 /**
  * First-run profile, shown once the relay has admitted the key and before the
- * gate lifts. A pure form: the caller owns what Continue and Skip do with the
+ * gate lifts. A pure form: the caller owns what Continue does with the
  * draft (the join's completion, which publishes the kind 0 through the shared
  * owner and saves the membership after it), and a rejection stays here with
  * the error inline and the draft intact.
@@ -19,7 +19,6 @@ export function ProfileStep({
   read,
   defaultName,
   onContinue,
-  onSkip,
 }: {
   found: Pick<FoundCommunity, "url" | "host">;
   /** The admission read that joined the community: the prefill. */
@@ -28,8 +27,6 @@ export function ProfileStep({
   defaultName: string;
   /** Publishes the trimmed draft and finishes the join; a rejection keeps the step. */
   onContinue: (profile: PersonalProfile) => Promise<void>;
-  /** Finishes the join without publishing; a rejection keeps the step. */
-  onSkip: () => Promise<void>;
 }) {
   const [draft, setDraft] = useState<PersonalProfile>(() =>
     read.exists ? read.profile : { name: defaultName, picture: "", about: "" },
@@ -50,7 +47,7 @@ export function ProfileStep({
   };
   return (
     <form
-      className="flex flex-col gap-6"
+      className="flex flex-1 flex-col gap-6"
       onSubmit={(event) => {
         event.preventDefault();
         if (canContinue)
@@ -71,14 +68,15 @@ export function ProfileStep({
         >
           Set up your profile
         </h1>
+        <p className="mt-2 break-all text-body text-subtle">{found.url}</p>
         <p className="mt-2 text-body text-subtle">
-          Add a name and avatar. They’ll show up on your messages, reactions,
-          and agent handoffs in {found.host}. You can change them any time in
-          Settings → Profile.
+          Enter a name for your community profile. You can change it later.
         </p>
       </div>
       <WireframePanel>
         <ProfileFields
+          showAbout={false}
+          emptyAvatarStyle="dotted-circle"
           profile={draft}
           onChange={setDraft}
           disabled={busy}
@@ -92,13 +90,10 @@ export function ProfileStep({
           {error}
         </p>
       )}
-      {/* Footer order: secondary first, primary last. */}
-      <div className="flex gap-3">
-        <Button onClick={() => void run(onSkip)} disabled={busy}>
-          Skip for now
-        </Button>
+      <div data-onboarding-actions="">
         <Button
           type="submit"
+          size="lg"
           variant="prominent"
           loading={busy}
           disabled={!canContinue}
@@ -116,7 +111,7 @@ export function ProfileStep({
  * shown as is. */
 function publishFailure(host: string, error: unknown) {
   if (readErrorKind(error) === "denied")
-    return `${host} no longer admits this key. Skip for now and ask a community administrator.`;
+    return `${host} no longer admits this key. Ask a community administrator to restore your access.`;
   return error instanceof Error
     ? error.message
     : "Could not reach the relay. Check your connection and try again.";

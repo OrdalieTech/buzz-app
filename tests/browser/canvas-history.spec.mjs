@@ -81,6 +81,15 @@ test("Canvas history previews and restores without losing the editor draft", asy
     name: "Channel Canvas",
     exact: true,
   });
+  const view = dialog.getByRole("article", {
+    name: "Saved Canvas",
+    exact: true,
+  });
+  await expect(
+    view.getByRole("heading", { name: "Current notes", exact: true }),
+  ).toBeVisible();
+  await expect(view).toBeFocused();
+  await dialog.getByRole("tab", { name: "Edit", exact: true }).click();
   const editor = dialog.getByRole("textbox", {
     name: "Canvas Markdown",
     exact: true,
@@ -91,6 +100,15 @@ test("Canvas history previews and restores without losing the editor draft", asy
   await dialog.getByRole("tab", { name: "History", exact: true }).click();
   await expect(dialog.getByRole("radio")).toHaveCount(2);
   await dialog.getByRole("radio").last().click();
+  const changes = dialog.getByRole("region", {
+    name: "Changes from current version",
+  });
+  await expect(changes).toContainText("Removed: # Current notes");
+  await expect(changes).toContainText(`Added: ${old.content}`);
+  // The bounded diff is its own scroll owner, so keyboard users can enter it.
+  await changes.focus();
+  await expect(changes).toBeFocused();
+  await dialog.getByRole("checkbox", { name: "Show full content" }).click();
   await expect(
     dialog.getByRole("textbox", { name: "Revision Markdown" }),
   ).toHaveValue(old.content);
@@ -108,7 +126,7 @@ test("Canvas history previews and restores without losing the editor draft", asy
     exact: true,
   });
   await expect(
-    confirmation.getByRole("button", { name: "Cancel", exact: true }),
+    confirmation.getByRole("button", { name: "Restore version", exact: true }),
   ).toBeFocused();
   await page.mouse.click(8, 8);
   await expect(confirmation).toHaveCount(0);
@@ -228,6 +246,14 @@ for (const outcome of ["saved", "failed after moving focus"]) {
         name: "Channel Canvas",
         exact: true,
       });
+      const view = canvas.getByRole("article", {
+        name: "Saved Canvas",
+        exact: true,
+      });
+      await expect(view).toHaveText("Saved");
+      await expect(view).toBeFocused();
+      const edit = canvas.getByRole("tab", { name: "Edit", exact: true });
+      await edit.click();
       const editor = canvas.getByRole("textbox", {
         name: "Canvas Markdown",
         exact: true,
@@ -243,6 +269,8 @@ for (const outcome of ["saved", "failed after moving focus"]) {
         .click();
       await expect(canvas).toHaveCount(0);
       await openCanvas();
+      await expect(view).toBeVisible();
+      await edit.click();
       await expect(editor).toBeEditable();
       await editor.focus();
       reconcile = true;

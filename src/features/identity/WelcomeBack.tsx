@@ -1,33 +1,30 @@
+import { decode } from "nostr-tools/nip19";
 import { Button } from "../../shared/design-system/ui/Button";
-import { PublicKeyPanel } from "./PublicKeyPanel";
+import { Avatar } from "../../shared/design-system/ui/Avatar";
+import { CaretRightIcon } from "../../shared/design-system/icons";
+import { abbreviatedPublicKey } from "../../shared/identity/public-key";
 
-/**
- * Pause after the account check found a key already linked to the signed-in
- * Builderlab account. Binding is 1:1, so this lane never creates a key: the
- * user brings the linked one, restores it from a backup, or starts over
- * without it.
- */
+/** Select the linked identity before entering its existing recovery flow. */
 export function WelcomeBack({
   npub,
   email,
+  profile,
   onRestore,
   onImport,
-  onLost,
   onSwitchAccount,
 }: {
-  /** The linked key, as the account's npub. */
   npub: string;
-  /** The signed-in Builderlab account the key is linked to. */
-  email: string | undefined;
-  /** Restore the linked key; set only when backup status lists it. */
+  email?: string | undefined;
+  profile?: { name: string; picture: string } | undefined;
   onRestore?: (() => void) | undefined;
-  /** Open the import page, which accepts only this key. */
   onImport: () => void;
-  /** Open the start-over page. */
-  onLost: () => void;
-  /** Wrong account: sign the session out and return to the landing. */
   onSwitchAccount: () => void;
 }) {
+  const name = profile?.name.trim();
+  const title = name || "Saved key";
+  const decoded = decode(npub);
+  const label =
+    decoded.type === "npub" ? abbreviatedPublicKey(decoded.data) : npub;
   return (
     <>
       <div>
@@ -36,57 +33,56 @@ export function WelcomeBack({
           tabIndex={-1}
           className="text-heading text-standard"
         >
-          Welcome back
+          {name ? "Welcome back" : "Continue with this key"}
         </h1>
         <p className="mt-2 text-body text-subtle">
-          This account is already linked to a Buzz identity — the key you use on
-          your other device.
-          {onRestore
-            ? " Restore it from your backup, or enter that key to continue."
-            : " Enter that key to continue."}
+          {name
+            ? "Continue with your Buzz profile."
+            : "We found the key to your account."}
         </p>
-        {/* Who the linked key belongs to, so a wrong account is visible before anything is imported. */}
-        <p className="mt-2 text-body-sm text-subtle">
-          {email ? `Signed in as ${email}.` : "Signed in."}
-        </p>
-      </div>
-      <PublicKeyPanel publicKey={npub} heading="Linked public key (npub)" />
-      <div className="flex flex-col gap-3">
-        {onRestore && (
-          <Button
-            variant="prominent"
-            size="lg"
-            data-return-focus="restore"
-            onClick={onRestore}
-          >
-            Restore from backup
-          </Button>
+        {email && (
+          <p className="mt-2 break-words text-body-sm text-subtle">
+            Signed in as {email}
+          </p>
         )}
-        {/* Secondary choices are deliberately smaller than the primary. */}
+      </div>
+      <div className="grid auto-rows-fr gap-2">
         <Button
-          variant={onRestore ? "subtle" : "primary"}
-          size={onRestore ? "sm" : "lg"}
-          data-return-focus="import"
-          onClick={onImport}
+          shape="control"
+          size="row"
+          aria-label={`${name ? `Continue with ${name}` : title}, ${label}`}
+          data-return-focus={onRestore ? "restore" : "import"}
+          onClick={onRestore ?? onImport}
         >
-          Enter your private key
+          <span className="flex w-full items-center gap-3 text-left">
+            {(name || profile?.picture) && (
+              <Avatar
+                alt=""
+                src={profile?.picture}
+                fallback={name || ""}
+                fallbackSurface="panel"
+                size="large"
+              />
+            )}
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-label">{title}</span>
+              <span
+                className="block whitespace-nowrap text-body-sm text-subtle"
+                title={npub}
+              >
+                {label}
+              </span>
+            </span>
+            <CaretRightIcon size={20} aria-hidden="true" />
+          </span>
         </Button>
-        {/* Future entry for NIP-AB device pairing: the signed-in device hands the key over. */}
-        <Button size="sm" disabled>
-          Recover from another device — Coming soon
-        </Button>
-        {/* Quieter than the other choices: starting over loses the old identity. */}
-        <Button
-          size="sm"
-          variant="ghost"
-          data-return-focus="lost"
-          onClick={onLost}
-        >
-          I lost this key
-        </Button>
-        {/* A lane exit, not a key choice, so it comes last. */}
-        <Button size="sm" variant="ghost" onClick={onSwitchAccount}>
-          Use a different account
+        <Button shape="control" size="row" onClick={onSwitchAccount}>
+          <span className="flex w-full items-center gap-3 text-left">
+            <span className="min-w-0 flex-1 text-label">
+              Use a different account
+            </span>
+            <CaretRightIcon size={20} aria-hidden="true" />
+          </span>
         </Button>
       </div>
     </>

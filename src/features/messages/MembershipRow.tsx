@@ -1,5 +1,11 @@
 import type { IdentityNameView } from "../identity-names/service";
 import { useIdentityNames } from "../identity-names/react";
+import {
+  PopoverRoot,
+  PopoverTrigger,
+  PopoverPopup,
+  PopoverTitle,
+} from "../../shared/design-system/ui/Popover";
 import { Avatar } from "../../shared/design-system/ui/Avatar";
 import referenceStyles from "../../shared/InlineReference.module.css";
 import { Fragment, memo } from "react";
@@ -77,9 +83,44 @@ export const MembershipRow = memo(function MembershipRow({
           )}
         </span>
         <p title={title}>
-          {parts.map((part) => {
-            // Members appear once per sentence and its literals never repeat.
-            const key = `${part.id ?? ""}:${part.text}`;
+          {parts.map((part, index) => {
+            const key = `${index}:${part.id ?? ""}:${part.text}`;
+            if (part.preview) {
+              const { label, members } = part.preview;
+              return (
+                <PopoverRoot key={key}>
+                  <PopoverTrigger
+                    openOnHover="preview"
+                    render={
+                      <button
+                        type="button"
+                        title=""
+                        className={`${referenceStyles.link} ${styles.membershipName}`}
+                      >
+                        {part.text}
+                      </button>
+                    }
+                  />
+                  <PopoverPopup side="top" align="center" size="compact">
+                    <PopoverTitle>
+                      {label} ({members.length})
+                    </PopoverTitle>
+                    <section
+                      className={styles.membershipPeople}
+                      aria-label={label}
+                      // biome-ignore lint/a11y/noNoninteractiveTabindex: The bounded member list needs keyboard focus for native scrolling.
+                      tabIndex={0}
+                    >
+                      <ul>
+                        {members.map((member) => (
+                          <li key={member.id}>{member.name}</li>
+                        ))}
+                      </ul>
+                    </section>
+                  </PopoverPopup>
+                </PopoverRoot>
+              );
+            }
             const agent = !!part.id && !!agentPubkeys?.has(part.id);
             const target = part.id && profileTarget(part.id, { agent });
             if (!target || !canOpenLink?.(target))

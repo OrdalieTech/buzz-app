@@ -20,6 +20,12 @@ export type PageSidebarProps = {
   children?: ReactNode | undefined;
 };
 
+/** Props for a primary page's navigation hover preview. */
+export type PagePreviewProps = {
+  /** Close the preview, for example after its content opened something. */
+  close(): void;
+};
+
 export type Page = Readonly<{
   id: string;
   title: string;
@@ -41,10 +47,11 @@ export type Page = Readonly<{
    * listed in search and reachable by deep link or from another page.
    */
   primary?: boolean;
-  /** Preferred navigation location for a primary page; omitted means sidebar.
-   * The host may move header entries into an overflow menu when space is tight.
+  /** Preferred navigation location for a primary page: a row in the Messages
+   * sidebar (the default) or an app in the dock. `topbar` and `toolbar` are
+   * pre-dock aliases for `dock`, still accepted.
    */
-  placement?: "sidebar" | "topbar" | "toolbar";
+  placement?: "sidebar" | "dock" | "topbar" | "toolbar";
   /**
    * A `data:image/<subtype>[;params],<payload>` URL shown beside the page in
    * search and primary navigation. Any other value is dropped with a warning,
@@ -56,6 +63,12 @@ export type Page = Readonly<{
    * compact corner badge; prefer a short count or dot there.
    */
   badge?: ComponentType;
+  /**
+   * Supplemental content the shell shows while a pointer rests on this page's
+   * sidebar or app-dock entry. It is never shown without hover or while the
+   * page is selected, so the page must stay complete without it.
+   */
+  preview?: ComponentType<PagePreviewProps>;
 }>;
 export type RegisteredPage = Contribution<Page>;
 export type PagesReader = {
@@ -93,7 +106,8 @@ export class PagesService extends Service implements Pages {
         page.layout !== "workspace") ||
       (page.companion !== undefined && typeof page.companion !== "boolean") ||
       (page.primary !== undefined && typeof page.primary !== "boolean") ||
-      (page.badge !== undefined && typeof page.badge !== "function")
+      (page.badge !== undefined && typeof page.badge !== "function") ||
+      (page.preview !== undefined && typeof page.preview !== "function")
     ) {
       throw new Error(
         "A page needs an id, a title, and a React component function",
@@ -116,12 +130,13 @@ export class PagesService extends Service implements Pages {
     if (
       placement === undefined ||
       placement === "sidebar" ||
+      placement === "dock" ||
       placement === "topbar" ||
       placement === "toolbar"
     )
       return page;
     console.warn(
-      `Ignoring page placement for ${this.ctx.pluginOwner?.id}/${page.id}: expected sidebar, topbar, or toolbar`,
+      `Ignoring page placement for ${this.ctx.pluginOwner?.id}/${page.id}: expected sidebar or dock`,
     );
     return rest;
   }

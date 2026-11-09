@@ -242,8 +242,9 @@ async fn full_head_suffix_and_open_ended_responses_have_exact_boundaries() {
     spool_files_deleted().await;
 }
 
-/// Serves the first block by `Range`, then fails every later request.
-fn failing_media_server(blob: Vec<u8>) -> Url {
+/// Serves the first block of `blob` by `Range`, as part of a blob of `total`
+/// bytes, then fails every later request.
+fn failing_media_server(blob: Vec<u8>, total: u64) -> Url {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
     std::thread::spawn(move || {
@@ -258,9 +259,8 @@ fn failing_media_server(blob: Vec<u8>) -> Url {
             let response = if index == 0 {
                 let body = &blob[..BLOCK as usize];
                 let range = format!(
-                    "Content-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\n",
+                    "Content-Range: bytes 0-{}/{total}\r\nContent-Length: {}\r\n",
                     BLOCK - 1,
-                    blob.len(),
                     body.len()
                 );
                 media_response("206 Partial Content", &range, body)
@@ -280,28 +280,83 @@ async fn a_failure_mid_stream_ends_the_response_short_of_its_length() {
     let blob = media_blob(total);
     let stream = stream();
     // A range origin failing after the first block.
-    let url = failing_media_server(blob.clone())
+    let url = failing_media_server(blob.clone(), total)
         .join(&format!("/media/{}.mp4", "4".repeat(64)))
         .unwrap();
     let reply = get(&stream, &url, "").await;
     assert_eq!(reply.status, 200);
     assert_eq!(length(&reply), total as usize);
     assert_eq!(reply.body, &blob[..BLOCK as usize]);
-    // A whole 200 shorter than its `Content-Length`.
-    let (whole, _, _) = whole_media_server(
-        blob[..2 * BLOCK as usize].to_vec(),
-        Some(total),
-        Duration::ZERO,
-    );
-    let url = whole
-        .join(&format!("/media/{}.mp4", "5".repeat(64)))
-        .unwrap();
-    let reply = get(&stream, &url, "").await;
+    // Keep the truncated origin open until the downstream response starts.
+    // Otherwise EOF may win the initial spool read and correctly return 502,
+    // exercising an opening failure instead of the intended mid-stream failure.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = Url::parse(&format!(
+        "http://{}/media/{}.mp4",
+        listener.local_addr().unwrap(),
+        "5".repeat(64)
+    ))
+    .unwrap();
+    let (close_origin, wait_for_response) = std::sync::mpsc::channel::<()>();
+    let partial = blob[..2 * BLOCK as usize].to_vec();
+    let origin = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while !request.ends_with(b"\r\n\r\n") {
+            socket.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        socket
+            .write_all(&media_response(
+                "200 OK",
+                &format!("Content-Length: {total}\r\n"),
+                &partial,
+            ))
+            .unwrap();
+        // Dropping the sender also releases the fixture during panic cleanup.
+        let _ = wait_for_response.recv();
+    });
+    let mut socket = open(&stream, &url, "", 0).await;
+    let mut response = Vec::new();
+    let mut byte = [0];
+    while !response.ends_with(b"\r\n\r\n") {
+        socket.read_exact(&mut byte).await.unwrap();
+        response.push(byte[0]);
+    }
+    drop(close_origin);
+    socket.read_to_end(&mut response).await.unwrap();
+    origin.join().unwrap();
+    let reply = parse_reply(&response);
     assert_eq!(reply.status, 200);
     assert_eq!(length(&reply), total as usize);
     assert!(reply.body.len() < total as usize);
     assert_eq!(reply.body, &blob[..reply.body.len()]);
     spool_files_deleted().await;
+}
+
+/// A relay serving a blob by `Range` may declare any total behind one valid
+/// block. The listener sends that total as a whole response's
+/// `Content-Length`, which only the media menu's limit keeps off the disk.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn menu_downloads_refuse_an_oversized_declared_total() {
+    let stream = stream();
+    let blob = media_blob(BLOCK);
+    for (total, saves) in [(3 * BLOCK, true), (1 << 40, false)] {
+        let url = failing_media_server(blob.clone(), total)
+            .join(&format!("/media/{}.mp4", "b".repeat(64)))
+            .unwrap();
+        let reply = get(&stream, &url, "").await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(length(&reply) as u64, total);
+        assert_eq!(reply.body, blob);
+        assert_eq!(
+            crate::media_context_menu::fits(length(&reply) as i64),
+            saves,
+            "{total}"
+        );
+    }
 }
 
 /// Sends a request and keeps the connection, reading at most `read` bytes of

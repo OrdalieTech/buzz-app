@@ -61,6 +61,8 @@ export async function nativeCommunityRequest(
     const info = await discovery;
     const response = await joinPolicy;
     return {
+      membershipRequired:
+        Array.isArray(info.supported_nips) && info.supported_nips.includes(43),
       name: typeof info.name === "string" ? info.name : undefined,
       icon: typeof info.icon === "string" ? info.icon : undefined,
       policy:

@@ -37,10 +37,22 @@ test("the existing attachment queue carries voice metadata through upload, retry
   expect(row?.attachments[0]).toMatchObject({
     kind: "audio",
     voiceNote: true,
-    duration: 1,
-    waveform: [0, 25, 0, 100],
   });
   expect(row?.content).toBe("Caption");
+  // block/buzz handlers/imeta.rs accepts these fields; waveform is rejected,
+  // and capture duration can differ from the stored 1 fps video duration.
+  expect(body.tags).toEqual([
+    [
+      "imeta",
+      `url ${uploaded.url}`,
+      "m video/mp4",
+      "size 1000",
+      `x ${uploaded.sha256}`,
+      "filename voice-note-test.mp4",
+    ],
+  ]);
+  expect(row?.attachments[0]?.duration).toBeUndefined();
+  expect(row?.attachments[0]?.waveform).toBeUndefined();
 });
 test("old voice notes are recognized even when their Markdown label is not the filename", () => {
   const event = message(keypair(), "general", "", 1, [

@@ -174,7 +174,7 @@ it("connects the Buzz identity when the account has none", async () => {
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
-it("pauses create and offers a switch when the account uses another identity", async () => {
+it("pauses create and offers a warned switch when the account uses another identity", async () => {
   routes["/api/builderlab/identity"] = () => ({
     identity: { pubkey_hex: other },
   });
@@ -192,6 +192,19 @@ it("pauses create and offers a switch when the account uses another identity", a
   });
   fireEvent.click(
     screen.getByRole("button", { name: "Switch to this device’s identity" }),
+  );
+  const warning = await screen.findByRole("alertdialog");
+  expect(warning).toHaveTextContent(
+    "It can never be linked to a Builderlab account again.",
+  );
+  expect(warning).toHaveTextContent(
+    "If this device’s key was unlinked before, Builderlab refuses it too",
+  );
+  expect(calls.map(([url]) => url)).not.toContain("/api/builderlab/unbind");
+  fireEvent.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Switch identity",
+    }),
   );
   await waitFor(() =>
     expect(
@@ -337,6 +350,9 @@ it("attributes transfer limit_reached to the recipient, not this owner's quota",
     Response.json({ error: { code: "limit_reached" } }, { status: 409 });
   renderCard();
   fireEvent.click(await screen.findByRole("button", { name: "Transfer" }));
+  await waitFor(() =>
+    expect(screen.getByLabelText("Recipient npub")).toHaveFocus(),
+  );
   fireEvent.change(screen.getByPlaceholderText("npub1…"), {
     target: { value: npubEncode(other) },
   });
@@ -522,6 +538,11 @@ it("does not bind after the card is deactivated during Switch", async () => {
       name: "Switch to this device’s identity",
     }),
   );
+  fireEvent.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Switch identity",
+    }),
+  );
   await waitFor(() =>
     expect(calls.map(([url]) => url)).toContain("/api/builderlab/unbind"),
   );
@@ -531,6 +552,39 @@ it("does not bind after the card is deactivated during Switch", async () => {
   expect(
     screen.getByRole("button", { name: "Connect Buzz identity" }),
   ).toBeInTheDocument();
+});
+
+it("never unlinks again after Switch unlinks but its bind fails", async () => {
+  routes["/api/builderlab/identity"] = () => ({
+    identity: { pubkey_hex: other },
+  });
+  routes["/api/builderlab/unbind"] = () => ({});
+  // The bind may have landed on the server even though its response was lost.
+  routes["/api/builderlab/bind"] = () =>
+    new Response("Bad gateway", { status: 502 });
+  renderCard();
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "Switch to this device’s identity",
+    }),
+  );
+  fireEvent.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Switch identity",
+    }),
+  );
+  const connect = await screen.findByRole("button", {
+    name: "Connect Buzz identity",
+  });
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  routes["/api/builderlab/bind"] = () => ({ identity: { pubkey_hex: local } });
+  routes["/api/builderlab/identity"] = () => ({
+    identity: { pubkey_hex: local },
+  });
+  fireEvent.click(connect);
+  await screen.findByText("Buzz identity connected");
+  const unlinks = calls.filter(([url]) => url === "/api/builderlab/unbind");
+  expect(unlinks).toHaveLength(1);
 });
 
 async function typeName(value: string) {
@@ -567,6 +621,54 @@ it("shows an availability failure and retries the same name", async () => {
   expect(
     screen.getByRole("button", { name: "Create community" }),
   ).toBeEnabled();
+});
+
+it("opens the join for a created community instead of handing off its address", async () => {
+  routes["/api/builderlab/availability"] = () => ({ available: true });
+  routes["/api/builderlab/create"] = () => ({
+    community: { id: "c1", normalized_host: "north.communities.buzz.xyz" },
+  });
+  const writeText = vi.fn(async () => {});
+  vi.stubGlobal("navigator", { clipboard: { writeText } });
+  const join = vi.fn(() => true);
+  render(
+    <StrictMode>
+      <HostedCommunities api={brokerApi} active={() => true} join={join} />
+    </StrictMode>,
+  );
+  await typeName("north");
+  await screen.findByText("That address is available.", {}, { timeout: 2000 });
+  fireEvent.click(screen.getByRole("button", { name: "Create community" }));
+  await waitFor(() =>
+    expect(join).toHaveBeenCalledWith("wss://north.communities.buzz.xyz"),
+  );
+  expect(join).toHaveBeenCalledOnce();
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Create community" }),
+    ).not.toHaveAttribute("aria-busy", "true"),
+  );
+  expect(writeText).not.toHaveBeenCalled();
+  expect(screen.queryByText(/Address copied/)).not.toBeInTheDocument();
+});
+
+it("hands off the address when the app cannot open the join", async () => {
+  routes["/api/builderlab/availability"] = () => ({ available: true });
+  routes["/api/builderlab/create"] = () => ({
+    community: { id: "c1", normalized_host: "north.communities.buzz.xyz" },
+  });
+  const writeText = vi.fn(async () => {});
+  vi.stubGlobal("navigator", { clipboard: { writeText } });
+  const join = vi.fn(() => false);
+  render(<HostedCommunities api={brokerApi} active={() => true} join={join} />);
+  await typeName("north");
+  await screen.findByText("That address is available.", {}, { timeout: 2000 });
+  fireEvent.click(screen.getByRole("button", { name: "Create community" }));
+  await waitFor(() =>
+    expect(writeText).toHaveBeenCalledWith("wss://north.communities.buzz.xyz"),
+  );
+  expect(join).toHaveBeenCalledOnce();
+  expect(await screen.findByText(/Address copied/)).toBeInTheDocument();
 });
 
 it("keeps the address visible when the clipboard rejects", async () => {
@@ -627,39 +729,6 @@ const listed = {
   can_create: true,
 };
 
-it("drops a failed copy handoff when the identity is unpaired", async () => {
-  routes["/api/builderlab/list"] = () => listed;
-  routes["/api/builderlab/unbind"] = () => ({});
-  const writeText = vi.fn(async (_: string): Promise<void> => {
-    throw new Error("denied");
-  });
-  vi.stubGlobal("navigator", { clipboard: { writeText } });
-  renderCard();
-  fireEvent.click(await screen.findByRole("button", { name: "Copy address" }));
-  expect(
-    await screen.findByRole("button", { name: "Try copying again" }),
-  ).toBeEnabled();
-  routes["/api/builderlab/identity"] = () => ({
-    error: { code: "missing_mapping", setup_needed: true },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Unpair identity" }));
-  fireEvent.click(
-    within(await screen.findByRole("alertdialog")).getByRole("button", {
-      name: "Unpair identity",
-    }),
-  );
-  expect(
-    await screen.findByRole("button", { name: "Connect Buzz identity" }),
-  ).toBeInTheDocument();
-  expect(
-    screen.queryByRole("button", { name: "Try copying again" }),
-  ).not.toBeInTheDocument();
-  expect(
-    screen.queryByText("wss://north.communities.buzz.xyz"),
-  ).not.toBeInTheDocument();
-  expect(writeText).toHaveBeenCalledTimes(1);
-});
-
 it("does not carry a failed copy handoff into the next sign-in", async () => {
   routes["/api/builderlab/list"] = () => listed;
   routes["/api/builderlab/sign-out"] = () => ({});
@@ -709,6 +778,36 @@ it("does not write to the clipboard when create finishes after the card retires"
   );
   expect(writeText).not.toHaveBeenCalled();
 });
+
+for (const ending of ["retires", "unmounts"] as const)
+  it(`does not open the join when create finishes after the card ${ending}`, async () => {
+    const create = hold();
+    let live = true;
+    routes["/api/builderlab/availability"] = () => ({ available: true });
+    routes["/api/builderlab/create"] = create.answer as Handler;
+    const join = vi.fn(() => true);
+    const { unmount } = render(
+      <HostedCommunities api={brokerApi} active={() => live} join={join} />,
+    );
+    await typeName("north");
+    await screen.findByText(
+      "That address is available.",
+      {},
+      { timeout: 2000 },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Create community" }));
+    await waitFor(() =>
+      expect(calls.map(([url]) => url)).toContain("/api/builderlab/create"),
+    );
+    if (ending === "retires") live = false;
+    else unmount();
+    await act(async () =>
+      create.release({
+        community: { id: "c1", normalized_host: "north.communities.buzz.xyz" },
+      }),
+    );
+    expect(join).not.toHaveBeenCalled();
+  });
 
 it("keeps a created community's address when the following refresh fails", async () => {
   routes["/api/builderlab/availability"] = () => ({ available: true });
@@ -800,6 +899,15 @@ it.each([
     });
     renderCard();
     fireEvent.click(await screen.findByRole("button", { name: action }));
+    // Archive stops every connection, so Enter cancels; unarchive confirms.
+    const dialog = await screen.findByRole("alertdialog");
+    await waitFor(() =>
+      expect(
+        within(dialog).getByRole("button", {
+          name: kind === "archive" ? "Cancel" : action,
+        }),
+      ).toHaveFocus(),
+    );
     routes["/api/builderlab/list"] = () => ({
       error: { code: "relay_unavailable" },
     });
@@ -1084,6 +1192,19 @@ async function confirmDeletion(host = archived.normalized_host) {
 const deletionPosts = () =>
   calls.filter(([url]) => url === "/api/builderlab/delete");
 
+it("starts permanent deletion in the host field with submission gated", async () => {
+  routes["/api/builderlab/list"] = () => ({ communities: [archived] });
+  renderCard();
+  const dialog = await openDeletion();
+  await waitFor(() =>
+    expect(within(dialog).getByLabelText("Type the exact host")).toHaveFocus(),
+  );
+  expect(
+    within(dialog).getByRole("button", { name: "Start deletion" }),
+  ).toBeDisabled();
+  expect(deletionPosts()).toEqual([]);
+});
+
 async function startUncertainDeletion() {
   routes["/api/builderlab/list"] = () => ({ communities: [archived] });
   routes["/api/builderlab/delete"] = () =>
@@ -1159,20 +1280,15 @@ it("hides but retains an uncertain UUID across A to B to A", async () => {
   await expectSameRequestRecovery(saved);
 });
 
-it("retains the uncertain UUID through unpair and same-owner rebind", async () => {
+it("retains the uncertain UUID through an unpair elsewhere and same-owner rebind", async () => {
   const { saved } = await startUncertainDeletion();
-  routes["/api/builderlab/unbind"] = () => ({});
   routes["/api/builderlab/identity"] = () => ({
     error: { code: "missing_mapping", setup_needed: true },
   });
   routes["/api/builderlab/list"] = () => ({
     error: { code: "missing_mapping", setup_needed: true },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Unpair identity" }));
-  const dialog = await screen.findByRole("alertdialog");
-  fireEvent.click(
-    within(dialog).getByRole("button", { name: "Unpair identity" }),
-  );
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
   await screen.findByRole("button", { name: "Connect Buzz identity" });
   expect(deletionPosts()).toHaveLength(1);
   expect(JSON.parse(localStorage.getItem(DELETION_PENDING_KEY) ?? "")).toEqual(
@@ -1314,6 +1430,11 @@ it("retains the uncertain UUID through Switch back to its owner", async () => {
   });
   fireEvent.click(
     screen.getByRole("button", { name: "Switch to this device’s identity" }),
+  );
+  fireEvent.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Switch identity",
+    }),
   );
   await screen.findByText(saved.request.request_id);
   await expectSameRequestRecovery(saved);

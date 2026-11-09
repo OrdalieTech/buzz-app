@@ -151,6 +151,24 @@ test("PR media plays under the packaged media policy in a narrow GitHub panel", 
   }
   for (const source of [before, after])
     await expect(panel.locator(`a[href="${source}"]`)).toHaveCount(0);
+  // WebKit can finish a seek issued just after playback pauses without moving:
+  // seeked fires and currentTime stays where playback paused. Keep the
+  // fullscreen video from autoplaying, so the seek below follows no pause, and
+  // seek only after its initial-position restore has landed.
+  await page.evaluate(() => {
+    window.fullscreenRestored = new Promise((resolve) => {
+      const observer = new MutationObserver(() => {
+        const video = document.querySelector(
+          '[role="dialog"][aria-label="Video attachment"] video',
+        );
+        if (!video) return;
+        observer.disconnect();
+        video.pause();
+        video.addEventListener("seeked", resolve, { once: true });
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    });
+  });
   await panel
     .getByRole("button", { name: "Open video fullscreen" })
     .nth(1)
@@ -175,9 +193,9 @@ test("PR media plays under the packaged media policy in a narrow GitHub panel", 
       ),
     )
     .toBe(true);
+  await page.evaluate(() => window.fullscreenRestored);
   // Native seek controls are browser-owned; observe the real media seek boundary.
   const seek = await fullscreen.evaluate(async (element) => {
-    element.pause();
     const seconds = element.duration / 2;
     const completed = new Promise((resolve) =>
       element.addEventListener("seeked", resolve, { once: true }),

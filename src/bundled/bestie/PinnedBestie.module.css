@@ -1,5 +1,10 @@
-/* The Solo column and composer use this existing named query container to
- * adapt their width inside the Bestie workspace. */
+/* Bestie is a DM: the shared timeline and composer own their width and insets. */
 .work {
-  container: solo-conversation / inline-size;
+  height: 100%;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }

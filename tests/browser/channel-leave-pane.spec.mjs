@@ -29,6 +29,7 @@ async function openSettings(page, app) {
 test.use({
   productionBroker: true,
   channelLifecycle: true,
+  leaveRosterBeforeAck: true,
   lifecycleRole: "member",
   historyCounts: { alpha: 2, beta: 1 },
 });
@@ -91,28 +92,67 @@ test("management Leave restores focus on cancel, holds pending, and completes th
     await held;
     await route.continue();
   });
+  let releaseAck;
+  const ackHeld = new Promise((resolve) => {
+    releaseAck = resolve;
+  });
+  let publicationSeen;
+  const published = new Promise((resolve) => {
+    publicationSeen = resolve;
+  });
+  await page.route(
+    "**/api/relay/**/channel-lifecycle-publish",
+    async (route) => {
+      const response = await route.fetch();
+      publicationSeen();
+      await ackHeld;
+      await route.fulfill({ response });
+    },
+  );
+  const pending = page.getByRole("dialog", {
+    name: "Leaving channel…",
+    exact: true,
+  });
   try {
-    await leave.click();
-    await dialog
-      .getByRole("button", { name: "Leave channel", exact: true })
-      .click();
-    await seen;
-    await expect(dialog).toHaveCount(0);
-    const pending = page.getByRole("dialog", {
-      name: "Leaving channel…",
-      exact: true,
-    });
-    await expect(pending).toBeVisible();
-    await expect(pending).not.toHaveAttribute("aria-modal", "true");
-    await page.keyboard.press("Escape");
+    try {
+      await leave.click();
+      await dialog
+        .getByRole("button", { name: "Leave channel", exact: true })
+        .click();
+      await seen;
+      await expect(dialog).toHaveCount(0);
+
+      await expect(pending).toBeVisible();
+      await expect(pending).not.toHaveAttribute("aria-modal", "true");
+      await page.keyboard.press("Escape");
+      await expect(pending).toBeVisible();
+      await expect(
+        page.locator(`[data-channel-id="${channelId}"]`),
+      ).toBeVisible();
+      expect(app.report.lifecyclePublications ?? []).toHaveLength(0);
+    } finally {
+      release();
+    }
+    // The signed roster has removed membership while the actual publication
+    // response is still withheld. Content cleanup must not fail the dialog.
+    await published;
+    await expect(
+      sidebar.locator(`[data-channel-id="${channelId}"]`),
+    ).toHaveCount(0);
     await expect(pending).toBeVisible();
     await expect(
-      page.locator(`[data-channel-id="${channelId}"]`),
-    ).toBeVisible();
-    expect(app.report.lifecyclePublications ?? []).toHaveLength(0);
+      page.getByRole("dialog", { name: "Leave channel failed", exact: true }),
+    ).toHaveCount(0);
   } finally {
-    release();
+    releaseAck();
   }
+  await expect(pending).toHaveCount(0);
+  await expect(
+    page.getByRole("dialog", { name: "Leave channel failed", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Channel left: Lifecycle channel", { exact: true }),
+  ).toBeVisible();
   await expect(dialog).toHaveCount(0);
   await expect(panel).toHaveCount(0);
   await expect(sidebar.locator(`[data-channel-id="${channelId}"]`)).toHaveCount(
@@ -165,12 +205,19 @@ test.describe("last visible channel", () => {
     await expect(page.getByRole("textbox", { name: /^Message #/ })).toHaveCount(
       0,
     );
-    expect(
-      await page.evaluate(
-        () =>
-          document.activeElement?.closest('[aria-label="Sidebar"]') !== null,
-      ),
-    ).toBe(true);
+    // Roster revocation can render the empty page before Leave is confirmed.
+    // Its completion hands focus back through the sidebar owner.
+    await expect(
+      page.getByText("Channel left: Lifecycle channel", { exact: true }),
+    ).toBeVisible();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            document.activeElement?.closest('[aria-label="Sidebar"]') !== null,
+        ),
+      )
+      .toBe(true);
     await page.reload();
     await expect(
       page.getByText("Select a channel to read it.", { exact: true }),

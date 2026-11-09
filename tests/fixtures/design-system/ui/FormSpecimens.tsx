@@ -434,6 +434,14 @@ export function SelectExamples() {
           description="Choose where this item belongs."
         />
         <Select
+          label="Filled workspace"
+          variant="compact"
+          appearance="inverted"
+          value={value}
+          onValueChange={setValue}
+          groups={workspaceGroups}
+        />
+        <Select
           label="Read-only workspace"
           variant="field"
           readOnly
@@ -610,8 +618,19 @@ export function WorkspaceCombobox({
   );
 }
 
-function PopupSearchExample() {
-  const options = ["Anthropic", "Databricks", "OpenAI"];
+function PopupSearchExample({ compact = false }: { compact?: boolean }) {
+  const options = compact
+    ? [
+        "Anthropic",
+        "Databricks",
+        "OpenAI",
+        "Google",
+        "Mistral",
+        "Ollama",
+        "OpenRouter",
+        "xAI",
+      ]
+    : ["Anthropic", "Databricks", "OpenAI"];
   const [value, setValue] = useState<string | null>("Databricks");
   const [query, setQuery] = useState("");
   return (
@@ -626,10 +645,20 @@ function PopupSearchExample() {
       }}
       autoHighlight
     >
-      <Combobox.Trigger label="Provider">
+      <Combobox.Trigger
+        label={compact ? "Compact provider picker" : "Provider"}
+      >
         {value ?? "Choose a provider"}
       </Combobox.Trigger>
-      <Combobox.Popup search empty="No matching providers.">
+      <Combobox.Popup
+        search
+        size={compact ? "compact" : "default"}
+        side="bottom"
+        collisionAvoidance={
+          compact ? { side: "none", align: "shift" } : undefined
+        }
+        empty="No matching providers."
+      >
         <Combobox.List>
           {(item: string) => (
             <Combobox.Item key={item} value={item}>
@@ -658,6 +687,7 @@ ${workspaceComboboxCode}`}
       >
         <WorkspaceCombobox />
         <PopupSearchExample />
+        <PopupSearchExample compact />
         <WorkspaceCombobox label="Compact row choice" compact />
         <WorkspaceCombobox label="Read-only choices" readOnly />
         <WorkspaceCombobox label="Disabled choices" disabled />

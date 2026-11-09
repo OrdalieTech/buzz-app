@@ -53,13 +53,21 @@ export function createAgentHooks(root: Context) {
   };
 }
 
+export type AgentHookDispatchOptions = Readonly<{
+  accepts(output: unknown): boolean;
+  milliseconds: number;
+  /** Label native output using the registered owner, independently of payload. */
+  compose?(output: unknown, pluginId: string): unknown;
+}>;
+
 /** Adapters supply native response acceptance and an event-wide time budget. */
 export function dispatchAgentHooks(
-  hooks: readonly AgentHook[],
+  hooks: readonly (AgentHook & { pluginId: string })[],
   input: unknown,
   context: AgentHookContext,
   accepts: (output: unknown) => boolean,
   milliseconds: number,
+  compose?: AgentHookDispatchOptions["compose"],
 ): Promise<unknown> {
   const deadline = Date.now() + milliseconds;
   const message = "Agent hook dispatch timed out";
@@ -70,7 +78,8 @@ export function dispatchAgentHooks(
         if (Date.now() >= deadline) throw new Error(message);
         try {
           const output = await hook.run(input, context);
-          if (accepts(output)) return output;
+          if (accepts(output))
+            return compose ? compose(output, hook.pluginId) : output;
         } catch (error) {
           console.warn("Agent hook failed", hook.id, error);
           errors.push(error);

@@ -15,6 +15,13 @@ export type ReadOptions = {
   priority?: Priority;
   /** A write preflight must start after its intent, never join an older in-flight read. */
   fresh?: boolean;
+  /** Replaces the reader's deadline for new work; a joining read keeps the
+   * deadline of the read it joins. */
+  deadlineMs?: number;
+  /** A read of every channel resolves the channels its events name first,
+   * whatever their kinds, so a readable one the session does not know yet is
+   * not dropped. It waits for discovery: before it, the read fails. */
+  resolveChannels?: boolean;
 };
 /** Finite, verified event reads. No retained event cache or claim of live freshness. */
 export type RelayReader = {
@@ -56,6 +63,14 @@ type Job = {
   profiles?: { query: string; limit: number; page: number };
 };
 const cancelled = () => new DOMException("Relay read cancelled", "AbortError");
+
+/** The most serialized events one read may return. */
+export const RELAY_READ_BYTES = 8 * 1024 * 1024;
+/** For reads whose result can approach RELAY_READ_BYTES: the native
+ * transport's per-request ceiling (src-tauri/src/relay.rs). Ten seconds needs
+ * about 800 KB/s for such a result, so a slow relay link would fail the read
+ * on every retry rather than finish it. */
+export const LARGE_READ_DEADLINE_MS = 30_000;
 
 /** Session-owned scheduling and cancellation. Equal concurrent reads share work;
  * cancelling one consumer never cancels another. Completion releases all request state. */
@@ -193,7 +208,7 @@ export function createRelayReader(
                 );
         void query
           .then(async (events) => {
-            if (byteSize(events) > 8 * 1024 * 1024)
+            if (byteSize(events) > RELAY_READ_BYTES)
               throw new ReadError(
                 "invalid-response",
                 "Relay response exceeds the read budget",
@@ -228,7 +243,12 @@ export function createRelayReader(
   ): Promise<AgentLibrary>;
   function read(
     filters: readonly ReadFilter[],
-    { signal, priority = "foreground", fresh = false }: ReadOptions = {},
+    {
+      signal,
+      priority = "foreground",
+      fresh = false,
+      deadlineMs = timeoutMs,
+    }: ReadOptions = {},
     snapshot = false,
     profiles?: Job["profiles"],
     library = false,
@@ -325,7 +345,7 @@ export function createRelayReader(
               undefined,
               new ReadError("unavailable", "Relay read timed out"),
             ),
-          timeoutMs,
+          deadlineMs,
         ),
       };
       jobs.set(key, job);
@@ -359,7 +379,7 @@ export function createRelayReader(
     readStateSnapshot: (options?: ReadOptions) =>
       read(
         [{ kinds: [30078], authors: [transport?.viewer ?? ""], limit: 500 }],
-        options,
+        { ...options, deadlineMs: LARGE_READ_DEADLINE_MS },
         true,
       ),
     ...(transport?.searchProfiles

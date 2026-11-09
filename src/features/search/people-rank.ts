@@ -1,5 +1,6 @@
-import { matchPerson } from "./person-match";
+import { matchTier, normalizeName } from "./person-match";
 import { searchOrder, type SearchUsage } from "./usage";
+import { typedPublicKey } from "../../shared/identity/public-key";
 
 export type PersonCandidate = {
   pubkey: string;
@@ -7,8 +8,13 @@ export type PersonCandidate = {
   label: string;
   /** The kind-0 handle, shown beside the label, when it differs from it. */
   username?: string | undefined;
+  /** A community-verified full name, shown beside the label's detail. */
+  fullName?: string | undefined;
   /** A managed agent's own name, matched but not shown, as in mentions. */
   agentName?: string | undefined;
+  /** The profile name and handle the directory found this person by, matched
+   * but not shown once a verified name replaces them. */
+  profileNames?: readonly string[] | undefined;
   agent: boolean;
   /** peopleRelationships rank: lower is closer. */
   relationship: number;
@@ -19,21 +25,30 @@ export type PersonCandidate = {
 export const personKey = (pubkey: string) => `person:${pubkey}`;
 
 /**
- * How well a person matches the typed text, or undefined. The shown label and
- * username use the shared name rule (person-match). A hidden agent name ranks
- * after every shown name, as `mentionMatch` ranks hidden aliases.
+ * How well a person matches the typed text, or undefined. The shown label,
+ * username and verified full name use the shared name rule (person-match). A
+ * hidden agent or profile name ranks after every shown name, as `mentionMatch`
+ * ranks hidden aliases.
  */
-export function personMatch(person: PersonCandidate, needle: string) {
+function personMatch(
+  person: PersonCandidate,
+  folded: readonly string[] | undefined,
+) {
   // Blank suggestions have no exact name; relationship and usage order them.
-  if (!needle.trim()) return 1;
+  if (!folded) return 1;
   const tier = (name: string | undefined) =>
-    name === undefined ? undefined : matchPerson(name, needle)?.tier;
-  const shown = [tier(person.label), tier(person.username)].filter(
-    (value) => value !== undefined,
-  );
+    name === undefined ? undefined : matchTier(name, folded);
+  const shown = [
+    tier(person.label),
+    tier(person.username),
+    tier(person.fullName),
+  ].filter((value) => value !== undefined);
   if (shown.length) return Math.min(...shown);
-  const hidden = tier(person.agentName);
-  return hidden === undefined ? undefined : 4 + hidden;
+  const hidden = [
+    tier(person.agentName),
+    ...(person.profileNames ?? []).map(tier),
+  ].filter((value) => value !== undefined);
+  return hidden.length ? 4 + Math.min(...hidden) : undefined;
 }
 
 /**
@@ -50,9 +65,13 @@ export function rankPeople<T extends PersonCandidate>(
   usage: SearchUsage,
   picked: string | undefined,
 ) {
+  // A pasted public key names its person exactly, though no name matches it.
+  const key = typedPublicKey(needle);
+  // Fold the query once, not once per person.
+  const folded = needle.trim() ? [...normalizeName(needle)] : undefined;
   return people
     .flatMap((person) => {
-      const rank = personMatch(person, needle);
+      const rank = person.pubkey === key ? 0 : personMatch(person, folded);
       if (rank === undefined) return [];
       const row = {
         key: personKey(person.pubkey),

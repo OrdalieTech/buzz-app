@@ -71,7 +71,11 @@ test("mocked native IPC admission and uncertain delivery survive page reload wit
         body: JSON.stringify(body),
       });
       if (payload.path === "/")
-        return response({ self: viewer, name: "Fixture community" });
+        return response({
+          self: viewer,
+          name: "Fixture community",
+          supported_nips: [1, 42, 43],
+        });
       if (payload.path === "/api/join-policy")
         return response({ policy: null });
       if (payload.path === "/api/invites/claim") {
@@ -107,7 +111,7 @@ test("mocked native IPC admission and uncertain delivery survive page reload wit
     await page.getByRole("button", { name: "Add a community" }).click();
     await page.getByLabel("Community URL").fill(community);
     await page.getByRole("button", { name: "Continue", exact: true }).click();
-    await page.getByLabel("Invite code (if required)").fill("v2.fixture");
+    await page.getByLabel("Invite code").fill("v2.fixture");
     await page.getByRole("button", { name: "Continue", exact: true }).click();
     await expect(page.getByRole("alert")).toHaveText("Claim receipt lost");
     await page.reload();

@@ -6,7 +6,6 @@ import { localCommunityNameKey } from "./names";
 import * as destinations from "./destination";
 import { flush } from "../relay/testing";
 import type { ReadTransport } from "../relay/transport";
-import { recordReaction } from "../messages/quick-reactions";
 import { readView, writeView } from "../../shared/view-state";
 
 const viewer = "a".repeat(64);
@@ -621,7 +620,10 @@ it("leave still forgets the community when a store will not clear, and logs and 
   );
   await flush();
   const origin = communityDestination("primary").url;
-  recordReaction(`${origin}:${viewer}`, "🎉");
+  localStorage.setItem(
+    `buzz.quick-reactions.v1:${origin}:${viewer}`,
+    '[{"emoji":"🎉","count":1,"used":1}]',
+  );
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   // Key enumeration is what the view and channel-setup sweeps rely on.
   const denied = new Error("denied");
@@ -660,7 +662,10 @@ it("leave without a purge forgets the community and disposes its session but kee
   const scope = `${communityDestination("primary").url}:${viewer}`;
   writeView(scope, "draft:general", "unsent");
   writeView(scope, "channel", "general");
-  recordReaction(scope, "🎉");
+  localStorage.setItem(
+    `buzz.quick-reactions.v1:${scope}`,
+    '[{"emoji":"🎉","count":1,"used":1}]',
+  );
   const sessions = () => requests.filter((url) => url.endsWith("/session"));
   const before = sessions().length;
   // The banned answer: the relay still holds the membership, so nothing keyed

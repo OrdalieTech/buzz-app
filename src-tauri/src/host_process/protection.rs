@@ -13,25 +13,44 @@ pub(crate) struct ProcessProtection {
 }
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl ProcessProtection {
+    /// Paths may be under the user's home, written `~/…`, as directories are.
+    pub(crate) fn at_home(mut self) -> Result<Self, String> {
+        for path in self
+            .read_only_paths
+            .iter_mut()
+            .chain(&mut self.hidden_paths)
+        {
+            if let Some(expanded) = path
+                .to_str()
+                .filter(|text| super::under_home(text).is_some())
+                .map(super::expand_home)
+            {
+                *path = expanded?;
+            }
+        }
+        Ok(self)
+    }
     pub(crate) fn profile(&self, controls: &[PathBuf]) -> Result<String, String> {
         let paths = self
             .read_only_paths
             .iter()
-            .chain(&self.hidden_paths)
-            .chain(controls);
+            .map(|path| (path, true))
+            .chain(self.hidden_paths.iter().chain(controls).map(|p| (p, false)));
         let mut roots = BTreeSet::new();
         let mut ancestors = BTreeSet::new();
         if self.read_only_paths.len() + self.hidden_paths.len() > 128 {
             return Err("Too many protection paths".into());
         }
-        for path in paths {
+        for (path, may_be_missing) in paths {
             if !path.is_absolute() || path.as_os_str().len() > 4096 {
                 return Err("Protection paths must be absolute".into());
             }
             let original = path.clone();
             let path = path
                 .canonicalize()
-                .map_err(|_| "Protection path is unavailable")?;
+                .ok()
+                .or_else(|| may_be_missing.then(|| missing_leaf(path)).flatten())
+                .ok_or("Protection path is unavailable")?;
             for parent in path.ancestors().skip(1).filter(|p| *p != Path::new("/")) {
                 ancestors.insert(parent.to_path_buf());
             }
@@ -75,6 +94,17 @@ impl ProcessProtection {
     }
 }
 
+/// A read-only path that does not exist yet is protected by name in its existing,
+/// non-root parent, so nothing can be created, linked or renamed to it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn missing_leaf(path: &Path) -> Option<PathBuf> {
+    let (parent, name) = (path.parent()?.canonicalize().ok()?, path.file_name()?);
+    let missing = path
+        .symlink_metadata()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    (missing && parent != Path::new("/")).then(|| parent.join(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,10 +115,54 @@ mod tests {
             hidden_paths: vec![],
         };
         assert!(protection.profile(&[]).is_err());
+        // A missing read-only leaf needs an existing parent other than `/`.
         protection.read_only_paths = vec![PathBuf::from("/path-that-does-not-exist-buzz-security")];
         assert!(protection.profile(&[]).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        protection.read_only_paths = vec![dir.path().join("missing").join("leaf")];
+        assert!(protection.profile(&[]).is_err());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("dangling");
+            std::os::unix::fs::symlink(dir.path().join("absent"), &link).unwrap();
+            protection.read_only_paths = vec![link];
+            assert!(protection.profile(&[]).is_err());
+        }
+        protection.read_only_paths = vec![];
+        protection.hidden_paths = vec![dir.path().join("missing")];
+        assert!(protection.profile(&[]).is_err());
+        protection.hidden_paths = vec![];
+        assert!(protection.profile(&[dir.path().join("missing")]).is_err());
         protection.read_only_paths = vec![std::env::temp_dir(); 129];
         assert!(protection.profile(&[]).is_err());
+    }
+    #[test]
+    fn protects_a_missing_read_only_leaf_under_its_canonical_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let profile = ProcessProtection {
+            read_only_paths: vec![dir.path().join("config.tmp")],
+            hidden_paths: vec![],
+        }
+        .profile(&[])
+        .unwrap();
+        let leaf = serde_json::to_string(parent.join("config.tmp").to_str().unwrap()).unwrap();
+        assert!(profile.contains(&format!("(subpath {leaf})")));
+    }
+    #[test]
+    fn paths_may_be_under_home() {
+        let protection = ProcessProtection {
+            read_only_paths: vec![PathBuf::from("~/tools"), PathBuf::from("/opt/tools")],
+            hidden_paths: vec![PathBuf::from("~/private")],
+        }
+        .at_home()
+        .unwrap();
+        let home = super::super::expand_home("~").unwrap();
+        assert_eq!(
+            protection.read_only_paths,
+            [home.join("tools"), PathBuf::from("/opt/tools")]
+        );
+        assert_eq!(protection.hidden_paths, [home.join("private")]);
     }
     #[test]
     #[cfg(unix)]
@@ -161,5 +235,39 @@ mod tests {
             std::fs::read_to_string(workspace.join("note")).unwrap(),
             "allowed"
         );
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn kernel_denies_creating_a_missing_read_only_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("config.tmp");
+        let worker_file = dir.path().join("worker");
+        std::fs::write(&worker_file, "worker").unwrap();
+        let profile = ProcessProtection {
+            read_only_paths: vec![leaf.clone()],
+            hidden_paths: vec![],
+        }
+        .profile(&[])
+        .unwrap();
+        let run = |script: &str| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "/bin/sh", "-c", script, "sandbox-test"])
+                .arg(&leaf)
+                .arg(&worker_file)
+                .status()
+                .unwrap()
+                .success()
+        };
+        for script in [
+            "printf planted > \"$1\"",
+            "mkdir \"$1\"",
+            "mv \"$2\" \"$1\"",
+            "ln \"$2\" \"$1\"",
+            "ln -s \"$2\" \"$1\"",
+        ] {
+            assert!(!run(script), "{script}");
+            assert!(leaf.symlink_metadata().is_err(), "{script}");
+        }
+        assert!(run("printf allowed > \"$1.sibling\""));
     }
 }

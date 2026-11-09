@@ -327,3 +327,26 @@ entry. Close timing is unchanged. The shared value lives in
 
 Remove this part when a pinned Base UI release rests before opening a preview
 card; `src/shared/design-system/ui/Tooltip.test.tsx` covers it.
+
+
+## Reader movement during height reconciliation
+
+The element driver's automatic correction emits a synchronous, non-bubbling
+`virtua-scroll-correction` event with normalized native `before` and `after`
+offsets. ChannelTimeline's existing anchor hold uses this boundary to distinguish
+reader movement from layout correction, even when the browser coalesces both into
+one scroll event. The notification adds no scrolling policy or scheduler. The
+hold consumes reader movement before reconciling list height and rebases after its
+own correction; browser range clamping remains layout movement. Mounted regressions
+cover both model/DOM orderings and coalesced movement, while installed-driver tests
+verify actual offsets, including fractional clamping.
+
+## dnd-kit core 6.3.1: stable idle transform
+
+`DndContext` passes its drag transform as `ActiveDraggableContext`'s value and
+rebuilds that object on every render, even with no drag. The sidebar renders its
+`DndContext` whenever channel state changes, so each live message changed the
+context value, and React searched the whole sidebar subtree for consumers. The
+patch keeps the previous transform object while its four numbers are unchanged.
+A drag still publishes each new transform; only identity of an equal value is
+kept. Only the ESM entry, which the application imports, is patched.

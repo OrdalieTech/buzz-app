@@ -29,6 +29,30 @@ export function orderContributedSidebarSections<T extends { key: string }>(
     .map(({ section }) => section);
 }
 
+function compareName(a: ChannelSummary, b: ChannelSummary) {
+  return a.name.toLowerCase() < b.name.toLowerCase()
+    ? -1
+    : a.name.toLowerCase() > b.name.toLowerCase()
+      ? 1
+      : a.id.localeCompare(b.id);
+}
+
+/** The sidebar's "recent" order: newest activity first, channels without known
+ * activity after, then by name. */
+export function compareRecent(a: ChannelSummary, b: ChannelSummary) {
+  if (
+    a.lastActivityAt !== undefined &&
+    b.lastActivityAt !== undefined &&
+    a.lastActivityAt !== b.lastActivityAt
+  )
+    return b.lastActivityAt - a.lastActivityAt;
+  if (a.lastActivityAt !== undefined && b.lastActivityAt === undefined)
+    return -1;
+  if (a.lastActivityAt === undefined && b.lastActivityAt !== undefined)
+    return 1;
+  return compareName(a, b);
+}
+
 /** Preferences only arrange the supplied authorized roster; they never add channels. */
 export function sidebarSections<T extends ChannelSummary>(
   channels: readonly T[],
@@ -51,28 +75,10 @@ export function sidebarSections<T extends ChannelSummary>(
   const groups = preferences?.sections ?? [];
   const ids = new Set(groups.map((group) => group.id));
   const assignment = (id: string) => preferences?.assignments[id];
-  const compareName = (a: ChannelSummary, b: ChannelSummary) =>
-    a.name.toLowerCase() < b.name.toLowerCase()
-      ? -1
-      : a.name.toLowerCase() > b.name.toLowerCase()
-        ? 1
-        : a.id.localeCompare(b.id);
   const sort = (rows: readonly ChannelSummary[], key: string) =>
-    [...rows].sort((a, b) => {
-      if (preferences?.sort?.[key] === "recent") {
-        if (
-          a.lastActivityAt !== undefined &&
-          b.lastActivityAt !== undefined &&
-          a.lastActivityAt !== b.lastActivityAt
-        )
-          return b.lastActivityAt - a.lastActivityAt;
-        if (a.lastActivityAt !== undefined && b.lastActivityAt === undefined)
-          return -1;
-        if (a.lastActivityAt === undefined && b.lastActivityAt !== undefined)
-          return 1;
-      }
-      return compareName(a, b);
-    });
+    [...rows].sort(
+      preferences?.sort?.[key] === "recent" ? compareRecent : compareName,
+    );
   return [
     {
       key: "starred",

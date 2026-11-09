@@ -1,6 +1,6 @@
 import { hoverMessage } from "./message-actions.mjs";
 import { test, expect } from "./fixture.mjs";
-import { open } from "./timeline.mjs";
+import { open, settle } from "./timeline.mjs";
 import { holdReadingFocus } from "./reading.mjs";
 
 test.use({
@@ -43,6 +43,7 @@ test("Follow thread makes a peer thread's replies unread across reload, and Unfo
   await page.reload();
   await expect(thread(own)).toHaveAccessibleName(/Observed unread replies/);
   await expect(thread(peer)).toHaveAccessibleName(/Observed unread replies/);
+  await settle(page);
   await choose(peer, "Unfollow thread");
   await expect(thread(peer)).toHaveAccessibleName("View thread: 23 replies");
   // The viewer's own thread also carries a broadcast reply, which stays
@@ -50,6 +51,7 @@ test("Follow thread makes a peer thread's replies unread across reload, and Unfo
   await choose(own, "Unfollow thread");
   await page.reload();
   await expect(thread(peer)).toHaveAccessibleName("View thread: 23 replies");
+  await settle(page);
   await hoverMessage(row(own));
   await row(own).getByRole("button", { name: "More message actions" }).click();
   await expect(

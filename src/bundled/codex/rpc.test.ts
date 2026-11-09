@@ -85,3 +85,47 @@ it("contains consumer exceptions and closes malformed output while rejecting pen
     consoleError.mockRestore();
   }
 });
+it("attempts a failed close again and never spawns once closed", async () => {
+  const f = fixture();
+  await f.open();
+  f.process.end.mockRejectedValueOnce(new Error("stuck"));
+  f.process.kill.mockRejectedValueOnce(new Error("stuck"));
+  await expect(f.rpc.close()).rejects.toThrow("stuck");
+  await f.rpc.close();
+  expect(f.process.end).toHaveBeenCalledTimes(2);
+  const spawn = vi.fn();
+  await expect(f.rpc.open(spawn)).rejects.toThrow("Codex connection closed");
+  expect(spawn).not.toHaveBeenCalled();
+});
+it("reopens a protected runtime with the same security check and a live process", async () => {
+  const agents = ["fixture buzz-protection-v2", "fixture"];
+  const spawn = vi.fn(async (_id: string, options?: HostProcessOptions) => {
+    const userAgent = agents.shift();
+    let exit!: (code: number) => void;
+    return {
+      write: async (text: string) => {
+        const wire: Wire = JSON.parse(text);
+        if (wire.method === "initialize")
+          options?.onStdout?.(
+            `${JSON.stringify({ id: wire.id, result: { userAgent } })}\n`,
+          );
+      },
+      end: vi.fn(async () => exit(0)),
+      kill: vi.fn(async () => exit(1)),
+      exited: new Promise<number>((resolve) => {
+        exit = resolve;
+      }),
+    };
+  });
+  const rpc = new AppServer();
+  await rpc.open(spawn, "/work", true);
+  await expect(rpc.reopen()).rejects.toThrow("mandatory security hooks");
+  expect(spawn).toHaveBeenLastCalledWith(
+    "app-server",
+    expect.objectContaining({ cwd: "/work" }),
+  );
+  agents.push("fixture buzz-protection-v2");
+  await expect(rpc.reopen()).resolves.toBe(rpc);
+  expect(rpc.exited).toBe(false);
+  await rpc.close();
+});

@@ -1,8 +1,12 @@
 import { Context } from "@deepseek-ai/cordis";
 import { afterEach, expect, it, vi } from "vitest";
-import { AgentProtectionService, type ProtectionRequest } from "./service";
+import {
+  AgentProtectionService,
+  ProtectionDenied,
+  type ProtectionRequest,
+} from "./service";
 import type { Agent } from "../agents/service";
-import type { ReviewModelProvider } from "./models";
+import type { ProtectedSpawn, ReviewModelProvider } from "./models";
 import {
   HostService,
   type Host,
@@ -96,6 +100,8 @@ it("binds the runtime process and containment to the protection provider and kil
   expect(p.launch).toHaveBeenCalledWith("protected-engine", {
     cwd: "/workspace",
     protection: { readOnlyPaths: ["/immutable"], hiddenPaths: ["/private"] },
+    // Native binds its credential only for this agent, as its provider.
+    protectedAgent: { pubkey: f.agent.pubkey, relay: f.agent.relay },
   });
   lease.dispose();
   expect(p.process.kill).toHaveBeenCalledOnce();
@@ -132,10 +138,10 @@ it("kills a supplied runtime whose launch completes after its provider was revok
   expect(p.process.kill).toHaveBeenCalledOnce();
 });
 
-it("uses only the calling protection plugin's review runtime and stops it on cancellation", async () => {
+it("uses only the calling protection plugin's review runtime and keeps it until the provider goes", async () => {
   const f = await fixture();
   const p = processFixture(f.ctx);
-  f.plugin.agentProtection.register({
+  const lease = f.plugin.agentProtection.register({
     processProtection,
     runtimeProcesses: { "buzz.claude-code": "own-engine" },
     check: async () => true,
@@ -154,19 +160,28 @@ it("uses only the calling protection plugin's review runtime and stops it on can
       models: async () => [],
       complete: async (model, _prompt, _signal, spawn) => {
         if (!spawn) throw new Error("No protected reviewer runtime");
-        await spawn({});
+        spawns.push(spawn);
+        if (spawns.length === 1) await spawn({});
         return { text: "model reply", model };
       },
     });
-  const stopped = new AbortController();
-  await f.plugin.agentProtection.complete(
-    { runtime: "buzz.claude-code", id: "custom" },
-    { system: "Plugin prompt", input: "Evidence" },
-    stopped.signal,
-  );
+  const spawns: ProtectedSpawn[] = [];
+  const review = async () => {
+    const stopped = new AbortController();
+    await f.plugin.agentProtection.complete(
+      { runtime: "buzz.claude-code", id: "custom" },
+      { system: "Plugin prompt", input: "Evidence" },
+      stopped.signal,
+    );
+    stopped.abort();
+  };
+  await review();
+  await review();
   expect(p.owners).toEqual(["security.test"]);
   expect(p.launch.mock.calls[0]?.[0]).toBe("own-engine");
-  stopped.abort();
+  expect(spawns[1]).toBe(spawns[0]);
+  expect(p.process.kill).not.toHaveBeenCalled();
+  lease.dispose();
   expect(p.process.kill).toHaveBeenCalledOnce();
 });
 
@@ -453,6 +468,91 @@ it("denies a missing, failed or non-boolean checker", async () => {
   await expect(
     f.security.bind(bound)?.check(action, new AbortController().signal),
   ).rejects.toThrow("denied");
+});
+it("keeps a provider's explanation from the agent, as one bounded line", async () => {
+  const f = await fixture();
+  let decision: unknown;
+  f.plugin.agentProtection.register({
+    processProtection,
+    check: async () => decision as boolean,
+  });
+  const gate = f.security.bind({
+    ...f.agent,
+    protection: { provider: "security.test", policy: {} },
+  });
+  if (!gate) throw new Error("Expected protected handle");
+  const denial = async (value: unknown) => {
+    decision = value;
+    const error = await gate.check(action, new AbortController().signal).then(
+      () => undefined,
+      (failure: unknown) => failure,
+    );
+    expect(error).toBeInstanceOf(ProtectionDenied);
+    expect((error as Error).message).toBe(
+      "Agent action denied by its protection policy",
+    );
+    return (error as ProtectionDenied).reason;
+  };
+  expect(
+    await denial({
+      allowed: false,
+      reason: " It\u200b asks\nto \u202e\u200eleak\u0007 keys.\u{E0041}\u2028 ",
+    }),
+  ).toBe("It asks to leak keys.");
+  expect(await denial({ allowed: false, reason: "😀".repeat(300) })).toBe(
+    "😀".repeat(300),
+  );
+  expect(await denial({ allowed: false, reason: "😀".repeat(301) })).toBe(
+    `${"😀".repeat(299)}…`,
+  );
+  for (const value of [
+    false,
+    "denied",
+    { allowed: false },
+    { allowed: true, reason: "allowed" },
+    { allowed: false, reason: 5 },
+    { allowed: false, reason: " \n\u202e\u200b\u{E0041}\ud800 " },
+    { allowed: false, reason: "extra", note: "" },
+    // A denial that throws as it is read denies like a failed provider.
+    {
+      allowed: false,
+      get reason(): string {
+        throw new Error("Provider getter");
+      },
+    },
+    new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error("Provider proxy");
+        },
+      },
+    ),
+  ])
+    expect(await denial(value)).toBeUndefined();
+});
+it("gives no explanation for a check cancelled as its provider explained a denial", async () => {
+  const f = await fixture();
+  const stop = new AbortController();
+  // The denial settles first; the check was cancelled by the time it is read.
+  f.plugin.agentProtection.register({
+    processProtection,
+    check: async () => {
+      stop.abort();
+      return { allowed: false, reason: "Too late." };
+    },
+  });
+  const gate = f.security.bind({
+    ...f.agent,
+    protection: { provider: "security.test", policy: {} },
+  });
+  if (!gate) throw new Error("Expected protected handle");
+  const error = await gate.check(action, stop.signal).then(
+    () => undefined,
+    (failure: unknown) => failure,
+  );
+  expect(error).toBeInstanceOf(Error);
+  expect(error).not.toBeInstanceOf(ProtectionDenied);
 });
 it("provider disposal cancels even a checker that ignores its signal, without removing its replacement", async () => {
   const f = await fixture();

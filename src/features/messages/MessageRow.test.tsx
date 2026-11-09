@@ -1,8 +1,11 @@
 // @vitest-environment jsdom
+import {
+  createLocalAgentActivity,
+  REPLY_CORRELATION_MS,
+} from "../agents/local-activity";
 import { StrictMode } from "react";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { bytesToHex } from "nostr-tools/utils";
-import { npubEncode } from "nostr-tools/nip19";
 import "@testing-library/jest-dom/vitest";
 import { stubAvatarBrowserApis } from "../agents/avatar-testing";
 stubAvatarBrowserApis();
@@ -16,9 +19,17 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { PREVIEW_REST_MS } from "../../shared/design-system/ui/hoverIntent";
 import { messageCopyText } from "./message-copy";
-import { profileTarget, profileActivityViewTarget } from "../profiles/target";
+import { useShowingDraft } from "./draft-places";
+import { clearView, writeView } from "../../shared/view-state";
+import {
+  profileTarget,
+  profileActivityViewTarget,
+  profileTranscriptRequest,
+  claimProfileTranscript,
+} from "../profiles/target";
 import { renderToStaticMarkup } from "react-dom/server";
 import { foldMessages } from "../relay/fold";
 import { eventDto } from "../relay/events";
@@ -33,10 +44,12 @@ import {
 import { ToastProvider } from "../../shared/design-system/ui/Toast";
 import { ConversationPresentation } from "../conversation/ConversationPresentation";
 import { MessageRow } from "./MessageRow";
+import { ReplySummary } from "./ReplySummary";
+import { setClockPreference } from "../../shared/clock-preference";
 import { MessageManagement } from "./MessageManagement";
 import type { ChannelMessage, Profile } from "../relay/contracts";
 import type { UnreadCapability, UnreadSnapshot } from "../relay/unread";
-import type { RelaySession } from "../relay/session";
+import { createRelaySession, type RelaySession } from "../relay/session";
 import type { TypingEntry } from "../relay/typing";
 import { LinkLabel } from "../../bundled/links/InlineLink";
 import { attestedOwner } from "../agents/owner-attestation";
@@ -59,6 +72,93 @@ const row: ChannelMessage = {
   reactions: [],
   replyCount: 23,
 };
+
+it("discloses an automatic failure reply while keeping its original text available", () => {
+  const content =
+    "Sorry, I couldn’t complete this request. Please try again in a new thread, or try a different model.";
+  const props = {
+    row: { ...row, content, notice: "execution-failure" as const },
+    profile: { name: "Spongebob", isAgent: true as const },
+    media: () => undefined,
+    onOpenLink: () => false,
+    day: false,
+    retry: undefined,
+  };
+  try {
+    const view = renderDom(<MessageRow {...props} />);
+    const details = screen.getByRole("button", {
+      name: "Show activity history: Spongebob: Couldn’t finish",
+    });
+    expect(details).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(content)).not.toBeInTheDocument();
+    fireEvent.click(details);
+    expect(screen.getByText(content)).toBeVisible();
+    expect(details).toHaveAttribute("aria-expanded", "true");
+    expect(details).toHaveAccessibleName(
+      "Collapse activity history: Spongebob: Couldn’t finish",
+    );
+    fireEvent.click(details);
+    expect(details).toHaveAttribute("aria-expanded", "false");
+    view.rerender(
+      <MessageRow
+        {...props}
+        row={{
+          ...props.row,
+          edited: true,
+          content: "Here is the useful result.",
+        }}
+      />,
+    );
+    expect(screen.getByText("Here is the useful result.")).toBeVisible();
+    expect(
+      screen.queryByRole("button", {
+        name: /activity history: Spongebob: Couldn’t finish/,
+      }),
+    ).not.toBeInTheDocument();
+    view.rerender(<MessageRow {...props} row={{ ...row, content }} />);
+    expect(screen.getByText(content)).toBeVisible();
+  } finally {
+    cleanup();
+  }
+});
+
+it("keeps automatic failure explanations in the incoming agent frame for every request author", () => {
+  const request = { ...row, id: "request", authorId: "viewer" };
+  const props = {
+    row: { ...row, notice: "execution-failure" as const },
+    stoppedRequest: request,
+    viewer: "viewer",
+    profile: { name: "Spongebob", isAgent: true as const },
+    media: () => undefined,
+    onOpenLink: () => false,
+    day: false,
+    retry: undefined,
+  };
+  try {
+    const view = renderDom(<MessageRow {...props} />);
+    const caption = () =>
+      screen
+        .getByRole("button", {
+          name: "Show activity history: Spongebob: Couldn’t finish",
+        })
+        .closest("[data-message-notice]");
+    expect(caption()).not.toHaveAttribute("data-viewer-message");
+    expect(
+      caption()?.closest("[data-agent-response-preview]"),
+    ).toBeInTheDocument();
+    view.rerender(
+      <MessageRow
+        {...props}
+        stoppedRequest={{ ...request, authorId: "another-human" }}
+      />,
+    );
+    expect(caption()).not.toHaveAttribute("data-viewer-message");
+    view.rerender(<MessageRow {...props} stoppedRequest={undefined} />);
+    expect(caption()).not.toHaveAttribute("data-viewer-message");
+  } finally {
+    cleanup();
+  }
+});
 
 it.each([false, true])(
   "previews human and agent identities and preserves avatar navigation: %s",
@@ -193,6 +293,107 @@ it("tells link handlers the thread a reply was opened from", () => {
   }
 });
 
+it.each([
+  { agentEnvelope: false, scheme: "nostr:npub1" },
+  { agentEnvelope: true, scheme: "buzz:agent-profile:" },
+])(
+  "opens the author's profile from the byline name: %j",
+  ({ agentEnvelope, scheme }) => {
+    const authorId = "ab".repeat(32);
+    const open = vi.fn(() => true);
+    try {
+      renderMessage({
+        row: {
+          ...row,
+          authorId,
+          ...(agentEnvelope ? { agentEnvelope: true as const } : {}),
+        },
+        profile: { name: "Mic" },
+        onOpenLink: open,
+        canOpenLink: () => true,
+      });
+      const name = screen.getByRole("button", { name: "Mic" });
+      // Text with a role, so a selection can start on it; the avatar stays
+      // the group's only tab stop.
+      expect(name.tagName).toBe("SPAN");
+      expect(name).toHaveAttribute("tabindex", "-1");
+      expect(name).not.toHaveAttribute("data-profile-target");
+      fireEvent.click(name);
+      // Focused first, so closing the profile can return here.
+      expect(name).toHaveFocus();
+      const target = profileTarget(authorId, { agent: agentEnvelope });
+      expect(target?.startsWith(scheme)).toBe(true);
+      expect(open).toHaveBeenCalledExactlyOnceWith(target, { rootId: "root" });
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+it("treats a click that selected the name as a selection, and opens from Enter or Space", () => {
+  const open = vi.fn(() => true);
+  try {
+    renderMessage({
+      row: { ...row, authorId: "ab".repeat(32) },
+      profile: { name: "Mic" },
+      onOpenLink: open,
+      canOpenLink: () => true,
+    });
+    const name = screen.getByRole("button", { name: "Mic" });
+    const selection = document.getSelection();
+    if (!selection) throw new Error("jsdom selection missing");
+    // A double-click or drag leaves the name selected when the click lands.
+    selection.selectAllChildren(name);
+    fireEvent.click(name);
+    expect(open).not.toHaveBeenCalled();
+    selection.removeAllRanges();
+    fireEvent.click(name);
+    expect(open).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(name, { key: "a" });
+    expect(open).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(name, { key: "Enter" });
+    // Space must not also scroll the timeline: the default is cancelled.
+    expect(fireEvent.keyDown(name, { key: " " })).toBe(false);
+    expect(open).toHaveBeenCalledTimes(3);
+  } finally {
+    cleanup();
+  }
+});
+
+it("keeps the byline name plain where profiles cannot open or the byline is screen-reader only", () => {
+  const props = {
+    row: { ...row, authorId: "ab".repeat(32) },
+    profile: { name: "Mic" },
+    canOpenLink: () => true,
+  };
+  try {
+    const { rerender } = renderMessage({
+      ...props,
+      canOpenLink: () => false,
+    });
+    expect(screen.getByText("Mic").closest('[role="button"]')).toBeNull();
+    rerender(
+      <MessageRow
+        {...props}
+        media={() => undefined}
+        onOpenLink={() => true}
+        day={false}
+        retry={undefined}
+        stackPrevious
+      />,
+    );
+    // The continuation still has its avatar, but its byline is text only.
+    expect(
+      screen.getByRole("button", { name: "View Mic profile" }),
+    ).toBeInTheDocument();
+    const name = screen.getByText("Mic");
+    expect(name.closest(".sr-only")).toBeInTheDocument();
+    expect(name.closest('[role="button"]')).toBeNull();
+  } finally {
+    cleanup();
+  }
+});
+
 it("keeps plain agent presence without avatar activity, and omits human presence from messages", () => {
   const agentRow = { ...row, authorId: "a".repeat(64) };
   const subscribe = vi.fn(() => () => {});
@@ -286,7 +487,9 @@ it("keeps plain agent presence without avatar activity, and omits human presence
   ).toHaveAccessibleDescription("Presence: online");
   expect(document.querySelector(".agent-motion-avatar")).toBeNull();
   expect(document.querySelector('[data-status="online"]')).toBeInTheDocument();
-  expect(activityListeners.size).toBe(0);
+  expect(
+    screen.queryByRole("button", { name: /^View activity$/ }),
+  ).not.toBeInTheDocument();
   act(() => {
     working = false;
     for (const listener of activityListeners) listener();
@@ -1265,7 +1468,11 @@ it.each(["peer", "own"] as const)(
     const operations: never[] = [];
     const session = {
       viewer: author === "own" ? row.authorId : "viewer",
-      channels: { list: () => snapshot, subscribeList: () => () => {} },
+      channels: {
+        list: () => snapshot,
+        subscribeList: () => () => {},
+        window: () => ({ rows: [row] }),
+      },
       messages: { report: vi.fn(async () => {}) },
       profiles: { subscribe: () => () => {}, event: () => undefined },
       outbox: {
@@ -1275,6 +1482,8 @@ it.each(["peer", "own"] as const)(
         snapshot: () => operations,
       },
       unread: {
+        revision: () => 0,
+        sync: () => ({ capability: "unsupported" }),
         subscribe: () => () => {},
         subscribeSync: () => () => {},
         snapshot: () => undefined,
@@ -1308,11 +1517,18 @@ it.each(["peer", "own"] as const)(
               "Mark unread",
               "Copy message",
               "Send to channel",
+              "Copy link",
               "Delete message",
               "Follow thread",
               "Report",
             ]
-          : ["Mark unread", "Copy message", "Follow thread", "Report"],
+          : [
+              "Mark unread",
+              "Copy message",
+              "Copy link",
+              "Follow thread",
+              "Report",
+            ],
       );
     } finally {
       cleanup();
@@ -1353,7 +1569,7 @@ it.each(["sending", "failed"] as const)(
       await screen.findByRole("menu");
       expect(
         screen.getAllByRole("menuitem").map((item) => item.textContent),
-      ).toEqual(["Copy message"]);
+      ).toEqual(["Copy message", "Copy link"]);
       expect(screen.queryByRole("separator")).toBeNull();
     } finally {
       cleanup();
@@ -1377,6 +1593,32 @@ function renderMessage(
     />,
   );
 }
+
+it.each([
+  { channelType: "solo", visible: false },
+  { channelType: "stream", visible: true },
+] as const)(
+  "Hide in Solo chats keeps only the accessible date in Solo (%o)",
+  ({ channelType, visible }) => {
+    setClockPreference({ messageTimestamps: "hide-solo" });
+    const list = {
+      channels: [{ id: row.channelId, channelType }],
+      status: "ready",
+    };
+    const references = {
+      channels: { list: () => list, subscribeList: () => () => {} },
+    } as unknown as RelaySession;
+    const view = renderMessage({ references });
+    try {
+      const time = view.container.querySelector("time");
+      expect(time?.querySelector(".sr-only")).toHaveTextContent(/19(69|70)/);
+      expect(!!time?.querySelector('[aria-hidden="true"]')).toBe(visible);
+    } finally {
+      view.unmount();
+      setClockPreference({ messageTimestamps: "show" });
+    }
+  },
+);
 
 it.each([true, false])(
   "offers thread starts only where the conversation starts threads (startsThreads=%s)",
@@ -1437,13 +1679,20 @@ it.each([true, false])(
   },
 );
 
-it.each([
-  { startsThreads: true, replyCount: 0, thread: true },
-  { startsThreads: false, replyCount: 0, thread: false },
-  { startsThreads: false, replyCount: 23, thread: true },
-])(
+it.each(
+  [
+    { startsThreads: true, replyCount: 0, thread: true },
+    { startsThreads: false, replyCount: 0, thread: false },
+    { startsThreads: false, replyCount: 23, thread: true },
+  ].flatMap((scenario) =>
+    (["message", "response"] as const).map((placement) => ({
+      ...scenario,
+      placement,
+    })),
+  ),
+)(
   "gives message accessories a thread only where the row has one to open (%o)",
-  ({ startsThreads, replyCount, thread }) => {
+  ({ startsThreads, replyCount, thread, placement }) => {
     const subscribe = () => () => {};
     const channels = { channels: [], status: "ready" };
     const noTyping: never[] = [];
@@ -1468,7 +1717,7 @@ it.each([
         pluginId: "test",
         revision: "1",
         title: "Agent activity",
-        placement: "message" as const,
+        placement,
         decoratesMessageSummary: true,
         component: ({
           renderMessageSummary,
@@ -1490,6 +1739,7 @@ it.each([
       row: { ...row, replyCount },
       session,
       scope: "test",
+      viewer: row.authorId,
       onOpenThread: () => {},
       startsThreads,
       extensions: {
@@ -1501,11 +1751,140 @@ it.each([
       },
     });
     try {
-      expect(seen).toHaveBeenLastCalledWith(thread, thread);
-      expect(screen.getByText("Brain working")).toBeInTheDocument();
-      expect(!!screen.queryByRole("button", { name: /^View thread/ })).toBe(
+      expect(seen).toHaveBeenLastCalledWith(
+        placement === "message" && thread,
         thread,
       );
+      expect(
+        !!screen.getByText("Brain working").closest("[data-viewer-message]"),
+      ).toBe(placement === "message");
+      expect(screen.getByText("Brain working")).toBeInTheDocument();
+      expect(!!screen.queryByRole("button", { name: /^View thread/ })).toBe(
+        placement === "message" ? thread : replyCount > 0,
+      );
+    } finally {
+      view.unmount();
+    }
+  },
+);
+
+it("forwards replied agents and the stopped request to response accessories", () => {
+  const subscribe = () => () => {};
+  const channels = { channels: [], status: "ready" };
+  const noTyping: never[] = [];
+  const catalog = { entries: [] };
+  const profiles = new Map();
+  const library = { identities: [] };
+  const session = {
+    channels: { list: () => channels, subscribeList: subscribe },
+    messages: {},
+    emoji: { snapshot: () => catalog, subscribe },
+    profiles: { snapshot: () => profiles, subscribe },
+    agentChoices: { snapshot: () => library, subscribe },
+    typing: { snapshot: () => noTyping, subscribe },
+  } as unknown as RelaySession;
+  const seen = vi.fn();
+  const noEntries: never[] = [];
+  const empty = { snapshot: () => noEntries, subscribe };
+  const entries = [
+    {
+      id: "activity",
+      key: "test:activity",
+      pluginId: "test",
+      revision: "1",
+      title: "Agent activity",
+      placement: "response" as const,
+      component: (
+        props: import("../conversation/contracts").ComposerAccessoryProps,
+      ) => {
+        seen(props.repliedAgents, props.stoppedRequest);
+        return null;
+      },
+    },
+  ];
+  const agent = "a".repeat(64);
+  const repliedAgents = [agent];
+  const request = { ...row, id: "request" };
+  const view = renderMessage({
+    session,
+    scope: "test",
+    repliedAgents,
+    stoppedRequest: request,
+    extensions: {
+      inline: empty,
+      links: empty,
+      messages: empty,
+      tools: empty,
+      accessories: { snapshot: () => entries, subscribe },
+    },
+  });
+  try {
+    expect(seen).toHaveBeenLastCalledWith(repliedAgents, request);
+  } finally {
+    view.unmount();
+  }
+});
+
+it.each(
+  (["message", "response"] as const).flatMap((placement) => [
+    { placement, threadRootId: undefined, rootId: "root" },
+    { placement, threadRootId: "parent", rootId: "parent" },
+  ]),
+)(
+  "opens message accessory targets in the row's own thread (%o)",
+  ({ placement, threadRootId, rootId }) => {
+    const subscribe = () => () => {};
+    const channels = { channels: [], status: "ready" };
+    const noTyping: never[] = [];
+    const catalog = { entries: [] };
+    const profiles = new Map();
+    const library = { identities: [] };
+    const session = {
+      channels: { list: () => channels, subscribeList: subscribe },
+      messages: {},
+      emoji: { snapshot: () => catalog, subscribe },
+      profiles: { snapshot: () => profiles, subscribe },
+      agentChoices: { snapshot: () => library, subscribe },
+      typing: { snapshot: () => noTyping, subscribe },
+    } as unknown as RelaySession;
+    const noEntries: never[] = [];
+    const empty = { snapshot: () => noEntries, subscribe };
+    const target = `buzz:profile?agent=${"a".repeat(64)}&tab=activity`;
+    const entries = [
+      {
+        id: "activity",
+        key: "test:activity",
+        pluginId: "test",
+        revision: "1",
+        title: "Agent activity",
+        placement,
+        component: ({
+          open,
+        }: import("../conversation/contracts").ComposerAccessoryProps) => (
+          <button type="button" onClick={() => open(target)}>
+            View activity
+          </button>
+        ),
+      },
+    ];
+    const onOpenLink = vi.fn(() => true);
+    const view = renderMessage({
+      row: { ...row, threadRootId },
+      session,
+      scope: "test",
+      onOpenLink,
+      extensions: {
+        inline: empty,
+        links: empty,
+        messages: empty,
+        tools: empty,
+        accessories: { snapshot: () => entries, subscribe },
+      },
+    });
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "View activity" }));
+      // The transcript belongs to this message's conversation, not the view's.
+      expect(onOpenLink).toHaveBeenCalledExactlyOnceWith(target, { rootId });
     } finally {
       view.unmount();
     }
@@ -1529,10 +1908,36 @@ it("rejects attachment URLs outside the shared safe-link policy", () => {
     const links = screen.getAllByRole("link", {
       name: "Open image attachment",
     });
-    expect(media).toHaveBeenCalledExactlyOnceWith("https://safe.test/a.png");
+    expect(media.mock.calls).toEqual([
+      ["https://safe.test/a.png"],
+      ["https://safe.test/a.png", "small"],
+    ]);
     expect(links).toHaveLength(1);
     expect(links[0]).toHaveAttribute("href", "https://safe.test/a.png");
     expect(view.container.innerHTML).not.toContain("unsafe.test");
+  } finally {
+    view.unmount();
+  }
+});
+
+it.each([
+  ["jpg", "small:.jpg"],
+  ["png", ".thumb.webp"],
+  ["gif", ".thumb.webp"],
+])("passes a %s image attachment its relay thumbnail", (extension, suffix) => {
+  const hash = "a".repeat(64);
+  const url = `https://relay.test/media/${hash}.${extension}`;
+  const view = renderMessage({
+    row: { ...row, attachments: [{ url, kind: "image" }] },
+    media: (value, size) => (size ? `small:${value}` : value),
+  });
+  try {
+    expect(view.container.querySelector("img[data-thumbnail]")).toHaveAttribute(
+      "src",
+      suffix.startsWith("small:")
+        ? `small:${url}`
+        : `https://relay.test/media/${hash}${suffix}`,
+    );
   } finally {
     view.unmount();
   }
@@ -1626,7 +2031,31 @@ it("shows unbadged working-agent avatars and shared dots only while a known agen
     },
   } as unknown as RelaySession;
   const media = vi.fn(() => "https://proxy/brain");
-  let view = renderMessage({ session, media, onOpenThread: () => {} });
+  const emptyEntries: readonly never[] = [];
+  const empty = { snapshot: () => emptyEntries, subscribe: () => () => {} };
+  const accessories = [
+    {
+      key: "activity",
+      pluginId: "activity",
+      revision: "1",
+      id: "activity",
+      title: "Activity",
+      placement: "response" as const,
+      component: () => null,
+    },
+  ];
+  let view = renderMessage({
+    session,
+    media,
+    onOpenThread: () => {},
+    extensions: {
+      inline: empty,
+      links: empty,
+      messages: empty,
+      tools: empty,
+      accessories: { snapshot: () => accessories, subscribe: () => () => {} },
+    },
+  });
   try {
     const working = screen.getByRole("button", {
       name: "View thread: 23 replies. Brain working",
@@ -1943,7 +2372,7 @@ it("keeps audio and video players between their original image runs", () => {
 });
 
 it.each([true, false])(
-  "uses the shared small avatar without shrinking profile controls (clickable=%s)",
+  "keeps timeline-sized thread avatars and one step smaller nested ones (clickable=%s)",
   (clickable) => {
     const props = {
       row: { ...row, authorId: "a".repeat(64) },
@@ -1968,7 +2397,7 @@ it.each([true, false])(
     view.rerender(<MessageRow {...props} />);
     expect(view.container.querySelector(".buzz-avatar")).toHaveAttribute(
       "data-size",
-      clickable ? "fill" : "default",
+      "default",
     );
     view.unmount();
   },
@@ -2168,25 +2597,37 @@ it("dismisses an unsubmitted report when its retained row is suspended", async (
   }
 });
 
-it("presents automation, links the owner and discloses the separate relay signer", async () => {
-  const ownerId = "ab".repeat(32),
-    signer = "cd".repeat(32);
+function renderWorkflowMessage(open = vi.fn(() => true)) {
+  const ownerId = "ab".repeat(32);
+  renderMessage({
+    row: {
+      ...row,
+      authorId: ownerId,
+      signerId: "cd".repeat(32),
+      workflowOwnerId: ownerId,
+    },
+    viewer: ownerId,
+    profile: { name: "Wes" },
+    participantProfiles: new Map([[ownerId, { name: "Wes" }]]),
+    onOpenLink: open,
+    canOpenLink: () => true,
+  });
+  return {
+    ownerId,
+    trigger: screen.getByRole("button", { name: "Workflow message details" }),
+  };
+}
+
+it("presents automation, links the owner and explains the message without keys", async () => {
   const open = vi.fn(() => true);
+  const user = userEvent.setup();
   try {
-    renderMessage({
-      row: {
-        ...row,
-        authorId: ownerId,
-        signerId: signer,
-        workflowOwnerId: ownerId,
-      },
-      viewer: ownerId,
-      profile: { name: "Wes" },
-      participantProfiles: new Map([[ownerId, { name: "Wes" }]]),
-      onOpenLink: open,
-      canOpenLink: () => true,
-    });
-    expect(screen.getByText("Workflow")).toBeTruthy();
+    const { ownerId, trigger } = renderWorkflowMessage(open);
+    // The automation label stays plain; only the owner opens a profile.
+    expect(
+      screen.getByText("Workflow").closest('button, [role="button"]'),
+    ).toBeNull();
+    expect(screen.queryByRole("button", { name: "Wes" })).toBeNull();
     expect(document.querySelector("[data-viewer-message]")).toBeNull();
     expect(document.querySelector("[data-own]")).toBeNull();
     fireEvent.click(
@@ -2195,23 +2636,75 @@ it("presents automation, links the owner and discloses the separate relay signer
     expect(open).toHaveBeenCalledWith(profileTarget(ownerId), {
       rootId: "root",
     });
-    fireEvent.click(
-      screen.getByRole("button", { name: "Workflow message details" }),
+    trigger.focus();
+    await user.keyboard("{Enter}");
+    const card = await screen.findByRole("dialog", {
+      name: "Workflow message",
+    });
+    // The byline beside the trigger already names the owner; the card only
+    // says what a workflow message is, without keys or relay identity.
+    expect(card).toHaveAccessibleDescription(
+      "Sent automatically by a workflow. Its owner set it up but didn’t send this message personally.",
     );
-    expect(
-      await screen.findByText(/the owner did not sign this message/),
-    ).toBeTruthy();
-    expect(
-      screen.getByText("Signed by the relay").nextElementSibling,
-    ).toHaveTextContent(npubEncode(signer));
-    expect(
-      screen.getByText("Owner public key").nextElementSibling,
-    ).toHaveTextContent(npubEncode(ownerId));
+    expect(card).not.toHaveTextContent(/npub1|Wes/);
     expect(
       screen.queryByRole("button", { name: "View Relay profile" }),
     ).toBeNull();
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(trigger).toHaveFocus();
+    // fireEvent moves no pointer, so no hover rest timer can open the card.
+    fireEvent.click(trigger);
+    expect(
+      screen.getByRole("dialog", { name: "Workflow message" }),
+    ).toBeInTheDocument();
   } finally {
     cleanup();
+  }
+});
+
+it("opens workflow message details once the pointer rests, without a competing hint", async () => {
+  // Base UI's PATIENT_CLICK_THRESHOLD: a click this soon after a hover open
+  // keeps the popover open.
+  const BASE_UI_PATIENT_CLICK_MS = 500;
+  vi.useFakeTimers();
+  try {
+    const { trigger } = renderWorkflowMessage();
+    const focused = document.activeElement;
+    fireEvent.mouseEnter(trigger);
+    fireEvent.mouseMove(trigger);
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_REST_MS - 1));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    screen.getByRole("dialog", { name: "Workflow message" });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    // A hover heads-up leaves focus where the reader had it.
+    expect(document.activeElement).toBe(focused);
+    // Clicking the trigger that just opened it keeps it open.
+    fireEvent.click(trigger);
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_REST_MS));
+    expect(
+      screen.getByRole("dialog", { name: "Workflow message" }),
+    ).toBeInTheDocument();
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_REST_MS));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // Past Base UI's patient-click window, a click toggles a hover-opened
+    // card closed, as with every openOnHover="preview" popover.
+    fireEvent.mouseLeave(trigger);
+    fireEvent.mouseEnter(trigger);
+    fireEvent.mouseMove(trigger);
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_REST_MS));
+    screen.getByRole("dialog", { name: "Workflow message" });
+    await act(() => vi.advanceTimersByTimeAsync(BASE_UI_PATIENT_CLICK_MS));
+    fireEvent.click(trigger);
+    await act(() => vi.advanceTimersByTimeAsync(PREVIEW_REST_MS));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  } finally {
+    cleanup();
+    vi.useRealTimers();
   }
 });
 
@@ -2376,48 +2869,57 @@ it("contains a throwing plugin action icon and opened component", async () => {
   }
 });
 
-it("keeps a plugin action dialog closed when its plugin is reinstalled with the same key", async () => {
-  const listeners = new Set<() => void>();
-  const entry = () => ({
-    id: "remind",
-    title: "Remind",
-    key: "test.plugin/remind",
-    pluginId: "test.plugin",
-    revision: "one",
-    matches: () => true,
-    component: () => <span>action dialog</span>,
-  });
-  let actions = [entry()];
-  const swap = (next: typeof actions) => {
-    actions = next;
-    act(() => {
-      for (const listener of listeners) listener();
+it.each(["menu", "toolbar", "coordination"] as const)(
+  "retires a %s action when its contribution or session ends",
+  async (variant) => {
+    const placement = variant === "menu" ? undefined : "toolbar";
+    const listeners = new Set<() => void>();
+    const entry = () => ({
+      id: "remind",
+      title: "Remind",
+      key: "test.plugin/remind",
+      pluginId: "test.plugin",
+      revision: "one",
+      ...(placement ? { placement: "toolbar" as const } : {}),
+      matches: () => true,
+      component: () => <span>action dialog</span>,
     });
-  };
-  const none: never[] = [];
-  const empty = { snapshot: () => none, subscribe: () => () => {} };
-  const channelList = { channels: [], status: "ready" };
-  const session = {
-    viewer: "viewer",
-    presence: {
-      subscribe: () => () => {},
-      status: () => "unknown",
-      limited: () => false,
-    },
-    unread: {
-      subscribe: () => () => {},
-      subscribeSync: () => () => {},
-      snapshot: () => undefined,
-      following: () => false,
-    },
-    messages: { report: undefined },
-    channels: { subscribeList: () => () => {}, list: () => channelList },
-  } as unknown as RelaySession;
-  try {
-    renderDom(
+    let actions = [entry()];
+    const swap = (next: typeof actions) => {
+      actions = next;
+      act(() => {
+        for (const listener of listeners) listener();
+      });
+    };
+    const none: never[] = [];
+    const empty = { snapshot: () => none, subscribe: () => () => {} };
+    const channelList = { channels: [], status: "ready" };
+    const session = {
+      viewer: "viewer",
+      presence: {
+        subscribe: () => () => {},
+        status: () => "unknown",
+        limited: () => false,
+      },
+      unread: {
+        subscribe: () => () => {},
+        subscribeSync: () => () => {},
+        snapshot: () => undefined,
+        following: () => false,
+      },
+      messages: { report: undefined },
+      channels: { subscribeList: () => () => {}, list: () => channelList },
+    } as unknown as RelaySession;
+    const draw = (currentSession = session) => (
       <MessageRow
-        row={{ ...row, replyCount: 0 }}
-        session={session}
+        row={{
+          ...row,
+          replyCount: 0,
+          ...(variant === "coordination"
+            ? { audience: "agents" as const }
+            : {}),
+        }}
+        session={currentSession}
         profile={undefined}
         media={() => undefined}
         onOpenLink={() => false}
@@ -2434,21 +2936,44 @@ it("keeps a plugin action dialog closed when its plugin is reinstalled with the 
             },
           },
         }}
-      />,
+      />
     );
-    fireEvent.click(
-      screen.getByRole("button", { name: "More message actions" }),
-    );
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Remind" }));
-    expect(await screen.findByText("action dialog")).toBeInTheDocument();
-    swap([]);
-    expect(screen.queryByText("action dialog")).toBeNull();
-    swap([entry()]);
-    expect(screen.queryByText("action dialog")).toBeNull();
-  } finally {
-    cleanup();
-  }
-});
+    const activate = async () => {
+      if (variant === "coordination") {
+        fireEvent.contextMenu(screen.getByRole("button", { name: /Root/ }));
+        fireEvent.click(
+          await screen.findByRole("menuitem", { name: "Remind" }),
+        );
+      } else if (placement === "toolbar") {
+        const button = screen.getByRole("button", { name: "Remind" });
+        button.focus();
+        await userEvent.setup().keyboard("{Enter}");
+      } else {
+        fireEvent.click(
+          screen.getByRole("button", { name: "More message actions" }),
+        );
+        fireEvent.click(
+          await screen.findByRole("menuitem", { name: "Remind" }),
+        );
+      }
+    };
+    try {
+      const view = renderDom(draw());
+      await activate();
+      expect(await screen.findByText("action dialog")).toBeInTheDocument();
+      swap([]);
+      expect(screen.queryByText("action dialog")).toBeNull();
+      swap([entry()]);
+      expect(screen.queryByText("action dialog")).toBeNull();
+      await activate();
+      expect(await screen.findByText("action dialog")).toBeInTheDocument();
+      view.rerender(draw({ ...session }));
+      expect(screen.queryByText("action dialog")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  },
+);
 
 it.each(["timeline", "thread", "continuation"] as const)(
   "right-aligns own %s rows and keeps only the last grouped avatar",
@@ -2488,6 +3013,70 @@ it.each(["timeline", "thread", "continuation"] as const)(
       rerender(<MessageRow {...props} viewer={undefined} />);
       expect(container.querySelector("[data-viewer-message]")).toBeNull();
     } finally {
+      cleanup();
+    }
+  },
+);
+
+it.each(["timeline", "thread", "continuation"] as const)(
+  "lists own %s rows unaligned in compact density, with the first grouped avatar",
+  async (layout) => {
+    const props = {
+      layout,
+      compactAvatar: true,
+      row: { ...row, authorId: "ab".repeat(32) },
+      viewer: "ab".repeat(32),
+      profile: { name: "author" },
+      media: () => undefined,
+      onOpenLink: () => true,
+      canOpenLink: () => true,
+      day: false,
+      retry: undefined,
+    };
+    const root = document.documentElement;
+    root.dataset.messageDensity = "compact";
+    try {
+      // The first row of a group, which is the one a flat list gives an avatar.
+      const { container, rerender } = renderDom(
+        <MessageRow {...props} stackPrevious={false} stackNext />,
+      );
+      expect(container.querySelector("[data-own]")).toBeNull();
+      expect(container.querySelector("[data-viewer-message]")).toBeNull();
+      expect(container.querySelector(".buzz-avatar")).toHaveAttribute(
+        "data-size",
+        "default",
+      );
+      expect(
+        screen.getByRole("button", { name: "View author profile" }),
+      ).toBeInTheDocument();
+      rerender(<MessageRow {...props} stackPrevious />);
+      expect(
+        screen.queryByRole("button", { name: "View author profile" }),
+      ).toBeNull();
+      expect(container.querySelectorAll("time")).toHaveLength(1);
+      expect(
+        container.querySelector('time > [aria-hidden="true"]'),
+      ).toHaveTextContent(/\d+:\d+/);
+      // Choosing Default while mounted restores bubbles without a remount.
+      rerender(<MessageRow {...props} stackPrevious={false} />);
+      act(() => {
+        root.dataset.messageDensity = "default";
+      });
+      await waitFor(() =>
+        expect(
+          container.querySelector("[data-viewer-message]"),
+        ).toHaveTextContent("Root"),
+      );
+      expect(container.querySelector("[data-own]")).toHaveTextContent("Root");
+      expect(container.querySelector(".buzz-avatar")).toHaveAttribute(
+        "data-size",
+        "small",
+      );
+      expect(
+        screen.getByRole("button", { name: "View author profile" }),
+      ).toBeInTheDocument();
+    } finally {
+      delete root.dataset.messageDensity;
       cleanup();
     }
   },
@@ -2710,6 +3299,110 @@ it("keeps the timestamp seek action beside a detached session card", () => {
   }
 });
 
+it("marks remote activity steps and animates only while active", () => {
+  const subscribe = () => () => {};
+  const profiles = new Map();
+  const choices = {
+    identities: [{ pubkey: row.authorId, execution: "remote" }],
+  };
+  const session = {
+    viewer: "owner",
+    channels: { list: () => listed, subscribeList: subscribe },
+    messages: {},
+    profiles: { snapshot: () => profiles, subscribe },
+    agentChoices: { snapshot: () => choices, subscribe },
+  } as unknown as RelaySession;
+  const props = {
+    row: { ...row, audience: "agents" as const, replyCount: 0 },
+    profile: { name: "Agent" },
+    session,
+    media: () => undefined,
+    onOpenLink: () => false,
+    day: false,
+    retry: undefined,
+    recordedActivity: {
+      requestId: row.id,
+      active: true,
+      ownsLive: false,
+      container: "standalone" as const,
+    },
+  };
+  const view = renderDom(<MessageRow {...props} />);
+  try {
+    const trigger = screen.getByRole("button", { name: "Agent: Root" });
+    const cloud = () => trigger.querySelector(".tabler-icon-cloud");
+    expect(cloud()).toHaveAttribute("data-active", "true");
+    expect(cloud()).toHaveAttribute("aria-hidden", "true");
+    expect(trigger).not.toHaveTextContent("Remote");
+    view.rerender(
+      <MessageRow
+        {...props}
+        recordedActivity={{ ...props.recordedActivity, active: false }}
+      />,
+    );
+    expect(cloud()).not.toBeNull();
+    expect(cloud()).not.toHaveAttribute("data-active");
+    fireEvent.click(trigger);
+    expect(cloud()).toBeNull();
+    fireEvent.click(trigger);
+    expect(cloud()).not.toBeNull();
+    view.rerender(<MessageRow {...props} viewer="someone-else" />);
+    expect(cloud()).toBeNull();
+  } finally {
+    cleanup();
+  }
+});
+
+it("identifies the author on each activity summary in a message group", () => {
+  const props = {
+    row: { ...row, audience: "agents" as const },
+    profile: { name: "Activity author" },
+    media: () => undefined,
+    onOpenLink: () => false,
+    day: false,
+    retry: undefined,
+  };
+  try {
+    const { rerender } = renderDom(<MessageRow {...props} stackNext />);
+    expect(screen.getByTitle("Activity author")).toBeVisible();
+    rerender(<MessageRow {...props} stackPrevious />);
+    expect(screen.getByTitle("Activity author")).toBeVisible();
+  } finally {
+    cleanup();
+  }
+});
+
+it.each([280, 281])(
+  "caps activity previews at 280 characters (%s input)",
+  (length) => {
+    const content = "🙂".repeat(length);
+    try {
+      renderDom(
+        <MessageRow
+          row={{ ...row, audience: "agents", content }}
+          profile={{ name: "author" }}
+          media={() => undefined}
+          onOpenLink={() => false}
+          day={false}
+          retry={undefined}
+        />,
+      );
+      const preview = length === 280 ? content : `${"🙂".repeat(279)}…`;
+      const trigger = screen.getByRole("button", {
+        name: `author: ${preview}`,
+      });
+      expect(trigger).toHaveTextContent(preview);
+      fireEvent.click(trigger);
+      expect(screen.getByText(content)).toBeVisible();
+      expect(trigger).not.toHaveTextContent(preview);
+      fireEvent.click(trigger);
+      expect(trigger).toHaveTextContent(preview);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
 it("shows a message for agents as one line from its author to whom it addresses", () => {
   const agent = keypair();
   const rivet = "b".repeat(64);
@@ -2753,43 +3446,18 @@ it("shows a message for agents as one line from its author to whom it addresses"
       name: "Morgarita to Rivet: **run** the suite…",
     });
     expect(line).toHaveAttribute("aria-expanded", "false");
-    const timestamp = line.parentElement?.querySelector("time");
-    const timestampSlot = timestamp?.parentElement;
-    expect(timestamp).toBeVisible();
-    expect(
-      screen.getByText(/(?:1969|1970) at /, {
-        selector: 'time > span[aria-hidden="true"]',
-      }),
-    ).toBeVisible();
+    expect(line.parentElement?.querySelector("time")).toBeNull();
     // Reveal focuses the scroll anchor with tabIndex -1; on the button, that
     // would take the only toggle out of the Tab order.
     expect(line).not.toHaveAttribute("data-message-id");
     expect(line.parentElement).toHaveAttribute("data-message-id");
     expect(screen.queryByText(/Then report back/)).toBeNull();
-    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBe(
-      timestamp,
-    );
+    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBeNull();
     fireEvent.pointerEnter(line);
-    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBe(
-      timestamp,
-    );
+    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBeNull();
     fireEvent.click(line);
     expect(line).toHaveAttribute("aria-expanded", "true");
-    // Expanding preserves the timestamp node and its trailing slot, rather
-    // than remounting it above the body and moving it to the opposite edge.
-    expect(
-      line.parentElement?.querySelectorAll("time:not(.sr-only)"),
-    ).toHaveLength(1);
-    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBe(
-      timestamp,
-    );
-    expect(timestamp?.parentElement).toBe(timestampSlot);
-    expect(line.parentElement?.lastElementChild).toBe(timestampSlot);
-    expect(
-      screen.getByText(/(?:1969|1970) at /, {
-        selector: 'time > span[aria-hidden="true"]',
-      }),
-    ).toBeVisible();
+    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBeNull();
     expect(
       screen.queryByRole("button", { name: "View Morgarita profile" }),
     ).toBeNull();
@@ -2798,13 +3466,9 @@ it("shows a message for agents as one line from its author to whom it addresses"
     expect(expanded?.querySelector('[class*="messageBubble"]')).toBeNull();
     expect(expanded?.querySelector("[data-own]")).toBeNull();
 
-    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBe(
-      timestamp,
-    );
+    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBeNull();
     fireEvent.pointerEnter(expanded ?? line);
-    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBe(
-      timestamp,
-    );
+    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBeNull();
     // Base UI binds the trigger to its panel. One stable message anchor stays
     // outside the animated content, including while that content is retiring.
     const panelId = line.getAttribute("aria-controls");
@@ -2823,9 +3487,7 @@ it("shows a message for agents as one line from its author to whom it addresses"
     // Anywhere in the open box folds it back.
     fireEvent.click(screen.getByText(/Then report back/));
     expect(line).toHaveAttribute("aria-expanded", "false");
-    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBe(
-      timestamp,
-    );
+    expect(line.parentElement?.querySelector("time:not(.sr-only)")).toBeNull();
   } finally {
     cleanup();
   }
@@ -3246,7 +3908,7 @@ it.each([0, 23])(
       });
       expect(summary).toHaveTextContent("1 failed");
       expect(summary).not.toHaveTextContent("View thread");
-      if (replyCount) expect(summary).toHaveTextContent("23 replies");
+      if (replyCount) expect(summary).not.toHaveTextContent("23 replies");
       expect(
         summary.querySelector('[data-thread-working] [data-state="working"]'),
       ).not.toBeNull();
@@ -3703,7 +4365,7 @@ it.each([
     viewer: undefined,
     label: "Logan’s agent",
   },
-  // The viewer's own agent shows only the mark.
+  // The viewer's own agent omits the owner attribution.
   { case: "viewer's agent", forged: false, viewer: "owner", label: undefined },
   { case: "forged owner", forged: true, viewer: undefined, label: undefined },
 ])(
@@ -3796,6 +4458,112 @@ it.each([
     } finally {
       view.unmount();
       directory.dispose();
+    }
+  },
+);
+
+it.each(["timeline", "thread", "continuation"] as const)(
+  "shows a reactive remote byline hint only to the agent's owner in %s",
+  async (layout) => {
+    const authorId = "a".repeat(64);
+    const ownerId = "b".repeat(64);
+    const user = userEvent.setup();
+    const subscribe = () => () => {};
+    const listeners = new Set<() => void>();
+    const profiles = new Map();
+    let choices: {
+      identities: {
+        pubkey: string;
+        execution: "remote" | "local" | undefined;
+        runtime?: string;
+      }[];
+    } = { identities: [] };
+    const session = {
+      viewer: ownerId,
+      channels: { list: () => listed, subscribeList: subscribe },
+      messages: {},
+      profiles: { snapshot: () => profiles, subscribe },
+      agentChoices: {
+        snapshot: () => choices,
+        subscribe(listener: () => void) {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      },
+    } as unknown as RelaySession;
+    const props = {
+      layout,
+      row: { ...row, authorId, agentEnvelope: true as const, replyCount: 0 },
+      profile: { name: "Quinn" },
+      session,
+      stackPrevious: false,
+    };
+    const view = renderMessage(props);
+    const execution = (value?: "remote" | "local", runtime?: string) => {
+      act(() => {
+        choices = {
+          identities: [
+            {
+              pubkey: authorId,
+              execution: value,
+              ...(runtime ? { runtime } : {}),
+            },
+          ],
+        };
+        for (const listener of listeners) listener();
+      });
+    };
+    const rerender = (
+      patch: Partial<import("./MessageRow").MessageRowProps> = {},
+    ) =>
+      view.rerender(
+        <MessageRow
+          media={() => undefined}
+          onOpenLink={() => false}
+          day={false}
+          retry={undefined}
+          {...props}
+          {...patch}
+        />,
+      );
+    try {
+      expect(screen.queryByText("Remote")).toBeNull();
+      execution("remote", "block.builderlab/builderlab");
+      const hint = screen.getByText("Remote");
+      expect(hint).toBeVisible();
+      expect(hint.closest("strong")).toBeNull();
+      expect(hint).toHaveAttribute("tabindex", "0");
+      await user.hover(hint);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(
+        "Runs remotely on Builderlab",
+      );
+      await user.unhover(hint);
+      await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
+      act(() => hint.focus());
+      await waitFor(() =>
+        expect(hint).toHaveAccessibleDescription(/Runs remotely on Builderlab/),
+      );
+      execution("remote", "another/provider");
+      expect(screen.getByRole("tooltip")).toHaveTextContent(
+        "Runs on a remote machine",
+      );
+      execution("local");
+      expect(screen.queryByText("Remote")).toBeNull();
+      execution();
+      expect(screen.queryByText("Remote")).toBeNull();
+      execution("remote");
+      rerender({ viewer: "c".repeat(64) });
+      expect(screen.queryByText("Remote")).toBeNull();
+      rerender({ stackPrevious: true });
+      expect(screen.queryByText("Remote")).toBeNull();
+      rerender({ row: { ...props.row, workflowOwnerId: ownerId } });
+      expect(screen.queryByText("Remote")).toBeNull();
+      rerender({ row: { ...row, authorId, replyCount: 0 } });
+      expect(screen.queryByText("Remote")).toBeNull();
+      rerender();
+      expect(screen.getByText("Remote")).toBeVisible();
+    } finally {
+      view.unmount();
     }
   },
 );
@@ -3981,4 +4749,320 @@ it("marks an edited body after its last line, and leaves an unedited one unmarke
   } finally {
     cleanup();
   }
+});
+
+it.each([
+  "agent",
+  "failed",
+  "failed publishing",
+  "stopped",
+  "superseded",
+  "human",
+  "disabled",
+  "retired",
+  "coordination",
+  "working",
+  "waiting",
+  "unknown",
+  "helper working",
+  "publishing",
+  "unlinked",
+])("opens the message conversation transcript from its byline: %s", (mode) => {
+  const author = "ab".repeat(32);
+  const target = profileActivityViewTarget(author);
+  if (!target) throw new Error("Invalid fixture author");
+  const rootId = "cd".repeat(32);
+  const open = vi.fn(() => true);
+  let available = mode !== "disabled";
+  const owner = createRelaySession(null);
+  const listeners = new Set<() => void>();
+  const request = "request";
+  const local = {
+    scope: "test",
+    agent: author,
+    channelId: row.channelId,
+    messageId: request,
+    threadRootId: rootId,
+    startedAt: 1,
+    state: mode === "waiting" ? ("waiting" as const) : ("working" as const),
+    publishedMessageIds: mode === "unlinked" ? [] : [row.id],
+  };
+  let snapshot = {
+    status: "listening",
+    records: [],
+    turns: [],
+    trimmed: 0,
+    typing: [],
+    local: [local],
+  } as ReturnType<RelaySession["agentActivity"]["snapshot"]>;
+  const session = {
+    ...owner.session,
+    agentActivity: {
+      ...owner.session.agentActivity,
+      snapshot: () => snapshot,
+      subscribe: (listener: () => void) => {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+    },
+  };
+  try {
+    renderDom(
+      <MessageRow
+        row={{
+          ...row,
+          authorId: author,
+          threadRootId: rootId,
+          ...(mode !== "human" ? { agentEnvelope: true as const } : {}),
+          ...(mode === "coordination" ? { audience: "agents" as const } : {}),
+        }}
+        session={session}
+        profile={undefined}
+        media={() => undefined}
+        onOpenLink={open}
+        canOpenLink={() => available}
+        day={false}
+        retry={undefined}
+      />,
+    );
+    expect(
+      screen.queryByRole("button", { name: /^View activity$/ }),
+    ).not.toBeInTheDocument();
+    act(() => {
+      if (!["working", "waiting"].includes(mode))
+        snapshot = {
+          ...snapshot,
+          local:
+            mode === "unknown"
+              ? []
+              : [
+                  {
+                    ...local,
+                    state: mode.startsWith("failed")
+                      ? "error"
+                      : mode === "stopped" || mode === "superseded"
+                        ? mode
+                        : "done",
+                    ...(mode.includes("publishing") ? { publishing: 1 } : {}),
+                  },
+                  ...(mode === "helper working"
+                    ? [{ ...local, agent: "ef".repeat(32) }]
+                    : []),
+                ],
+        };
+      for (const listener of listeners) listener();
+    });
+    const link = screen.queryByRole("button", {
+      name: /^View activity$/,
+    });
+    if (
+      [
+        "human",
+        "disabled",
+        "coordination",
+        "working",
+        "waiting",
+        "unknown",
+        "helper working",
+        "publishing",
+        "failed publishing",
+        "unlinked",
+      ].includes(mode)
+    ) {
+      expect(link).not.toBeInTheDocument();
+      return;
+    }
+    if (!link) throw new Error("Missing byline activity link");
+    expect(link).toBeVisible();
+    expect(
+      link.parentElement?.parentElement?.querySelector("time"),
+    ).not.toBeNull();
+    available = mode !== "retired";
+    fireEvent.click(link);
+    if (mode === "retired") expect(open).not.toHaveBeenCalled();
+    else {
+      expect(open).toHaveBeenCalledExactlyOnceWith(target, { rootId });
+      expect(profileTranscriptRequest(target)).toBeDefined();
+    }
+  } finally {
+    cleanup();
+    claimProfileTranscript(target);
+    owner.dispose();
+  }
+});
+
+it.each([false, true])(
+  "keeps completion evidence after notification expiry (nested=%s)",
+  (nested) => {
+    vi.useFakeTimers();
+    const local = createLocalAgentActivity();
+    const owner = createRelaySession(null);
+    const author = "ab".repeat(32);
+    const rootId = "cd".repeat(32);
+    const input = {
+      scope: "test",
+      agent: author,
+      channelId: row.channelId,
+      threadRootId: rootId,
+    };
+    local.begin({ ...input, messageId: rootId }).finish({ ok: true });
+    const work = local.begin({ ...input, messageId: "actual-request" });
+    work.started();
+    work.reply(row.id);
+    let snapshot = {
+      ...owner.session.agentActivity.snapshot(),
+      local: local.reader.work(),
+    };
+    const unsubscribe = local.reader.subscribeWork(() => {
+      snapshot = { ...snapshot, local: local.reader.work() };
+    });
+    const session = {
+      ...owner.session,
+      agentActivity: {
+        ...owner.session.agentActivity,
+        snapshot: () => snapshot,
+        subscribe: local.reader.subscribeWork,
+      },
+    };
+    try {
+      const show = () => (
+        <MessageRow
+          row={{
+            ...row,
+            authorId: author,
+            agentEnvelope: true,
+            threadRootId: rootId,
+            ...(nested ? { replyParentId: rootId } : {}),
+          }}
+          session={session}
+          profile={undefined}
+          media={() => undefined}
+          onOpenLink={() => true}
+          canOpenLink={() => true}
+          day={false}
+          retry={undefined}
+        />
+      );
+      renderDom(show());
+      act(() => vi.advanceTimersByTime(REPLY_CORRELATION_MS + 1));
+      expect(
+        screen.queryByRole("button", { name: /^View activity$/ }),
+      ).not.toBeInTheDocument();
+      act(() => work.finish({ ok: true }));
+      expect(
+        screen.getByRole("button", { name: /^View activity$/ }),
+      ).toBeVisible();
+      cleanup();
+      renderDom(show());
+      expect(
+        screen.getByRole("button", { name: /^View activity$/ }),
+      ).toBeVisible();
+      let retry: ReturnType<typeof local.begin>;
+      act(() => {
+        retry = local.begin({ ...input, messageId: "actual-request" });
+      });
+      expect(
+        screen.queryByRole("button", { name: /^View activity$/ }),
+      ).not.toBeInTheDocument();
+      act(() => retry.finish({ ok: true }));
+      expect(
+        screen.getByRole("button", { name: /^View activity$/ }),
+      ).toBeVisible();
+    } finally {
+      cleanup();
+      unsubscribe();
+      owner.dispose();
+      vi.useRealTimers();
+    }
+  },
+);
+
+it("notes a thread's unsent reply on its summary until the thread's composer shows it", () => {
+  const scope = `https://demo.invalid:${"a".repeat(64)}`;
+  // Drafts are keyed by a real event id.
+  const root = { ...row, id: "d".repeat(64) };
+  const key = `draft:${root.channelId}:thread:${root.id}`;
+  const channels = { channels: [], status: "ready" };
+  const profiles = new Map();
+  const library = { identities: [] };
+  const typing: readonly never[] = [];
+  const session = {
+    scope,
+    channels: { list: () => channels, subscribeList: () => () => {} },
+    messages: {},
+    profiles: { snapshot: () => profiles, subscribe: () => () => {} },
+    agentChoices: { snapshot: () => library, subscribe: () => () => {} },
+    typing: { snapshot: () => typing, subscribe: () => () => {} },
+  } as unknown as RelaySession;
+  function Composer({ shown }: { shown: boolean }) {
+    useShowingDraft(scope, key, shown);
+    return null;
+  }
+  let view = renderMessage({
+    session,
+    row: { ...root, replyCount: 0 },
+    onOpenThread: () => {},
+  });
+  try {
+    // A message nobody replied to has no line until a reply is drafted.
+    expect(screen.queryByRole("button", { name: /^View thread/ })).toBeNull();
+    act(() => {
+      writeView(scope, key, { text: "Half a reply", recipients: [] });
+    });
+    const first = screen.getByRole("button", {
+      name: "View thread: Draft reply",
+    });
+    expect(first).toHaveTextContent("Draft reply");
+    expect(first).not.toHaveTextContent("View thread");
+    view.unmount();
+    view = renderMessage({ session, row: root, onOpenThread: () => {} });
+    const summary = screen.getByRole("button", {
+      name: "View thread: 23 replies. Draft reply",
+    });
+    expect(summary.querySelector("[data-thread-draft]")).toHaveTextContent(
+      "·Draft",
+    );
+    // A retained tab's composer is mounted but out of sight.
+    const open = renderDom(<Composer shown={false} />);
+    expect(summary.querySelector("[data-thread-draft]")).not.toBeNull();
+    open.rerender(<Composer shown />);
+    expect(
+      screen.getByRole("button", { name: "View thread: 23 replies" }),
+    ).toBe(summary);
+    expect(summary.querySelector("[data-thread-draft]")).toBeNull();
+    open.unmount();
+    expect(summary.querySelector("[data-thread-draft]")).not.toBeNull();
+    act(() => clearView(scope, key));
+    expect(summary.querySelector("[data-thread-draft]")).toBeNull();
+  } finally {
+    view.unmount();
+    localStorage.clear();
+  }
+});
+
+it("words a thread's draft by its replies even while an activity line hides their count", () => {
+  const summary = (replied: boolean) =>
+    renderDom(
+      <ReplySummary
+        count={0}
+        hideEmptyLabel
+        draft
+        replied={replied}
+        participants={[]}
+        resolveName={(id) => id}
+        media={() => undefined}
+      />,
+    );
+  const busy = summary(true);
+  expect(busy.container.querySelector("[data-thread-draft]")).toHaveTextContent(
+    /^·Draft$/,
+  );
+  busy.unmount();
+  const fresh = summary(false);
+  expect(
+    fresh.container.querySelector("[data-thread-draft]"),
+  ).toHaveTextContent(/^Draft reply$/);
+  fresh.unmount();
 });

@@ -3,6 +3,7 @@ import "@testing-library/jest-dom/vitest";
 import {
   act,
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -18,12 +19,18 @@ import {
 } from "../../features/channel-navigation/routes";
 
 import { fixture, owners, id, viewer, scope } from "./sidebar-testing";
+import { federatedFixture } from "../../features/federated-identity/testing";
 import type { ChannelDetails } from "../../features/relay/channel-details-protocol";
 import { createSoloRegionFixture } from "../../features/channel-navigation/solo-navigation-testing";
 import { PrimarySidebar } from "./PrimarySidebar";
+import type {
+  RegisteredSidebarRestriction,
+  SidebarScope,
+} from "../../features/channel-navigation/sidebar-scope-service";
 import { ToastProvider } from "../../shared/design-system/ui/Toast";
 import { SOLO_LABEL } from "../../features/solo/labels";
 import type { ChannelDetailsCapability } from "../../features/relay/channel-details";
+import { SIDEBAR_REVEAL_BUDGET_MS } from "../../bundled/channels/useSidebarStartup";
 stubAvatarBrowserApis();
 afterEach(() => {
   cleanup();
@@ -194,6 +201,50 @@ it("keeps focus on a different chat after an Enter-save finishes", async () => {
   );
   expect(destination).toHaveFocus();
 });
+it("shows only Solo under a plugin restriction and restores the saved filter after", async () => {
+  const user = userEvent.setup();
+  let restrictions: readonly RegisteredSidebarRestriction[] = [];
+  const listeners = new Set<() => void>();
+  const publish = (next: readonly RegisteredSidebarRestriction[]) => {
+    restrictions = next;
+    for (const listener of listeners) listener();
+  };
+  const sidebarScope: SidebarScope = {
+    snapshot: () => restrictions,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => void listeners.delete(listener);
+    },
+    restrict: () => () => {},
+  };
+  fixture(true, false, undefined, undefined, 0, undefined, undefined, {
+    sidebarScope,
+  });
+  await user.click(screen.getByRole("tab", { name: "Team" }));
+  act(() =>
+    publish([
+      {
+        id: "focus",
+        scope: "solo",
+        banner: () => <span>Focusing</span>,
+        key: "test.focus/focus",
+        pluginId: "test.focus",
+        revision: "bundled",
+      },
+    ]),
+  );
+  expect(screen.queryByRole("tab")).toBeNull();
+  expect(screen.queryByRole("tabpanel")).toBeNull();
+  expect(screen.getByText("Focusing")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Inbox" })).toBeNull();
+  expect(screen.getByRole("region", { name: "Solo" })).toBeVisible();
+  act(() => publish([]));
+  expect(screen.getByRole("tab", { name: "Team" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  expect(screen.getByRole("button", { name: "Inbox" })).toBeVisible();
+});
 it("filters the combined sidebar without navigating or resetting Solo sections", async () => {
   const user = userEvent.setup();
   const f = fixture(true);
@@ -218,6 +269,11 @@ it("filters the combined sidebar without navigating or resetting Solo sections",
   );
   await user.click(solo);
   expect(screen.getByRole("button", { name: "Inbox" })).toBeVisible();
+  expect(screen.queryByRole("heading", { name: "Solo" })).toBeNull();
+  // Without its heading, Solo creates from New beside the tabs.
+  expect(
+    screen.queryByRole("button", { name: "New chat or workspace" }),
+  ).toBeNull();
   expect(screen.getByRole("button", { name: "Chats" })).toHaveAttribute(
     "aria-expanded",
     "false",
@@ -252,6 +308,114 @@ it("filters the combined sidebar without navigating or resetting Solo sections",
     scope: { viewer, communityOrigin: "https://relay.test" },
     route: { version: 1, params: "new-message" },
   });
+});
+
+it("collapses the Solo and Team inventories independently in All", async () => {
+  const user = userEvent.setup();
+  fixture(true);
+  const section = (key: "solo" | "team") => {
+    const summary = document.querySelector<HTMLElement>(
+      `[data-sidebar-section="scope:${key}"] summary`,
+    );
+    expect(summary).not.toBeNull();
+    const panel = document.getElementById(
+      summary?.getAttribute("aria-controls") ?? "",
+    );
+    expect(panel).not.toBeNull();
+    return { summary: summary as HTMLElement, panel: panel as HTMLElement };
+  };
+  const solo = section("solo");
+  const team = section("team");
+  expect(solo.panel).not.toHaveAttribute("hidden");
+  expect(team.panel).not.toHaveAttribute("hidden");
+
+  await user.click(solo.summary);
+  expect(solo.panel).toHaveAttribute("hidden");
+  expect(team.panel).not.toHaveAttribute("hidden");
+
+  await user.click(team.summary);
+  expect(solo.panel).toHaveAttribute("hidden");
+  expect(team.panel).toHaveAttribute("hidden");
+
+  await user.click(screen.getByRole("tab", { name: "Solo" }));
+  await user.click(screen.getByRole("tab", { name: "All" }));
+  expect(section("solo").panel).toHaveAttribute("hidden");
+  expect(section("team").panel).toHaveAttribute("hidden");
+});
+
+it("mounts no actions menu for the Solo and Team group headers", async () => {
+  vi.useFakeTimers();
+  try {
+    fixture(true);
+    await act(() => vi.advanceTimersByTimeAsync(SIDEBAR_REVEAL_BUDGET_MS));
+    const more = (title: string) =>
+      document.querySelector(`button[aria-label="More actions for ${title}"]`);
+    // Both headers hide their actions, yet each channel update re-rendered a menu.
+    expect(more("Channels")).not.toBeNull();
+    expect(more("Solo")).toBeNull();
+    expect(more("Team")).toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("expands Team when navigation selects one of its conversations", async () => {
+  vi.useFakeTimers();
+  try {
+    const f = fixture(true);
+    await act(() => vi.advanceTimersByTimeAsync(SIDEBAR_REVEAL_BUDGET_MS));
+    const summary = document.querySelector<HTMLElement>(
+      '[data-sidebar-section="scope:team"] summary',
+    );
+    expect(summary).not.toBeNull();
+    const panel = document.getElementById(
+      summary?.getAttribute("aria-controls") ?? "",
+    );
+    expect(panel).not.toBeNull();
+    fireEvent.click(summary as HTMLElement);
+    expect(panel).toHaveAttribute("hidden");
+
+    await act(() =>
+      f.open({
+        version: 1,
+        kind: "conversation",
+        channelId: "team-channel",
+        scope: { viewer, communityOrigin: "https://relay.test" },
+      }),
+    );
+    expect(panel).not.toHaveAttribute("hidden");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("expands fallback Solo when navigation selects an ordinary chat", async () => {
+  vi.useFakeTimers();
+  try {
+    const f = fixture(true);
+    f.navigate({
+      version: 1,
+      kind: "conversation",
+      channelId: "team-channel",
+      scope: { viewer, communityOrigin: "https://relay.test" },
+    });
+    await act(() => vi.advanceTimersByTimeAsync(SIDEBAR_REVEAL_BUDGET_MS));
+    const summary = document.querySelector<HTMLElement>(
+      '[data-sidebar-section="scope:solo"] summary',
+    );
+    expect(summary).not.toBeNull();
+    const panel = document.getElementById(
+      summary?.getAttribute("aria-controls") ?? "",
+    );
+    expect(panel).not.toBeNull();
+    fireEvent.click(summary as HTMLElement);
+    expect(panel).toHaveAttribute("hidden");
+
+    await act(() => f.open(conversationTarget(scope, id)));
+    expect(panel).not.toHaveAttribute("hidden");
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it.each([
@@ -327,10 +491,7 @@ it("keeps unavailable creation actions disabled", async () => {
   );
 });
 
-it.each([
-  ["New", "New workspace"],
-  ["New chat or workspace", "New workspace"],
-])(
+it.each([["New", "New workspace"]])(
   "does not navigate to a replaced session after project creation from %s completes",
   async (triggerName, itemName) => {
     const f = fixture(true, true);
@@ -611,9 +772,7 @@ it.each(["empty", "chats", "projects", "both"])(
       expect(f.open).toHaveBeenLastCalledWith(soloDraftTarget(scope));
     }
     await user.click(screen.getByRole("tab", { name: "Solo" }));
-    const trigger = within(nav).getByRole("button", {
-      name: "New chat or workspace",
-    });
+    const trigger = screen.getByRole("button", { name: "New" });
     await user.click(trigger);
     await user.click(await screen.findByRole("menuitem", { name: "New chat" }));
     expect(f.open).toHaveBeenLastCalledWith(soloDraftTarget(scope));
@@ -630,9 +789,7 @@ it.each(["empty", "chats", "projects", "both"])(
 it("keeps new Solo chats available when project creation is unavailable", async () => {
   const user = userEvent.setup();
   const f = fixture(true);
-  await user.click(
-    screen.getByRole("button", { name: "New chat or workspace" }),
-  );
+  await user.click(screen.getByRole("button", { name: "New" }));
   expect(
     await screen.findByRole("menuitem", { name: "New workspace" }),
   ).toHaveAttribute("aria-disabled", "true");
@@ -677,7 +834,63 @@ it("changes Team to Solo only for a live explicit chip intent and does not repla
   }
 });
 
-it("uses one contributed heading and the prior All Team Nexus order without losing chat creation", async () => {
+it("an explicit Solo reveal during a restriction keeps the saved Team filter", async () => {
+  const h = createSoloRegionFixture(viewer);
+  let restrictions: readonly RegisteredSidebarRestriction[] = [];
+  const listeners = new Set<() => void>();
+  const publish = (next: readonly RegisteredSidebarRestriction[]) => {
+    restrictions = next;
+    for (const listener of listeners) listener();
+  };
+  const sidebarScope: SidebarScope = {
+    snapshot: () => restrictions,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => void listeners.delete(listener);
+    },
+    restrict: () => () => {},
+  };
+  const target = conversationTarget(h.scope, "owned");
+  const view = render(
+    <ToastProvider>
+      <PrimarySidebar
+        relay={h.relay}
+        navigator={h.navigator}
+        target={target}
+        sidebarScope={sidebarScope}
+      >
+        {null}
+      </PrimarySidebar>
+    </ToastProvider>,
+  );
+  try {
+    await act(() => h.navigate(target));
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Team" }));
+    act(() =>
+      publish([
+        {
+          id: "focus",
+          scope: "solo",
+          banner: () => <span>Focusing</span>,
+          key: "test.focus/focus",
+          pluginId: "test.focus",
+          revision: "bundled",
+        },
+      ]),
+    );
+    act(() => h.service.reveal("owned"));
+    act(() => publish([]));
+    expect(screen.getByRole("tab", { name: "Team" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  } finally {
+    view.unmount();
+    await h.dispose();
+  }
+});
+
+it("uses one contributed heading and the prior All Team Nexus order, with no heading creation", async () => {
   const h = createSoloRegionFixture(viewer);
   await h.register({ title: "Nexus", component: () => null });
   const target = conversationTarget(h.scope, "owned");
@@ -696,33 +909,22 @@ it("uses one contributed heading and the prior All Team Nexus order without losi
     ]);
     expect(screen.queryByText("Solo")).not.toBeInTheDocument();
     expect(screen.getAllByText("Nexus")).toHaveLength(2);
-    await userEvent
-      .setup()
-      .click(screen.getByRole("button", { name: "Create" }));
+    await userEvent.setup().click(screen.getByRole("tab", { name: "Nexus" }));
+    expect(screen.getAllByText("Nexus")).toHaveLength(1);
+    await userEvent.setup().click(screen.getByRole("tab", { name: "All" }));
+    expect(screen.getAllByText("Nexus")).toHaveLength(2);
+    // Headings carry no creation of their own; the New menu owns it.
     expect(
-      await screen.findByRole("menuitem", { name: "New chat" }),
-    ).toBeVisible();
-    expect(
-      screen.getByRole("menuitem", { name: "New workspace" }),
-    ).toBeVisible();
+      screen.queryByRole("button", { name: "Create" }),
+    ).not.toBeInTheDocument();
   } finally {
     view.unmount();
     await h.dispose();
   }
 });
 
-it("merged Create keeps workspace creation and return focus when a plugin menu fails", async () => {
+it("omits a contributed create action whose menu fails", async () => {
   const h = createSoloRegionFixture(viewer);
-  const create = vi.fn(async (_section: { id: string; name: string }) => {});
-  Object.assign(h.session, {
-    soloPreferences: {
-      ...h.session.soloPreferences,
-      sectionCreationWritable: true,
-      createSection: create,
-    },
-  });
-  const open = vi.fn(async () => ({ status: "opened" as const }));
-  const navigator = { ...h.navigator, open };
   await h.register({
     title: "Nexus",
     component: () => null,
@@ -742,48 +944,25 @@ it("merged Create keeps workspace creation and return focus when a plugin menu f
     <ToastProvider>
       <PrimarySidebar
         relay={h.relay}
-        navigator={navigator}
+        navigator={h.navigator}
         target={conversationTarget(h.scope, "owned")}
       >
         {null}
       </PrimarySidebar>
     </ToastProvider>,
   );
-  const user = userEvent.setup();
   try {
-    const trigger = screen.getByRole("button", { name: "Create" });
-    await user.click(trigger);
-    await user.click(
-      await screen.findByRole("menuitem", { name: "New workspace" }),
-    );
-    await screen.findByRole("dialog", { name: "New workspace" });
-    await user.keyboard("{Escape}");
-    await waitFor(() => expect(trigger).toHaveFocus());
-    await user.click(trigger);
-    await user.click(
-      await screen.findByRole("menuitem", { name: "New workspace" }),
-    );
-    const dialog = await screen.findByRole("dialog", { name: "New workspace" });
-    await user.type(
-      within(dialog).getByRole("textbox", { name: "Name" }),
-      "Planning",
-    );
-    await user.click(within(dialog).getByRole("button", { name: "Create" }));
-    await waitFor(() => expect(create).toHaveBeenCalledOnce());
-    const project = create.mock.calls[0]?.[0] as unknown as { id: string };
-    await waitFor(() =>
-      expect(open).toHaveBeenCalledWith(
-        soloDraftTarget(h.scope, { project: project.id }),
-      ),
-    );
-    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(screen.getAllByText("Nexus")).toHaveLength(2);
+    expect(
+      screen.queryByRole("button", { name: "Create" }),
+    ).not.toBeInTheDocument();
   } finally {
     view.unmount();
     await h.dispose();
   }
 });
 
-it("collapsing the contributed task section keeps ordinary chats visible", async () => {
+it("collapsing the contributed Solo section in All hides its ordinary chats", async () => {
   const h = createSoloRegionFixture(viewer);
   await h.register({
     title: "Nexus",
@@ -806,18 +985,65 @@ it("collapsing the contributed task section keeps ordinary chats visible", async
   );
   try {
     const heading = view.container.querySelector(
-      "[data-sidebar-section] summary",
+      '[data-sidebar-section^="solo-region:"] summary',
     );
     expect(heading).not.toBeNull();
     await userEvent.setup().click(heading as HTMLElement);
     await waitFor(() =>
       expect(heading?.closest("details")).not.toHaveAttribute("open"),
     );
-    expect(screen.getByRole("button", { name: /^Chat$/ })).toBeVisible();
+    expect(
+      document.getElementById(heading?.getAttribute("aria-controls") ?? ""),
+    ).toHaveAttribute("hidden");
+    expect(
+      view.container.querySelector('[data-solo-channel-id="chat"]'),
+    ).not.toBeVisible();
   } finally {
     view.unmount();
     await h.dispose();
   }
+});
+
+// A refused community gets one notice in the toast stack on every page, with
+// what fixes it. The sidebar's sign-in prompt and Try again would repeat it.
+it("moves a refusal's recovery from the sidebar to its one notice", async () => {
+  const h = federatedFixture();
+  const f = fixture(
+    true,
+    false,
+    undefined,
+    undefined,
+    0,
+    undefined,
+    undefined,
+    {
+      federatedIdentity: h.service,
+    },
+  );
+  const sidebar = () => screen.getByRole("complementary", { name: "Sidebar" });
+  // A connection failure with native's sign-in error asks for sign-in here.
+  f.connection({ status: "error", error: "Federated sign-in is required" });
+  expect(
+    within(sidebar()).getByRole("button", {
+      name: "Sign in with builderlab.example",
+    }),
+  ).toBeVisible();
+  f.connection({ denied: true, refusal: "sign-in" });
+  const notice = await screen.findByRole("dialog", {
+    name: "Sign in to open this community",
+  });
+  expect(
+    within(notice).getByRole("button", {
+      name: "Sign in with builderlab.example",
+    }),
+  ).toBeVisible();
+  expect(
+    within(notice).queryByRole("button", { name: "Try again" }),
+  ).toBeNull();
+  expect(
+    within(sidebar()).queryByRole("button", { name: /Sign in|Try again/ }),
+  ).toBeNull();
+  expect(within(sidebar()).queryByText(/sign-in/)).toBeNull();
 });
 
 it("shows Try again beside a settled failure, and Connecting while the connection retries", async () => {
@@ -832,19 +1058,24 @@ it("shows Try again beside a settled failure, and Connecting while the connectio
     .setup()
     .click(within(sidebar()).getByRole("button", { name: "Try again" }));
   expect(retry).toHaveBeenCalledOnce();
-  // A refusal is about access, not the connection.
+  // A refusal is about access, not the connection. Its notice reports it on
+  // every page; the sidebar neither repeats it nor offers Try again.
   f.connection({
     status: "error",
     error: "ReadError: Relay read failed (403)",
     denied: true,
   });
+  const notice = await screen.findByRole("dialog", {
+    name: "You don’t have access to this community",
+  });
   expect(
-    within(sidebar()).getByText("You don’t have access to this community."),
+    within(notice).getByRole("button", { name: "Check again" }),
   ).toBeVisible();
   expect(within(sidebar()).queryByText("Couldn’t load channels.")).toBeNull();
+  expect(within(sidebar()).queryByText(/have access/)).toBeNull();
   expect(
-    within(sidebar()).getByRole("button", { name: "Try again" }),
-  ).toBeVisible();
+    within(sidebar()).queryByRole("button", { name: "Try again" }),
+  ).toBeNull();
   for (const working of [
     { status: "connecting" },
     { status: "error", error, retrying: true },

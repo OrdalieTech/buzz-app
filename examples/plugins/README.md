@@ -3,8 +3,8 @@
 All example plugins live here with `manifest.json` and prebuilt `plugin.js` files:
 
 - `counter` and `notes`: offline playgrounds.
-- `shortcut-counter`: offline keyboard-shortcut consumer; Command+Shift+K /
-  Control+Shift+K increments through the injected host service. Requires `shortcuts`.
+- `shortcut-counter`: offline keyboard-shortcut consumer; Command+Shift+G /
+  Control+Shift+G increments through the injected host service. Requires `shortcuts`.
 - `broken-page`: intentionally fails when its page renders to exercise error handling.
 
 ## Try the offline playgrounds

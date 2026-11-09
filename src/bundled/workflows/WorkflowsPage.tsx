@@ -26,6 +26,10 @@ import {
 } from "../../shared/design-system/ui/PanelHeader";
 import { WorkflowChannelPicker } from "./WorkflowChannelPicker";
 import { WorkflowChannel } from "./WorkflowChannel";
+import {
+  useWorkflowMentionMembers,
+  WorkflowMentionMembers,
+} from "./WorkflowMessageText";
 import { WorkflowWebhookSecrets } from "./WorkflowWebhookSecrets";
 import { WorkflowLanding, workflowOperationLocked } from "./WorkflowLanding";
 import { PanelWorkspace } from "../../features/panels/PanelWorkspace";
@@ -90,7 +94,7 @@ export function WorkflowCommunity({
   const [deleteError, setDeleteError] = useState<string>();
   const [createOpen, setCreateOpen] = useState(false);
   const [filter, setFilter] = useState<readonly string[]>([]);
-  const split = usePanelSplit(448, 320);
+  const split = usePanelSplit(session.scope, "workflows", 448, 320);
   const [detail, setDetail] = useState<{ key: string; name: string }>();
   const [detailTarget, setDetailTarget] = useState<HTMLElement | null>(null);
   const mainRef = useRef<HTMLDivElement>(null);
@@ -123,6 +127,7 @@ export function WorkflowCommunity({
     return () => narrow.removeEventListener("change", handoff);
   }, [open, detailTarget]);
   const channel = eligible.find((item) => item.id === selected);
+  const mentionMembers = useWorkflowMentionMembers(session, channel);
   useEffect(() => {
     if (
       !selected ||
@@ -171,9 +176,14 @@ export function WorkflowCommunity({
       openChannel("");
       return;
     }
-    if (definition.owner !== viewer || !capability.availability.delete) return;
     deleting.current = true;
     try {
+      if (!capability.permissions.canDelete(definition))
+        throw new Error(
+          "You no longer have permission to delete this workflow. Refresh and try again.",
+        );
+      if (!capability.availability.delete)
+        throw new Error("Workflow deletion is unavailable on this connection.");
       capability.delete(definition);
       setDeleteError(undefined);
     } catch (cause) {
@@ -309,21 +319,23 @@ export function WorkflowCommunity({
         />
       )}
       {channel && selectedDefinition ? (
-        <WorkflowChannel
-          key={`${channel.id}:${
-            typeof selectedDefinition === "object"
-              ? selectedDefinition.revision
-              : selectedDefinition
-          }`}
-          capability={capability}
-          channelId={channel.id}
-          channel={channel}
-          initialSelection={selectedDefinition}
-          onSaveReadback={setSaveReadback}
-          onDelete={deleteWorkflow}
-          viewer={viewer}
-          onClose={() => openChannel("")}
-        />
+        <WorkflowMentionMembers.Provider value={mentionMembers}>
+          <WorkflowChannel
+            key={`${channel.id}:${
+              typeof selectedDefinition === "object"
+                ? selectedDefinition.revision
+                : selectedDefinition
+            }`}
+            capability={capability}
+            channelId={channel.id}
+            channel={channel}
+            initialSelection={selectedDefinition}
+            onSaveReadback={setSaveReadback}
+            onDelete={deleteWorkflow}
+            viewer={viewer}
+            onClose={() => openChannel("")}
+          />
+        </WorkflowMentionMembers.Provider>
       ) : null}
       <WorkflowWebhookSecrets capability={capability} />
       {createOpen && (

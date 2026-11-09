@@ -1,16 +1,18 @@
-import { RecommendationCount } from "../RecommendationCount";
+import { PluginUpdatesMenu } from "../PluginUpdates";
 import { formatPublicKey } from "../../shared/identity/public-key";
 import { usePresenceStatus } from "../../features/presence/react";
 import { useRelayConnection } from "../../features/relay/react";
 import { avatarMedia, avatarSource } from "../../shared/avatar-source";
 import { useUserStatus } from "../../features/user-status/useUserStatus";
 import { useStatusEditor } from "../../features/user-status/useStatusEditor";
+import { statusShortcut } from "../../features/user-status/status-shortcut";
 import { StatusEmoji } from "../../features/user-status/StatusEmoji";
 import { Button } from "../../shared/design-system/ui/Button";
 import { StatusEditor } from "../../features/user-status/StatusEditor";
 import {
   useCallback,
   useEffect,
+  useEffectEvent,
   useId,
   useRef,
   useState,
@@ -23,7 +25,6 @@ import {
   GearIcon,
   UserIcon,
   PlugIcon,
-  SquaresFourIcon,
   SunIcon,
   MoonIcon,
   MonitorIcon,
@@ -197,6 +198,18 @@ export function ProfileButton({
   const picture = selected ? avatarMedia(source, session?.media) : source;
   const status = useUserStatus(session?.statuses, viewer ?? "");
   const statusEditor = useStatusEditor(session, viewer ?? undefined);
+  // The Set status shortcut follows the menu item's availability.
+  const statusAvailable =
+    !!viewer && !!session?.statuses?.writable && !!connection.scope;
+  const openStatus = useEffectEvent(() => statusEditor.open());
+  useEffect(() => {
+    if (!statusAvailable) return;
+    const open = () => openStatus();
+    statusShortcut.current = open;
+    return () => {
+      if (statusShortcut.current === open) statusShortcut.current = undefined;
+    };
+  }, [statusAvailable]);
   const profileTrigger = useRef<HTMLButtonElement>(null);
   const appearanceTrigger = useRef<HTMLDivElement>(null);
   const openingStatus = useRef(false);
@@ -282,6 +295,8 @@ export function ProfileButton({
         />
         <MenuPopup
           data-profile-menu=""
+          side="right"
+          collisionAvoidance={{ fallbackAxisSide: "start" }}
           align="end"
           sideOffset={8}
           aria-labelledby={accountLabel}
@@ -418,6 +433,7 @@ export function ProfileButton({
                       session={session}
                       value={status.emoji}
                       url={status.emojiUrl}
+                      hint
                     />
                     <span className="min-w-0 truncate text-body-sm">
                       {status.text}
@@ -486,22 +502,13 @@ export function ProfileButton({
               )}
             </MenuSubmenuPopup>
           </MenuSubmenu>
-          <MenuItem
-            onClick={() => {
+          <PluginUpdatesMenu
+            recommendations={pluginRecommendations}
+            onManage={() => {
               handoff.current = true;
               onSettings("plugins");
             }}
-          >
-            <MenuIcon>
-              <SquaresFourIcon aria-hidden="true" size={16} />
-            </MenuIcon>
-            Plugins
-            {pluginRecommendations > 0 && (
-              <MenuTrailing>
-                <RecommendationCount count={pluginRecommendations} />
-              </MenuTrailing>
-            )}
-          </MenuItem>
+          />
           <MenuItem
             aria-current={settingsSelected ? "page" : undefined}
             onClick={() => {

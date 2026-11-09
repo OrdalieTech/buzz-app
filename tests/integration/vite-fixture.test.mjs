@@ -7,6 +7,8 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { Server as HttpServer } from "node:http";
+import { Server, createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -132,6 +134,64 @@ test("app builds, previews and fixture servers in one worker do not change each 
   }
 });
 
+test("port 0 servers, restarts and previews bind where the OS assigns, not a probed port", async () => {
+  // Vite probes for a free port, closes the probe and binds that number later.
+  // Take each such port just before its bind, as a concurrent process can.
+  const listen = Server.prototype.listen;
+  const blockers = [];
+  Server.prototype.listen = function (port, ...args) {
+    if (!(this instanceof HttpServer) || !port)
+      return listen.call(this, port, ...args);
+    const blocker = createNetServer();
+    blockers.push(blocker);
+    blocker.listen(port, "127.0.0.1", () => listen.call(this, port, ...args));
+    return this;
+  };
+  const bound = (server) => {
+    const { port } = server.httpServer.address();
+    assert.equal(server.resolvedUrls.local[0], `http://127.0.0.1:${port}/`);
+  };
+  let server, previewServer;
+  try {
+    server = await createServer({
+      configFile: false,
+      envDir: false,
+      logLevel: "silent",
+      server: {
+        host: "127.0.0.1",
+        port: 0,
+        strictPort: true,
+        ws: false,
+        watch: null,
+      },
+    });
+    await server.listen();
+    bound(server);
+    const { cacheDir } = server.config;
+    // A restart binds a new HTTP server to the port Vite recorded at start.
+    await server.restart();
+    bound(server);
+    // It also replaces the server's members, and close must still remove the
+    // cache the restarted server kept using.
+    assert.equal(server.config.cacheDir, cacheDir);
+    await server.close();
+    await assert.rejects(stat(cacheDir), { code: "ENOENT" });
+    previewServer = await preview({
+      root,
+      configFile: false,
+      envFile: false,
+      logLevel: "silent",
+      preview: { host: "127.0.0.1", port: 0, strictPort: true },
+    });
+    bound(previewServer);
+  } finally {
+    Server.prototype.listen = listen;
+    await server?.close();
+    await previewServer?.close();
+    for (const blocker of blockers) blocker.close();
+  }
+});
+
 test("fixture servers reject configuration that would change dependency optimization", async () => {
   await assert.rejects(
     createServer({ ...config, optimizeDeps: { include: ["yaml"] } }),
@@ -197,19 +257,13 @@ test("browser fixture call sites cannot fall back to Vite's shared default cache
     for (const [, names] of source.matchAll(
       /import\s*\{([^}]*)\}\s*from\s*"vite"/g,
     )) {
-      // The helper restores NODE_ENV after build and preview; see keepNodeEnv.
+      // The helper restores NODE_ENV after build and preview (keepNodeEnv),
+      // and gives each server its own cache and an OS-assigned port 0
+      // (bindAssignedPort).
       assert.doesNotMatch(
         names,
-        /\b(build|preview)\b/,
-        `${name} must import build and preview from vite-server.mjs`,
-      );
-      if (!/\bcreateServer\b/.test(names)) continue;
-      // This existing test owns a temporary directory through its full lifecycle.
-      assert.ok(name === "emoji.spec.mjs", name);
-      assert.match(
-        source,
-        /cacheDir[,:]/,
-        `${name} must keep its explicit cache`,
+        /\b(build|preview|createServer)\b/,
+        `${name} must import build, preview and createServer from vite-server.mjs`,
       );
     }
   }

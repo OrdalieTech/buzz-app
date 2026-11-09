@@ -56,7 +56,10 @@ async function harness(
     relayUrl: fixtureRelayUrl,
     communityAliases: fixtureAliases,
     identity: () => key,
-    authority: async () => ({ relayAuthor: getPublicKey(key) }),
+    authority: async () => ({
+      relayAuthor: getPublicKey(key),
+      artifactSupport: true,
+    }),
     upstreamFetch: async (url, init) => {
       upstream.push(String(url));
       const filters = JSON.parse(init?.body ?? "[]");
@@ -1056,6 +1059,11 @@ test("production interest controls preserve socket/global routes and pending wri
 test.each([
   ["restricted: not a member", true, "Relay request failed (503)"],
   [
+    'invalid: an open channel named "Launch" already exists',
+    true,
+    'An open channel named "Launch" already exists',
+  ],
+  [
     "error: internal server error",
     false,
     "Relay delivery could not be confirmed (503)",
@@ -1134,6 +1142,52 @@ test("lost publication receipt stays unknown; reconnect never automatically repu
     expect(h.publications).toHaveLength(1);
     expect(h.upstream.some((url) => url.endsWith("/events"))).toBe(false);
   } finally {
+    traffic?.dispose();
+    vi.unstubAllGlobals();
+    await h.close();
+  }
+});
+
+test("a reconnect's continuous channel replays cross the real HTTP boundary", async () => {
+  const h = await harness(0, undefined, { holdAuth: true });
+  let traffic;
+  const clock = vi.spyOn(Date, "now");
+  try {
+    const now = Date.now();
+    clock.mockReturnValue(now - 20 * 60_000);
+    browserFetch(h.base);
+    const transport = await connectBrokerTransport(h.base);
+    const established = vi.fn();
+    traffic = transport.subscribe({ ...callbacks, established });
+    traffic.update(["a", "b", "c"], ["a", "b"]);
+    await until(() => h.frames.some((frame) => frame.kind === "AUTH"));
+    // Start the session before the floor, then authenticate at the current
+    // time so the connection cursor has the full resume lag behind it.
+    clock.mockRestore();
+    const auth = h.frames.find((frame) => frame.kind === "AUTH");
+    await h.sockets[0].receive(["OK", auth.id.id, true]);
+    const channels = () =>
+      established.mock.calls.filter(([ids]) => ids !== undefined);
+    await until(() => channels().length === 2);
+    // A first connection has no cursor: no channel reports continuity.
+    expect(channels()).toEqual(expect.arrayContaining([[["a", "b"]], ["c"]]));
+    established.mockClear();
+    h.sockets[0].close();
+    await until(
+      () => h.frames.filter((frame) => frame.kind === "AUTH").length === 2,
+    );
+    const nextAuth = h.frames.filter((frame) => frame.kind === "AUTH")[1];
+    await h.sockets[1].receive(["OK", nextAuth.id.id, true]);
+    await until(() => channels().length === 2);
+    // The quiet replays resumed from their cursors, below the limit.
+    expect(channels()).toEqual(
+      expect.arrayContaining([
+        [["a", "b"], undefined, ["a", "b"]],
+        ["c", undefined, ["c"]],
+      ]),
+    );
+  } finally {
+    clock.mockRestore();
     traffic?.dispose();
     vi.unstubAllGlobals();
     await h.close();
@@ -1490,24 +1544,22 @@ test("joined batches survive the real HTTP boundary and retirement only rebuilds
     );
     traffic.update([...joined, "preview"], joined);
     await until(
-      () => established.mock.calls.length === 4 && h.requests.length === 30,
+      () => established.mock.calls.length === 4 && h.requests.length === 5,
     );
-    expect(h.requests).toHaveLength(30);
+    expect(h.requests).toHaveLength(5);
     const batches = h.requests.filter(
       (r) => r.filter["#h"] && r.filter.limit === 0,
     );
+    // Every joined channel replays through one combined filter; the preview
+    // channel has its own route.
     const replays = h.requests.filter(
-      (r) => r.filter["#h"] && r.filters.length > 1,
+      (r) =>
+        r.filter["#h"] &&
+        r.filter.limit === 500 &&
+        !r.filter["#h"].includes("preview"),
     );
-    expect(replays.map((r) => r.filters.length)).toEqual([
-      ...Array(25).fill(10),
-      6,
-    ]);
-    for (const r of replays)
-      for (const f of r.filters) {
-        expect(f["#h"]).toHaveLength(1);
-        expect(f.limit).toBe(500);
-      }
+    expect(replays.map((r) => r.filters.length)).toEqual([1]);
+    expect(replays[0].filter["#h"]).toEqual(joined);
     expect(
       established.mock.calls
         .filter(([ids]) => Array.isArray(ids))
@@ -1539,12 +1591,12 @@ test("joined batches survive the real HTTP boundary and retirement only rebuilds
     });
     expect(malformed.status).toBe(400);
     await malformed.text();
-    expect(h.requests).toHaveLength(30);
+    expect(h.requests).toHaveLength(5);
     const retained = joined.slice(1);
     traffic.update([...retained, "preview"], retained);
     await until(() => established.mock.calls.length === 5);
     expect(established).toHaveBeenCalledTimes(5);
-    expect(h.requests).toHaveLength(31);
+    expect(h.requests).toHaveLength(6);
     expect(
       h.frames.filter((f) => f.kind === "CLOSE" && f.id === old.id),
     ).toHaveLength(1);
@@ -1901,13 +1953,20 @@ test.each([
       ]);
       await h.sockets[0].receive(["OK", event.id, false, reason]);
       const response = await result;
-      expect(response.status).toBe(503);
-      expect(await response.json()).toEqual({
-        error: summary.startsWith("rate-limited:")
-          ? summary
-          : "Socket publication could not be confirmed",
-        ...(!sent ? { sent: false } : {}),
-      });
+      // A proven validation refusal answers this client as the relay's HTTP
+      // API does, with its own text; the log keeps only the safe summary.
+      const validation = !sent && reason.startsWith("invalid:");
+      expect(response.status).toBe(validation ? 400 : 503);
+      expect(await response.json()).toEqual(
+        validation
+          ? { error: reason }
+          : {
+              error: summary.startsWith("rate-limited:")
+                ? summary
+                : "Socket publication could not be confirmed",
+              ...(!sent ? { sent: false } : {}),
+            },
+      );
       expect(lines).toContain(
         `publication id=${event.id} kind=9000 stage=socket sent=${sent} reason=Relay publication not confirmed refusal=${summary}`,
       );

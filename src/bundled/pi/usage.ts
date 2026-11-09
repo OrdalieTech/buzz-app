@@ -1,7 +1,10 @@
 // The token use of an agent's Pi conversations, as pi-ai records it on each
 // of their answers and Pi durable totals it, read from the agent's storage
 // through the host. Pi owns the entries; nothing here writes or keeps them.
-import { promptSections } from "../../features/agents/activity-transcript";
+import {
+  promptMessage,
+  promptSections,
+} from "../../features/agents/activity-transcript";
 import type {
   SessionUsage,
   UsageObservation,
@@ -47,9 +50,8 @@ const text = (content: unknown) =>
 /** What was asked, from the conversation's first prompt. */
 function title(entries: readonly PiEntry[]) {
   const first = entries.find((entry) => entry.kind === "pi.user")?.model?.[0];
-  return promptSections(text(first?.content))
-    .find((section) => section.tag === "buzz-event")
-    ?.body.match(/^Content: (.*)$/m)?.[1]
+  return promptMessage(promptSections(text(first?.content)))
+    .text.split("\n", 1)[0]
     ?.trim();
 }
 

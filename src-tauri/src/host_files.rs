@@ -127,11 +127,16 @@ pub(crate) async fn plugin_host_read_file(
     path: String,
     cwd: Option<String>,
 ) -> Result<tauri::ipc::Response, String> {
+    // Reserve before any await; a delete racing an admitted attachment read refuses.
+    let lease = FileReadLease::new()?;
     granted(manager, id, revision).await?;
     let late = format!("Reading {path} took too long");
     tokio::time::timeout(
         READ_TIMEOUT,
-        bounded(&READS, move || read(&path, cwd.as_deref())),
+        bounded(&READS, move || {
+            let _lease = lease;
+            read(&path, cwd.as_deref())
+        }),
     )
     .await
     .map_err(|_| late)?
@@ -151,9 +156,50 @@ pub(crate) async fn plugin_host_resolve_directory(
     bounded(&DIRECTORIES, move || directory(&path)).await
 }
 
-// GET and saves share one non-queued native byte operation. A blocking saver
-// owns the permit even when its async caller has stopped waiting.
+// One admitted byte operation; waiting never clones a raw save body. Tokio's
+// semaphore preserves FIFO order. At most 16 callers can wait, within their own deadline.
 pub(crate) static BYTE_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+pub(crate) static BYTE_WAITERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+pub(crate) async fn byte_admission(
+    deadline: tokio::time::Instant,
+) -> Result<tokio::sync::SemaphorePermit<'static>, String> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err("Byte operation timed out in admission".into());
+    }
+    let _waiting = BYTE_WAITERS
+        .try_acquire()
+        .map_err(|_| "Byte operation queue is full")?;
+    let permit = tokio::time::timeout_at(deadline, BYTE_WORK.acquire())
+        .await
+        .map_err(|_| "Byte operation timed out in admission")?
+        .map_err(|_| "Byte admission unavailable")?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err("Byte operation timed out in admission".into());
+    }
+    Ok(permit)
+}
+
+// App-wide, conservative deletion exclusion: any plugin's host.readFile call or
+// process named read/read-protected blocks every plugin's managed deletion.
+// Leases outlive async waiters until the actual blocking/process work completes.
+static FILE_READS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+pub(crate) struct FileReadLease;
+impl FileReadLease {
+    pub(crate) fn new() -> Result<Self, String> {
+        let mut reads = FILE_READS
+            .lock()
+            .map_err(|_| "File read admission unavailable")?;
+        *reads = reads.checked_add(1).ok_or("Too many file reads")?;
+        Ok(Self)
+    }
+}
+impl Drop for FileReadLease {
+    fn drop(&mut self) {
+        if let Ok(mut reads) = FILE_READS.lock() {
+            *reads -= 1;
+        }
+    }
+}
 const MAX_SAVE_BYTES: usize = 16 * 1024 * 1024;
 const ROOT_BYTES: u64 = 64 * 1024 * 1024;
 const ROOT_FILES: usize = 16;
@@ -211,9 +257,7 @@ pub(crate) async fn plugin_host_save_bytes<R: tauri::Runtime>(
     let revision = save_header(&request, "x-buzz-plugin-revision", 128)?;
     let hash = save_header(&request, "x-buzz-sha256", 64)?;
     validate_save(body, &hash)?;
-    let place = BYTE_WORK
-        .try_acquire()
-        .map_err(|_| "A byte operation is already under way")?;
+    let place = byte_admission(tokio::time::Instant::from_std(deadline)).await?;
     let manager = manager.0.clone()?;
     let root = app
         .path()
@@ -299,8 +343,23 @@ fn private_options() -> std::fs::OpenOptions {
     options
 }
 
+// Explicit unlock matters when a concurrent fork temporarily inherits an open
+// file description: close alone would leave flock held until that child execs.
+struct ManagedLock(std::fs::File);
+impl std::ops::Deref for ManagedLock {
+    type Target = std::fs::File;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for ManagedLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 /// One verified fixed lock covers accounting through final eligibility/cleanup.
-fn managed_lock(root: &Path) -> Result<std::fs::File, String> {
+fn managed_lock(root: &Path) -> Result<ManagedLock, String> {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -338,14 +397,108 @@ fn managed_lock(root: &Path) -> Result<std::fs::File, String> {
         return Err("Invalid managed storage ownership file".into());
     }
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| "Managed storage is busy")?;
-    Ok(lock)
+    Ok(ManagedLock(lock))
 }
 
 fn artifact_expiry(name: &str) -> Option<u64> {
     let (expiry, id) = name.split_once('-')?;
     let expiry: u64 = expiry.parse().ok()?;
+    let (id, owner) = if id.len() == 36 {
+        (id, None)
+    } else {
+        let (id, owner) = id.split_at_checked(36)?;
+        let owner = owner.strip_prefix('-')?;
+        if owner.len() != 64
+            || !owner
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        (id, Some(owner))
+    };
     let uuid = uuid::Uuid::parse_str(id).ok()?;
-    (name == format!("{expiry}-{uuid}")).then_some(expiry)
+    let canonical = match owner {
+        Some(owner) => format!("{expiry}-{uuid}-{owner}"),
+        None => format!("{expiry}-{uuid}"),
+    };
+    (name == canonical).then_some(expiry)
+}
+
+fn managed_owner(id: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(id.as_bytes()))
+}
+
+/// Deletes only host-named files owned by this plugin; legacy unowned files refuse.
+fn delete_managed(
+    root: &Path,
+    path: &str,
+    manager: &buzzodz_plugins::Manager,
+    id: &str,
+    revision: &str,
+) -> Result<(), String> {
+    managed_granted(manager, id, revision)?;
+    let path = Path::new(path);
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid managed file")?;
+    if path.parent() != Some(root)
+        || artifact_expiry(name).is_none()
+        || !name.ends_with(&format!("-{}", managed_owner(id)))
+    {
+        return Err("Managed file is not owned by this plugin".into());
+    }
+    let _lock = managed_lock(root)?;
+    let reads = FILE_READS
+        .try_lock()
+        .map_err(|_| "Managed file is in use by a file read")?;
+    if *reads != 0 {
+        return Err("Managed file is in use by a file read".into());
+    }
+    private_metadata(path, false)?;
+    managed_granted(manager, id, revision)?;
+    std::fs::remove_file(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn plugin_host_delete_managed_file<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    manager: tauri::State<'_, PluginManager>,
+    id: String,
+    revision: String,
+    path: String,
+) -> Result<(), String> {
+    use tauri::Manager as _;
+    let deadline = tokio::time::Instant::now() + SAVE_WINDOW;
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("plugin-artifacts");
+    let manager = manager.0.clone()?;
+    delete_with_admission(deadline, move || {
+        delete_managed(&root, &path, &manager, &id, &revision)
+    })
+    .await
+}
+
+async fn delete_with_admission(
+    deadline: tokio::time::Instant,
+    work: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    // Same ordering as saves: byte permit, root lock, then nonblocking reader
+    // exclusion. No filesystem work has started if admission refuses or expires.
+    let place = byte_admission(deadline)
+        .await
+        .map_err(|error| format!("{error}; managed file not deleted"))?;
+    let writer = managed_writer(place, work);
+    // Once handed to the blocking pool, cancellation cannot prove no unlink.
+    tokio::time::timeout_at(deadline, writer)
+        .await
+        .map_err(|_| "Managed deletion timed out; outcome unknown")?
+        .map_err(|e| e.to_string())?
 }
 
 fn managed_capacity(root: &Path, now: u64, incoming: usize) -> Result<(), String> {
@@ -456,7 +609,11 @@ fn save_managed_with_io(
         .filter(|n| *n <= 9_007_199_254_740_991)
         .ok_or("Invalid managed file expiry")?;
     managed_capacity(root, now, bytes.len())?;
-    let path = root.join(format!("{expiry}-{}", uuid::Uuid::new_v4()));
+    let path = root.join(format!(
+        "{expiry}-{}-{}",
+        uuid::Uuid::new_v4(),
+        managed_owner(id)
+    ));
     let path_text = path
         .to_str()
         .ok_or("Managed file path is not UTF-8")?

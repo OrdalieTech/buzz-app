@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import type { DeviceSetting } from "../../shared/device-settings";
 
 const preferenceKey = "buzz-remember-mentioned-agents.v1";
 const changedEvent = "buzz-remember-mentioned-agents-changed";
@@ -41,3 +42,21 @@ export function setRememberAgentsPreference(enabled: boolean): string | null {
   window.dispatchEvent(new Event(changedEvent));
   return error;
 }
+
+/** Remembering mentioned agents as a device setting. */
+export const rememberAgentsSetting: DeviceSetting = {
+  key: "agents.remember_mentioned",
+  description:
+    "Keep the same agents selected for your next message in this channel or thread.",
+  schema: { type: "boolean" },
+  read: () => ({
+    value: rememberAgentsPreference(),
+    unsaved:
+      unsavedPreference === undefined
+        ? null
+        : "This choice is active, but could not be saved on this device.",
+  }),
+  write: (value) => {
+    setRememberAgentsPreference(value as boolean);
+  },
+};

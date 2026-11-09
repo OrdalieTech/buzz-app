@@ -444,3 +444,23 @@ it("retains local inventory failure and the existing deadline after dispatch", a
   await expired;
   expect(signal.aborted).toBe(true);
 });
+
+it("gives large reads their own deadline; a joining read keeps it", async () => {
+  vi.useFakeTimers();
+  const { read, next } = setup({ timeoutMs: 100 });
+  const large = read(filter("a"), { deadlineMs: 1_000 });
+  const joined = read(filter("a"));
+  const ordinary = read(filter("b"));
+  const wire = next();
+  const expired = expect(ordinary).rejects.toThrow("timed out");
+  await vi.advanceTimersByTimeAsync(101);
+  await expired;
+  expect(wire.signal?.aborted).toBe(false);
+  const failures = Promise.all([
+    expect(large).rejects.toThrow("timed out"),
+    expect(joined).rejects.toThrow("timed out"),
+  ]);
+  await vi.advanceTimersByTimeAsync(899);
+  await failures;
+  expect(wire.signal?.aborted).toBe(true);
+});

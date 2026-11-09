@@ -12,6 +12,11 @@ import {
   resolveLineup,
 } from "../src/features/channel-templates/model.ts";
 import {
+  CANVAS_MAX_EVENT_BYTES,
+  LIVE_CANVAS_BYTES,
+} from "../src/features/channel-templates/canvas-limits.ts";
+import {
+  canvasEventFits,
   admitChannelKit,
   decodeChannelKit,
   prepareChannelKit,
@@ -162,9 +167,27 @@ it("bounds Canvas content in UTF-8 bytes, not JavaScript characters", () => {
     kind: 40100,
     tags: [["h", "11111111-1111-4111-8111-111111111111"]],
   };
-  const content = "é".repeat(12 * 1024);
+  const content = "é".repeat(LIVE_CANVAS_BYTES / 2);
   expect(validCanvas({ ...canvas, content })).toBe(true);
   expect(validCanvas({ ...canvas, content: `${content}x` })).toBe(false);
+});
+
+it("bounds the complete Canvas event separately from its content", () => {
+  const event = {
+    kind: 40100,
+    tags: [["h", "11111111-1111-4111-8111-111111111111"]],
+    content: "",
+  };
+  const room =
+    CANVAS_MAX_EVENT_BYTES - Buffer.byteLength(JSON.stringify(event));
+  expect(canvasEventFits({ ...event, content: "x".repeat(room) })).toBe(true);
+  expect(canvasEventFits({ ...event, content: "x".repeat(room + 1) })).toBe(
+    false,
+  );
+  // Within the content limit, but every quote escapes to two bytes.
+  const quotes = { ...event, content: '"'.repeat(LIVE_CANVAS_BYTES) };
+  expect(validCanvas(quotes)).toBe(true);
+  expect(canvasEventFits(quotes)).toBe(false);
 });
 
 it("encrypts manifest and payload records with exact owner/revision admission", async () => {

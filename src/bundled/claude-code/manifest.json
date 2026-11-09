@@ -12,6 +12,16 @@
     "files": true,
     "processes": [
       {
+        "id": "read-protected",
+        "program": "buzz-agent-command",
+        "bundled": true,
+        "args": [
+          "--shell",
+          "case \"$1\" in \"~/\"*) set -- \"$HOME/${1:2}\";; esac; exec /usr/bin/base64 -i \"$1\"",
+          "buzz-read"
+        ]
+      },
+      {
         "id": "claude-sh",
         "program": "bash",
         "args": ["-c"]
@@ -26,7 +36,20 @@
         "program": "base64",
         "args": ["-i"]
       },
-      { "id": "workspace", "program": "pwd" },
+      { "id": "size", "program": "wc", "args": ["-c"] },
+      {
+        "id": "read-page",
+        "program": "bash",
+        "args": [
+          "-c",
+          "set -o pipefail; dd if=\"$1\" bs=1048576 skip=\"$2\" count=\"$3\" | base64",
+          "buzz-read-page"
+        ]
+      },
+      {
+        "id": "workspace",
+        "program": "pwd"
+      },
       {
         "id": "starts",
         "program": "grep",
@@ -41,13 +64,31 @@
           "-e",
           "Thread root: [0-9a-f]{64}",
           "-e",
-          "Agent: [0-9a-f]{64}(@[A-Za-z0-9._~%-]+)?"
+          "Agent: [0-9a-f]{64}(@[A-Za-z0-9._~%-]+)?",
+          "-e",
+          "</?(thread|conversation)-context>"
         ]
       },
       {
         "id": "list",
         "program": "find",
         "args": [".", "-type", "f", "-name", "*.jsonl"]
+      },
+      {
+        "id": "claude-protected-arm64",
+        "program": "claude",
+        "artifact": {
+          "path": "~/Library/Application Support/Buzz/claude-code/2.1.305/claude",
+          "sha256": "ea3ea3c08d2a9634a4651e687fcf900d410c489bce2b00f22bd7352b91ba704f"
+        }
+      },
+      {
+        "id": "claude-protected-x64",
+        "program": "claude",
+        "artifact": {
+          "path": "~/Library/Application Support/Buzz/claude-code/2.1.305/claude",
+          "sha256": "af7ad8d6d8b1e49059988f6657d91bb8b9feac127bf8bec005c4c27d0093f153"
+        }
       }
     ]
   }

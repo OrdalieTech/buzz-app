@@ -1,3 +1,4 @@
+import { TypingIndicator } from "./TypingIndicator";
 import { workflowLabel } from "../relay/workflow-attribution";
 import { MessageEditScope } from "./MessageEditScope";
 import { useReviewSidebarMotion } from "./use-review-sidebar-motion";
@@ -13,6 +14,7 @@ import { Button } from "../../shared/design-system/ui/Button";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -37,6 +39,10 @@ import { useKnownAgentPubkeys } from "../agents/use-known";
 import { MessageComposer } from "./MessageComposer";
 import { ImageReviewStage } from "./ImageReviewStage";
 import { MessageRow } from "./MessageRow";
+import {
+  useActivityPresentation,
+  useStableRowActivity,
+} from "./activity-presentation";
 import { parseMediaTimeReply } from "./media-timecode";
 import { VideoReviewReactions } from "./VideoReviewReactions";
 import styles from "./Messages.module.css";
@@ -62,14 +68,17 @@ type MediaReviewViewerProps = {
 
 export function MediaReviewViewer(props: MediaReviewViewerProps) {
   const { session, channelId, messageId } = props;
-  const [origin] = useState(() =>
-    readReviewOrigin(
+  const [{ origin, readingAnchor }] = useState(() => {
+    const opener =
       props.restoreFocus?.current ??
-        (document.activeElement instanceof HTMLElement
-          ? document.activeElement
-          : null),
-    ),
-  );
+      (document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null);
+    return {
+      origin: readReviewOrigin(opener),
+      readingAnchor: firstVisibleMessageId(opener),
+    };
+  });
   const [active, setActive] = useState(() => ({
     attachment: props.attachment,
     initialTime: props.initialTime,
@@ -91,6 +100,7 @@ export function MediaReviewViewer(props: MediaReviewViewerProps) {
   const activeProps = {
     ...props,
     origin,
+    readingAnchor,
     attachment: active.attachment,
     initialTime: active.initialTime,
     selectionRequest: active.request,
@@ -106,8 +116,19 @@ export function MediaReviewViewer(props: MediaReviewViewerProps) {
   );
 }
 
+/** The reader's place in the conversation the review opens over. */
+function firstVisibleMessageId(opener: HTMLElement | null) {
+  const scroller = opener?.closest<HTMLElement>("[data-message-scroller]");
+  if (!scroller) return undefined;
+  const top = scroller.getBoundingClientRect().top;
+  return [...scroller.querySelectorAll<HTMLElement>("[data-message-id]")].find(
+    (row) => row.getBoundingClientRect().bottom > top,
+  )?.dataset.messageId;
+}
+
 type ActiveReviewProps = MediaReviewViewerProps & {
   origin: ReturnType<typeof readReviewOrigin>;
+  readingAnchor: string | undefined;
   selectionRequest: number;
   selectAttachment(attachment: Attachment, initialTime: number): void;
 };
@@ -229,6 +250,7 @@ function ReviewShell({
   initialTime,
   hasComments = false,
   origin,
+  readingAnchor,
   close,
   onOpenLink,
   rootId,
@@ -279,10 +301,41 @@ function ReviewShell({
   const [commentsMotion, setCommentsMotion] = useState(false);
   const [selectedComment, setSelectedComment] = useState<string>();
   const profiles = useRowProfiles(session.profiles, replies);
+  const [currentTime, setCurrentTime] = useState(initialTime);
+  const [includeTime, setIncludeTime] = useState(true);
+  const mediaAttachments = useMemo(() => {
+    const seen = new Set<string>();
+    return [
+      ...galleryAttachments,
+      ...editMessages.flatMap((row) => row.attachments),
+      attachment,
+    ].filter(
+      (item) =>
+        (item.kind === "image" || item.kind === "video") &&
+        !!safeMessageUrl(item.url) &&
+        !seen.has(item.url) &&
+        !!seen.add(item.url),
+    );
+  }, [attachment, editMessages, galleryAttachments]);
+  const attachmentOwner = editMessages.find((row) =>
+    row.attachments.some((item) => item.url === attachment.url),
+  );
+  const videoCount = mediaAttachments.filter(
+    (item) => item.kind === "video",
+  ).length;
+  const timecodeApplies = (row: ChannelMessage) => {
+    if (row.mediaTargetUrl) return row.mediaTargetUrl === attachment.url;
+    if (videoCount === 1) return true;
+    // Older timed replies were always rooted at the thread, so their exact
+    // gallery target cannot be recovered. Preserve their previous broad
+    // visibility instead of hiding them from reply-owned videos.
+    if (row.replyParentId === rootId) return true;
+    return row.replyParentId === attachmentOwner?.id;
+  };
   const markers = timecodesSeekable
     ? replies.flatMap((row) => {
         const parsed = parseMediaTimeReply(row.content);
-        if (!parsed) return [];
+        if (!parsed || !timecodeApplies(row)) return [];
         const displayId = row.workflowOwnerId ?? row.authorId;
         const profile = profiles.get(displayId);
         const name = profile?.name ?? displayId.slice(0, 10);
@@ -300,22 +353,6 @@ function ReviewShell({
         ];
       })
     : [];
-  const [currentTime, setCurrentTime] = useState(initialTime);
-  const [includeTime, setIncludeTime] = useState(true);
-  const mediaAttachments = useMemo(() => {
-    const seen = new Set<string>();
-    return [
-      ...galleryAttachments,
-      ...editMessages.flatMap((row) => row.attachments),
-      attachment,
-    ].filter(
-      (item) =>
-        (item.kind === "image" || item.kind === "video") &&
-        !!safeMessageUrl(item.url) &&
-        !seen.has(item.url) &&
-        !!seen.add(item.url),
-    );
-  }, [attachment, editMessages, galleryAttachments]);
   const mixedGallery =
     mediaAttachments.length > 1 &&
     mediaAttachments.some((item) => item.kind === "video");
@@ -455,13 +492,17 @@ function ReviewShell({
             {rootId && source ? (
               <MessageEditScope>
                 <ReviewComments
+                  channelId={channelId}
+                  threadRootId={rootId}
                   selectedComment={selectedComment}
+                  readingAnchor={readingAnchor}
                   replies={replies}
                   limited={limited}
                   session={session}
                   scope={scope}
                   extensions={extensions}
                   selectAttachment={selectAttachment}
+                  canSeekTimecode={timecodeApplies}
                   {...(attachment.kind === "video" && timecodesSeekable
                     ? { seek }
                     : {})}
@@ -491,7 +532,11 @@ function ReviewShell({
                     threadRootId={rootId}
                     editMessages={editMessages}
                     {...(attachment.kind === "video" && includeTime
-                      ? { mediaTimeSeconds: currentTime }
+                      ? {
+                          mediaTimeSeconds: currentTime,
+                          replyParentId: attachmentOwner?.id ?? rootId,
+                          mediaTargetUrl: attachment.url,
+                        }
                       : {})}
                     hideMediaTimeIndicator
                   />
@@ -554,6 +599,8 @@ function ReviewShell({
               scope={scope}
               channelId={channelId}
               rootId={rootId}
+              replyParentId={attachmentOwner?.id ?? rootId}
+              mediaTargetUrl={attachment.url}
               videoRef={video}
               extensions={extensions}
             />
@@ -578,26 +625,40 @@ function ReviewShell({
 }
 
 function ReviewComments({
+  channelId,
+  threadRootId,
   replies,
   selectedComment,
+  readingAnchor,
   limited,
   session,
   scope,
   extensions,
   seek,
+  canSeekTimecode,
   selectAttachment,
 }: {
+  channelId: string;
+  threadRootId: string;
   replies: ReturnType<ThreadView["snapshot"]>["replies"];
   selectedComment?: string | undefined;
+  readingAnchor: string | undefined;
   limited: boolean;
   session: RelaySession;
   scope: string;
   extensions?: ConversationExtensions | undefined;
   seek?: (seconds: number) => void;
+  canSeekTimecode(row: ChannelMessage): boolean;
   selectAttachment(attachment: Attachment, initialTime: number): void;
 }) {
   const profiles = useRowProfiles(session.profiles, replies);
   const agentPubkeys = useKnownAgentPubkeys(session, profiles);
+  const activity = useActivityPresentation(
+    replies,
+    session.agentActivity,
+    agentPubkeys,
+  );
+  const stableActivity = useStableRowActivity();
   const comments = useRef<HTMLElement>(null);
   useEffect(() => {
     if (selectedComment)
@@ -605,6 +666,22 @@ function ReviewComments({
         ?.querySelector(`[data-review-comment="${selectedComment}"]`)
         ?.scrollIntoView?.({ block: "nearest" });
   }, [selectedComment]);
+  // Open where the reader was in the thread behind the review. Replies load in
+  // pages, so wait for the anchor to arrive, then place it once.
+  const anchored = useRef(false);
+  const anchorLoaded = replies.some((row) => row.id === readingAnchor);
+  useLayoutEffect(() => {
+    const section = comments.current;
+    const row =
+      anchorLoaded &&
+      section?.querySelector(
+        `[data-review-comment="${CSS.escape(readingAnchor ?? "")}"]`,
+      );
+    if (anchored.current || !section || !row) return;
+    anchored.current = true;
+    section.scrollTop +=
+      row.getBoundingClientRect().top - section.getBoundingClientRect().top;
+  }, [readingAnchor, anchorLoaded]);
   const authors = [...new Set(replies.flatMap(rowProfileIds))].sort().join(":");
   const profileGeneration = useProfileGeneration(session.profiles);
   useEffect(() => {
@@ -624,37 +701,52 @@ function ReviewComments({
         className={styles.mediaReviewThread}
         aria-label="Media comments"
       >
-        {replies.map((row, index) => (
-          <div
-            key={row.id}
-            data-review-comment={row.id}
-            data-selected={selectedComment === row.id || undefined}
-            className={styles.mediaReviewComment}
-          >
-            <MessageRow
-              row={row}
-              extensions={extensions}
-              session={session}
-              scope={scope}
-              profile={profiles.get(row.authorId)}
-              agentPubkeys={agentPubkeys}
-              media={session.media}
-              onOpenLink={() => false}
-              day={
-                index === 0 ||
-                new Date(
-                  (replies[index - 1]?.createdAt ?? 0) * 1000,
-                ).toDateString() !==
-                  new Date(row.createdAt * 1000).toDateString()
-              }
-              retry={session.messages.retry}
-              onOpenMediaReview={(_rowId, attachment, seconds) =>
-                selectAttachment(attachment, seconds)
-              }
-              {...(seek ? { onMediaTime: seek } : {})}
-            />
-          </div>
-        ))}
+        {replies.map((row, index) => {
+          return (
+            <div
+              key={row.id}
+              data-review-comment={row.id}
+              data-selected={selectedComment === row.id || undefined}
+              className={styles.mediaReviewComment}
+            >
+              <MessageRow
+                row={row}
+                recordedActivity={stableActivity.activity(
+                  row.id,
+                  activity.byRow.get(row.id),
+                  "history",
+                )}
+                extensions={extensions}
+                session={session}
+                scope={scope}
+                profile={profiles.get(row.authorId)}
+                agentPubkeys={agentPubkeys}
+                media={session.media}
+                onOpenLink={() => false}
+                day={
+                  index === 0 ||
+                  new Date(
+                    (replies[index - 1]?.createdAt ?? 0) * 1000,
+                  ).toDateString() !==
+                    new Date(row.createdAt * 1000).toDateString()
+                }
+                retry={session.messages.retry}
+                onOpenMediaReview={(_rowId, attachment, seconds) =>
+                  selectAttachment(attachment, seconds)
+                }
+                {...(seek && canSeekTimecode(row) ? { onMediaTime: seek } : {})}
+              />
+            </div>
+          );
+        })}
+        <TypingIndicator
+          session={session}
+          channelId={channelId}
+          threadRootId={threadRootId}
+          audience="agents"
+          inFlow
+          previousAuthor={replies.at(-1)?.authorId}
+        />
         {!replies.length && (
           <p className={styles.threadNote}>
             No comments yet. Add the first below.

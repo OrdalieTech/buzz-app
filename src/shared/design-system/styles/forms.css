@@ -396,6 +396,22 @@
     width: var(--anchor-width);
     overflow-wrap: anywhere;
   }
+  /* Roughly four avatar-and-detail rows plus search. The viewport may make
+     the list shorter; keep search fixed and every result scrollable. */
+  .buzz-select-popup[data-combobox-size="compact"] {
+    display: flex;
+    flex-direction: column;
+    max-height: min(20rem, var(--available-height));
+    overflow: hidden;
+  }
+  .buzz-select-popup[data-combobox-size="compact"] > :not([role="listbox"]) {
+    flex-shrink: 0;
+  }
+  .buzz-select-popup[data-combobox-size="compact"] > [role="listbox"] {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
   .buzz-combobox-empty:not(:empty) {
     padding: var(--space-2) var(--space-3);
     color: var(--text-subtle);

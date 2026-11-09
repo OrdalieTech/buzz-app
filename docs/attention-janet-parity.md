@@ -21,6 +21,8 @@ Terms:
 | Interests that run at the same time | 8 | 8, beside the mention lane | Same |
 | Jobs that wait for one Interest | 8 | 8 (32 in total for watch work) | Same |
 | Live events of a watch wait while that watch catches up | Yes | Yes. At most 512 events or 4 MiB wait. | Same |
+| Kinds catch-up reads | Kind 9 only. Other kinds get only the recent replay that a reconnect sends. | Each watch's own kinds. A watch that names none reads the kinds live hears, as a relay read must name its kinds. | Intended difference |
+| Catch-up while connected | — | A tick moves a stream's checkpoint to now only when live covers it: one channel whose route is live, and kinds live hears. Any other stream, a watch on every channel included, is read again about every 30 s, up to 10 s before now. Each such read covers the last 16 minutes again (the relay's 15-minute timestamp drift plus 1 minute for clock skew), so an event stored late with an older time is still found, also after a read cut short by a restart. The events read are kept as heard, so none is given twice. Past 256 of them, the checkpoint moves past the oldest that were read. | Intended difference |
 | Catch-up page limit | 256 pages or 8 MiB for a named channel; none for `channels: "all"` | 256 pages or 8 MiB for both | Intended difference |
 | Author and reply selection | A `filter` expression (`author ==`, `content ==`, `is_reply`, `!`, `&&`, `||`). A lone `root` tag or an unmarked `e` tag counts as a reply. | The relay spec's fields `authors`, `exclude_authors` and `is_reply`. Only a NIP-10 `reply` marker makes a reply, as in relay ingest and thread display. Startup converts a stored `filter` once; `content ==`, `false` and mixed `||` cannot be converted, so such a watch is skipped and shown for repair. | Intended difference |
 | Watch tags are sent in the catch-up read | Yes | No. The relay applies most tag filters after its page limit, so a tagged read can return an empty page while older matches remain. The watch's own match still checks the tags, so results are the same. | Intended difference |
@@ -35,7 +37,7 @@ Terms:
 
 ## Configuration compatibility
 
-These extensions retain the `agent-attention/v1` schema name. Older readers reject fields and watch types they do not support, retain the objects for repair, and do not execute them. Janet does not support conversation delivery addresses or plugin source watches. Conversion to Janet must reject unsupported objects rather than silently dropping a source or its destination. Converter enforcement of this requirement remains unverified.
+These extensions retain the `agent-attention/v1` schema name. Older readers reject fields and watch types they do not support, retain the objects for repair, and do not execute them. Janet does not support conversation delivery addresses or plugin source watches. Watches saved under an Interest an older reader cannot apply, because it is paused or has a `title` or `summary`, carry a storage-only `interest_paused` envelope that also preserves timer progress, completed-source state, and wake history across older-reader rewrites. Older readers reject and retain those watches too, so they never run them without their instructions; supported readers remove the marker only after validating the parent. Active Interests omit the pause field on disk so older readers retain their instructions. Conversion to Janet must reject unsupported objects rather than silently dropping a source or its destination. Converter enforcement of this requirement remains unverified.
 
 ## Known limit
 

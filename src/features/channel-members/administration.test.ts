@@ -9,12 +9,17 @@ import { PublishRejected } from "../relay/outbox";
 import { createRelaySession } from "../relay/session";
 import { matchesEvent } from "../relay/projection";
 import { SOLO_LABEL } from "../solo/labels";
-import { createMemberAdministration } from "./administration";
+import {
+  administerMember,
+  createMemberAdministration,
+  type MemberAdministrationState,
+} from "./administration";
 import {
   authorizeMemberChange,
   memberAuthority,
   validateMemberAdministrationTemplate,
   type MemberChange,
+  type MemberRole,
 } from "./administration-protocol";
 
 const key = new Uint8Array(32).fill(2);
@@ -1163,4 +1168,98 @@ it("authorizes a system-channel add only for a non-member other than the viewer 
   expect(add({ role: "owner" as never })).toThrow(
     /Membership or permissions changed/,
   );
+});
+
+it("administers one member change from a fresh roster read", async () => {
+  const roles: Record<string, string> = { [target]: "member" };
+  let after: object = {};
+  const state = (value: object) => value as MemberAdministrationState;
+  const admin = {
+    refresh: vi.fn(async () => {}),
+    run: vi.fn(async () => {}),
+    snapshot: vi.fn(() =>
+      state(
+        admin.run.mock.calls.length
+          ? { status: "ready", authority: { roles }, ...after }
+          : { status: "ready", authority: { roles } },
+      ),
+    ),
+  };
+  const remove = (role: MemberRole | undefined) =>
+    role ? ({ expectedRole: role, role: "remove" } as const) : undefined;
+  const settled = (status: string, error?: string) => {
+    after = {
+      operation: { change: { pubkey: target, role: "remove" }, status },
+      ...(error ? { error } : {}),
+    };
+  };
+
+  settled("confirmed");
+  await expect(administerMember(admin, id, target, remove)).resolves.toEqual({
+    status: "confirmed",
+  });
+  expect(admin.refresh).toHaveBeenCalledWith(id);
+  expect(admin.run).toHaveBeenCalledWith(id, {
+    pubkey: target,
+    expectedRole: "member",
+    role: "remove",
+  });
+
+  // The roster already shows the result: nothing is sent.
+  admin.run.mockClear();
+  await expect(administerMember(admin, id, otherId, remove)).resolves.toEqual({
+    status: "confirmed",
+  });
+  expect(admin.run).not.toHaveBeenCalled();
+
+  settled("failed", "Rejected");
+  await expect(administerMember(admin, id, target, remove)).resolves.toEqual({
+    status: "failed",
+    error: "Rejected",
+  });
+  settled("uncertain", "May have taken effect");
+  await expect(administerMember(admin, id, target, remove)).resolves.toEqual({
+    status: "uncertain",
+    error: "May have taken effect",
+  });
+  // A pending, or someone else's, operation is no confirmation.
+  settled("pending");
+  await expect(administerMember(admin, id, target, remove)).resolves.toEqual({
+    status: "uncertain",
+  });
+  after = {
+    operation: {
+      change: { pubkey: otherId, role: "remove" },
+      status: "confirmed",
+    },
+  };
+  await expect(administerMember(admin, id, target, remove)).resolves.toEqual({
+    status: "uncertain",
+  });
+
+  admin.run.mockRejectedValueOnce(new Error("Offline"));
+  await expect(administerMember(admin, id, target, remove)).resolves.toEqual({
+    status: "failed",
+    error: "Offline",
+  });
+
+  admin.snapshot.mockReturnValue(
+    state({ status: "error", authority: { roles } }),
+  );
+  admin.run.mockClear();
+  await expect(administerMember(admin, id, target, remove)).resolves.toEqual({
+    status: "failed",
+    error: "Roles unavailable",
+  });
+  await expect(
+    administerMember(admin, id, target, remove, "Try again."),
+  ).resolves.toEqual({ status: "failed", error: "Try again." });
+  admin.snapshot.mockReturnValue(
+    state({ status: "error", authority: { roles }, error: "Read failed" }),
+  );
+  await expect(administerMember(admin, id, target, remove)).resolves.toEqual({
+    status: "failed",
+    error: "Read failed",
+  });
+  expect(admin.run).not.toHaveBeenCalled();
 });

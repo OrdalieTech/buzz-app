@@ -86,13 +86,14 @@ it("shows the host while finding, then only published facts, gating Join on ever
   expect(screen.queryByRole("button", { name: /join/i })).toBeNull();
   await act(async () => info.resolve(Response.json(buzz)));
   expect(joinCommunity()).toBeVisible();
-  expect(screen.getByText(host)).toHaveClass("font-mono");
+  expect(screen.getByText(host)).toHaveClass("text-body");
   expect(document.querySelector("img")).toHaveAttribute(
     "src",
     "https://cdn.example.com/icon.png",
   );
   // Nothing the relay does not publish: no name, description, counts or version.
   expect(document.body).not.toHaveTextContent(/member|owner|invite|v1\.4/i);
+  expect(screen.getByText(url)).toBeVisible();
   const terms = screen.getByRole("link", { name: "Terms of Service" });
   expect(terms).toHaveAttribute("href", `${url}/api/join-policy/terms`);
   expect(terms).toHaveAttribute("target", "_blank");
@@ -125,6 +126,7 @@ it("shows the host while finding, then only published facts, gating Join on ever
     {
       url,
       host,
+      name: "Buzz Relay",
       icon: "https://cdn.example.com/icon.png",
       self,
       policy,
@@ -179,6 +181,7 @@ it("with onFound a found community is handed over while the lookup page stays", 
     expect(onFound).toHaveBeenCalledWith({
       url,
       host,
+      name: "Buzz Relay",
       icon: "https://cdn.example.com/icon.png",
       self,
       policy,
@@ -231,6 +234,128 @@ it("holds the page while onJoin is pending and leaves a failed join's meaning to
   expect(screen.queryByRole("alert")).toBeNull();
   expect(joinCommunity()).toBeVisible();
   expect(onJoin).toHaveBeenCalledTimes(2);
+});
+
+it("with autoJoin a found community asking no consent joins at once, holding the page without Join Community, and Join Community follows a join that returns", async () => {
+  const request = relay(() => ({
+    "/": Response.json(buzz),
+    "/api/join-policy": new Response("missing", { status: 404 }),
+  }));
+  const pending = deferred<void>();
+  const onJoin = vi
+    .fn<(found: unknown, consent: unknown) => Promise<void>>()
+    .mockReturnValueOnce(pending.promise);
+  const onCancel = vi.fn();
+  const user = userEvent.setup();
+  render(
+    <FindCommunity
+      url={url}
+      onCancel={onCancel}
+      onJoin={onJoin}
+      autoJoin
+      request={request}
+    />,
+  );
+  await waitFor(() =>
+    expect(onJoin).toHaveBeenCalledWith(
+      expect.objectContaining({ url, host }),
+      { adult: false, agreed: false },
+    ),
+  );
+  expect(
+    screen.getByRole("heading", { name: "Joining community" }),
+  ).toBeVisible();
+  expect(joinCommunity()).toBeNull();
+  expect(screen.queryByRole("button", { name: /join/i })).toBeNull();
+  expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+  await user.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(onCancel).not.toHaveBeenCalled();
+  // A join that returns without the caller moving on can be tried again.
+  await act(async () => pending.resolve());
+  expect(joinCommunity()).toBeVisible();
+  expect(join()).toBeEnabled();
+  expect(onJoin).toHaveBeenCalledTimes(1);
+});
+
+it("with autoJoin a policy's consent is still asked on Join Community", async () => {
+  const request = relay(() => ({
+    "/": Response.json(buzz),
+    "/api/join-policy": Response.json({ policy }),
+  }));
+  const onJoin = vi.fn();
+  render(
+    <FindCommunity
+      url={url}
+      onCancel={vi.fn()}
+      onJoin={onJoin}
+      autoJoin
+      request={request}
+    />,
+  );
+  expect(
+    await screen.findByRole("heading", { name: "Join Community" }),
+  ).toBeVisible();
+  expect(join()).toBeDisabled();
+  expect(onJoin).not.toHaveBeenCalled();
+});
+
+it("a community whose consent was given asks nothing on Join Community, and Join attests it", async () => {
+  const request = relay(() => ({
+    "/": Response.json(buzz),
+    "/api/join-policy": Response.json({ policy }),
+  }));
+  const onJoin = vi.fn();
+  const consentGiven = vi.fn(() => true);
+  const user = userEvent.setup();
+  render(
+    <FindCommunity
+      url={url}
+      onCancel={vi.fn()}
+      onJoin={onJoin}
+      consentGiven={consentGiven}
+      request={request}
+    />,
+  );
+  expect(
+    await screen.findByRole("heading", { name: "Join Community" }),
+  ).toBeVisible();
+  expect(consentGiven).toHaveBeenCalledWith(
+    expect.objectContaining({ url, policy }),
+  );
+  expect(screen.queryByRole("checkbox")).toBeNull();
+  await user.click(join());
+  expect(onJoin).toHaveBeenCalledWith(expect.objectContaining({ url }), {
+    adult: true,
+    agreed: true,
+  });
+});
+
+it("with autoJoin a community whose consent was given joins at once, attesting it", async () => {
+  const request = relay(() => ({
+    "/": Response.json(buzz),
+    "/api/join-policy": Response.json({ policy }),
+  }));
+  const onJoin = vi.fn(() => new Promise<void>(() => {}));
+  render(
+    <FindCommunity
+      url={url}
+      onCancel={vi.fn()}
+      onJoin={onJoin}
+      autoJoin
+      consentGiven={() => true}
+      request={request}
+    />,
+  );
+  await waitFor(() =>
+    expect(onJoin).toHaveBeenCalledWith(expect.objectContaining({ url }), {
+      adult: true,
+      agreed: true,
+    }),
+  );
+  expect(
+    screen.getByRole("heading", { name: "Joining community" }),
+  ).toBeVisible();
+  expect(joinCommunity()).toBeNull();
 });
 
 it("announces the lookup only after a second, and again a second after Retry", async () => {
@@ -359,7 +484,9 @@ it.each([
   ],
   [
     "a Buzz relay with no community here",
-    Response.json({ name: "Buzz Relay" }),
+    new Response("relay: no community is configured for this host", {
+      status: 404,
+    }),
     "No community is set up at this address.",
   ],
 ])("%s offers only Cancel", async (_label, answer, message) => {

@@ -104,10 +104,18 @@
 .popup[data-mention] .preview:has([data-team-avatars]) {
   width: auto;
 }
-.popup[data-mention] .label:has([data-recipient-key]) {
+/* The name ellipsizes; the agent mark beside it never does. */
+.nameRow {
   display: flex;
+  min-width: 0;
   align-items: center;
-  gap: var(--space-2);
+}
+.agentMark {
+  display: inline-flex;
+  flex-shrink: 0;
+  width: 1em;
+  height: 1em;
+  margin-inline-start: var(--space-1);
 }
 .name {
   display: block;
@@ -117,12 +125,8 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.popup[data-mention] [data-recipient-key] {
-  flex: 0 0 12ch;
-  overflow: hidden;
-  white-space: nowrap;
-  font-family: var(--font-mono);
-  color: var(--text-metadata);
+.nameRow .name {
+  flex: 0 1 auto;
 }
 .option[aria-disabled="true"] {
   color: var(--text-subtle);

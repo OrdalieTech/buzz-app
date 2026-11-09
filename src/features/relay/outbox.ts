@@ -13,6 +13,10 @@ import {
   MAX_CONTENT_BYTES,
   MAX_EVENT_BYTES,
 } from "../agents/catalog-envelope";
+import {
+  CANVAS_MAX_EVENT_BYTES,
+  LIVE_CANVAS_BYTES,
+} from "../channel-templates/canvas-limits.ts";
 
 export type Delivery = "sending" | "accepted" | "unknown" | "failed" | "seen";
 /** Durable, caller-owned recovery state committed with the operation. */
@@ -44,6 +48,14 @@ export type OutgoingEvent = Readonly<{
    * device, being asked to wait, or going unanswered. */
   refused?: true | undefined;
 }>;
+type OutboxInput = Pick<EventTemplate, "kind" | "content" | "tags"> & {
+  /** NIP-AP: created_at of the newest observed head this event replaces. */
+  supersedes?: number;
+};
+type Replacement = {
+  input(): OutboxInput | undefined;
+  queued(id: string): void;
+};
 export interface Outbox {
   /** Outstanding operations only. Confirmed events live in the session's retained data. */
   snapshot(): readonly OutgoingEvent[];
@@ -53,17 +65,26 @@ export interface Outbox {
   observeSend(listener: SendObserver): () => void;
   supports(kind: number): boolean;
   ready(): Promise<void>;
+  /** Fresh shared-journal ownership without importing another window's operations. */
+  recovery(key: string): Promise<OutgoingEvent | undefined>;
   send(
-    input: Pick<EventTemplate, "kind" | "content" | "tags"> & {
-      /** NIP-AP: created_at of the newest observed head this event replaces. */
-      supersedes?: number;
-    },
+    input: OutboxInput,
     recovery?: OutboxRecovery,
     active?: () => boolean,
   ): string;
-  /** Attach caller-owned recovery to an existing receipt before resuming it. */
-  recover(id: string, recovery: OutboxRecovery): Promise<void>;
-  acknowledge(id: string): Promise<void>;
+  /** Establish durable recovery, then synchronously consume its source while
+   * holding the receipt's shared dismissal lock. */
+  recover(
+    id: string,
+    recovery: OutboxRecovery,
+    consume?: () => void,
+  ): Promise<void>;
+  /** An expired no-role invitation may be resolved by fresh command/roster readback. */
+  acknowledge(
+    id: string,
+    verifyRetirement?: (event: EventData) => Promise<"recorded" | undefined>,
+    replacement?: Replacement,
+  ): Promise<void>;
   retry(id: string, active?: () => boolean): void;
   dismiss(id: string): Promise<void>;
   /** Durable explicit dismissal, with delivery evidence at removal. */
@@ -75,9 +96,18 @@ type SendObserver = (
 ) => ((pending: readonly EventData[]) => void) | undefined;
 export type LocalEvents = Pick<Outbox, "snapshot" | "subscribe">;
 export interface OutboxStorage {
+  /** Serialize receipt adoption and dismissal across windows. */
+  lock?<T>(id: string, run: () => Promise<T>): Promise<T>;
+  /** Relinquish incremental write ownership after observing external removal. */
+  forget?(id: string): void;
   close?(): void;
-  load(): readonly OutgoingEvent[] | Promise<readonly OutgoingEvent[]>;
-  save(operations: readonly OutgoingEvent[]): void | Promise<void>;
+  load(options?: {
+    readOnly?: boolean;
+  }): readonly OutgoingEvent[] | Promise<readonly OutgoingEvent[]>;
+  save(
+    operations: readonly OutgoingEvent[],
+    options?: { force?: string },
+  ): void | Promise<void>;
 }
 export class PublishRejected extends Error {
   /** The relay's own refusal text, when it sent one; `message` stays the
@@ -98,6 +128,28 @@ export { browserOutboxStorage } from "./outbox-storage";
 const abortError = () => new DOMException("Relay session closed", "AbortError");
 const MAX_PENDING = 256;
 const MAX_CONFIRMED = 2048;
+/** Unresolved Canvas saves have their own allowance, so a few large canvases
+ * never use up the room that ordinary messages need. */
+const PENDING_MESSAGE_BYTES = 2 * 1024 * 1024;
+const PENDING_CANVAS_BYTES = 4 * 1024 * 1024;
+const CONFIRMED_BYTES = 8 * 1024 * 1024;
+/** Stored delivery diagnostics are clipped to this many characters. */
+const ERROR_CHARS = 256;
+/** Everything a pending record can gain after admission besides its signed
+ * copy: two signatures, `signed`, delivery state and flags, and an error of
+ * at most `ERROR_CHARS` characters, each escaped to at most 6 bytes. */
+const LIFECYCLE_BYTES = 512 + 6 * ERROR_CHARS;
+const clip = (error: string) => error.slice(0, ERROR_CHARS);
+const unsigned = ({ sig: _, ...event }: EventData & { sig?: string }) => event;
+/** Any journal save accepts: the `[…]` list, confirmed records with their
+ * commas, and both pending allowances, whose records never outgrow their
+ * charges and which already count their own `[]` and commas. */
+const SAVED_BYTES =
+  2 +
+  CONFIRMED_BYTES +
+  MAX_CONFIRMED +
+  PENDING_MESSAGE_BYTES +
+  PENDING_CANVAS_BYTES;
 
 /** One journal owns pending delivery and bounded confirmed retention. Views receive one change stream. */
 export function createOutbox(
@@ -145,12 +197,40 @@ export function createOutbox(
       throw new DOMException("Channel addition cancelled", "AbortError");
   };
   let snapshot: readonly OutgoingEvent[] = Object.freeze([]);
+  // Hydrated receipts are observations, not delivery owned by this window.
+  const restoredReceipts = new Set<string>();
   let visible: readonly OutgoingEvent[] = snapshot;
   let finalSnapshot: readonly OutgoingEvent[] | undefined;
   let finalVisible: readonly OutgoingEvent[] | undefined;
-  const completed = new ByteLru<OutgoingEvent>(MAX_CONFIRMED, 8 * 1024 * 1024);
+  const completed = new ByteLru<OutgoingEvent>(MAX_CONFIRMED, CONFIRMED_BYTES);
   const sizes = new WeakMap<OutgoingEvent, number>();
-  let pendingBytes = 0;
+  /** Pending charges, split by allowance. A record is charged its largest
+   * size over its delivery lifecycle, so it never outgrows its admission. */
+  const pendingSize = (items: readonly OutgoingEvent[]) => {
+    const total = { messages: 2, canvases: 2 };
+    for (const item of items) {
+      let size = sizes.get(item);
+      if (size === undefined) {
+        size =
+          2 * byteSize(unsigned(item.event)) +
+          (item.recovery ? byteSize(item.recovery) + 16 : 0) +
+          LIFECYCLE_BYTES;
+        sizes.set(item, size);
+      }
+      total[item.event.kind === 40100 ? "canvases" : "messages"] += size + 1;
+    }
+    return total;
+  };
+  /** Refuse what an allowance cannot hold, before it joins the outbox. */
+  const admit = (items: readonly OutgoingEvent[], kind: number) => {
+    const charged = pendingSize(items);
+    if (
+      kind === 40100
+        ? charged.canvases > PENDING_CANVAS_BYTES
+        : charged.messages > PENDING_MESSAGE_BYTES
+    )
+      throw new Error("Outbox storage is full");
+  };
   const listeners = new Set<() => void>();
   const localListeners = new Set<() => void>();
   const dismissListeners = new Set<(item: OutgoingEvent) => void>();
@@ -232,17 +312,6 @@ export function createOutbox(
   let hydrated = false;
   let durable = Promise.resolve();
   const notify = () => {
-    pendingBytes = snapshot.reduce(
-      (sum, item) => {
-        let size = sizes.get(item);
-        if (size === undefined) {
-          size = byteSize(item);
-          sizes.set(item, size);
-        }
-        return sum + size;
-      },
-      2 + Math.max(0, snapshot.length - 1),
-    );
     visible = Object.freeze([
       ...completed.entries().map(([, item]) => item),
       ...snapshot,
@@ -250,7 +319,11 @@ export function createOutbox(
     for (const listener of localListeners) notifyListener(listener);
     for (const listener of listeners) notifyListener(listener);
   };
-  const persist = (id: string, action?: "acknowledge" | "dismiss") => {
+  const persist = (
+    id: string,
+    action?: "acknowledge" | "dismiss" | "recover",
+    addition?: OutgoingEvent,
+  ) => {
     const queued = profiling.start("outbox.queue", id);
     const work = durable
       .catch(() => {})
@@ -263,8 +336,8 @@ export function createOutbox(
         queued();
         // Hydration may have added restored intent while this commit waited.
         // Commit current state so no intermediate transaction erases that intent.
-        const records =
-          action === "dismiss"
+        const records = [
+          ...(action === "dismiss"
             ? visible.filter((item) => item.event.id !== id)
             : action === "acknowledge"
               ? visible.map((item) =>
@@ -276,15 +349,15 @@ export function createOutbox(
                       }
                     : item,
                 )
-              : visible;
-        const bytes =
-          action === "dismiss"
-            ? byteSize(snapshot.filter((item) => item.event.id !== id))
-            : pendingBytes;
+              : visible),
+          ...(addition ? [addition] : []),
+        ];
         return profiling.measureAsync("outbox.persist", id, async () => {
-          if (bytes > 2 * 1024 * 1024)
-            throw new Error("Outbox storage is full");
-          await storage.save(records);
+          if (action === "recover") await storage.save(records, { force: id });
+          else await storage.save(records);
+          // The replacement joins visible intent only with durable retirement.
+          // Other queued saves must never observe two unresolved recovery keys.
+          if (addition) snapshot = Object.freeze([...snapshot, addition]);
           if (action === "dismiss") {
             // Commit removal inside the serialized write, before a later save
             // can capture state. Failed storage never exposes a temporary absence.
@@ -345,7 +418,7 @@ export function createOutbox(
     if (
       !Array.isArray(loaded) ||
       loaded.length > MAX_PENDING + MAX_CONFIRMED ||
-      byteSize(loaded) > 10 * 1024 * 1024
+      byteSize(loaded) > SAVED_BYTES
     )
       throw new Error("Saved outbox exceeds its budget");
   }
@@ -353,7 +426,13 @@ export function createOutbox(
     const signed = item.signed
       ? eventDto(JSON.parse(JSON.stringify(item.signed)))
       : undefined;
-    const event = signed ?? item.event;
+    // Trust the verified copy, in the stored row's own shape, so restoring
+    // never changes a row's size.
+    const event = signed
+      ? item.event && "sig" in item.event
+        ? signed
+        : unsigned(signed)
+      : item.event;
     if (!event || event.pubkey !== viewer || getEventHash(event) !== event.id)
       throw new Error("Saved outbox event is invalid");
     return Object.freeze({
@@ -373,7 +452,7 @@ export function createOutbox(
           : item.delivery === "failed"
             ? "failed"
             : "unknown",
-      ...(item.error ? { error: item.error } : {}),
+      ...(item.error ? { error: clip(item.error) } : {}),
     });
   }
   function restore(restored: readonly OutgoingEvent[]) {
@@ -394,6 +473,7 @@ export function createOutbox(
           (item.event.kind === 9007 && confirmedKeep?.(item.event)))
       )
         completed.set(item.event.id, item);
+    for (const item of pending) restoredReceipts.add(item.event.id);
     snapshot = Object.freeze([...pending, ...snapshot]);
     notify();
   }
@@ -587,18 +667,20 @@ export function createOutbox(
             !(error instanceof PublishNotSent)
               ? true
               : undefined,
-          error: awaitsReceipt(latest.event)
-            ? publishing && !(error instanceof PublishRejected)
-              ? "Workflow delivery could not be confirmed; inspect recent activity before submitting another command."
-              : "Workflow command rejected; retain the draft and refresh the saved configuration."
-            : `${
-                attempt.previousDelivery === "unknown" ||
-                attempt.previousDelivery === "accepted"
-                  ? error instanceof PublishRejected
-                    ? "Retry blocked: "
-                    : "Retry failed: "
-                  : ""
-              }${error instanceof Error ? error.message : String(error)}`,
+          error: clip(
+            awaitsReceipt(latest.event)
+              ? publishing && !(error instanceof PublishRejected)
+                ? "Workflow delivery could not be confirmed; inspect recent activity before submitting another command."
+                : "Workflow command rejected; retain the draft and refresh the saved configuration."
+              : `${
+                  attempt.previousDelivery === "unknown" ||
+                  attempt.previousDelivery === "accepted"
+                    ? error instanceof PublishRejected
+                      ? "Retry blocked: "
+                      : "Retry failed: "
+                    : ""
+                }${error instanceof Error ? error.message : String(error)}`,
+          ),
         });
       if (publishing && latest?.signed && !(error instanceof PublishRejected))
         onAccepted(latest.signed, delivery !== "unknown");
@@ -638,6 +720,152 @@ export function createOutbox(
       set.delete(listener);
     };
   };
+  /** Persist replacement intent and retire its verified predecessor in one save. */
+  function enqueue(
+    { supersedes, ...input }: OutboxInput,
+    recovery?: OutboxRecovery,
+    active?: () => boolean,
+    replacing?: string,
+  ) {
+    if (active && !active())
+      throw new DOMException("Channel addition cancelled", "AbortError");
+    if (closed) throw abortError();
+    if (storageError) throw new Error(storageError);
+    const savedRecovery = recoveryValue(recovery);
+    if (
+      savedRecovery &&
+      (!hydrated ||
+        snapshot.some(
+          (item) =>
+            item.event.id !== replacing &&
+            item.recovery?.key === savedRecovery.key,
+        ))
+    )
+      throw new Error("Recover the earlier message before sending another");
+    if (
+      !Number.isInteger(input.kind) ||
+      input.kind < 0 ||
+      input.kind > 65535 ||
+      !outbox.supports(input.kind)
+    )
+      throw new Error("This relay connection cannot publish that event kind");
+    const catalog = isCatalogKind(input.kind);
+    if (
+      (input.kind === 9 && !input.content.trim()) ||
+      // NIP-AP admits larger public definitions than ordinary input.
+      (catalog
+        ? bytes(input.content) > MAX_CONTENT_BYTES ||
+          byteSize(input) > MAX_EVENT_BYTES
+        : // A live Canvas carries up to its own content limit.
+          input.kind === 40100
+          ? bytes(input.content) > LIVE_CANVAS_BYTES ||
+            byteSize(input) > CANVAS_MAX_EVENT_BYTES
+          : byteSize(input) > OUTBOX_INPUT_MAX_BYTES)
+    )
+      throw new Error("Message is empty or too large");
+    if (snapshot.length >= MAX_PENDING)
+      throw new Error(
+        "Too many outstanding operations; resolve or dismiss a pending operation",
+      );
+    // Rendered messages carry send order within their second; the optimistic
+    // row and the signed event share this exact ms and created_at.
+    const channelId = channelRowKind(input.kind)
+      ? input.tags.find(([name]) => name === "h")?.[1]
+      : undefined;
+    const ms = channelId ? clock.next(channelId) : Date.now();
+    let createdAt = Math.floor(ms / 1000);
+    if (input.kind === 40003) {
+      if (!hydrated)
+        throw new Error("Message history is still loading. Try again.");
+      const target = input.tags.find(([name]) => name === "e")?.[1];
+      const channel = input.tags.find(([name]) => name === "h")?.[1];
+      // Edits use second precision on every client. Preserve retained local
+      // submission order without changing the protocol's event-ID tie-break.
+      for (const { event } of visible) {
+        if (
+          target &&
+          channel &&
+          event.kind === 40003 &&
+          event.pubkey === viewer &&
+          event.tags.some(([name, id]) => name === "e" && id === target) &&
+          event.tags.some(([name, id]) => name === "h" && id === channel)
+        )
+          createdAt = Math.max(createdAt, event.created_at + 1);
+      }
+      // Stay well inside the signer's 15-minute clock-skew allowance.
+      if (createdAt > Math.floor(ms / 1000) + 60)
+        throw new Error(
+          "Edits are arriving too quickly or your clock changed. Wait a moment and try again.",
+        );
+    }
+    if (catalog) {
+      // NIP-AP: max(now, head + 1) over the observed relay head and this
+      // device's retained writes, so a replacement can never lose or tie.
+      if (supersedes !== undefined)
+        createdAt = Math.max(createdAt, supersedes + 1);
+      const d = input.tags.find(([name]) => name === "d")?.[1];
+      for (const { event } of visible)
+        if (
+          event.kind === input.kind &&
+          event.pubkey === viewer &&
+          event.tags.some(([name, value]) => name === "d" && value === d)
+        )
+          createdAt = Math.max(createdAt, event.created_at + 1);
+      if (createdAt > Math.floor(ms / 1000) + 60)
+        throw new Error(
+          "Sharing is changing too quickly or your clock changed. Wait a moment and try again.",
+        );
+    }
+    const template = {
+      ...input,
+      pubkey: viewer,
+      created_at: createdAt,
+      tags: [
+        ...input.tags.map((tag) => [...tag]),
+        ["client-id", crypto.randomUUID()],
+        ...(channelId ? [["ms", String(ms % 1000)]] : []),
+      ],
+    };
+    const event = Object.freeze({
+      ...template,
+      tags: Object.freeze(
+        template.tags.map((tag) => Object.freeze(tag)),
+      ) as unknown as string[][],
+      id: getEventHash(template),
+    });
+    const operation = Object.freeze({
+      event,
+      delivery: "sending" as const,
+      ...(savedRecovery ? { recovery: savedRecovery } : {}),
+      ...(active ? { guarded: true } : {}),
+    });
+    admit([...snapshot, operation], event.kind);
+    if (active) admissionGates.set(event.id, active);
+    captureSend(event);
+    if (!replacing)
+      profiling.measure("send.local", event.id, () => {
+        snapshot = Object.freeze([...snapshot, operation]);
+        notify();
+      });
+    const intent = ready.then(() => {
+      if (storageError) throw new Error(storageError);
+      return persist(
+        replacing ?? event.id,
+        replacing ? "acknowledge" : undefined,
+        replacing ? operation : undefined,
+      );
+    });
+    void intent.catch(() => {
+      if (replacing) deliveryWork.delete(event.id);
+    });
+    if (replacing)
+      void intent.then(
+        () => schedule(event.id),
+        () => {},
+      );
+    else schedule(event.id, intent);
+    return { id: event.id, persisted: intent };
+  }
   const outbox: Outbox = Object.freeze({
     snapshot: () => finalSnapshot ?? snapshot,
     subscribe: (listener: () => void) => subscribe(listeners, listener),
@@ -654,44 +882,146 @@ export function createOutbox(
       if (closed) throw abortError();
       if (storageError) throw new Error(storageError);
     },
-    async recover(id: string, recovery: OutboxRecovery) {
+    async recovery(key: string) {
       await outbox.ready();
-      const saved = recoveryValue(recovery);
-      if (!saved) throw new Error("Invalid outbox recovery state");
-      const item = visible.find((entry) => entry.event.id === id);
-      if (!item || dismissing.has(id))
-        throw new Error(
-          "The original operation is unavailable. Refresh before retrying.",
-        );
-      if (item.acknowledged) return;
-      if (
-        (item.recovery &&
-          (item.recovery.key !== saved.key ||
-            item.recovery.value !== saved.value)) ||
-        snapshot.some(
-          (entry) => entry.event.id !== id && entry.recovery?.key === saved.key,
-        )
-      )
-        throw new Error("Recover the earlier message before sending another");
-      if (!find(id) && snapshot.length >= MAX_PENDING)
-        throw new Error(
-          "Too many outstanding operations; resolve a pending operation",
-        );
-      // Protect immediately against dismissal/echo eviction. On save failure keep
-      // that protection; a later recovery attempt must persist it again before use.
-      const retained = Object.freeze({ ...item, recovery: saved });
-      completed.delete(id);
-      snapshot = Object.freeze([
-        ...snapshot.filter((entry) => entry.event.id !== id),
-        retained,
-      ]);
-      notify();
-      await persist(id);
+      const shared = (await storage.load({ readOnly: true })).find(
+        (item) => item.recovery?.key === key,
+      );
+      const local = snapshot.find((item) => item.recovery?.key === key);
+      // A local send/retry can still own intent whose save failed or is pending.
+      if (local && !restoredReceipts.has(local.event.id)) return local;
+      if (local && local.event.id !== shared?.event.id) {
+        restoredReceipts.delete(local.event.id);
+        storage.forget?.(local.event.id);
+        snapshot = Object.freeze(snapshot.filter((item) => item !== local));
+        notify();
+      }
+      return shared;
     },
-    async acknowledge(id: string) {
+    async recover(id: string, recovery: OutboxRecovery, consume?: () => void) {
+      const adopt = async () => {
+        await outbox.ready();
+        const saved = recoveryValue(recovery);
+        if (!saved) throw new Error("Invalid outbox recovery state");
+        let item = visible.find((entry) => entry.event.id === id);
+        if (!item || dismissing.has(id))
+          throw new Error(
+            "The original operation is unavailable. Refresh before retrying.",
+          );
+        const shared = (await storage.load({ readOnly: true })).find(
+          (entry) => entry.event.id === id,
+        );
+        if (!shared && restoredReceipts.has(id))
+          throw new Error(
+            "The original operation was removed in another window. Try Send again.",
+          );
+        if (
+          shared?.recovery?.key === saved.key &&
+          shared.recovery.value === saved.value
+        ) {
+          // The receipt already owns this source durably. Do not overwrite
+          // delivery progress made by another window after our read.
+          consume?.();
+          return;
+        }
+        if (shared && restoredReceipts.has(id)) item = shared;
+        if (item.acknowledged) {
+          consume?.();
+          return;
+        }
+        if (
+          (item.recovery &&
+            (item.recovery.key !== saved.key ||
+              item.recovery.value !== saved.value)) ||
+          snapshot.some(
+            (entry) =>
+              entry.event.id !== id && entry.recovery?.key === saved.key,
+          )
+        )
+          throw new Error("Recover the earlier message before sending another");
+        if (!find(id) && snapshot.length >= MAX_PENDING)
+          throw new Error(
+            "Too many outstanding operations; resolve a pending operation",
+          );
+        // Protect immediately against dismissal/echo eviction. On save failure keep
+        // that protection; a later recovery attempt must persist it again before use.
+        if (!item.recovery) restoredReceipts.delete(id);
+        const retained = Object.freeze({ ...item, recovery: saved });
+        admit(
+          [...snapshot.filter((entry) => entry.event.id !== id), retained],
+          item.event.kind,
+        );
+        completed.delete(id);
+        snapshot = Object.freeze([
+          ...snapshot.filter((entry) => entry.event.id !== id),
+          retained,
+        ]);
+        notify();
+        // Adoption must write the receipt even if this window cached the same
+        // record before another window removed it.
+        await persist(id, shared ? undefined : "recover");
+        consume?.();
+      };
+      return storage.lock ? storage.lock(id, adopt) : adopt();
+    },
+    async acknowledge(
+      id: string,
+      verifyRetirement?: (event: EventData) => Promise<"recorded" | undefined>,
+      replacement?: Replacement,
+    ) {
       await outbox.ready();
       const item = visible.find((item) => item.event.id === id);
       if (!item?.recovery) return;
+      if (verifyRetirement) {
+        const eligible = (recorded = false) => {
+          const current = find(id);
+          return (
+            !closed &&
+            !attempts.has(id) &&
+            current?.event.kind === 9000 &&
+            current.recovery?.key.startsWith("member-add:") &&
+            (current.delivery === "unknown" ||
+              current.delivery === "failed" ||
+              (recorded && current.delivery === "seen")) &&
+            current.event.content === "" &&
+            current.event.tags.every(
+              (tag) =>
+                tag.length === 2 &&
+                ["h", "p", "client-id", "ms"].includes(tag[0] ?? ""),
+            ) &&
+            current.event.tags.filter(([tag]) => tag === "h").length === 1 &&
+            current.event.tags.filter(([tag]) => tag === "p").length === 1 &&
+            current.event.created_at < Math.floor(Date.now() / 1000) - 15 * 60
+          );
+        };
+        // Seen may enter verification, but only fresh recorded-command evidence
+        // with caller-verified membership can retire it below.
+        if (dismissing.has(id) || !eligible(true))
+          throw new Error(
+            "This saved invitation may still arrive. Retry after its 15-minute delivery window ends.",
+          );
+        // Fence every local replay until verification and retirement are durable.
+        const work = Promise.resolve().then(async () => {
+          const result = await verifyRetirement(item.event);
+          if (!eligible(result === "recorded"))
+            throw new Error(
+              "The invitation changed while checking it. Refresh members and try again.",
+            );
+          const input = replacement?.input();
+          if (input) {
+            const next = enqueue(input, item.recovery, undefined, id);
+            await next.persisted;
+            replacement?.queued(next.id);
+          } else await persist(id, "acknowledge");
+        });
+        dismissing.set(id, work);
+        try {
+          await work;
+        } finally {
+          if (dismissing.get(id) === work) dismissing.delete(id);
+        }
+        return;
+      }
       // Member callers verify a fresh signed roster even when the receipt was lost.
       if (
         !(
@@ -704,136 +1034,11 @@ export function createOutbox(
         throw new Error("Confirm delivery before completing this message");
       await persist(id, "acknowledge");
     },
-    send(
-      {
-        supersedes,
-        ...input
-      }: Pick<EventTemplate, "kind" | "content" | "tags"> & {
-        supersedes?: number;
-      },
+    send: (
+      input: OutboxInput,
       recovery?: OutboxRecovery,
       active?: () => boolean,
-    ) {
-      if (active && !active())
-        throw new DOMException("Channel addition cancelled", "AbortError");
-      if (closed) throw abortError();
-      if (storageError) throw new Error(storageError);
-      const savedRecovery = recoveryValue(recovery);
-      if (
-        savedRecovery &&
-        (!hydrated ||
-          snapshot.some((item) => item.recovery?.key === savedRecovery.key))
-      )
-        throw new Error("Recover the earlier message before sending another");
-      if (
-        !Number.isInteger(input.kind) ||
-        input.kind < 0 ||
-        input.kind > 65535 ||
-        !outbox.supports(input.kind)
-      )
-        throw new Error("This relay connection cannot publish that event kind");
-      const catalog = isCatalogKind(input.kind);
-      if (
-        (input.kind === 9 && !input.content.trim()) ||
-        // NIP-AP admits larger public definitions than ordinary input.
-        (catalog
-          ? bytes(input.content) > MAX_CONTENT_BYTES ||
-            byteSize(input) > MAX_EVENT_BYTES
-          : byteSize(input) > OUTBOX_INPUT_MAX_BYTES)
-      )
-        throw new Error("Message is empty or too large");
-      if (snapshot.length >= MAX_PENDING)
-        throw new Error(
-          "Too many outstanding operations; resolve or dismiss a pending operation",
-        );
-      // Rendered messages carry send order within their second; the optimistic
-      // row and the signed event share this exact ms and created_at.
-      const channelId = channelRowKind(input.kind)
-        ? input.tags.find(([name]) => name === "h")?.[1]
-        : undefined;
-      const ms = channelId ? clock.next(channelId) : Date.now();
-      let createdAt = Math.floor(ms / 1000);
-      if (input.kind === 40003) {
-        if (!hydrated)
-          throw new Error("Message history is still loading. Try again.");
-        const target = input.tags.find(([name]) => name === "e")?.[1];
-        const channel = input.tags.find(([name]) => name === "h")?.[1];
-        // Edits use second precision on every client. Preserve retained local
-        // submission order without changing the protocol's event-ID tie-break.
-        for (const { event } of visible) {
-          if (
-            target &&
-            channel &&
-            event.kind === 40003 &&
-            event.pubkey === viewer &&
-            event.tags.some(([name, id]) => name === "e" && id === target) &&
-            event.tags.some(([name, id]) => name === "h" && id === channel)
-          )
-            createdAt = Math.max(createdAt, event.created_at + 1);
-        }
-        // Stay well inside the signer's 15-minute clock-skew allowance.
-        if (createdAt > Math.floor(ms / 1000) + 60)
-          throw new Error(
-            "Edits are arriving too quickly or your clock changed. Wait a moment and try again.",
-          );
-      }
-      if (catalog) {
-        // NIP-AP: max(now, head + 1) over the observed relay head and this
-        // device's retained writes, so a replacement can never lose or tie.
-        if (supersedes !== undefined)
-          createdAt = Math.max(createdAt, supersedes + 1);
-        const d = input.tags.find(([name]) => name === "d")?.[1];
-        for (const { event } of visible)
-          if (
-            event.kind === input.kind &&
-            event.pubkey === viewer &&
-            event.tags.some(([name, value]) => name === "d" && value === d)
-          )
-            createdAt = Math.max(createdAt, event.created_at + 1);
-        if (createdAt > Math.floor(ms / 1000) + 60)
-          throw new Error(
-            "Sharing is changing too quickly or your clock changed. Wait a moment and try again.",
-          );
-      }
-      const template = {
-        ...input,
-        pubkey: viewer,
-        created_at: createdAt,
-        tags: [
-          ...input.tags.map((tag) => [...tag]),
-          ["client-id", crypto.randomUUID()],
-          ...(channelId ? [["ms", String(ms % 1000)]] : []),
-        ],
-      };
-      const event = Object.freeze({
-        ...template,
-        tags: Object.freeze(
-          template.tags.map((tag) => Object.freeze(tag)),
-        ) as unknown as string[][],
-        id: getEventHash(template),
-      });
-      if (active) admissionGates.set(event.id, active);
-      captureSend(event);
-      profiling.measure("send.local", event.id, () => {
-        snapshot = Object.freeze([
-          ...snapshot,
-          Object.freeze({
-            event,
-            delivery: "sending" as const,
-            ...(savedRecovery ? { recovery: savedRecovery } : {}),
-            ...(active ? { guarded: true } : {}),
-          }),
-        ]);
-        notify();
-      });
-      const intent = ready.then(() => {
-        if (storageError) throw new Error(storageError);
-        return persist(event.id);
-      });
-      void intent.catch(() => {}); // Delivery reports persistence errors; disposal still saves queued intent.
-      schedule(event.id, intent);
-      return event.id;
-    },
+    ) => enqueue(input, recovery, active).id,
     retry(id: string, active?: () => boolean) {
       const item = find(id);
       if (item?.guarded && (active ?? admissionGates.get(id))?.() !== true)
@@ -847,6 +1052,7 @@ export function createOutbox(
         !attempts.has(id) &&
         !dismissing.has(id)
       ) {
+        restoredReceipts.delete(id);
         // A profile retry can reuse an older, unguarded saved invitation.
         // Promote that intent before scheduling so signing and publication honor
         // the renewed caller policy, including after the next hydration.
@@ -882,7 +1088,8 @@ export function createOutbox(
               : "Confirm this message in New message before removing it",
           ),
         );
-      const work = persist(id, "dismiss")
+      const remove = () => persist(id, "dismiss");
+      const work = (storage.lock ? storage.lock(id, remove) : remove())
         .then(() => {
           admissionGates.delete(id);
         })

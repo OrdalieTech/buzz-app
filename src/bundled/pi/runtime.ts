@@ -27,9 +27,12 @@ import {
   MemoryReads,
   READ_TIMEOUT_MS,
 } from "../../features/agent-harness/core-memory";
+import { readAuthorNames } from "../../features/agent-harness/author-names";
 import { readProject } from "../../features/agent-harness/project";
 import { fromOwner, workflowOf } from "../../features/agents/owner-attestation";
 import { type AgentKey, pubkeyOf } from "../../features/agents/membership";
+import { sessionPrompts } from "../../features/agents/session-prompts";
+import { localStore, type AgentStore } from "../../features/agents/store";
 import type { AgentReads } from "../../features/agents/reads";
 import type {
   Agent,
@@ -93,7 +96,7 @@ export const config = (value: unknown): Config => ({
   ...(value && typeof value === "object" ? (value as Partial<Config>) : {}),
 });
 
-const NAMES_TIMEOUT_MS = 2_000;
+const CONVERSATION_READ_TIMEOUT_MS = 4_000;
 /** How long an adopted run's mention is looked for. */
 const READ_MS = 10_000;
 const CHAT = [9, 40002];
@@ -174,6 +177,14 @@ type Entry = {
   closed: boolean;
 };
 
+/** A turn Pi took, in which conversation, and the session it starts there
+ * when it is that session's first turn. */
+type Delivered = {
+  submission: number;
+  conversation: number;
+  session?: number;
+};
+
 export class PiRuntime {
   private readonly agents = new Map<AgentKey, Entry>();
   private readonly revisions = new Map<AgentKey, number>();
@@ -223,6 +234,8 @@ export class PiRuntime {
       key: AgentKey,
       listener: () => void,
     ) => () => void = () => () => {},
+    /** Agent storage, where what each session started with is kept. */
+    private readonly storage: AgentStore = localStore(),
   ) {
     this.pi = new Pi(
       () => this.spawn,
@@ -415,7 +428,17 @@ export class PiRuntime {
     working: boolean,
     signal: AbortSignal,
   ) {
-    return readTranscript(this.pi, agent, place, working, signal);
+    return readTranscript(this.pi, agent, place, working, signal, (pubkey) =>
+      this.reads(agent)?.name(pubkey),
+    ).then((transcript) => ({
+      ...transcript,
+      turns: this.prompts(agent).shown(transcript.turns),
+    }));
+  }
+  /** What each of the agent's sessions started with, by
+   * `conversation:session`. */
+  private prompts(agent: AgentKey) {
+    return sessionPrompts(this.storage, "pi", agent);
   }
   subscribe(listener: () => void) {
     this.listeners.add(listener);
@@ -556,10 +579,7 @@ export class PiRuntime {
     const same = prior?.topLevel === topLevel;
     const wait = prior && (same ? prior.handed : prior.settled);
     const request = wake?.type === "plugin" ? `${WAKE}${wake.id}` : event.id;
-    let submitted:
-      | { submission: number; conversation: number }
-      | false
-      | undefined;
+    let submitted: Delivered | false | undefined;
     // A delivery during a session action waits for it, past its handover.
     const control = `${agent.key}/${key}`;
     let interrupted = false;
@@ -597,7 +617,6 @@ export class PiRuntime {
               solo,
             )),
             agent: agent.key,
-            label: "@mention",
             channelLevel: topLevel && !solo,
             ...(wake
               ? { wake: { ...wake, text: (await wakeText?.()) ?? wake.text } }
@@ -651,6 +670,14 @@ export class PiRuntime {
         () => !interrupted && (!wake || !current || current()),
       );
       if (!submitted) return;
+      if (submitted.session !== undefined)
+        void this.prompts(agent.key).save(
+          `${submitted.conversation}:${submitted.session}`,
+          [
+            { label: "instructions", text: picked.instructions },
+            { label: "core memory", text: picked.core?.text ?? "" },
+          ],
+        );
       if (
         this.remember(agent.key, key, submitted.conversation, event.created_at)
       )
@@ -902,7 +929,7 @@ export class PiRuntime {
     agent: AgentKey,
     params: object,
     current: () => boolean,
-  ): Promise<{ submission: number; conversation: number } | false | undefined> {
+  ): Promise<Delivered | false | undefined> {
     try {
       return await this.pi.request("deliver", params);
     } catch (error) {
@@ -1110,10 +1137,13 @@ export class PiRuntime {
   }
 
   private async open(agent: AgentKey) {
+    const handle = this.agents.get(agent)?.handle ?? this.handle(agent);
     await this.pi.request("open", {
       agent,
-      tools: sessionTools(this.added()),
-      hint: sessionHint(this.added()),
+      // Whichever host runs the agent fills in its tools' credential.
+      ...(handle && { as: { pubkey: handle.pubkey, relay: handle.relay } }),
+      tools: sessionTools(this.added(), !!handle?.ownerAccess),
+      hint: sessionHint(this.added(), !!handle?.ownerAccess),
     });
   }
 
@@ -1264,7 +1294,7 @@ export class PiRuntime {
                 { kinds: CHAT, "#h": [channelId], "#e": [rootId], limit: 200 },
               ]
             : [{ kinds: CHAT, "#h": [channelId], limit: CONTEXT_LIMIT + 1 }],
-          AbortSignal.timeout(NAMES_TIMEOUT_MS * 2),
+          AbortSignal.timeout(CONVERSATION_READ_TIMEOUT_MS),
         );
         earlier = events
           .filter(
@@ -1285,22 +1315,15 @@ export class PiRuntime {
       (item) =>
         item.created_at > seen && (!seen || item.pubkey !== agent.pubkey),
     );
-    const pubkeys = [
-      ...new Set([
-        event.pubkey,
-        ...unseen.map((item) => item.pubkey),
-        ...event.tags
-          .filter((tag) => tag[0] === "p")
-          .map((tag) => tag[1] ?? ""),
-      ]),
-    ].filter(Boolean);
-    if (reads)
-      await Promise.race([
-        reads.profiles(pubkeys).catch(() => undefined),
-        new Promise((resolve) => setTimeout(resolve, NAMES_TIMEOUT_MS)),
-      ]);
-    const members = summary?.members ?? [];
-    const project = (await reading)?.section;
+    const signingAuthority = reads?.workflowAuthority();
+    const [names, project] = await Promise.all([
+      readAuthorNames(
+        reads,
+        [event, ...unseen.slice(-CONTEXT_LIMIT)],
+        signingAuthority,
+      ),
+      reading.then((read) => read?.section),
+    ]);
     return {
       event,
       scope,
@@ -1313,7 +1336,8 @@ export class PiRuntime {
       ...(thread ? { thread } : {}),
       context: unseen,
       total: earlier.length + 1,
-      name: (pubkey: string) => reads?.name(pubkey, members),
+      names,
+      ...(signingAuthority ? { signingAuthority } : {}),
       ...(project ? { project } : {}),
     };
   }
@@ -1339,6 +1363,11 @@ export class PiRuntime {
     const spawn = this.host.spawn?.bind(this.host);
     if (!spawn) throw new Error("Pi agents run only in the desktop app");
     return spawn;
+  }
+
+  /** A file as the agent's sessions read one: in its saved workspace. */
+  workspaceFile(agent: Agent, path: string) {
+    return this.readFile(path, { cwd: config(agent.config).workspace });
   }
 
   private get readFile() {

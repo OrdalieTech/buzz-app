@@ -28,7 +28,7 @@ the thread root. Search transcripts for the context Buzz sent to Claude:
 ```sh
 root='<thread-root-id>'
 claude_config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-rg -l -F -e "Thread root: $root" -e "Event ID: $root" \
+rg -l -F -e "Thread root: $root" -e "Event ID: $root" -e "{\\\"id\\\":\\\"$root" \
   "$claude_config_dir/projects" -g '*.jsonl'
 ```
 

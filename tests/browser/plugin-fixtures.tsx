@@ -131,8 +131,32 @@ function SidebarWorkIcon() {
   return <FolderOpenIcon aria-hidden="true" />;
 }
 
+// Full-window paint, so any pixel the shell leaves uncovered shows which wins.
+const fill = (background: string, zIndex?: number) => () => (
+  <div style={{ position: "absolute", inset: 0, background, zIndex }} />
+);
+
 export const fixturePlugins: readonly BundledPlugin[] = [
   soloRegionFixture,
+  {
+    manifest: {
+      id: "fixture.backdrops",
+      name: "Backdrop fixture",
+      apiVersion: 1,
+    },
+    enabledByDefault: false,
+    module: {
+      apply(ctx) {
+        const backdrops = ctx.reflect.get("backdrops");
+        // The earlier layer raises its content; the later one must still win.
+        backdrops?.register({
+          id: "under",
+          component: fill("rgb(255 0 0)", 1),
+        });
+        backdrops?.register({ id: "over", component: fill("rgb(0 0 255)") });
+      },
+    },
+  },
   {
     manifest: {
       id: "fixture.provider",
@@ -158,6 +182,37 @@ export const fixturePlugins: readonly BundledPlugin[] = [
               </button>
             ),
           },
+        });
+      },
+    },
+  },
+  {
+    manifest: {
+      id: "fixture.sidebar-rows",
+      name: "Host row fixture",
+      apiVersion: 1,
+    },
+    enabledByDefault: false,
+    module: {
+      apply(ctx) {
+        ctx.reflect.get("sidebarRows")?.register({
+          version: 1,
+          id: "rows",
+          render: (row, Default) =>
+            row.id === "beta" ? (
+              <div data-plugin-row="decorated" title="Tracked by this plugin">
+                {Default}
+              </div>
+            ) : (
+              Default
+            ),
+          sortModes: [
+            {
+              id: "reverse",
+              label: "Reverse name",
+              compare: (a, b) => b.label.localeCompare(a.label),
+            },
+          ],
         });
       },
     },
@@ -240,6 +295,13 @@ export const fixturePlugins: readonly BundledPlugin[] = [
             primary: true,
             component: () => <h1>{title}</h1>,
           });
+        // Listed in the Messages sidebar, with no sidebar of its own.
+        ctx.pages.register({
+          id: "listed",
+          title: "Listed destination",
+          primary: true,
+          component: () => <h1>Listed destination</h1>,
+        });
         ctx.pages.register({
           id: "sidebar",
           title: "Sidebar playground",
@@ -258,7 +320,9 @@ export const fixturePlugins: readonly BundledPlugin[] = [
                     Target:{" "}
                     {target.kind === "page" ? target.pageId : target.kind}
                   </p>
-                  <button type="button">Fixture sidebar action</button>
+                  <button type="button" tabIndex={0}>
+                    Fixture sidebar action
+                  </button>
                   {children}
                 </aside>
               </div>

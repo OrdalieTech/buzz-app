@@ -1,4 +1,19 @@
+import { historyPresentation } from "../../features/agents/history-presentation";
+import {
+  profileHistoryActive,
+  profileHistoryRoute,
+  profileHistoryTarget,
+} from "../../features/profiles/target";
 import { useProfileMessage } from "../../features/profiles/useProfileMessage";
+import {
+  otherVerifiedName,
+  verifiedLabel,
+} from "../../features/profiles/name-preference";
+import {
+  AgentSaveState,
+  DiscardChanges,
+  useAgentSaveReports,
+} from "../../features/agents/AgentSaveButton";
 import { AgentDetails } from "../agents/AgentDetails";
 import { AgentMessageButton } from "../agents/AgentMessageButton";
 import { useAgents } from "../../features/agents/react";
@@ -36,7 +51,6 @@ import { Tabs } from "../../shared/design-system/ui/Tabs";
 import type { PanelProps } from "../../features/panels/service";
 import {
   claimProfileTranscript,
-  profileActivityTranscript,
   profileActivityViewKey,
   profileTranscriptRequest,
   subscribeProfileTranscripts,
@@ -67,8 +81,11 @@ import type {
 } from "../../features/agents/service";
 import type { CommunityReader } from "../../features/communities/service";
 import { agentSections } from "../../features/agents/tabs";
+import type { ConversationExtensions } from "../../features/conversation/contracts";
 import { useAgentSettingsHost } from "../agents/AgentSettingsHost";
 import { conversationOpener } from "../agents/routes";
+import { buzzLinkTarget } from "../../features/navigation/buzz-links";
+import type { NavigationScope } from "../../features/navigation/targets";
 import { avatarMedia } from "../../shared/avatar-source";
 import { writeClipboardText } from "../../shared/clipboard";
 
@@ -88,6 +105,20 @@ function panelCommunity(scope: string | undefined, viewer: string | undefined) {
   }
 }
 
+/** The conversation the profile was opened from. Agents keep a Solo chat or
+ * a DM as one conversation, so a message's thread there is not its own. */
+function openedFrom(session: RelaySession, context: PanelProps["context"]) {
+  if (!context) return undefined;
+  const kind = session.channels
+    .list()
+    .channels.find((item) => item.id === context.channelId)?.channelType;
+  const whole = kind === "solo" || kind === "dm";
+  return {
+    channelId: context.channelId,
+    ...(context.rootId && !whole && { rootId: context.rootId }),
+  };
+}
+
 export function ProfilePanel({
   relay,
   target,
@@ -95,6 +126,7 @@ export function ProfilePanel({
   navigation,
   agents,
   communities,
+  linkRenderers,
   close,
 }: PanelProps & {
   relay: RelayData;
@@ -102,17 +134,17 @@ export function ProfilePanel({
   /** Agents show their type's tabs. */
   agents?: Agents;
   communities?: CommunityReader | undefined;
+  linkRenderers?: ConversationExtensions["links"] | undefined;
 }) {
   const connection = useRelayConnection(relay);
   const activityKey = profileActivityViewKey(target);
-  const transcript = profileActivityTranscript(target);
-  const opening = transcript ? "transcript" : activityKey ? "activity" : "info";
+  const opening = activityKey ? "activity" : "info";
   // Asked once per opening. This profile takes the opening as soon as it is
   // shown, even on another section, so remounting with the channel finds
   // nothing to reopen; changing sections back after it was offered does not
   // ask again either.
   const asked = useSyncExternalStore(subscribeProfileTranscripts, () =>
-    transcript ? profileTranscriptRequest(target) : undefined,
+    activityKey ? profileTranscriptRequest(target) : undefined,
   );
   const [held, setHeld] = useState<number>();
   const [offered, setOffered] = useState(0);
@@ -153,6 +185,8 @@ export function ProfilePanel({
   )
     return (
       <OwnedAgentProfile
+        linkRenderers={linkRenderers}
+        target={target}
         key={`${connection.scope}:${connection.generation}:${pubkey}:${opening}`}
         agents={agents}
         communities={communities}
@@ -161,6 +195,7 @@ export function ProfilePanel({
         pubkey={pubkey}
         relay={relay}
         session={connection.session}
+        scope={panelCommunity(connection.scope, connection.viewer)}
         navigation={navigation}
         context={context}
         openConversation={openConversation}
@@ -169,6 +204,7 @@ export function ProfilePanel({
     );
   return (
     <ProfileDetails
+      linkRenderers={linkRenderers}
       key={`${connection.scope}:${connection.generation}:${pubkey}:${opening}`}
       initialTab={activityKey ? "activity" : "info"}
       initialTranscript={initialTranscript}
@@ -187,6 +223,8 @@ export function ProfilePanel({
   );
 }
 function OwnedAgentProfile({
+  linkRenderers,
+  target,
   agents,
   communities,
   initialActivity,
@@ -194,11 +232,14 @@ function OwnedAgentProfile({
   pubkey,
   relay,
   session,
+  scope,
   navigation,
   context,
   openConversation,
   close,
 }: {
+  target: string;
+  linkRenderers: ConversationExtensions["links"] | undefined;
   agents: Agents;
   communities: CommunityReader | undefined;
   initialActivity: boolean;
@@ -206,6 +247,7 @@ function OwnedAgentProfile({
   pubkey: string;
   relay: RelayData;
   session: RelaySession;
+  scope: NavigationScope | undefined;
   navigation: Navigation | undefined;
   context: PanelProps["context"];
   openConversation: AgentViewProps["openConversation"];
@@ -214,46 +256,99 @@ function OwnedAgentProfile({
   const { types } = useAgents(agents);
   const owned = useAgent(agents, pubkey);
   const channels = useChannelChoices(session.channels);
+  // Unsaved edits are asked about before a link replaces this profile.
+  const [unsaved, reportUnsaved] = useAgentSaveReports();
+  const [leaving, setLeaving] = useState<string>();
+  if (leaving && !unsaved.dirty) setLeaving(undefined);
   if (!owned) return null;
+  const address = navigation?.snapshot().entry.target;
+  const conversationTarget = (link: string) => {
+    const target = scope && buzzLinkTarget(link, scope);
+    return target?.kind === "conversation" ? target : undefined;
+  };
+  const go = (link: string) => {
+    const target = conversationTarget(link);
+    if (target && navigation) {
+      void navigation.open(target);
+      return true;
+    }
+    return (context?.push ?? context?.open)?.(link);
+  };
+  const openLink = (link: string) => {
+    if (!context?.canOpen(link) && !(navigation && conversationTarget(link)))
+      return false;
+    if (!unsaved.saving && !unsaved.dirty) return !!go(link);
+    if (!unsaved.saving) setLeaving(link);
+    return false;
+  };
   return (
-    <AgentDetails
-      agents={agents}
-      communities={communities}
-      agent={owned.agent}
-      type={owned.type}
-      types={types}
-      channels={channels}
-      memories={session.agentMemories}
-      onRemoved={close}
-      initialActivity={initialActivity}
-      initialTranscript={initialTranscript}
-      close={close}
-      openConversation={openConversation}
-      conversation={
-        context && {
-          channelId: context.channelId,
-          ...(context.rootId && { rootId: context.rootId }),
+    <AgentSaveState value={reportUnsaved}>
+      <AgentDetails
+        historyPresentation={
+          navigation &&
+          address?.kind === "conversation" &&
+          address.detail?.target === target
+            ? historyPresentation(
+                navigation,
+                profileHistoryRoute(target),
+                (selected) => ({
+                  ...address,
+                  detail: {
+                    ...address.detail,
+                    target: profileHistoryTarget(target, selected),
+                  },
+                }),
+                profileHistoryActive(target),
+              )
+            : undefined
         }
-      }
-      messageAction={(variant) => (
-        <AgentMessageButton
-          variant={variant}
-          pubkey={pubkey}
-          relay={relay}
-          navigator={navigation}
-          navigation={undefined}
+        agents={agents}
+        communities={communities}
+        agent={owned.agent}
+        type={owned.type}
+        types={types}
+        channels={channels}
+        memories={session.agentMemories}
+        memoryLinks={{ session, registry: linkRenderers, open: openLink }}
+        onRemoved={close}
+        initialActivity={initialActivity}
+        initialTranscript={initialTranscript}
+        close={close}
+        openConversation={openConversation}
+        openLink={context && openLink}
+        canOpenLink={context && ((link) => context.canOpen(link))}
+        conversation={openedFrom(session, context)}
+        messageAction={(variant) => (
+          <AgentMessageButton
+            variant={variant}
+            pubkey={pubkey}
+            relay={relay}
+            navigator={navigation}
+            navigation={undefined}
+          />
+        )}
+        openSettings={
+          navigation &&
+          ((section) =>
+            void navigation.open({ version: 1, kind: "settings", section }))
+        }
+      />
+      {leaving && (
+        <DiscardChanges
+          description={`Your unsaved changes to ${owned.agent.name} will be lost.`}
+          onKeep={() => setLeaving(undefined)}
+          onDiscard={() => {
+            setLeaving(undefined);
+            go(leaving);
+          }}
         />
       )}
-      openSettings={
-        navigation &&
-        ((section) =>
-          void navigation.open({ version: 1, kind: "settings", section }))
-      }
-    />
+    </AgentSaveState>
   );
 }
 
 function ProfileDetails({
+  linkRenderers,
   initialTab,
   initialTranscript,
   agentHint,
@@ -269,6 +364,7 @@ function ProfileDetails({
   close,
 }: {
   agents: Agents | undefined;
+  linkRenderers: ConversationExtensions["links"] | undefined;
   communities: CommunityReader | undefined;
   initialTab: "info" | "activity";
   initialTranscript: TranscriptRequest | undefined;
@@ -310,6 +406,13 @@ function ProfileDetails({
   const [tab, setTab] = useState<
     "info" | "activity" | "channels" | `agent:${string}`
   >(initialTab);
+  // A new transcript request shows Activity, as choosing its tab would.
+  const opening = initialTranscript?.opening;
+  const [asked, setAsked] = useState(opening);
+  if (opening !== asked) {
+    setAsked(opening);
+    if (opening !== undefined) setTab("activity");
+  }
   // An agent's sections come from its type and the app, not the harness.
   const plugin = useAgent(agents, pubkey);
   const agentTypes = useSyncExternalStore(
@@ -330,11 +433,13 @@ function ProfileDetails({
           agent: settings.agent,
           type: settings.type,
           memories: session.agentMemories,
-          communities,
-          conversation: context && {
-            channelId: context.channelId,
-            ...(context.rootId && { rootId: context.rootId }),
+          memoryLinks: {
+            session,
+            registry: linkRenderers,
+            open: (url) => !!context?.open(url),
           },
+          communities,
+          conversation: openedFrom(session, context),
           initialTranscript,
           close,
           ...(openConversation && { openConversation }),
@@ -405,6 +510,12 @@ function ProfileDetails({
     profile?.name ??
       (displayAgent ? "Unknown agent" : (formatPublicKey(pubkey) ?? pubkey)),
   );
+  // The verification line carries the check, so it keeps the handle when the
+  // name already is it.
+  const otherName =
+    profile?.verified &&
+    (otherVerifiedName(verifiedLabel(profile.verified), profile.verified) ??
+      `@${profile.verified.username}`);
   // The portrait is 5rem (at most 240 device px), so the relay's 320 px
   // thumbnail already covers it and reuses the URL message rows have loaded.
   const picture = avatarMedia(profile?.picture, session.media) ?? null;
@@ -486,23 +597,26 @@ function ProfileDetails({
           </div>
           <div className={styles.identity}>
             <h2 className="text-body-lg">{name}</h2>
-            {profile?.verified?.fullName && (
-              <p className="text-body-sm text-secondary">
-                {profile.verified.fullName}
-              </p>
-            )}
             {profile?.verified && (
-              <p className="text-body-sm text-secondary">
+              <p
+                className={`${styles.verifiedName} text-body-sm text-secondary`}
+              >
+                <span>{otherName}</span>
                 {profile.verified.status === "checked" && (
                   <CheckCircleIcon
                     aria-hidden="true"
                     className={styles.verificationIcon}
                   />
-                )}{" "}
+                )}
+              </p>
+            )}
+            {profile?.verified && (
+              <p className="text-body-sm text-secondary">
                 {profile.verified.status === "checked"
                   ? `Name verified by ${profile.verified.issuerLabel}`
                   : `Cached verification from ${profile.verified.issuerLabel}`}{" "}
-                · @{profile.verified.username}
+                {otherName !== `@${profile.verified.username}` &&
+                  `· @${profile.verified.username}`}
               </p>
             )}
             {presence !== "unknown" && (

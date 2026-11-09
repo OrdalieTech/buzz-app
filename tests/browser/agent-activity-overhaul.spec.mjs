@@ -26,7 +26,12 @@ test("removing a reaction from a tall message preserves the reading position", a
   );
   await expect(row).toBeVisible();
   await hoverMessage(row);
-  await row.getByRole("button", { name: "React with 👍", exact: true }).click();
+  await row.getByRole("button", { name: "Add reaction", exact: true }).click();
+  await page.locator('em-emoji-picker input[type="search"]').fill("thumbsup");
+  await page
+    .locator("em-emoji-picker")
+    .getByRole("button", { name: "👍", exact: true })
+    .click();
   const reaction = row.locator('button[data-reaction="👍"]');
   await expect(reaction).toHaveAttribute("aria-pressed", "true");
   app.edit(
@@ -162,7 +167,9 @@ test("message activity opens a grouped preview and the agent's profile without l
       },
     });
   });
-  const region = thread.getByRole("region", {
+  const requestRow = thread.locator(`[data-message-id="${root.id}"]`);
+  // Expired outcomes can follow public replies; inspect this request's activity.
+  const region = requestRow.getByRole("region", {
     name: "Agent activity on this message",
     exact: true,
   });
@@ -178,11 +185,15 @@ test("message activity opens a grouped preview and the agent's profile without l
   ).toHaveCount(0);
   await expect(
     row.getByRole("region", { name: "Agent activity on this message" }),
-  ).toHaveCount(0);
+  ).toHaveCount(1);
   await expect(
     row.locator("[data-thread-summary] [data-thread-working]"),
-  ).toHaveCount(1);
-  await expect(bubble.locator(".buzz-avatar")).toHaveCount(2);
+  ).toHaveCount(0);
+  await expect(
+    bubble
+      .locator("xpath=ancestor::*[@data-agent-response-preview]")
+      .locator(".buzz-avatar"),
+  ).toHaveCount(2);
   await expect(bubble.locator(".buzz-avatar-status-dot")).toHaveCount(0);
   await expect(bubble).not.toContainText("working");
   publish(keys[0], 7, "👀", [
@@ -201,7 +212,6 @@ test("message activity opens a grouped preview and the agent's profile without l
     ["h", "alpha"],
     ["e", root.id],
   ]);
-  const requestRow = thread.locator(`[data-message-id="${root.id}"]`);
   const messageActions = requestRow.getByRole("group", {
     name: "Message actions",
     includeHidden: true,
@@ -228,13 +238,22 @@ test("message activity opens a grouped preview and the agent's profile without l
   const typing = thread.getByRole("status", { name: "Conversation activity" });
   await expect(typing).toContainText(getPublicKey(human).slice(0, 10));
   await expect(typing).not.toContainText("Agent 1");
-  const threadIndicator = row.locator("[data-thread-working]");
+  const threadIndicator = row.locator("[data-message-activity]");
   // The shared summary represents these requests once, alongside participants.
   await expect(threadIndicator).toHaveCount(1);
   await reply.fill("Keep this draft while inspecting activity");
+  let livenessSeq = 3;
+  const renew = () => {
+    telemetryTime = new Date().toISOString();
+    keys.forEach((_, index) => {
+      send(index, "turn_liveness", ++livenessSeq);
+    });
+  };
   for (const colorScheme of ["light", "dark"]) {
     await page.emulateMedia({ colorScheme });
     for (const width of [1440, 800, 390]) {
+      // Geometry checks inspect live tool details, not telemetry expiry.
+      renew();
       // Resize with the channel toolbar revealed: the overlay thread pane
       // must cover it, even if the pointer has not moved off its old row.
       await page.setViewportSize({ width: 1440, height: 950 });
@@ -246,21 +265,12 @@ test("message activity opens a grouped preview and the agent's profile without l
         .getByRole("form", { name: "Reply to thread", exact: true })
         .boundingBox();
       expect(groupBox.y + groupBox.height).toBeLessThanOrEqual(formBox.y);
-      await expect(bubble).toHaveAttribute("data-size", "xs");
-      // Channel and thread activity use the same gap below their message.
-      const channelGap = await row
-        .locator("[data-thread-summary]")
-        .evaluate((element) => getComputedStyle(element).marginTop);
-      await expect(region).toHaveCSS("margin-top", channelGap);
       const buttonBox = await bubble.boundingBox();
-      const artworkBox = await bubble
+      const artworkBox = await region
         .locator(".buzz-avatar")
         .first()
         .boundingBox();
-      expect(artworkBox.y).toBeGreaterThan(buttonBox.y);
-      expect(artworkBox.y + artworkBox.height).toBeLessThan(
-        buttonBox.y + buttonBox.height,
-      );
+      expect(artworkBox.x + artworkBox.width).toBeLessThanOrEqual(buttonBox.x);
       expect(buttonBox.x + buttonBox.width).toBeLessThanOrEqual(width);
       await bubble.focus();
       await page.keyboard.press("Enter");
@@ -276,7 +286,10 @@ test("message activity opens a grouped preview and the agent's profile without l
       await expect(
         popup.getByRole("button", { name: /^View activity for/ }),
       ).toHaveCount(2);
-      await expect(popup.getByRole("button")).toHaveCount(2);
+      // Each agent's row is the way in; there is no separate Activity heading.
+      await expect(
+        popup.getByRole("button", { name: "View full activity" }),
+      ).toHaveCount(0);
       const lastActivity = popup.getByRole("button").last();
       await expect
         .poll(() =>
@@ -330,6 +343,7 @@ test("message activity opens a grouped preview and the agent's profile without l
       await page.keyboard.press("Escape");
       await expect(popup).toBeHidden();
       await expect(bubble).toBeFocused();
+      await hoverMessage(requestRow);
       await expect
         .poll(() =>
           messageActions.evaluate((bar) => bar.matches(":popover-open")),
@@ -337,6 +351,7 @@ test("message activity opens a grouped preview and the agent's profile without l
         .toBe(true);
     }
   }
+  renew();
   await page.emulateMedia({ reducedMotion: "reduce" });
   expect(
     await bubble
@@ -406,6 +421,9 @@ test("message activity opens a grouped preview and the agent's profile without l
   const resumedAt = await page.evaluate(() => Math.floor(Date.now() / 1000));
   publish(keys[0], 20002, "", typingTags, resumedAt);
   publish(keys[1], 20002, "", typingTags, resumedAt);
+  // Typing does not renew exact request work; observer liveness does.
+  telemetryTime = await page.evaluate(() => new Date().toISOString());
+  send(0, "turn_liveness", ++livenessSeq);
   await expect(threadIndicator).toHaveCount(1);
   // The tab title may be the loaded message preview, not literally "Thread".
   await page
@@ -417,13 +435,43 @@ test("message activity opens a grouped preview and the agent's profile without l
     .click();
   publish(human, 9, "Unread reply while agents work", typingTags, resumedAt);
   await expect(summary).toHaveAccessibleName(/Observed unread replies/);
-  // Mixed freshness adds both dots and status text. Control expiry explicitly
-  // so narrow-layout coverage does not depend on the runner crossing 30s.
+  // Passive uncertainty stays quiet while the other agent keeps working.
+  // Control expiry so this transition does not depend on runner speed.
   await page.clock.fastForward(31_000);
   telemetryTime = await page.evaluate(() => new Date().toISOString());
-  send(1, "turn_liveness", 4);
-  await expect(summary).toHaveAccessibleName(/Agent 1, status unknown/);
-  await expect(summary).toHaveAccessibleName(/Agent 2, working/);
+  send(1, "turn_liveness", ++livenessSeq);
+  const channelActivity = row.getByRole("region", {
+    name: "Agent activity on this message",
+  });
+  await channelActivity.getByRole("button").click();
+  const mixedActivity = page.getByRole("dialog", {
+    name: "Agent activity",
+    exact: true,
+  });
+  const firstActivity = mixedActivity.getByRole("button", {
+    name: "View activity for Agent 1",
+    exact: true,
+  });
+  const secondActivity = mixedActivity.getByRole("button", {
+    name: "View activity for Agent 2",
+    exact: true,
+  });
+  await expect(secondActivity).toBeVisible();
+  await expect(secondActivity).not.toContainText(
+    "Activity interrupted or out of date",
+  );
+  await expect(firstActivity).toHaveCount(0);
+  await expect(channelActivity.locator(".buzz-avatar")).toHaveCount(1);
+  await expect(channelActivity).not.toContainText("Couldn’t finish");
+  // Uncertainty is retained internally: fresh evidence restores the same agent.
+  telemetryTime = await page.evaluate(() => new Date().toISOString());
+  send(0, "turn_liveness", ++livenessSeq);
+  await expect(firstActivity).toBeVisible();
+  await expect(firstActivity).not.toContainText(
+    "Activity interrupted or out of date",
+  );
+  await expect(channelActivity.locator(".buzz-avatar")).toHaveCount(2);
+  await page.keyboard.press("Escape");
   for (const colorScheme of ["light", "dark"]) {
     await page.emulateMedia({ colorScheme });
     for (const width of [1440, 800, 390]) {
@@ -436,26 +484,13 @@ test("message activity opens a grouped preview and the agent's profile without l
         3,
       );
       await expect(threadIndicator).toHaveCount(1);
-      const avatarSizes = await row
-        .locator(".buzz-avatar")
-        .evaluateAll((avatars) =>
-          avatars
-            .filter((avatar) =>
-              avatar.closest(
-                '[data-thread-summary], [aria-label="Agent activity on this message"]',
-              ),
-            )
-            .map((avatar) => ({
-              width: avatar.getBoundingClientRect().width,
-              height: avatar.getBoundingClientRect().height,
-              mini: !!avatar.closest('[data-avatar-stack][data-size="mini"]'),
-            })),
-        );
-      // Participants and working agents share one deduplicated summary.
-      expect(avatarSizes).toHaveLength(3);
-      for (const size of avatarSizes) {
-        expect(size.width).toBe(size.mini ? 16 : 21);
-        expect(size.height).toBe(size.mini ? 16 : 21);
+      const responseAvatars = channelActivity.locator(".buzz-avatar");
+      await expect(responseAvatars).toHaveCount(2);
+      for (const avatar of await responseAvatars.all()) {
+        const bounds = await avatar.boundingBox();
+        expect(bounds.width).toBeGreaterThan(0);
+        expect(bounds.x).toBeGreaterThanOrEqual(0);
+        expect(bounds.x + bounds.width).toBeLessThanOrEqual(width);
       }
       const box = await summary.boundingBox();
       expect(box.x + box.width).toBeLessThanOrEqual(width);
@@ -489,10 +524,14 @@ test("message activity opens a grouped preview and the agent's profile without l
   await page.setViewportSize({ width: 1440, height: 950 });
   await row.getByRole("button", { name: /^View thread:/ }).click();
   telemetryTime = await page.evaluate(() => new Date().toISOString());
-  send(0, "turn_completed", 4);
-  await expect(bubble.locator(".buzz-avatar")).toHaveCount(1);
+  send(0, "turn_completed", ++livenessSeq);
+  // Public replies do not complete work: both the thread and channel retain
+  // the remaining agent's request activity until its lifecycle finishes.
+  await expect(region.locator(".buzz-avatar")).toHaveCount(1);
+  await expect(channelActivity.locator(".buzz-avatar")).toHaveCount(1);
   await expect(threadIndicator).toHaveCount(1);
-  send(1, "turn_completed", 5);
+  send(1, "turn_completed", ++livenessSeq);
+  await expect(channelActivity).toHaveCount(0);
   await expect(region).toHaveCount(0);
   await expect(threadIndicator).toHaveCount(0);
   await expect(reply).toHaveText("Keep this draft while inspecting activity");
@@ -548,14 +587,22 @@ test("activity avatar stack stays one height with overflow at every supported wi
     await expect(bubble).toHaveAccessibleName(
       new RegExp(`Stack agent ${i + 1}, working`),
     );
-    await expect(bubble.locator(".buzz-avatar")).toHaveCount(
-      Math.min(3, i + 1),
-    );
+    await expect(
+      bubble
+        .locator("xpath=ancestor::*[@data-agent-response-preview]")
+        .locator(".buzz-avatar"),
+    ).toHaveCount(Math.min(3, i + 1));
     const box = await bubble.boundingBox();
     firstHeight ??= box.height;
     expect(box.height).toBe(firstHeight);
   }
-  await expect(bubble).toContainText("+2");
+  await bubble.click();
+  await expect(
+    page
+      .getByRole("dialog", { name: "Agent activity" })
+      .getByRole("button", { name: /^View activity for/ }),
+  ).toHaveCount(5);
+  await page.keyboard.press("Escape");
   for (const colorScheme of ["light", "dark"]) {
     await page.emulateMedia({ colorScheme });
     for (const width of [390, 800, 1440]) {
@@ -563,14 +610,19 @@ test("activity avatar stack stays one height with overflow at every supported wi
       const box = await bubble.boundingBox();
       expect(box.height).toBe(firstHeight);
       expect(box.x + box.width).toBeLessThanOrEqual(width);
-      const artwork = await bubble.locator(".buzz-avatar").evaluateAll((els) =>
-        els.map((el) => {
-          const r = el.getBoundingClientRect();
-          return { x: r.x, y: r.y, width: r.width };
-        }),
-      );
-      expect(new Set(artwork.map((r) => r.y)).size).toBe(1);
-      expect(artwork[1].x).toBeLessThan(artwork[0].x + artwork[0].width);
+      const artwork = await bubble
+        .locator("xpath=ancestor::*[@data-agent-response-preview]")
+        .locator(".buzz-avatar")
+        .evaluateAll((els) =>
+          els.map((el) => {
+            const r = el.getBoundingClientRect();
+            return { x: r.x, y: r.y, width: r.width };
+          }),
+        );
+      for (const avatar of artwork) {
+        expect(avatar.x).toBeGreaterThanOrEqual(0);
+        expect(avatar.x + avatar.width).toBeLessThanOrEqual(width);
+      }
       await page.mouse.move(0, 0);
       await page.screenshot({
         path: testInfo.outputPath(`stack-${colorScheme}-${width}.png`),
@@ -624,42 +676,23 @@ for (const own of [true, false]) {
         row,
         thread.locator(`[data-message-id="${root.id}"]`),
       ]) {
-        const chip =
-          target === row
-            ? target.locator("[data-thread-summary]")
-            : target
-                .getByRole("region", {
-                  name: "Agent activity on this message",
-                  exact: true,
-                })
-                .getByRole("button")
-                .first();
+        const chip = target.getByRole("region", {
+          name: "Agent activity on this message",
+          exact: true,
+        });
         await expect(chip).toBeVisible();
-        await expect
-          .poll(async () => {
-            const bubbleBox = await target
-              .locator("[data-message-action-anchor]")
-              .first()
-              .boundingBox();
-            const chipBox = await chip.boundingBox();
-            if (!bubbleBox || !chipBox) return Infinity;
-            const inset =
-              target === row
-                ? await chip.evaluate(
-                    (element) =>
-                      parseFloat(getComputedStyle(element).marginInlineStart) +
-                      parseFloat(getComputedStyle(element).marginInlineEnd),
-                  )
-                : 0;
-            return Math.abs(
-              own
-                ? bubbleBox.x +
-                    bubbleBox.width -
-                    (chipBox.x + chipBox.width + inset)
-                : bubbleBox.x + inset - chipBox.x,
-            );
-          })
-          .toBeLessThan(1);
+        const control = chip.getByRole("button", {
+          name: /^View agent activity:/,
+        });
+        const avatar = chip.locator(".buzz-avatar").first();
+        const [controlBox, avatarBox] = await Promise.all([
+          control.boundingBox(),
+          avatar.boundingBox(),
+        ]);
+        expect(avatarBox.x + avatarBox.width).toBeLessThanOrEqual(controlBox.x);
+        expect(controlBox.x + controlBox.width).toBeLessThanOrEqual(
+          (await target.boundingBox()).x + (await target.boundingBox()).width,
+        );
       }
       app.threadSummary(root.id, [getPublicKey(key)], 6);
       const summary = row.locator("[data-thread-summary]");
@@ -667,7 +700,7 @@ for (const own of [true, false]) {
       await expect(summary.locator("[data-avatar-shape][title]")).toHaveCount(
         1,
       );
-      await expect(summary.locator("[data-thread-working]")).toHaveCount(1);
+      await expect(summary.locator("[data-thread-working]")).toHaveCount(0);
       await page
         .locator(
           '[data-panel-workspace] :is([data-tab-value="thread"], [data-tab-value^="thread:"])[aria-selected="true"]',

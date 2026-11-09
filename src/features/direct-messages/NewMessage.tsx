@@ -31,8 +31,14 @@ import { MessageComposer } from "../messages/MessageComposer";
 import { mentionDraft, type MentionDraft } from "../messages/mention-draft";
 import { clearView, readView, writeView } from "../../shared/view-state";
 import { Button } from "../../shared/design-system/ui/Button";
+import {
+  useVerifiedNames,
+  withVerifiedNames,
+} from "../profiles/useVerifiedNames";
 import { RecipientPicker } from "./RecipientPicker";
 import type { Recipient } from "./usePeople";
+import { usePassThroughUntilDrafted } from "../messages/draft-visit";
+import type { PageNavigation } from "../navigation/service";
 import styles from "./NewMessage.module.css";
 
 const draftKey = "direct-message:new-draft";
@@ -135,9 +141,12 @@ export function NewMessage({
   host,
   onOpenThread,
   onStarted,
+  visit,
 }: {
   session: RelaySession;
   scope: string;
+  /** The visit presenting this composer, a Back stop only once drafted. */
+  visit?: PageNavigation | undefined;
   extensions?: ConversationExtensions | undefined;
   channels: readonly ChannelSummary[];
   host: ConversationHostServices;
@@ -150,10 +159,43 @@ export function NewMessage({
   ): void;
   onStarted(channelId: string, messageId: string): void;
 }) {
+  // A message held for delivery or retry stays a Back stop even when its
+  // draft view is gone or it carries only attachments.
+  const held = useRef(false);
+  const holds = useCallback(() => held.current, []);
+  const draftEdited = usePassThroughUntilDrafted(
+    visit,
+    session,
+    scope,
+    draftKey,
+    { held: holds },
+  );
   const [recipients, setRecipients] = useState(() =>
     savedRecipients(scope, session.viewer),
   );
-  const recipientNames = recipients.map((person) => person.name).join(", ");
+  // Recipients keep the facts they were chosen with; their labels follow the
+  // current verification and otherwise the current profile name, falling back
+  // to those facts.
+  const verified = useVerifiedNames(session, recipients);
+  const profiles = useSyncExternalStore(
+    session.profiles.subscribe,
+    session.profiles.snapshot,
+  );
+  const named = useMemo(
+    () =>
+      withVerifiedNames(
+        recipients.map((person) => {
+          const current = profiles.get(person.pubkey);
+          return current && !current.verified
+            ? { ...person, name: current.name }
+            : person;
+        }),
+        verified,
+        profiles,
+      ),
+    [recipients, verified, profiles],
+  );
+  const recipientNames = named.map((person) => person.name).join(", ");
   const roster = useMemo(() => ({ recipients }), [recipients]);
   // Text still in the To field may be a recipient not chosen yet, so Send
   // waits for it to become one or be cleared.
@@ -188,6 +230,7 @@ export function NewMessage({
   } catch {
     /* Readiness presents invalid recovery. */
   }
+  held.current = !!pending;
   const failed =
     pending && session.directMessages.delivery(pending.id) === "failed";
   const locked = !ready || !!busy || (!!pending && !failed);
@@ -195,10 +238,11 @@ export function NewMessage({
     clearAttachmentDraft(session, `${scope}:${draftKey}`);
     retiring.current = undefined;
     prepared.current = undefined;
+    draftEdited(undefined);
     setRecipients([]);
     setRestoredDraft(mentionDraft(""));
     setDraftRevision((revision) => revision + 1);
-  }, [session, scope]);
+  }, [session, scope, draftEdited]);
   useLayoutEffect(() => {
     const confirmed = pending && session.directMessages.delivery(pending.id);
     if (pending) {
@@ -448,6 +492,7 @@ export function NewMessage({
         session={session}
         scope={scope}
         selected={recipients}
+        labels={named}
         disabled={locked}
         onChange={change}
         onComplete={focusComposer}
@@ -473,7 +518,7 @@ export function NewMessage({
               animateEntrance
               size="hero-large"
               max={5}
-              items={recipients.map((person) => ({
+              items={named.map((person) => ({
                 id: person.pubkey,
                 name: person.name,
                 src: avatarMedia(person.picture, session.media),
@@ -539,6 +584,7 @@ export function NewMessage({
             attachments: true,
             allowAttachmentOnly: true,
             recoveredDraft: restoredDraft,
+            onDraftChange: draftEdited,
             locked,
             disabled:
               !ready ||

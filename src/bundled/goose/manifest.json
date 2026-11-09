@@ -8,7 +8,23 @@
     "tags": ["Essentials", "code", "coding-agents"]
   },
   "host": {
-    "processes": [{ "id": "goose", "program": "goose-acp", "bundled": true }],
+    "processes": [
+      {
+        "id": "goose",
+        "program": "goose-acp",
+        "bundled": true
+      },
+      {
+        "id": "read-protected",
+        "program": "buzz-agent-command",
+        "bundled": true,
+        "args": [
+          "--shell",
+          "case \"$1\" in \"~/\"*) set -- \"$HOME/${1:2}\";; esac; exec /usr/bin/base64 -i \"$1\"",
+          "buzz-read"
+        ]
+      }
+    ],
     "mcp": true,
     "files": true
   }

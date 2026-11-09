@@ -6,13 +6,18 @@
  * deliberate deviation noted on `formatDayGroupLabel`. Formats use the default
  * locale and time zone, checked again after yielding, so a running app follows
  * OS changes without resolving the defaults for every row in one render batch.
+ * Clock times follow the hour cycle and seconds chosen in Appearance settings.
  */
+
+import { clockHourCycle, clockPreference } from "./clock-preference";
 
 let defaultsChecked = false;
 let formats:
   | {
       locale: string;
       timeZone: string;
+      hourCycle: string | undefined;
+      seconds: boolean;
       weekday: Intl.DateTimeFormat;
       weekdayMonthDay: Intl.DateTimeFormat;
       monthDayYear: Intl.DateTimeFormat;
@@ -23,14 +28,30 @@ let formats:
     }
   | undefined;
 function dateFormats() {
-  if (defaultsChecked && formats) return formats;
+  const hourCycle = clockHourCycle();
+  const { seconds } = clockPreference();
+  if (
+    defaultsChecked &&
+    formats &&
+    formats.hourCycle === hourCycle &&
+    formats.seconds === seconds
+  )
+    return formats;
   const { locale, timeZone } = new Intl.DateTimeFormat().resolvedOptions();
-  if (formats?.locale !== locale || formats.timeZone !== timeZone) {
+  if (
+    formats?.locale !== locale ||
+    formats.timeZone !== timeZone ||
+    formats.hourCycle !== hourCycle ||
+    formats.seconds !== seconds
+  ) {
     const format = (options: Intl.DateTimeFormatOptions) =>
       new Intl.DateTimeFormat(undefined, options);
+    const clock = hourCycle ? { hourCycle } : {};
     formats = {
       locale,
       timeZone,
+      hourCycle,
+      seconds,
       weekday: format({ weekday: "long" }),
       weekdayMonthDay: format({
         weekday: "long",
@@ -48,8 +69,13 @@ function dateFormats() {
         day: "numeric",
         year: "numeric",
       }),
-      time: format({ hour: "numeric", minute: "2-digit" }),
-      full: format({ dateStyle: "full", timeStyle: "long" }),
+      time: format({
+        hour: "numeric",
+        minute: "2-digit",
+        ...(seconds ? { second: "2-digit" } : {}),
+        ...clock,
+      }),
+      full: format({ dateStyle: "full", timeStyle: "long", ...clock }),
     };
   }
   defaultsChecked = true;
@@ -57,6 +83,25 @@ function dateFormats() {
     defaultsChecked = false;
   });
   return formats;
+}
+
+const days = new Map<number, string>();
+let daysZone: string | undefined;
+/** Local calendar day of a unix-seconds timestamp. Every row compares days on
+ * each render, so days are memoized under the time zone `dateFormats` saw. */
+export function calendarDay(createdAt: number) {
+  const { timeZone } = dateFormats();
+  if (timeZone !== daysZone) {
+    daysZone = timeZone;
+    days.clear();
+  }
+  let day = days.get(createdAt);
+  if (day === undefined) {
+    if (days.size >= 8192) days.clear();
+    day = new Date(createdAt * 1000).toDateString();
+    days.set(createdAt, day);
+  }
+  return day;
 }
 
 /** Days in a week, past which the weekday name stops being unambiguous. */
@@ -145,7 +190,7 @@ export function formatFullTimestamp(unixSeconds: number): string {
   return dateFormats().full.format(new Date(unixSeconds * 1_000));
 }
 
-/** The hour and minute, such as "3:05 PM". */
+/** The clock time, such as "3:05 PM". */
 export function formatTime(unixSeconds: number): string {
   return dateFormats().time.format(new Date(unixSeconds * 1_000));
 }

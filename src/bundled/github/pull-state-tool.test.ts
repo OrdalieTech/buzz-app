@@ -99,9 +99,10 @@ it("says why it could not read a pull request, and refuses other links", async (
   await expect(call({ url })).rejects.toThrow(
     `Could not read ${url}: GitHub couldn’t find this`,
   );
+  // The store reads issues for links, but this tool is pull requests'.
   await expect(
     call({ url: "https://github.com/block/buzz-app/issues/7" }),
-  ).rejects.toThrow("Not a GitHub pull request URL");
+  ).rejects.toThrow("url must be a GitHub pull request URL");
 });
 
 it("answers the last state read, and why reading it again failed", async () => {

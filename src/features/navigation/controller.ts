@@ -102,6 +102,8 @@ export function createNavigationController(
     timer?: ReturnType<typeof setTimeout> | undefined;
     /** Cancels a failed visit's reopen after sign-in. */
     reauthorizing?: () => void;
+    /** Timed out on the shown page, which stayed: it may still answer. */
+    late?: boolean;
   };
   let disposed = false;
   let active: Operation;
@@ -110,7 +112,21 @@ export function createNavigationController(
   // key-setup gate, IdentitySetup, hides the app for minutes), so it runs only
   // while one is attached.
   let presenters = 0;
+  // The visit whose page is on screen. A later attempt on it (a retry, a
+  // same-target open, a reopen after sign-in) that times out leaves that page
+  // up: background work never replaces content already shown.
+  let shown: string | undefined;
   let ingressRetry: (() => Promise<OpenResult>) | undefined;
+  // Visits whose page currently reports nothing worth returning to.
+  const passing = new Map<string, () => boolean>();
+  // A page that cannot answer keeps its visit, never the opening.
+  const passes = (entryId: string) => {
+    try {
+      return passing.get(entryId)?.() === true;
+    } catch {
+      return false;
+    }
+  };
   const listeners = new Set<() => void>();
   // Commit state and capture each caller's result before invoking external code.
   // Reentrant opens run against committed state and own their own result; deferred
@@ -155,16 +171,51 @@ export function createNavigationController(
     operation.timer = setTimeout(
       () =>
         transaction(() => {
-          finish(operation, { status: "failed", reason: "timeout" });
+          finish(
+            operation,
+            { status: "failed", reason: "timeout" },
+            "deadline",
+          );
         }),
       timeoutMs,
     );
   }
-  function finish(operation: Operation, result: OpenResult) {
-    if (operation !== active || !operation.pending) return;
+  /**
+   * `source`: "deadline" when this controller's own deadline passed; "answer"
+   * when the page or host answered, which a kept attempt may still do late;
+   * "host" when the host ends the attempt itself, which keeps no page.
+   */
+  function finish(
+    operation: Operation,
+    outcome: OpenResult,
+    source: "deadline" | "answer" | "host",
+  ) {
+    if (
+      operation !== active ||
+      !(operation.pending || (source === "answer" && operation.late))
+    )
+      return;
+    operation.late = false;
+    // A page that stays silent past the deadline keeps showing what it showed.
+    // Any failure that is answered, a timeout included, still replaces it with
+    // the host's explanation and Retry, as does a rejected incoming link. That
+    // covers the host's own report that it was not drawing the kept page.
+    const result: OpenResult =
+      source === "deadline" &&
+      outcome.status === "failed" &&
+      !snapshot.ingress &&
+      operation.attempt.entry.id === shown
+        ? { ...outcome, presented: true }
+        : outcome;
+    if (result !== outcome) operation.late = true;
+    if (result.status === "opened") shown = operation.attempt.entry.id;
+    // The host's failure now covers the page.
+    else if (result.status === "failed" && !result.presented) shown = undefined;
+    // A late answer resolves no caller: settle already ran at the deadline.
     settle(operation, result);
+    const { reason: _reason, presented: _presented, ...current } = snapshot;
     snapshot = Object.freeze({
-      ...snapshot,
+      ...current,
       status: result.status,
       ...(result.status === "failed"
         ? {
@@ -207,6 +258,7 @@ export function createNavigationController(
     }
     const controller = new AbortController();
     const state = history.snapshot();
+    if (state.current.id !== shown) shown = undefined;
     const attempt: OpenAttempt = Object.freeze({
       id: crypto.randomUUID(),
       entry: state.current,
@@ -235,7 +287,7 @@ export function createNavigationController(
       canGoForward: state.canGoForward,
     });
     if (state.invalidAddress) {
-      finish(operation, { status: "failed", reason: "invalid-target" });
+      finish(operation, { status: "failed", reason: "invalid-target" }, "host");
       return promise;
     }
     arm(operation);
@@ -402,9 +454,16 @@ export function createNavigationController(
           opening = true;
           openingFocus = options?.focus;
           returningFocus = undefined;
+          // A passing visit leaves as a dismissal does: back to its opener when
+          // that is the page opening, else replaced by it. Settings returns to
+          // that visit, so it never replaces it. Any forward entries stay.
+          const dismiss =
+            options?.dismiss ||
+            (target.kind !== "settings" &&
+              passes(history.snapshot().current.id));
           const previous = history.snapshot().previous;
           if (
-            options?.dismiss &&
+            dismiss &&
             previous &&
             targetKey(previous.target) === targetKey(target) &&
             history.returnTo(previous.id)
@@ -412,7 +471,7 @@ export function createNavigationController(
             if (openingFocus) returningFocus = openingFocus;
             return active.promise;
           }
-          if (options?.replace || options?.dismiss) history.replace(target);
+          if (options?.replace || dismiss) history.replace(target);
           else {
             const { current, previous } = history.snapshot();
             if (
@@ -516,7 +575,8 @@ export function createNavigationController(
           disposed ||
           attempt !== active.attempt ||
           attempt.signal.aborted ||
-          !active.pending
+          // A kept page may still normalize before its late answer.
+          (!active.pending && !active.late)
         )
           return false;
         try {
@@ -543,12 +603,22 @@ export function createNavigationController(
           disposed ||
           attempt !== active.attempt ||
           attempt.signal.aborted ||
-          !active.pending
+          (!active.pending && !active.late)
         )
           return false;
-        finish(active, result);
+        // A kept page may still answer after its deadline, either way.
+        finish(active, result, "answer");
         return true;
       });
+    },
+    /** While registered, the page presenting visit `entryId` reports through
+     * `passes` whether it holds anything to come back to. When it holds
+     * nothing, the next page opened from it replaces it in history. */
+    passThrough(entryId: string, passes: () => boolean) {
+      passing.set(entryId, passes);
+      return () => {
+        if (passing.get(entryId) === passes) passing.delete(entryId);
+      };
     },
     /** Host-only traversal to a retained visit; does not retire dismissed content. */
     returnTo(entryId: string) {
@@ -558,7 +628,7 @@ export function createNavigationController(
       transaction(() => {
         ingressRetry = undefined;
         const operation = active;
-        finish(operation, { status: "cancelled" });
+        finish(operation, { status: "cancelled" }, "host");
         effects.push(() => operation.controller.abort(NAVIGATION_ABORTED));
       });
     },
@@ -573,7 +643,7 @@ export function createNavigationController(
           ingress: true,
           retryable: !!retry,
         });
-        finish(active, { status: "failed", reason });
+        finish(active, { status: "failed", reason }, "host");
       });
     },
     dispose() {
@@ -586,10 +656,11 @@ export function createNavigationController(
         ingressRetry = undefined;
         active.reauthorizing?.();
         unsubscribe();
-        finish(active, { status: "cancelled" });
+        finish(active, { status: "cancelled" }, "host");
         const operation = active;
         effects.push(() => operation.controller.abort(NAVIGATION_ABORTED));
         listeners.clear();
+        passing.clear();
         history.dispose();
       });
     },

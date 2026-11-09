@@ -16,10 +16,12 @@ import styles from "./Panels.module.css";
 export function PanelCard({
   ref,
   panel,
+  contentKey,
   ...props
 }: PanelProps & {
   ref?: Ref<HTMLElement>;
   panel: RegisteredPanel;
+  contentKey?: string;
 }) {
   const tabbed = !!usePanelTabHost();
   return (
@@ -29,7 +31,7 @@ export function PanelCard({
       className={styles.cardLayout}
       aria-label={panel.title}
       onKeyDown={(event) => {
-        if (event.key === "Escape" && !tabbed) {
+        if (event.key === "Escape" && !event.shiftKey && !tabbed) {
           event.stopPropagation();
           props.close();
         }
@@ -61,7 +63,7 @@ export function PanelCard({
               />
             )}
             <div className={styles.content}>
-              <PanelView panel={panel} {...props} />
+              <PanelView panel={panel} contentKey={contentKey} {...props} />
             </div>
           </div>
         </PanelSubviewHost>

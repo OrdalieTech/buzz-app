@@ -1,16 +1,13 @@
 import {
   sameLabels,
   type ChannelDetailsDraft,
+  type ChannelDetails,
 } from "../relay/channel-details-protocol";
-import {
-  addChannelMember,
-  canAddMembers,
-  canShareSoloChat,
-} from "../channel-members/members";
-import { archiveHides } from "../relay/identity-archives";
+import { canAddMembers, canShareSoloChat } from "../channel-members/members";
 import type { ChannelSummary } from "../relay/contracts";
 import type { RelaySession } from "../relay/session";
-import type { MemberAdditionIntent } from "../channel-members/members";
+import { ownSolo, soloLabels } from "./labels";
+import { generalAccessPolicy } from "../channels/general-access";
 
 /** Sharing changes access, never presentation or Solo placement. */
 export function canShareConversation(
@@ -37,66 +34,28 @@ export const soloChatLink = (id: string) =>
 export const soloChatLinkMessage = (id: string, name = id.slice(0, 8)) =>
   `[Chat: ${name.replace(/\s+/g, " ").replace(/[\\`[\]*_~<>&|]/g, "\\$&")}](${soloChatLink(id)})`;
 
-/** Exact selected people are grants to the chat, not the destination or its parent. */
-export async function grantSoloChatAccess(
-  session: RelaySession,
-  channelId: string,
-  people: readonly string[],
-  intents: Map<string, MemberAdditionIntent>,
-  signal: AbortSignal,
-  onConfirmed: (key: string) => void,
-  includeAgents = false,
-  soloParticipant = true,
-  skipArchived = false,
-  beforeDispatch?: () => void,
-) {
-  if (people.length > 100 || new Set(people).size !== people.length)
-    throw new Error("Choose at most 100 distinct recipients.");
-  for (const key of people) {
-    signal.throwIfAborted();
-    // Channel audiences omit archived identities; direct selections still fail explicitly.
-    if (skipArchived && archiveHides(session.archives, key, session.viewer))
-      continue;
-    const intent = intents.get(key) ?? {};
-    intents.set(key, intent);
-    await addChannelMember(
-      session,
-      channelId,
-      key,
-      signal,
-      intent,
-      session.outbox,
-      soloParticipant,
-      includeAgents,
-      beforeDispatch,
-    );
-    onConfirmed(key);
-  }
-}
-
-/** Conversations whose members a chat can be shared with: channels and DMs. */
-export function sharesWithMembers(
+/** Link sharing is available in channels, their threads and DMs. */
+export function chatShareDestination(
   destination: Pick<ChannelSummary, "channelType"> | undefined,
 ) {
   return ["stream", "forum", "dm"].includes(destination?.channelType ?? "");
 }
 
-/** The destination's current members other than the viewer, without archived
- * identities, including oversized rosters so the 100-recipient check sees them. */
-export async function destinationShareAudience(
+/** Check the destination before opening community reading; never enroll its members. */
+export async function checkShareDestination(
   session: RelaySession,
-  destinationId: string,
+  id: string,
   signal: AbortSignal,
 ) {
   signal.throwIfAborted();
-  const fresh = await session.channels.refreshRoster?.(destinationId, {
+  const fresh = await session.channels.refreshRoster?.(id, {
     consistency: "strong",
     signal,
   });
   signal.throwIfAborted();
   const destination = session.channels
     .list()
-    .channels.find((item) => item.id === destinationId);
+    .channels.find((item) => item.id === id);
   if (
     !fresh ||
     !destination ||
@@ -106,110 +65,83 @@ export async function destinationShareAudience(
     destination.archived ||
     destination.readOnly ||
     !destination.members?.includes(session.viewer ?? "") ||
-    !sharesWithMembers(destination)
+    !chatShareDestination(destination)
   )
     throw new Error(
       "Destination membership could not be confirmed. Retry to share.",
     );
-  const keys = [
-    ...new Set(destination.members.filter((key) => key !== session.viewer)),
-  ];
-  if (keys.some((key) => !/^[0-9a-f]{64}$/.test(key)))
-    throw new Error("Destination membership contains an invalid identity.");
-  return keys.filter(
-    (key) => !archiveHides(session.archives, key, session.viewer),
-  );
 }
 
-/** Captured members a share grants: those missing from at least one chat. */
-export function missingAccess(
-  sources: readonly ChannelSummary[],
-  audience: readonly string[],
-) {
-  return audience.filter((key) =>
-    sources.some((source) => !source.members?.includes(key)),
-  );
-}
-
-/** Why sharing these chats with this audience can't succeed, if it can't. */
-export function shareBlocker(
+/** Both share entry points confirm Private and View only chats. Public stays intact.
+ * Return the signed snapshot for consent; confirmed Private writes use the existing
+ * details owner and retain its exact uncertain attempt for explicit checking. */
+export async function shareSoloChatAccess(
   session: RelaySession,
-  sources: readonly ChannelSummary[],
-  audience: readonly string[],
-) {
-  if (sources.some((source) => !canShareConversation(session, source)))
-    return "You can’t share access to this chat, so some people may not be able to open it. Send the link only, or ask its owner to share it.";
-  if (missingAccess(sources, audience).length > 100)
-    return "This channel has too many members to share with at once. Send the link only, or share with people directly.";
-  return undefined;
-}
-
-/** A reason that retrying the same share can't change. */
-export class Unshareable extends Error {}
-
-/** The one way to share chats with a channel: give its current members who
- * lack access a membership in each chat. The caller posts the link. Grants
- * already confirmed are skipped, so a retry only adds who is still missing. */
-export async function shareChatsWithChannel(
-  session: RelaySession,
-  sourceIds: readonly string[],
-  channelId: string,
+  id: string,
   {
     signal,
+    confirmed,
+    attempts,
     check = () => signal.throwIfAborted(),
-    audience,
-    grants = new Map(),
-    onStarted,
+    onAccessChanged,
   }: {
     signal: AbortSignal;
-    /** Throws to stop before the next grant, e.g. when a draft changed. */
+    confirmed?: ChannelDetails | undefined;
+    attempts: Map<string, ChannelDetailsDraft>;
     check?: () => void;
-    /** A previously captured audience; read fresh when absent. */
-    audience?: readonly string[];
-    grants?: Map<string, Map<string, MemberAdditionIntent>>;
-    onStarted?: () => void;
+    /** Only after this share's save or exact uncertain attempt is confirmed. */
+    onAccessChanged?: () => void;
   },
-) {
+): Promise<ChannelDetails | undefined> {
   check();
-  const members =
-    audience ?? (await destinationShareAudience(session, channelId, signal));
-  check();
-  // Check every source before starting any grant. A copied link is not authority.
-  const sources: ChannelSummary[] = [];
-  for (const id of sourceIds) {
-    sources.push(await session.channelWrites.refreshMembership(id));
+  const details = session.channelDetails;
+  const pending = details.snapshot(id);
+  if (pending) {
+    if (pending.status !== "unconfirmed" || pending.draft !== attempts.get(id))
+      throw new Error(
+        "Finish the existing General access change before sharing.",
+      );
+    await details.check(id, signal);
     check();
+    onAccessChanged?.();
   }
-  const blocked = shareBlocker(session, sources, members);
-  if (blocked) throw new Unshareable(blocked);
-  onStarted?.();
-  for (const source of sources) {
-    check();
-    let intents = grants.get(source.id);
-    if (!intents) {
-      intents = new Map();
-      grants.set(source.id, intents);
-    }
-    const confirmed = intents;
-    await grantSoloChatAccess(
-      session,
-      source.id,
-      members.filter(
-        (key) =>
-          !confirmed.get(key)?.confirmed && !source.members?.includes(key),
-      ),
-      confirmed,
-      signal,
-      () => {},
-      true,
-      source.channelType === "solo",
-      true,
-      // A dispatched addition may finish; a failed check stops the next one.
-      check,
+  const base = await details.load(id, signal);
+  check();
+  if (confirmed && confirmed.channelId !== id)
+    throw new Error("Chat selection changed. Try sharing again.");
+  if (base.visibility === "public")
+    return base.joinRole === "guest" && !confirmed ? base : undefined;
+  const source = session.channels
+    .list()
+    .channels.find((item) => item.id === id);
+  if (
+    !base.canEdit ||
+    !soloLabels(base.labels) ||
+    !ownSolo(source, session.viewer)
+  )
+    throw new Error("You can no longer change this chat’s general access.");
+  if (!confirmed) return base;
+  if (confirmed.visibility !== "private")
+    throw new Error(
+      "The chat is now Private. Close this dialog and share again to confirm the access change.",
     );
-  }
+  const saving = details.save(
+    confirmed,
+    {
+      ...confirmed,
+      ...generalAccessPolicy("view-only", confirmed.joinRole),
+    },
+    signal,
+    () => {
+      check();
+      return true;
+    },
+  );
+  const draft = details.snapshot(id)?.draft;
+  if (draft) attempts.set(id, draft);
+  await saving;
   check();
-  return members;
+  onAccessChanged?.();
 }
 
 /** Promote in place through the existing signed details owner. A retry checks an
@@ -226,6 +158,7 @@ export async function applySharedChannelDetails(
     value.name === draft.name &&
     value.description === draft.description &&
     value.visibility === draft.visibility &&
+    (draft.joinRole === undefined || value.joinRole === draft.joinRole) &&
     value.ttlSeconds === draft.ttlSeconds &&
     (draft.labels === undefined ||
       sameLabels(value.labels ?? [], draft.labels));
@@ -245,6 +178,7 @@ export async function applySharedChannelDetails(
       base.name !== expected.name ||
       base.description !== expected.description ||
       base.visibility !== expected.visibility ||
+      base.joinRole !== expected.joinRole ||
       base.ttlSeconds !== expected.ttlSeconds ||
       (draft.labels !== undefined &&
         !sameLabels(base.labels ?? [], expected.labels ?? []))

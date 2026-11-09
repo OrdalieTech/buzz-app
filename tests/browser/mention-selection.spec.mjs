@@ -14,15 +14,15 @@ const variants = [
   {
     title: "one-word labels",
     query: "",
-    first: (keys) => `Honey ${keys.first}`,
-    second: (keys) => `Honey (agent) ${keys.second}`,
+    first: (keys) => keys.first,
+    second: (keys) => keys.second,
     value: "@Honey say hello to @Honey ",
   },
   {
     title: "a label with a space",
     query: "?delayed-profiles",
-    first: (keys) => `Honey ${keys.second}`,
-    second: (keys) => `Mary Jane ${keys.first}`,
+    first: (keys) => keys.second,
+    second: (keys) => keys.first,
     value: "@Honey say hello to @Mary Jane ",
   },
 ];
@@ -35,11 +35,15 @@ async function compose(page, variant) {
     second: window.mentionFixture.second,
   }));
   const input = page.getByRole("textbox", { name: "Message #General" });
-  const mention = async (name) => {
+  // Rows no longer spell out their key, so each picks by the key it carries.
+  const mention = async (key) => {
     await page
       .getByRole("button", { name: "Mention a member", exact: true })
       .click();
-    await page.getByRole("button", { name, exact: true }).click();
+    await page
+      .getByRole("button")
+      .and(page.locator(`[data-mention-choice="${key}"]`))
+      .click();
     // The picker restores focus and the caret on the next animation frame.
     await page.evaluate(() => new Promise(requestAnimationFrame));
     await expect(input).toBeFocused();

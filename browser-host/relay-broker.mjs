@@ -32,6 +32,7 @@ import {
   prepareChannelKit,
   decodeChannelKit,
   admitChannelKit,
+  canvasEventFits,
   validCanvas,
 } from "./channel-kit.mjs";
 import { uploadAttachment, UploadError } from "./attachment-upload.mjs";
@@ -52,6 +53,7 @@ import {
   directMessageReceipt,
 } from "./direct-messages.mjs";
 import { SocketRequestError } from "../src/features/relay/socket-requests.ts";
+import { CANVAS_MAX_EVENT_BYTES } from "../src/features/channel-templates/canvas-limits.ts";
 import {
   ARTIFACT_SYNC_MAX_VIEWS,
   artifactSyncFilter,
@@ -132,7 +134,10 @@ import {
   apiFailure,
   presenceFilter,
   presenceText,
+  readApiFailure,
+  BROKER_REFUSAL_HEADER,
 } from "../src/features/relay/http-admission.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { Readable, Transform } from "node:stream";
@@ -328,6 +333,9 @@ async function relayAuthority(fetch, relay) {
       nip11.supported_extensions.includes("nip-cl"),
     // NIP-AR sync: REQ with `"artifact": "current"` keeps a set current.
     artifactSync: nip11.artifacts?.sync?.version === 1,
+    artifactSupport:
+      Array.isArray(nip11.supported_extensions) &&
+      nip11.supported_extensions.includes("nip-ar"),
     // Bridge search accepts `search_sort: "newest"`.
     searchSort:
       Array.isArray(nip11.supported_extensions) &&
@@ -368,6 +376,7 @@ function relayMediaTarget(raw, relay) {
     /^[0-9a-f]{64}$/.test(hash) &&
     (extension === "" ||
       extension === "thumb.jpg" ||
+      extension === "thumb.webp" ||
       /^[a-z0-9]{1,8}$/.test(extension))
     ? target
     : undefined;
@@ -799,6 +808,35 @@ function failureSummary(error) {
   );
   return `${category}${code ? ` (${code})` : ""}`;
 }
+/** A community refusal in a relay 401/403, read from a copy of its body. Only
+ * the relay's short denial (its NIP-FI text, or a membership refusal's JSON)
+ * counts, so a longer body stops being read at once; its route still owns,
+ * reads or cancels the original. */
+async function refusalOf(response) {
+  const reader = response.clone().body?.getReader();
+  if (!reader) return undefined;
+  const chunks = [];
+  for (let bytes = 0; ; ) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > 256) {
+      // A tee'd copy's cancel settles only once the original's does too.
+      void reader.cancel().catch(() => {});
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const copy = new Response(Buffer.concat(chunks), { status: response.status });
+  return (await readApiFailure(copy)).admission;
+}
+/** The browser response whose route is making a relay request. */
+const refusalTarget = new AsyncLocalStorage();
+/** `admittedApiRequest`, but a queued request keeps its own route's response:
+ * the shared lane starts a waiting request from whichever one finished, so
+ * left unbound it would mark that one's response with this one's refusal. */
+const admittedRelayRequest = (lane, request, ...rest) =>
+  admittedApiRequest(lane, AsyncLocalStorage.bind(request), ...rest);
 const json = (res, code, body) => {
   res.writeHead(code, {
     "Content-Type": "application/json",
@@ -826,6 +864,22 @@ export function relayBrokerPlugin({
   const defaultRelay = relayUrl?.trim() ? relayOrigin(relayUrl) : undefined;
   return {
     name: "buzz-relay-broker",
+    configResolved(config) {
+      // Request headers express browser origin intent, not remote-client
+      // authentication. Check the effective listener, including CLI overrides,
+      // before configureServer loads the signing identity.
+      const host = config.server.host;
+      if (
+        host !== undefined &&
+        host !== false &&
+        host !== "localhost" &&
+        host !== "127.0.0.1" &&
+        host !== "::1"
+      )
+        throw new Error(
+          "The live identity broker requires a loopback-only Vite listener; remove --host or use --host 127.0.0.1.",
+        );
+    },
     async configureServer(server) {
       const log = getLogger("relay-broker");
       const key = identity();
@@ -834,7 +888,22 @@ export function relayBrokerPlugin({
       const localArchive = () => (archive ??= openArchive(archiveFile));
       const upstream = createUpstream();
       // Injected fixtures bypass the pool; the live relay always uses the warm agent.
-      const fetchUpstream = upstreamFetch ?? upstream.fetch;
+      const relayFetch = upstreamFetch ?? upstream.fetch;
+      /** Every relay request passes here, so a community refusal reaches the
+       * browser whichever route met it and whatever it does with the body. */
+      const fetchUpstream = async (url, init) => {
+        const response = await relayFetch(url, init);
+        const res = refusalTarget.getStore();
+        if (
+          res &&
+          !res.headersSent &&
+          (response.status === 401 || response.status === 403)
+        ) {
+          const admission = await refusalOf(response);
+          if (admission) res.setHeader(BROKER_REFUSAL_HEADER, admission);
+        }
+        return response;
+      };
       const readSidebarHead = async (response, label = "preference") => {
         if (!response.body)
           throw new Error(`Sidebar ${label} response missing`);
@@ -921,6 +990,10 @@ export function relayBrokerPlugin({
         `signing as ${viewer.slice(0, 8)}… for explicitly selected communities (lazy, scoped connections)`,
       );
       server.middlewares.use(async (req, res, next) => {
+        // This request's relay requests run with its response, so a community
+        // refusal any of them meets marks it (`fetchUpstream`). Each request
+        // has its own async context, so nothing else sees it.
+        refusalTarget.enterWith(res);
         if (
           !req.url?.startsWith("/api/relay/") &&
           !req.url?.startsWith("/api/builderlab/")
@@ -1203,6 +1276,9 @@ export function relayBrokerPlugin({
                 ? null
                 : (await policyResponse.json()).policy;
             return json(res, 200, {
+              membershipRequired:
+                Array.isArray(info.supported_nips) &&
+                info.supported_nips.includes(43),
               name: info.name,
               icon: info.icon,
               policy: policy ?? null,
@@ -1380,7 +1456,7 @@ export function relayBrokerPlugin({
                   AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
                 ]);
                 const dispatch = (path, body) =>
-                  admittedApiRequest(
+                  admittedRelayRequest(
                     lane,
                     () => {
                       requestSignal.throwIfAborted();
@@ -1556,7 +1632,7 @@ export function relayBrokerPlugin({
                 30178,
                 40100,
                 1984,
-                45010,
+                ...((await getAuthority(relay)).artifactSupport ? [45010] : []),
                 ...WORKFLOW_KINDS,
                 ...((await getAuthority(relay)).channelCreation ? [9007] : []),
               ],
@@ -1929,9 +2005,14 @@ export function relayBrokerPlugin({
                 const { interestRevision, singleton } = entry;
                 if (singleton) {
                   pendingEstablished.delete(first);
-                  write("established", { channelId: first, interestRevision });
+                  write("established", {
+                    channelId: first,
+                    ...(entry.continuous ? { continuous: [first] } : {}),
+                    interestRevision,
+                  });
                 } else {
                   const channels = [];
+                  const continuous = [];
                   for (const [id, pending] of pendingEstablished) {
                     if (
                       pending.interestRevision !== interestRevision ||
@@ -1940,9 +2021,14 @@ export function relayBrokerPlugin({
                       continue;
                     pendingEstablished.delete(id);
                     channels.push(id);
+                    if (pending.continuous) continuous.push(id);
                     if (channels.length === 512) break;
                   }
-                  write("established", { channels, interestRevision });
+                  write("established", {
+                    channels,
+                    ...(continuous.length ? { continuous } : {}),
+                    interestRevision,
+                  });
                 }
                 if (res.writableNeedDrain) return;
               }
@@ -2064,7 +2150,7 @@ export function relayBrokerPlugin({
                     ...state,
                     interestRevision: stream.interestRevision,
                   }),
-                established: (channelId, global) => {
+                established: (channelId, global, continuous) => {
                   if (statusDeltas && channelId !== undefined) {
                     for (const id of typeof channelId === "string"
                       ? [channelId]
@@ -2072,6 +2158,11 @@ export function relayBrokerPlugin({
                       pendingEstablished.set(id, {
                         interestRevision: stream.interestRevision,
                         singleton: typeof channelId === "string",
+                        // A coalesced establishment is continuous only if
+                        // every one it replaces was too.
+                        continuous:
+                          !!continuous?.includes(id) &&
+                          (pendingEstablished.get(id)?.continuous ?? true),
                       });
                     if (!res.writableNeedDrain) flushDeltas();
                   } else
@@ -2080,6 +2171,7 @@ export function relayBrokerPlugin({
                         ? { channels: channelId }
                         : { channelId }),
                       ...(global ? { global } : {}),
+                      ...(continuous ? { continuous } : {}),
                       interestRevision: stream.interestRevision,
                     });
                 },
@@ -2206,7 +2298,7 @@ export function relayBrokerPlugin({
               cancel.signal,
               AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
             ]);
-            const upstream = await fetchUpstream(target, {
+            const init = {
               headers: {
                 Authorization:
                   "Nostr " +
@@ -2215,7 +2307,20 @@ export function relayBrokerPlugin({
               },
               redirect: "error",
               signal: mediaDeadline,
-            });
+            };
+            let upstream = await fetchUpstream(target, init);
+            // Relays before WebP thumbnails, and images uploaded before them,
+            // have only the `.thumb.jpg` that every relay writes.
+            if (
+              upstream.status === 404 &&
+              target.pathname.endsWith(".thumb.webp")
+            ) {
+              await upstream.body?.cancel();
+              upstream = await fetchUpstream(
+                new URL(target.href.replace(/\.thumb\.webp$/, ".thumb.jpg")),
+                init,
+              );
+            }
             stats.media++;
             if (!upstream.ok) {
               await upstream.body?.cancel();
@@ -2325,8 +2430,9 @@ export function relayBrokerPlugin({
             return json(res, 404, { error: "Unknown broker route" });
           const memory = route === "/api/relay/agent-memories";
           const presence = route === "/api/relay/presence-snapshot";
-          // Only NIP-AP catalog events may exceed the ordinary body bound.
-          const catalogWrite =
+          // Only NIP-AP catalog and Canvas events may exceed the ordinary
+          // body bound, each up to its own complete-event bound.
+          const largeWrite =
             route === "/api/relay/sign" || route === "/api/relay/publish";
           let raw = "";
           const uploadDeadline = memory
@@ -2339,7 +2445,10 @@ export function relayBrokerPlugin({
               if (
                 presence
                   ? Buffer.byteLength(raw) > 20 * 1024
-                  : raw.length > (catalogWrite ? CATALOG_EVENT_BYTES : 65536)
+                  : raw.length >
+                    (largeWrite
+                      ? Math.max(CATALOG_EVENT_BYTES, CANVAS_MAX_EVENT_BYTES)
+                      : 65536)
               )
                 return json(res, 413, { error: "Filter body too large" });
             }
@@ -2354,8 +2463,15 @@ export function relayBrokerPlugin({
           }
           if (
             raw.length > 65536 &&
-            (!isCatalogKind(filters?.kind) ||
-              Buffer.byteLength(raw) > CATALOG_EVENT_BYTES)
+            !(
+              largeWrite &&
+              Buffer.byteLength(raw) <=
+                (isCatalogKind(filters?.kind)
+                  ? CATALOG_EVENT_BYTES
+                  : filters?.kind === 40100
+                    ? CANVAS_MAX_EVENT_BYTES
+                    : 0)
+            )
           )
             return json(res, 413, { error: "Filter body too large" });
           let memoryAgent;
@@ -2882,7 +2998,10 @@ export function relayBrokerPlugin({
                   throw new Error("Expired operation");
                 if (filters.kind === 30078)
                   admitChannelKit(filters, key, relay);
-                else if (!validCanvas(filters))
+                else if (
+                  !validCanvas(filters) ||
+                  (!signing && !canvasEventFits(filters))
+                )
                   throw new Error("Invalid Canvas");
               } catch {
                 return json(res, 400, {
@@ -2954,6 +3073,13 @@ export function relayBrokerPlugin({
                 },
                 key,
               );
+              // The relay limits the complete event, which escaping and the
+              // id, pubkey and sig make larger than its content.
+              if (event.kind === 40100 && !canvasEventFits(event))
+                return json(res, 400, {
+                  error: "Relay event is too large",
+                  sent: false,
+                });
               res.setHeader(
                 "Server-Timing",
                 `sign;dur=${(performance.now() - started).toFixed(2)}`,
@@ -3015,6 +3141,18 @@ export function relayBrokerPlugin({
               const conflict =
                 failure?.sent === false &&
                 failure.refusal?.startsWith("conflict:");
+              // Answer a proven validation refusal as the relay's HTTP API does,
+              // 400 with its bounded text, so every publish path shows the same
+              // reason. The text goes to this client only, never to the log.
+              if (
+                failure?.sent === false &&
+                failure.reason?.startsWith("invalid:") &&
+                !(
+                  readPublishing &&
+                  failure.refusal === READ_STATE_TIMESTAMP_REFUSAL
+                )
+              )
+                return json(res, 400, { error: failure.reason });
               return json(res, conflict ? 409 : 503, {
                 error:
                   failure?.sent === false &&
@@ -3133,7 +3271,7 @@ export function relayBrokerPlugin({
             };
             response = presence
               ? await request()
-              : await admittedApiRequest(
+              : await admittedRelayRequest(
                   lane,
                   request,
                   requestSignal,

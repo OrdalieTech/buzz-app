@@ -272,9 +272,16 @@ export function PageTabs({
       fallbackFocus.current
     )?.focus({ preventScroll: true });
   });
-  const split = usePanelSplit();
+  const split = usePanelSplit(scope, `page:${id}`);
   const hasTabs = secondary.items.length > 0;
   const showingPanel = tabState.paneOpen && hasTabs;
+  // As in a plain channel visit, the page reads its visible selected side tab
+  // while focus stays anywhere on the page, such as the row that opened it.
+  // A conversation moved to the main pane still reads only by its own focus.
+  const readingTab =
+    showingPanel &&
+    secondary.selectedMain === "conversation" &&
+    !!secondary.selectedTab;
   const tabMenu = {
     key: JSON.stringify([scope, id]),
     closeAll,
@@ -315,6 +322,7 @@ export function PageTabs({
         <div
           ref={split.ref}
           style={split.style}
+          data-reading-thread={readingTab ? "" : undefined}
           className={`${styles.board} ${panelStyles.splitMotion}`}
         >
           <div

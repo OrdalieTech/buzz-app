@@ -31,6 +31,8 @@ export const inlineFormats = [
     label: "Code",
     inputType: "formatInlineCode",
     binding: { key: "e", mod: true, shift: false },
+    // Slack's chord, for people moving over.
+    aliases: [{ key: "c", mod: true, shift: true }],
   },
 ] as const;
 export type InlineFormat = (typeof inlineFormats)[number]["mark"];
@@ -39,6 +41,7 @@ export const blockFormats = [
     mark: "code_block",
     label: "Code block",
     binding: { key: "c", mod: true, alt: true, shift: false },
+    aliases: [{ key: "c", mod: true, alt: true, shift: true }],
   },
   {
     mark: "bullet_list",
@@ -54,11 +57,29 @@ export const blockFormats = [
     mark: "blockquote",
     label: "Quote",
     binding: { key: "b", mod: true, shift: true },
+    aliases: [{ key: "9", mod: true, shift: true }],
   },
 ] as const;
 export type BlockFormat = (typeof blockFormats)[number]["mark"];
 export type ComposerFormat = InlineFormat | BlockFormat;
 export const composerFormats = [...inlineFormats, ...blockFormats];
+export type ComposerFormatBinding = Readonly<{
+  key: string;
+  mod: true;
+  shift: boolean;
+  alt?: boolean;
+}>;
+/** Every chord a format answers to; the first is the one hints show. */
+export function formatBindings(
+  format: (typeof composerFormats)[number],
+): readonly ComposerFormatBinding[] {
+  return [format.binding, ...("aliases" in format ? format.aliases : [])];
+}
+/** Add or edit a link around the selection: Buzz's ⌘K, then Slack's ⌘⇧U. */
+export const linkBindings: readonly ComposerFormatBinding[] = [
+  { key: "k", mod: true, shift: false },
+  { key: "u", mod: true, shift: true },
+];
 
 export type ComposerLinkEdit = {
   text: string;
@@ -82,17 +103,21 @@ export type ComposerInputElement = HTMLDivElement & {
     text: string,
     recipient?: MentionRecipient | readonly MentionRecipient[],
     range?: { start: number; end: number },
-    /** A typed closing colon is recorded before conversion for one-step undo. */
-    terminator?: ":",
+    /** The key typed to end the query. A closing colon is recorded before
+     * conversion for one-step undo; after recipients, it takes the place of
+     * the space that follows each one. */
+    terminator?: string,
     /** Automatic edits preserve focus and the current selection. */
     focus?: boolean,
   ): boolean;
   replaceRecipients(recipients: readonly MentionRecipient[]): boolean;
-  /** Replace the typed `@name` with a chip the host is still resolving; the
-   * returned id names it until `settlePendingMention`. One undo step. */
+  /** Replace the typed `@name` with a chip the host is still resolving,
+   * followed by the key that ended it (a space by default); the returned id
+   * names it until `settlePendingMention`. One undo step. */
   insertPendingMention(
     name: string,
     range: { start: number; end: number },
+    terminator?: string,
   ): string | false;
   /** Turn a pending chip into its recipient, or back into its typed text.
    * Outside undo history and allowed while sending; false once the chip is

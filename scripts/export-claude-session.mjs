@@ -8,9 +8,29 @@ const resultText = (content) =>
   content.every((block) => typeof block?.text === "string")
     ? content.map((block) => block.text).join("\n")
     : content;
-// Buzz events carry `Content: <message>` followed by a `Tags:` line.
-const buzzRequest = (value) =>
-  value.match(/^Content: ([\s\S]*?)\nTags: /m)?.[1];
+// An exact-record event is a section holding its JSON event, then a quoted
+// `Request:` line. Older events carry `Content: <message>` followed by a
+// `Tags:` line. Any other `Request:` line is the message's own text.
+const EVENT_SECTION =
+  /^<(buzz-event|new-message-arrived-while-you-were-working)(?:\s[^<>]*)?>\n(\{[^\n]*\})\nRequest: ("[^\n]*")\n<\/\1>$/gm;
+const eventRequest = (event, request) => {
+  try {
+    const pubkey = JSON.parse(event)?.pubkey;
+    const value = JSON.parse(request);
+    return typeof pubkey === "string" && typeof value === "string"
+      ? value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const buzzRequest = (value) => {
+  const requests = [...value.matchAll(EVENT_SECTION)]
+    .map((match) => eventRequest(match[2], match[3]))
+    .filter((request) => request !== undefined);
+  if (requests.length) return requests.join("\n\n");
+  return value.match(/^Content: ([\s\S]*?)\nTags: /m)?.[1];
+};
 // Name a tool call's target; shell commands already show as the input.
 const target = (input) =>
   ["file_path", "description", "pattern", "url", "query"]

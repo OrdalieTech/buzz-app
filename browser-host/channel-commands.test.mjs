@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
 import { validChannelCommand } from "./channel-commands.mjs";
 const id = "11111111-1111-4111-8111-111111111111";
-it("allows ordinary invitations with an optional explicit participant role", () => {
+it("allows ordinary invitations with an optional participant or guest role", () => {
   const invite = {
     kind: 9000,
     created_at: 1,
@@ -18,7 +18,13 @@ it("allows ordinary invitations with an optional explicit participant role", () 
       tags: [...invite.tags, ["role", "member"]],
     }),
   ).toBe(true);
-  for (const role of ["owner", "admin", "guest", "bot", ""]) {
+  expect(
+    validChannelCommand({
+      ...invite,
+      tags: [...invite.tags, ["role", "guest"]],
+    }),
+  ).toBe(true);
+  for (const role of ["owner", "admin", "bot", "Guest", ""]) {
     expect(
       validChannelCommand({
         ...invite,
@@ -111,6 +117,9 @@ it("accepts one trailing outbox identifier for invitations and rejects ambiguous
   expect(validChannelCommand(invite([h, p, ["role", "member"], client]))).toBe(
     true,
   );
+  expect(validChannelCommand(invite([h, p, ["role", "guest"], client]))).toBe(
+    true,
+  );
   for (const tags of [
     [h, p, client, client],
     [client, h, p],
@@ -118,6 +127,37 @@ it("accepts one trailing outbox identifier for invitations and rejects ambiguous
     [h, p, [...client, "extra"]],
     [h, p, ["role", "member", "extra"]],
     [h, p, ["role", "member"], ["role", "member"]],
+  ])
+    expect(validChannelCommand(invite(tags))).toBe(false);
+});
+
+it("signs a batch invitation of up to 100 distinct people without elevating roles", () => {
+  const invite = (tags) => ({ kind: 9000, created_at: 1, content: "", tags });
+  const h = ["h", id],
+    client = ["client-id", id];
+  const people = (count) =>
+    Array.from({ length: count }, (_, index) => [
+      "p",
+      index.toString(16).padStart(64, "0"),
+    ]);
+  for (const role of [
+    [],
+    [["role", "member"]],
+    [["role", "guest"]],
+    [["role", "bot"]],
+  ])
+    expect(
+      validChannelCommand(invite([h, ...people(100), ...role, client])),
+    ).toBe(true);
+  for (const tags of [
+    [h, ...people(101)],
+    [h, ...people(2), people(1)[0]],
+    [h, ...people(2), ["role", "admin"]],
+    [h, ...people(2), ["role", "owner"]],
+    [h, ["role", "member"]],
+    [h, people(1)[0], ["role", "bot"]],
+    [h, people(2)[0], ["role", "member"], people(2)[1]],
+    [h, ["p", "a".repeat(64), "admin"], ...people(1)],
   ])
     expect(validChannelCommand(invite(tags))).toBe(false);
 });

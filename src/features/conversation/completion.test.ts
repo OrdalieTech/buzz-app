@@ -113,6 +113,27 @@ it("a trigger that starts inside a resolved chip is not an open query; later tri
   ).toBe("mentions");
 });
 
+it("keeps the agent mark only when a provider sets it to true", () => {
+  const mention = { pubkey: "a".repeat(64), name: "Fizz" };
+  const result = completionResult({
+    items: [
+      { id: "agent", label: "Fizz", agent: true, edit: { mention } },
+      { id: "person", label: "Fizz", edit: { mention } },
+      {
+        id: "malformed",
+        label: "Fizz",
+        agent: "yes" as unknown as boolean,
+        edit: { mention },
+      },
+    ],
+  });
+  expect(result.items.map((item) => item.agent)).toEqual([
+    true,
+    undefined,
+    undefined,
+  ]);
+});
+
 it("copies and freezes batch recipients without allowing malformed or oversized edits", () => {
   const carl = { pubkey: "a".repeat(64), name: "Carl" };
   const recipients = [carl, { pubkey: "b".repeat(64), name: "Donut" }];

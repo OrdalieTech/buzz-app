@@ -1,9 +1,15 @@
 import {
+  artifactIncrementalCapability,
+  artifactIncrementalFailure,
+  createArtifactIncrementalReader,
+} from "./artifact-incremental-reader";
+import {
   verifiedProfileAuthority,
   verifiedProfileDiscovery,
 } from "./verified-profile";
 import { nativeSocket } from "./native-socket";
 import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { EventTemplate } from "nostr-tools";
 import { communityDestination, relayOrigin } from "../communities/destination";
 import {
@@ -21,14 +27,19 @@ import {
   validateUploadResult,
   type UploadProgress,
 } from "./attachments";
-import { eventDto, type RelayEvent } from "./events";
+import {
+  createEventVerifier,
+  eventDto,
+  type RelayEvent,
+  type SignatureVerifier,
+} from "./events";
 import {
   privateTag,
   privateCoordinate,
   parsePrivateRecord,
   type PrivateRecord,
 } from "../channel-templates/model";
-import type { RelayWriter } from "./transport";
+import { parseEvents, type RelayWriter } from "./transport";
 import { communityGitRepository } from "../repos/git";
 import { validateLifecycleTemplate } from "./channel-lifecycle-protocol";
 import { validateMemberAdministrationTemplate } from "../channel-members/administration-protocol";
@@ -66,7 +77,7 @@ import {
   type Signer,
 } from "./transport";
 import { nativeSidebar } from "./native-sidebar";
-import { readApiFailure } from "./http-admission";
+import { readApiFailure, type CommunityRefusal } from "./http-admission";
 
 async function nativeReadInvoke<T>(
   command: string,
@@ -335,9 +346,19 @@ export function nativeRelaySigner(community: string): Signer {
     },
     upload: (file, signal) => nativeUpload(origin, file, signal),
     media: nativeMediaUrl,
-    verifySignatures: (claims) =>
-      nativeReadInvoke<boolean[]>("relay_verify_signatures", { claims }),
+    verifySignatures: verifyNativeSignatures,
   };
+}
+
+const verifyNativeSignatures: SignatureVerifier = (claims) =>
+  nativeReadInvoke<boolean[]>("relay_verify_signatures", { claims });
+
+/** Device evidence can be verified before any relay connection exists. */
+export function verifyNativeStored(values: readonly unknown[]) {
+  return parseEvents(
+    values,
+    createEventVerifier(undefined, verifyNativeSignatures),
+  );
 }
 
 export const NOT_A_COMMUNITY_ERROR =
@@ -361,11 +382,47 @@ export function relaySelf(info: Record<string, unknown>): string | undefined {
     : undefined;
 }
 
+type RefusalListener = (kind: CommunityRefusal) => void;
+const refusalListeners = new Map<string, Set<RefusalListener>>();
+let refusalEvents: Promise<unknown> | undefined;
+/** Native reports a community's refusal from whichever signed request met it
+ * (`observe_refusal` in relay.rs), so no command needs its own check. One
+ * window listener serves every connection; it is ready before any connects. */
+async function nativeRefusals(origin: string) {
+  refusalEvents ??= listen<{ community: string; refusal: string }>(
+    "relay-refusal",
+    ({ payload }) => {
+      const kind = payload.refusal;
+      if (kind !== "sign-in" && kind !== "access") return;
+      for (const listener of [
+        ...(refusalListeners.get(payload.community) ?? []),
+      ])
+        listener(kind);
+    },
+  ).catch(() => {
+    // Without it a refusal still fails its own request; the next connect retries.
+    refusalEvents = undefined;
+  });
+  await refusalEvents;
+  const community = new URL(origin).origin;
+  return (listener: RefusalListener) => {
+    const listeners = refusalListeners.get(community) ?? new Set();
+    refusalListeners.set(community, listeners);
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+      if (!listeners.size && refusalListeners.get(community) === listeners)
+        refusalListeners.delete(community);
+    };
+  };
+}
+
 export async function connectNativeTransport(
   community: string,
   signal?: AbortSignal,
 ): Promise<ReadTransport> {
   const origin = communityDestination(community).url;
+  const observeRefusal = await nativeRefusals(origin);
   const info = await nativeRelayInfo(origin, signal);
   const author = relaySelf(info);
   if (!author) throw new Error("Relay did not advertise its identity");
@@ -375,6 +432,9 @@ export async function connectNativeTransport(
   const channelIdentity =
     Array.isArray(info.supported_extensions) &&
     info.supported_extensions.includes("nip-cl");
+  const artifactSupport =
+    Array.isArray(info.supported_extensions) &&
+    info.supported_extensions.includes("nip-ar");
   const searchSort =
     Array.isArray(info.supported_extensions) &&
     info.supported_extensions.includes("buzz-search-sort");
@@ -439,6 +499,22 @@ export async function connectNativeTransport(
   // Capabilities describe implemented host operations, not everything this key can sign.
   return {
     ...transport,
+    observeRefusal,
+    ...(artifactIncrementalCapability(info)
+      ? {
+          artifactIncremental: createArtifactIncrementalReader(
+            (filter, signal) =>
+              admitSignedRequest(
+                origin,
+                transport.viewer,
+                () => nativeRelayRequest(origin, "/query", [filter]),
+                signal,
+                "background",
+                artifactIncrementalFailure,
+              ),
+          ),
+        }
+      : {}),
     workflows: workflowHost(async (route, body, signal) => {
       if (route !== "workflow-runs") throw new Error("Invalid workflow read");
       workflowRunsPath(body);
@@ -510,21 +586,32 @@ export async function connectNativeTransport(
     // Artifact saves go straight to the relay, which accepts a replay of an
     // already-accepted revision, so they skip `writer`'s 15-minute retry
     // block below. Signing applies the artifact size bound.
-    configArtifacts: {
-      kinds: [ARTIFACT_KIND],
-      async sign(event, signal) {
-        if (event.kind !== ARTIFACT_KIND) throw new Error("Not an artifact");
-        const signed = await writer.sign(event, signal);
-        if (signed.kind !== ARTIFACT_KIND || signed.pubkey !== transport.viewer)
-          throw new Error("Invalid artifact signature");
-        return signed;
-      },
-      async publish(event, signal) {
-        if (event.kind !== ARTIFACT_KIND || event.pubkey !== transport.viewer)
-          throw new Error("Not this viewer's artifact");
-        return (await writer.publish(event, signal)) ?? "";
-      },
-    },
+    ...(artifactSupport
+      ? {
+          configArtifacts: {
+            kinds: [ARTIFACT_KIND],
+            async sign(event: EventTemplate, signal: AbortSignal) {
+              if (event.kind !== ARTIFACT_KIND)
+                throw new Error("Not an artifact");
+              const signed = await writer.sign(event, signal);
+              if (
+                signed.kind !== ARTIFACT_KIND ||
+                signed.pubkey !== transport.viewer
+              )
+                throw new Error("Invalid artifact signature");
+              return signed;
+            },
+            async publish(event: RelayEvent, signal: AbortSignal) {
+              if (
+                event.kind !== ARTIFACT_KIND ||
+                event.pubkey !== transport.viewer
+              )
+                throw new Error("Not this viewer's artifact");
+              return (await writer.publish(event, signal)) ?? "";
+            },
+          },
+        }
+      : {}),
     async openDirectMessage(pubkeys, signal) {
       signal.throwIfAborted();
       const id = await invoke<string>("relay_direct_message", {
@@ -652,25 +739,54 @@ export async function connectNativeTransport(
       agent: string,
       signal: AbortSignal,
       slug?: string,
+      onPage?: (page: MemoryListing) => void,
     ): Promise<MemoryListing> {
       if (!memoryAgent(agent, transport.viewer))
         throw new Error("Invalid memory target");
-      const bounded = AbortSignal.any([signal, AbortSignal.timeout(10000)]);
+      // A streamed read has no overall deadline: its pages arrive as they
+      // decode, and native code bounds each one.
+      const bounded = onPage
+        ? signal
+        : AbortSignal.any([signal, AbortSignal.timeout(10000)]);
       bounded.throwIfAborted();
+      // Aborting stops native paging and drops what it decoded.
+      const id = crypto.randomUUID();
+      const cancel = () => {
+        invoke("relay_http_cancel", { id }).catch(() => {});
+      };
+      bounded.addEventListener("abort", cancel, { once: true });
       let result: unknown;
       try {
         result = await invoke<unknown>("relay_agent_memories_read", {
           community: origin,
           agent,
           slug: slug ?? null,
+          id,
+          onPage: onPage
+            ? new Channel<unknown>((page) => {
+                if (bounded.aborted) return;
+                let listing: MemoryListing;
+                try {
+                  listing = memoryListing(page);
+                } catch {
+                  // The result is validated in full; an invalid page only
+                  // goes unshown.
+                  return;
+                }
+                onPage(listing);
+              })
+            : null,
         });
       } catch (reason) {
+        bounded.throwIfAborted();
         if (reason === "MemoryDenied") {
           const denied = new Error("Memory read failed");
           denied.name = "MemoryDenied";
           throw denied;
         }
         throw reason;
+      } finally {
+        bounded.removeEventListener("abort", cancel);
       }
       bounded.throwIfAborted();
       return memoryListing(result);

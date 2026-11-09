@@ -2,10 +2,11 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ChannelLifecycleCapability } from "../relay/channel-lifecycle";
 import { ChannelLifecycleUnconfirmed } from "../relay/channel-lifecycle";
 import { Button } from "../../shared/design-system/ui/Button";
+import { useToastClearance } from "../../shared/design-system/ui/Toast";
 import styles from "./Messages.module.css";
 
 /** Archived and read-only channels share the public preview's lower notice.
- * Member-default public previews offer Join; confirmed membership enables composition.
+ * Public previews offer Join; the admission role determines whether joining enables composition.
  * Confirmed membership can unmount this notice before its run settles, so the
  * page records the join intent when the run starts, not when it resolves. */
 export function ChannelJoinNotice({
@@ -32,6 +33,8 @@ export function ChannelJoinNotice({
   onHeightChange?(height: number): void;
 }) {
   const notice = useRef<HTMLElement>(null);
+  // Notices float above Join, not over it.
+  useToastClearance(notice);
   const [revealedChannel, setRevealedChannel] = useState<string>();
   const visible = ready || revealedChannel === channelId;
   useEffect(() => {
@@ -72,13 +75,13 @@ export function ChannelJoinNotice({
               ? "Join may have taken effect, but it is not confirmed yet. Try again to check."
               : reason instanceof Error
                 ? reason.message
-                : "Couldn’t join this channel.",
+                : `Couldn’t join this ${place}.`,
         });
       },
     );
   };
   const readOnly = guest || joinRole === "guest";
-  const canJoin = !archived && !readOnly && joinable && !!lifecycle?.available;
+  const canJoin = !archived && !guest && joinable && !!lifecycle?.available;
   return (
     <section
       ref={notice}
@@ -86,8 +89,10 @@ export function ChannelJoinNotice({
         archived
           ? `Archived ${place}`
           : readOnly
-            ? "Read-only channel"
-            : "Channel preview"
+            ? `Read-only ${place}`
+            : place === "chat"
+              ? "Chat preview"
+              : "Channel preview"
       }
       aria-hidden={!visible}
       inert={!visible}
@@ -103,11 +108,11 @@ export function ChannelJoinNotice({
             ? `This ${place} is archived`
             : readOnly
               ? joinRole === "guest"
-                ? "This channel is read-only"
+                ? `This ${place} is read-only${canJoin ? ". Join to keep it in your sidebar and appear as a viewer." : ""}`
                 : "Read-only access"
               : canJoin
-                ? "Join channel to send messages"
-                : "You’re previewing this channel"}
+                ? `Join ${place} to send messages`
+                : `You’re previewing this ${place}`}
         </p>
         {canJoin && (
           <Button

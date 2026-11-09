@@ -1,0 +1,18 @@
+diff --git a/dist/core.esm.js b/dist/core.esm.js
+index 1577c253774e3c37eafa4f267f1944426deee405..dd619126ab37a55d3e9bbf7ee69a8558e0e07736 100644
+--- a/dist/core.esm.js
++++ b/dist/core.esm.js
+@@ -2994,7 +2994,12 @@ const DndContext = /*#__PURE__*/memo(function DndContext(_ref) {
+   // window scroll delta
+ 
+   const appliedTranslate = usesDragOverlay ? modifiedTranslate : add(modifiedTranslate, activeNodeScrollDelta);
+-  const transform = adjustScale(appliedTranslate, (_over$rect = over == null ? void 0 : over.rect) != null ? _over$rect : null, activeNodeRect);
++  const nextTransform = adjustScale(appliedTranslate, (_over$rect = over == null ? void 0 : over.rect) != null ? _over$rect : null, activeNodeRect);
++  // Keep an equal transform's identity: it is ActiveDraggableContext's value,
++  // and a new object makes React search the whole subtree on every render.
++  const lastTransform = useRef(nextTransform);
++  const previous = lastTransform.current;
++  const transform = previous.x === nextTransform.x && previous.y === nextTransform.y && previous.scaleX === nextTransform.scaleX && previous.scaleY === nextTransform.scaleY ? previous : lastTransform.current = nextTransform;
+   const activeSensorRef = useRef(null);
+   const instantiateSensor = useCallback((event, _ref2) => {
+     let {

@@ -74,6 +74,7 @@ it("isolates callback errors while preserving ordered native decisions", async (
     .mockResolvedValueOnce({ deny: true });
   const hooks = ["observer", "policy"].map((id) => ({
     id,
+    pluginId: id,
     harness: "third/type",
     event: "before",
     run,
@@ -109,6 +110,7 @@ it("shares one dispatch deadline and starts no callbacks after it", async () => 
     const hooks = [
       {
         id: "slow",
+        pluginId: "slow",
         harness: "third/type",
         event: "before",
         run: () =>
@@ -116,7 +118,13 @@ it("shares one dispatch deadline and starts no callbacks after it", async () => 
             finish = resolve;
           }),
       },
-      { id: "later", harness: "third/type", event: "before", run: later },
+      {
+        id: "later",
+        pluginId: "later",
+        harness: "third/type",
+        event: "before",
+        run: later,
+      },
     ];
     const result = dispatchAgentHooks(
       hooks,
@@ -135,4 +143,59 @@ it("shares one dispatch deadline and starts no callbacks after it", async () => 
   } finally {
     vi.useRealTimers();
   }
+});
+
+it("composes only the winning response with its registered plugin source", async () => {
+  const { dispatchAgentHooks } = await import("./hooks");
+  const compose = vi.fn((output, pluginId) => ({ output, pluginId }));
+  const hooks = [
+    {
+      id: "same",
+      pluginId: "observer",
+      harness: "type",
+      event: "before",
+      run: () => undefined,
+    },
+    {
+      id: "same",
+      pluginId: "berd-call",
+      harness: "type",
+      event: "before",
+      run: () => ({ reason: "Reply first", pluginId: "spoof" }),
+    },
+    {
+      id: "same",
+      pluginId: "reply-first",
+      harness: "type",
+      event: "before",
+      run: vi.fn(),
+    },
+  ];
+  await expect(
+    dispatchAgentHooks(
+      hooks,
+      {},
+      { agent: "a", session: "s" },
+      (value) => value != null,
+      1000,
+      compose,
+    ),
+  ).resolves.toEqual({
+    output: { reason: "Reply first", pluginId: "spoof" },
+    pluginId: "berd-call",
+  });
+  expect(compose).toHaveBeenCalledOnce();
+  expect(hooks[2]?.run).not.toHaveBeenCalled();
+  compose.mockClear();
+  await expect(
+    dispatchAgentHooks(
+      [],
+      {},
+      { agent: "a", session: "s" },
+      () => true,
+      1000,
+      compose,
+    ),
+  ).resolves.toBeUndefined();
+  expect(compose).not.toHaveBeenCalled();
 });

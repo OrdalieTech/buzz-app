@@ -88,6 +88,10 @@ fn lists_each_identity_once_preferring_the_harness_copy() {
         found.agents,
         [
             Portable {
+                connection: SavedConnection {
+                    runtime: "custom".into(),
+                    ..Default::default()
+                },
                 source: PortSource::Harness,
                 pubkey: shared.pubkey().into(),
                 name: "Ada".into(),
@@ -98,6 +102,10 @@ fn lists_each_identity_once_preferring_the_harness_copy() {
                 carry: Carry::default(),
             },
             Portable {
+                connection: SavedConnection {
+                    runtime: "buzz-agent".into(),
+                    ..Default::default()
+                },
                 source: PortSource::Installed,
                 pubkey: old.pubkey().into(),
                 name: "Bea".into(),
@@ -107,6 +115,10 @@ fn lists_each_identity_once_preferring_the_harness_copy() {
                 carry: Carry::default(),
             },
             Portable {
+                connection: SavedConnection {
+                    runtime: "buzz-agent".into(),
+                    ..Default::default()
+                },
                 source: PortSource::Development,
                 pubkey: dev.pubkey().into(),
                 name: "Cy".into(),

@@ -1,7 +1,7 @@
 // The part of the Claude agent type that runs agents, without its views: the
 // desktop app registers it with its tabs, and a standalone host runs it alone.
 import { syncedSettingsSchema, withSyncedSettings } from "./settings";
-import type { AgentType } from "../../features/agents/service";
+import type { AgentType, AgentHandle } from "../../features/agents/service";
 import { type ClaudeRuntime, type Config, config } from "./runtime";
 
 export const TYPE_ID = "claude-code";
@@ -12,7 +12,7 @@ const HANDOVER_MS = 2 * 60_000;
  * when given, such as for the first download of Claude, within its deadline. */
 export const claudeRun = (
   runtime: ClaudeRuntime,
-  ready?: (signal: AbortSignal) => Promise<void>,
+  ready?: (signal: AbortSignal, agent?: AgentHandle) => Promise<void>,
 ): Pick<
   AgentType<Config>,
   | "models"
@@ -22,8 +22,9 @@ export const claudeRun = (
   | "timeoutMs"
   | "syncedSettings"
   | "resumes"
+  | "readFile"
 > => ({
-  models: (agent) => runtime.models(agent.key),
+  models: (agent) => runtime.models(agent.key, agent.config),
   sessionControls: {
     scope: (agent) => config(agent.config).scope,
     state: (agent, place) => runtime.sessionState(agent, place),
@@ -31,13 +32,14 @@ export const claudeRun = (
     subscribe: (listener) => runtime.subscribe(listener),
   },
   run: async (delivery) => {
-    await ready?.(delivery.signal);
+    await ready?.(delivery.signal, delivery.agent);
     return runtime.run(delivery);
   },
   runOnce: async (turn) => {
-    await ready?.(turn.signal);
+    await ready?.(turn.signal, turn.delivery.agent);
     return runtime.runOnce(turn);
   },
+  readFile: (agent, path, signal) => runtime.workspaceFile(agent, path, signal),
   timeoutMs: HANDOVER_MS,
   syncedSettings: {
     schema: syncedSettingsSchema,

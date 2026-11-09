@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Context } from "@deepseek-ai/cordis";
 import { invoke } from "@tauri-apps/api/core";
@@ -82,6 +89,7 @@ beforeEach(() => {
           self: relay.pubkey,
           pubkey: viewer.pubkey,
           name: "Native community",
+          supported_nips: [1, 42, 43],
         });
       case "/api/join-policy":
         return response({
@@ -133,6 +141,7 @@ beforeEach(() => {
   });
 });
 afterEach(async () => {
+  vi.useRealTimers();
   cleanup();
   for (const root of roots.splice(0)) await root.fiber.dispose();
   vi.restoreAllMocks();
@@ -174,12 +183,21 @@ async function start(user: ReturnType<typeof userEvent.setup>) {
   await user.clear(screen.getByLabelText("Community URL"));
   await user.type(screen.getByLabelText("Community URL"), community);
   await user.click(screen.getByRole("button", { name: "Continue" }));
-  await user.type(
-    await screen.findByLabelText("Invite code (if required)"),
-    "v2.fixture",
-  );
+  await user.type(await screen.findByLabelText("Invite code"), "v2.fixture");
   await user.click(screen.getByRole("checkbox", { name: /I agree/ }));
   await user.click(screen.getByRole("checkbox", { name: /at least 18/ }));
+}
+/** A claim or publish in flight can't be abandoned: Back, Close and Escape wait. */
+async function expectWriteLocked(
+  user: ReturnType<typeof userEvent.setup>,
+  close: () => void,
+  action: string,
+) {
+  expect(screen.getByRole("button", { name: action })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Back" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Close" })).toBeDisabled();
+  await user.keyboard("{Escape}");
+  expect(close).not.toHaveBeenCalled();
 }
 
 it("resumes after an uncertain claim, saves the profile, and restores only the selected native session", async () => {
@@ -279,7 +297,7 @@ it("retains submitted profile progress through publication and local membership-
       if (key.startsWith("buzz-client.v1:")) throw new Error("Full disk");
       setItem.call(this, key, value);
     });
-  await user.click(screen.getByRole("button", { name: "Open community" }));
+  await user.click(screen.getByRole("button", { name: "Continue" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Could not save this community",
   );
@@ -290,9 +308,8 @@ it("retains submitted profile progress through publication and local membership-
   await second.stop();
   const third = await open();
   await user.click(screen.getByRole("button", { name: "Continue" }));
-  await user.click(
-    await screen.findByRole("button", { name: "Open community" }),
-  );
+  await screen.findByLabelText("Display name");
+  await user.click(await screen.findByRole("button", { name: "Continue" }));
   await waitFor(() => expect(third.close).toHaveBeenCalledOnce());
   expect(calls.filter((call) => call.path === "/events")).toHaveLength(1);
   expect(calls.some((call) => call.path === "/api/invites/claim")).toBe(false);
@@ -467,7 +484,7 @@ it.each(["current", "unmounted", "replaced"])(
     );
     try {
       await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
-      expect(screen.getByRole("button", { name: "Working…" })).toBeDisabled();
+      await expectWriteLocked(user, app.close, "Publishing…");
       expect(app.communities.snapshot().memberships).toEqual([]);
       expect(journal().get(community)?.profile?.name).toBe("Submitted");
       if (state === "unmounted") await app.stop();
@@ -533,6 +550,22 @@ it("retains pending admission during network failure without redeeming the invit
   expect(calls.some((call) => call.path === "/api/invites/claim")).toBe(false);
 });
 
+it("names a relay it couldn't reach while resuming an interrupted join", async () => {
+  admitted = true;
+  journal().begin(community);
+  readProfile = () => Promise.reject("Relay request could not be confirmed");
+  await open();
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  // user-event and waitFor drain through a timer that fake timers would hold.
+  fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+  // The profile read retries on backoff timers within its 12 s budget.
+  await act(() => vi.advanceTimersByTimeAsync(12_000));
+  expect(screen.getByLabelText("Community URL")).toHaveAccessibleDescription(
+    "Couldn’t reach native-join.test. Check the address, or try again.",
+  );
+  expect(journal().get(community)).toBeDefined();
+});
+
 it("fences a late claim completion after the dialog is replaced", async () => {
   let release!: () => void;
   claim = () =>
@@ -547,6 +580,7 @@ it("fences a late claim completion after the dialog is replaced", async () => {
     expect(calls.some((call) => call.path === "/api/invites/claim")).toBe(true),
   );
   try {
+    await expectWriteLocked(user, first.close, "Joining…");
     await first.stop();
     await open();
     await user.click(screen.getByRole("button", { name: "Continue" }));
@@ -571,9 +605,7 @@ it("keeps a new invite bound to its relay despite another unfinished join", asyn
   await open({ community: other, code: "v2.other" });
   expect(screen.getByLabelText("Community URL")).toHaveValue(other);
   await user.click(screen.getByRole("button", { name: "Continue" }));
-  expect(await screen.findByLabelText("Invite code (if required)")).toHaveValue(
-    "v2.other",
-  );
+  expect(await screen.findByLabelText("Invite code")).toHaveValue("v2.other");
   await user.click(screen.getByRole("checkbox", { name: /I agree/ }));
   await user.click(screen.getByRole("checkbox", { name: /at least 18/ }));
   await user.click(screen.getByRole("button", { name: "Continue" }));
@@ -608,9 +640,7 @@ it("does not recover another viewer's unfinished join", async () => {
   const user = userEvent.setup();
   await open({ community, code: "v2.new" });
   await user.click(screen.getByRole("button", { name: "Continue" }));
-  expect(await screen.findByLabelText("Invite code (if required)")).toHaveValue(
-    "v2.new",
-  );
+  expect(await screen.findByLabelText("Invite code")).toHaveValue("v2.new");
   expect(screen.queryByLabelText("Display name")).toBeNull();
 });
 
@@ -623,8 +653,55 @@ it("clears invite material when the prefilled relay is edited", async () => {
   expect(screen.getByLabelText("Community URL")).toHaveValue(other);
   requestedCommunity = other;
   await user.click(screen.getByRole("button", { name: "Continue" }));
-  expect(await screen.findByLabelText("Invite code (if required)")).toHaveValue(
-    "",
-  );
+  expect(await screen.findByLabelText("Invite code")).toHaveValue("");
   expect(calls.some((call) => call.path === "/api/invites/claim")).toBe(false);
+});
+
+it("leaves a native lookup the relay never answers, then names a relay it couldn't reach", async () => {
+  await open();
+  const answer = vi.mocked(invoke).getMockImplementation();
+  let discovery: "held" | "failed" = "held";
+  let discovered = 0;
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  // Native discovery is a GET, which has no cancel id: Cancel can only fence it.
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "relay_http" && (args as { path: string }).path === "/") {
+      discovered++;
+      if (discovery === "failed")
+        return Promise.reject("Relay request could not be confirmed");
+      await held;
+    }
+    return answer?.(command, args);
+  });
+  const user = userEvent.setup();
+  const field = screen.getByLabelText("Community URL");
+  await user.type(field, community);
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  await waitFor(() => expect(discovered).toBe(1));
+  expect(screen.getByRole("button", { name: "Connecting…" })).toBeDisabled();
+  await user.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(field).toHaveFocus();
+  expect(field).toHaveValue(community);
+  expect(screen.getByRole("button", { name: "Back" })).toBeEnabled();
+  // The relay answers only after the lookup was left.
+  await act(async () => release());
+  await waitFor(() =>
+    expect(calls.some((call) => call.path === "/")).toBe(true),
+  );
+  expect(field).toBeEnabled();
+  expect(field).not.toHaveAttribute("aria-invalid", "true");
+  expect(screen.queryByLabelText("Invite code")).not.toBeInTheDocument();
+
+  discovery = "failed";
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  await waitFor(() =>
+    expect(field).toHaveAccessibleDescription(
+      "Couldn’t reach native-join.test. Check the address, or try again.",
+    ),
+  );
+  expect(field).toHaveAttribute("aria-invalid", "true");
+  expect(discovered).toBe(2);
 });

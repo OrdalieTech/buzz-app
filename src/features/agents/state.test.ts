@@ -1,7 +1,13 @@
 import { expect, it, vi } from "vitest";
-import { fileStore, loadAgentStorage, MOVED_KEY } from "./state";
+import {
+  executionStorage,
+  fileStore,
+  loadAgentStorage,
+  MOVED_KEY,
+} from "./state";
 import { memoryStorage } from "./test-fakes";
 import { SyncedTeams, teamSources } from "./team-config";
+import { TeamMoves } from "./team-migration";
 
 const files = (items: Record<string, string> = {}) => {
   const saved = new Map(Object.entries(items));
@@ -26,6 +32,7 @@ it("moves agent state from localStorage, which replaces what agent storage has",
   local.setItem("buzz.agents.archive-unchecked.v1", "unchecked");
   local.setItem("buzz.agents.catch-up.v1", "checkpoints");
   local.setItem("buzz.agents.catch-up.v1:aa", "agent checkpoints");
+  local.setItem("buzz.agent.execution.v1:aa", "binding");
   local.setItem("buzz.theme", "dark");
   const native = files({
     "buzz.agents.teams.v1": "stale teams",
@@ -43,6 +50,7 @@ it("moves agent state from localStorage, which replaces what agent storage has",
     "buzz.agents.archive-unchecked.v1": "unchecked",
     "buzz.agents.catch-up.v1": "checkpoints",
     "buzz.agents.catch-up.v1:aa": "agent checkpoints",
+    "buzz.agent.execution.v1:aa": "binding",
     [MOVED_KEY]: "1",
   });
   expect(storage.get("buzz.agents.teams.v1")).toBe("new teams");
@@ -133,6 +141,30 @@ it("keeps synced team rosters a start without agent storage saved", async () => 
   expect(local.length).toBe(0);
 });
 
+it("keeps a partial team move a start without agent storage saved, so Delete still finds its relay copy", async () => {
+  const local = memoryStorage();
+  const native = files();
+  await loadAgentStorage(local, native);
+
+  native.load.mockRejectedValueOnce(new Error("denied"));
+  const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  const fallback = await loadAgentStorage(local, native);
+  error.mockRestore();
+  await new TeamMoves(fallback).set("local-1", {
+    community: "wss://home",
+    failed: true,
+    created: true,
+  });
+
+  const next = await loadAgentStorage(local, native);
+  expect(new TeamMoves(next).get("local-1")).toEqual({
+    community: "wss://home",
+    failed: true,
+    created: true,
+  });
+  expect(local.length).toBe(0);
+});
+
 it("uses localStorage when agent storage cannot be read", async () => {
   const local = memoryStorage();
   const native = files();
@@ -213,4 +245,54 @@ it("puts back a key whose write failed, so it is not taken as saved and can be s
   await storage.set("a", "new");
   expect(native.saved.get("a")).toBe("new");
   expect(storage.get("a")).toBe("new");
+});
+
+it("rejects native execution when native state cannot be read", async () => {
+  vi.stubGlobal("isTauri", true);
+  const local = memoryStorage();
+  const native = files();
+  native.load.mockRejectedValueOnce(new Error("denied"));
+  const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const fallback = await loadAgentStorage(local, native);
+    await expect(
+      executionStorage(fallback).read("buzz.agent.execution.v1:aa"),
+    ).rejects.toThrow("Native agent storage is unavailable");
+    await expect(
+      executionStorage(fallback).add("buzz.agent.execution.v1:aa", '"local"'),
+    ).rejects.toThrow("Native agent storage is unavailable");
+  } finally {
+    error.mockRestore();
+    vi.unstubAllGlobals();
+  }
+});
+
+it("scans saved entries beyond the startup copy after its pending writes", async () => {
+  const prefix = "buzz.codex.sessions.v4:agent:";
+  const native = files();
+  const storage = await loadAgentStorage(memoryStorage(), native);
+  native.saved.set(`${prefix}other-window`, "remote");
+  native.saved.set("another-prefix", "private");
+  expect(storage.get(`${prefix}other-window`)).toBeNull();
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const save = native.set.getMockImplementation();
+  native.set.mockImplementationOnce(async (key, value) => {
+    await held;
+    await save?.(key, value);
+  });
+  const saving = storage.set(`${prefix}this-window`, "saved");
+  const scanning = storage.scan(prefix);
+  release();
+  await saving;
+  expect(await scanning).toEqual({
+    [`${prefix}other-window`]: "remote",
+    [`${prefix}this-window`]: "saved",
+  });
+  expect(storage.get(`${prefix}other-window`)).toBeNull();
+  expect(storage.keys()).not.toContain(`${prefix}other-window`);
+  native.load.mockRejectedValueOnce(new Error("Storage denied"));
+  await expect(storage.scan(prefix)).rejects.toThrow("Storage denied");
 });

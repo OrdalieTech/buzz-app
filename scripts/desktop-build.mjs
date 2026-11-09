@@ -1,7 +1,11 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { loadEnv } from "vite";
-import { desktopOverlay, options } from "./desktop-config.mjs";
+import {
+  desktopOverlay,
+  launchEnvironment,
+  options,
+} from "./desktop-config.mjs";
 
 // A debug bundle for the one thing `just desktop` cannot do: macOS routes a URL
 // scheme only to a bundled application, so testing OS deep links there needs a
@@ -84,6 +88,7 @@ const result = spawnSync(
   ["tauri", "build", ...defaults, ...forwarded],
   {
     stdio: "inherit",
+    env: launchEnvironment(root),
   },
 );
 if (result.error) console.error(result.error.message);

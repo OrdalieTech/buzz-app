@@ -10,7 +10,7 @@ import type {
   AgentViewProps,
   RegisteredAgentType,
 } from "../../features/agents/service";
-import { useId, useState } from "react";
+import { useId, useLayoutEffect, useState } from "react";
 import { AgentSaveButton } from "../../features/agents/AgentSaveButton";
 import { ToastProvider } from "../../shared/design-system/ui/Toast";
 import { AgentTabs } from "./AgentTabs";
@@ -115,6 +115,53 @@ function editingFixture(split: boolean, save = vi.fn(async () => {})) {
   return { props, save };
 }
 
+it.each(["here", "hosted"] as const)(
+  "does not duplicate management content as Identity for %s agents without a settings tab",
+  async (place) => {
+    const { props } = editingFixture(false);
+    const view = render(
+      <AgentTabs
+        {...props}
+        agent={{ ...props.agent, place }}
+        type={undefined}
+      />,
+    );
+    for (const type of [undefined, { ...props.type, tabs: [] }]) {
+      view.rerender(
+        <AgentTabs {...props} agent={{ ...props.agent, place }} type={type} />,
+      );
+      expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+        "Memory",
+        "Settings",
+      ]);
+      expect(screen.queryByRole("tab", { name: "Identity" })).toBeNull();
+    }
+    expect(screen.getByRole("tab", { name: "Memory" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await userEvent.click(screen.getByRole("tab", { name: "Settings" }));
+    expect(screen.getAllByText("Agent settings")).toHaveLength(1);
+  },
+);
+
+it("keeps a host-only Identity tab limited to its existing controls", () => {
+  const { props } = editingFixture(false);
+  render(
+    <AgentTabs
+      {...props}
+      type={undefined}
+      settingsHost={{ typeControl: () => <p>Provider control</p> }}
+    />,
+  );
+  expect(screen.getByRole("tab", { name: "Identity" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  expect(screen.getByText("Provider control")).toBeVisible();
+  expect(screen.queryByText("Agent settings")).toBeNull();
+});
+
 it.each([false, true])(
   "confirms before discarding a section draft (split %s)",
   async (split) => {
@@ -178,6 +225,53 @@ it("warns before discarding edits even when validation disables Save", async () 
   expect(screen.getByRole("textbox")).toHaveValue("Invalid");
 });
 
+it.each([false, true])(
+  "guards a version-address tab request without losing a draft (split %s)",
+  async (split) => {
+    const user = userEvent.setup();
+    const { props } = editingFixture(split);
+    const discard = vi.fn();
+    const view = render(<AgentTabs {...props} onDiscard={discard} />);
+    await user.type(screen.getByRole("textbox"), " draft");
+    const requested = <AgentTabs {...props} showSettings onDiscard={discard} />;
+    view.rerender(requested);
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent(
+      "Discard changes?",
+    );
+    await user.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByRole("textbox")).toHaveValue("Saved draft");
+    view.rerender(requested);
+    await user.type(screen.getByRole("textbox"), " again");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(discard).not.toHaveBeenCalled();
+    view.rerender(<AgentTabs {...props} onDiscard={discard} />);
+    view.rerender(requested);
+    await user.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(discard).toHaveBeenCalledOnce();
+    expect(screen.getByRole("tab", { name: "Settings" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await user.click(screen.getByRole("tab", { name: "Identity" }));
+    expect(screen.getByRole("textbox")).toHaveValue("Saved");
+  },
+);
+
+it("guards a version request while the host has a staged harness change", async () => {
+  const { props } = editingFixture(false);
+  const discard = vi.fn();
+  const pending = { ...props, settingsHost: { pendingSave: vi.fn() } };
+  const view = render(<AgentTabs {...pending} onDiscard={discard} />);
+  view.rerender(<AgentTabs {...pending} showSettings onDiscard={discard} />);
+  expect(await screen.findByRole("alertdialog")).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+  expect(screen.getByRole("tab", { name: "Identity" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  expect(discard).not.toHaveBeenCalled();
+});
+
 it("keeps a saving section mounted, then permits discarding after a failed save", async () => {
   const user = userEvent.setup();
   let reject!: (error: Error) => void;
@@ -188,10 +282,11 @@ it("keeps a saving section mounted, then permits discarding after a failed save"
     true,
     vi.fn(() => pending),
   );
-  render(<AgentTabs {...props} />);
+  const view = render(<AgentTabs {...props} />);
   await user.type(screen.getByRole("textbox"), " draft");
   await user.click(screen.getByRole("button", { name: "Save" }));
   try {
+    view.rerender(<AgentTabs {...props} showSettings />);
     expect(screen.getByRole("tab", { name: "Memory" })).toHaveAttribute(
       "aria-disabled",
       "true",
@@ -274,14 +369,24 @@ it("discards a staged harness change together with the section draft", async () 
 });
 
 it.each(["here", "hosted"] as const)(
-  "releases Memory on leaving and reads fresh memories on return for agents %s",
+  "unmounts Memory on leaving, shows its kept listing on return and reads fresh memories for agents %s",
   async (place) => {
     const user = userEvent.setup();
     let body = "Original memory";
-    const read = vi.fn(async () => ({
-      entries: [{ slug: "core", body, eventId: "b".repeat(64), createdAt: 1 }],
-      partial: false,
-    }));
+    let answer: (() => void) | undefined;
+    const read = vi.fn(async () => {
+      const listing = {
+        entries: [
+          { slug: "core", body, eventId: "b".repeat(64), createdAt: 1 },
+        ],
+        partial: false,
+      };
+      if (read.mock.calls.length > 1)
+        await new Promise<void>((resolve) => {
+          answer = resolve;
+        });
+      return listing;
+    });
     const owner = createAgentMemories(read, "c".repeat(64), () => true);
     const agent: Agent = {
       key: "a".repeat(64),
@@ -322,6 +427,8 @@ it.each(["here", "hosted"] as const)(
     expect(read).not.toHaveBeenCalled();
     expect(screen.queryByRole("tab", { name: "Attention" })).toBeNull();
     await user.click(screen.getByRole("tab", { name: "Memory" }));
+    // A closed memory's body is not rendered; open core to read it.
+    await user.click(await screen.findByRole("button", { name: "core" }));
     expect(await screen.findByText("Original memory")).toBeInTheDocument();
     expect(
       screen.queryAllByRole("button", { name: "Memory scope: example.com" }),
@@ -341,13 +448,18 @@ it.each(["here", "hosted"] as const)(
     }
     body = "Updated memory";
     await user.click(screen.getByRole("tab", { name: "Memory" }));
-    expect(await screen.findByText("Updated memory")).toBeInTheDocument();
+    // Within 30 seconds the kept listing shows before the relay answers,
+    // and it is read again.
+    await user.click(await screen.findByRole("button", { name: "core" }));
+    expect(await screen.findByText("Original memory")).toBeInTheDocument();
     expect(read).toHaveBeenCalledTimes(2);
+    await act(async () => answer?.());
+    expect(await screen.findByText("Updated memory")).toBeInTheDocument();
     expect(screen.queryByText("Original memory")).not.toBeInTheDocument();
   },
 );
 
-it("shows History for an agent whose config syncs", () => {
+it("leaves History out of the agent page tabs", () => {
   const agent: Agent = {
     key: "a".repeat(64),
     pubkey: "a".repeat(64),
@@ -385,7 +497,9 @@ it("shows History for an agent whose config syncs", () => {
     />,
     { wrapper: ToastProvider },
   );
-  expect(screen.getByRole("tab", { name: "History" })).toBeInTheDocument();
+  expect(
+    screen.queryByRole("tab", { name: "History" }),
+  ).not.toBeInTheDocument();
 });
 
 it("places plugin tabs after Activity and before Settings", () => {
@@ -431,4 +545,22 @@ it("places plugin tabs after Activity and before Settings", () => {
     "Watching",
     "Settings",
   ]);
+});
+
+it("restores Settings on the first commit without briefly selecting Identity", () => {
+  const { props } = editingFixture(false);
+  const selected: string[] = [];
+  function Probe() {
+    useLayoutEffect(() => {
+      selected.push(
+        screen
+          .getAllByRole("tab")
+          .find((tab) => tab.getAttribute("aria-selected") === "true")
+          ?.textContent ?? "missing",
+      );
+    }, []);
+    return <AgentTabs {...props} showSettings />;
+  }
+  render(<Probe />);
+  expect(selected).toEqual(["Settings"]);
 });

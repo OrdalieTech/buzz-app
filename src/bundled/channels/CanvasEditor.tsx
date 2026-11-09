@@ -10,6 +10,7 @@ import type { ChannelCanvas } from "../../features/channel-templates/capability"
 import type { ProfileQueries } from "../../features/relay/profile-directory";
 import { Tabs } from "../../shared/design-system/ui/Tabs";
 import { CanvasHistory } from "./CanvasHistory";
+import { CanvasView } from "./CanvasView";
 import type { RelayEvent } from "../../features/relay/events";
 import {
   clearView,
@@ -32,15 +33,25 @@ export function CanvasEditor({
   scope,
   channelId,
   readOnly = false,
+  openLink = () => false,
 }: {
   canvas: ChannelCanvas;
   profiles: ProfileQueries;
   scope: string;
   channelId: string;
   readOnly?: boolean;
+  /** Opens a Buzz link in the app; false lets the link open externally. */
+  openLink?: (url: string) => boolean;
 }) {
   const panelId = useId();
-  const [tab, setTab] = useState<"edit" | "history">("edit");
+  // A stable callback keeps the retained View from re-rendering its Markdown.
+  const linkOpener = useRef(openLink);
+  linkOpener.current = openLink;
+  const openViewLink = useCallback(
+    (url: string) => linkOpener.current(url),
+    [],
+  );
+  const [tab, setTab] = useState<"view" | "edit" | "history">("view");
   const key = `canvas-draft-v1:${channelId}`;
   const draftRevision = useSyncExternalStore(
     useCallback((notify) => subscribeView(scope, notify), [scope]),
@@ -81,17 +92,22 @@ export function CanvasEditor({
   const [head, setHead] = useState<RelayEvent>();
   const [loaded, setLoaded] = useState(false),
     [busy, setBusy] = useState(false),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [readError, setReadError] = useState("");
   const operation = useRef(0);
   const editor = useRef<HTMLTextAreaElement>(null);
+  const view = useRef<HTMLElement>(null);
+  const viewRetry = useRef<HTMLButtonElement>(null);
   const recovery = useRef<HTMLButtonElement>(null);
+  const comparison = useRef<HTMLDivElement>(null);
+  const historyRetry = useRef<HTMLButtonElement>(null);
   const [recovering, setRecovering] = useState(false);
   // The tab host places focus when Canvas opens, and a recovery button holds
-  // it while its read is pending. Take it into the editor once a read lands
-  // only if it is still there; never pull it back from elsewhere.
+  // it while its read is pending. Take it into the active tab's content once a
+  // read lands only if it is still there; never pull it back from elsewhere.
   const handoff = useRef<Element | null>(null);
   useEffect(() => {
-    const host = editor.current?.closest("[data-panel-workspace]");
+    const host = view.current?.closest("[data-panel-workspace]");
     handoff.current = host?.contains(document.activeElement)
       ? document.activeElement
       : null;
@@ -104,8 +120,13 @@ export function CanvasEditor({
       previous === document.activeElement ||
       (!previous.isConnected && document.activeElement === document.body)
     )
-      editor.current?.focus();
-  }, [loaded, busy]);
+      (tab === "view"
+        ? view
+        : tab === "history"
+          ? comparison
+          : editor
+      ).current?.focus();
+  }, [loaded, busy, tab]);
   const [confirmReload, setConfirmReload] = useState(false);
   const cancelReload = useRef<HTMLButtonElement>(null);
   useEffect(
@@ -126,6 +147,7 @@ export function CanvasEditor({
         if (generation !== operation.current) return;
         setHead(event);
         setLoaded(true);
+        setReadError("");
         if (replace || (!saved && !loaded)) {
           setDraft(event?.content ?? "");
           setAdopted(event?.content ?? "");
@@ -140,6 +162,7 @@ export function CanvasEditor({
           // Focus stays on the renewed recovery button.
           handoff.current = null;
           setError(String(reason));
+          setReadError(String(reason));
         }
       } finally {
         if (generation === operation.current) setBusy(false);
@@ -165,8 +188,11 @@ export function CanvasEditor({
     if (edited) replaceView(scope, key, null, { content: draft, base });
     void load(!edited);
   }, [draftRevision, loaded, busy, edited, load, scope, key, draft, base]);
-  const recover = (replace: boolean) => {
-    handoff.current = recovery.current;
+  const recover = (
+    replace: boolean,
+    control: HTMLElement | null = recovery.current,
+  ) => {
+    handoff.current = control;
     setRecovering(true);
     void load(replace, replace).finally(() => setRecovering(false));
   };
@@ -286,9 +312,12 @@ export function CanvasEditor({
           label="Canvas views"
           value={tab}
           onValueChange={(next) => {
-            if (!busy) setTab(next);
+            // History stays mounted while a read or write it started settles.
+            if (!busy || (tab !== "history" && next !== "history"))
+              setTab(next);
           }}
           items={[
+            { value: "view", label: "View", panelId: `${panelId}-view` },
             { value: "edit", label: "Edit", panelId: `${panelId}-edit` },
             {
               value: "history",
@@ -297,6 +326,25 @@ export function CanvasEditor({
             },
           ]}
         />
+        <div
+          hidden={tab !== "view"}
+          role="tabpanel"
+          id={`${panelId}-view`}
+          aria-labelledby={`${panelId}-view-tab`}
+        >
+          {/* View stays mounted so returning to it does not render again. */}
+          <CanvasView
+            content={head?.content}
+            loaded={loaded}
+            readError={readError}
+            busy={busy}
+            retry={() => recover(false, viewRetry.current)}
+            openLink={openViewLink}
+            focusRef={view}
+            retryRef={viewRetry}
+            active={tab === "view"}
+          />
+        </div>
         <div
           hidden={tab !== "edit"}
           role="tabpanel"
@@ -350,10 +398,15 @@ export function CanvasEditor({
               profiles={profiles}
               head={head}
               busy={busy}
-              loaded={loaded}
+              // A failed refresh leaves `head` possibly stale, so History
+              // treats it as unread until a read lands.
+              loaded={loaded && !readError}
               dirty={dirty}
               readOnly={readOnly}
               refreshHead={() => load()}
+              retryHead={() => recover(false, historyRetry.current)}
+              comparisonRef={comparison}
+              retryRef={historyRetry}
               restore={restore}
             />
           )}

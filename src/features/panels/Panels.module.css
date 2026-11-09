@@ -151,12 +151,14 @@ html[data-keyboard-input] .motion {
 .resize[data-panel-resize] {
   position: absolute;
   inset: 0 auto 0 -1px;
+  /* Keep the hit target inside the dock, clear of the main pane's scrollbar. */
+  margin: 0;
   /* The border starts one pixel before the dock's content box. */
   translate: 0.5px 0;
 }
 
 .resize[data-panel-resize]::after {
-  left: 50%;
+  left: 0;
 }
 
 /* Inline feature details reuse the same panel header and motion as target drill-ins. */
@@ -312,4 +314,9 @@ html[data-keyboard-input] :is(.subviewBase, .subview) {
   display: flex;
   border-inline-start: 1px solid var(--border-standard);
   padding-inline-start: var(--space-1);
+}
+
+.workspaceIdentity {
+  min-width: 0;
+  max-width: 100%;
 }

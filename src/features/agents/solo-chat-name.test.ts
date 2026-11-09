@@ -318,18 +318,31 @@ it.each(["history", "details"])(
   },
 );
 
-it.each([false, true])(
-  "staged session cards keep caption-first naming and protect chosen names (chosen=%s)",
-  async (chosen) => {
+it.each([
+  { chosen: false, caption: "Review this", title: "Review this" },
+  { chosen: true, caption: "Review this", title: "Review this" },
+  {
+    chosen: false,
+    caption: "Review [\\#design](buzz://channel/design)",
+    title: "Review #design",
+  },
+  {
+    chosen: true,
+    caption: "Review [\\#design](buzz://channel/design)",
+    title: "Review #design",
+  },
+])(
+  "staged cards and $caption preserve automatic naming and chosen names (chosen=$chosen)",
+  async ({ chosen, caption, title }) => {
     const { startingChatTitle } = await import("../solo/chat-title");
     const { composerMarkdown } = await import("../messages/composer-markdown");
     const draft = {
-      text: "@Agent Review this",
+      text: `@Agent ${caption}`,
       recipients: [{ pubkey: first, name: "Agent", start: 0, end: 6 }],
       chatCards: ["[Session: Fix](buzz://channel/session-id)"],
     };
     const name = startingChatTitle(draft);
-    expect(name).toBe("Review this");
+    expect(name).toBe(title);
     const sent = { ...event, content: composerMarkdown(draft) };
     const save = vi.fn();
     const relay = connection(() => ({
@@ -356,6 +369,54 @@ it.each([false, true])(
   },
 );
 
+it.each([
+  "Review [\\#design](buzz://channel/design)",
+  `Review [\\#design](buzz://channel/${"x".repeat(100)})`,
+  `Review 😀 [\\#design](buzz://channel/${"x".repeat(100)})`,
+  "[Session: Fix](buzz://channel/session-id)",
+])(
+  "recognizes the legacy starting title for %s without overwriting chosen names",
+  async (caption) => {
+    // Persist the old algorithm's literal, truncated title, not the new helper's result.
+    const legacyName = [...caption].slice(0, 80).join("");
+    const sent = { ...event, content: `@Agent ${caption}` };
+    let name = legacyName;
+    let labels: string[] = [];
+    const save = vi.fn(async (_base, draft) => {
+      name = draft.name;
+    });
+    const relay = connection(() => ({
+      status: "ready",
+      viewer: owner,
+      session: {
+        channels: soloChannels,
+        read: async () => [sent],
+        profiles: { snapshot: () => new Map([[first, { name: "Agent" }]]) },
+        agentChoices: { snapshot: () => ({ identities: [] }) },
+        channelDetails: {
+          available: true,
+          load: async () => ({ name, labels, canEdit: true }),
+          save,
+        },
+      },
+    }));
+    // Even a chosen name equal to the legacy default must remain protected.
+    labels = ["buzz.session.named"];
+    await nameSoloChat(relay, owner, first, sent, "Useful title");
+    expect(save).not.toHaveBeenCalled();
+    labels = [];
+    name = "My manual title";
+    await nameSoloChat(relay, owner, first, sent, "Useful title");
+    expect(save).not.toHaveBeenCalled();
+    name = legacyName;
+    await nameSoloChat(relay, owner, first, sent, "Useful title");
+    expect(save).toHaveBeenCalledOnce();
+    expect(name).toBe("Useful title");
+    await nameSoloChat(relay, owner, first, sent, "Another title");
+    expect(save).toHaveBeenCalledOnce();
+  },
+);
+
 it("an agent tag without a caption retains the session-card starting title", async () => {
   const { startingChatTitle } = await import("../solo/chat-title");
   expect(
@@ -364,5 +425,5 @@ it("an agent tag without a caption retains the session-card starting title", asy
       recipients: [{ pubkey: first, name: "Agent", start: 0, end: 6 }],
       chatCards: ["[Session: Fix](buzz://channel/session-id)"],
     }),
-  ).toBe("[Session: Fix](buzz://channel/session-id)");
+  ).toBe("Session: Fix");
 });

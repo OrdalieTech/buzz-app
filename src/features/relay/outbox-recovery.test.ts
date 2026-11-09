@@ -13,6 +13,7 @@ const recovery = { key: "new-dm", value: '{"draft":"First message"}' };
 const owners: ReturnType<typeof createOutbox>[] = [];
 afterEach(() => {
   for (const owner of owners.splice(0)) owner.dispose();
+  vi.useRealTimers();
 });
 function setup(
   storage: OutboxStorage,
@@ -295,4 +296,407 @@ it("retires roster-confirmed member recovery without inventing a delivery receip
   });
   expect(h.publish).toHaveBeenCalledOnce();
   expect(restored.publish).not.toHaveBeenCalled();
+});
+
+it("finds another window's durable recovery without importing or publishing its operation", async () => {
+  const store = memory();
+  const reader = setup(store);
+  await reader.outbox.ready();
+  const writer = setup(store);
+  await writer.outbox.ready();
+  const id = writer.outbox.send(input, recovery);
+  await vi.waitFor(() => expect(writer.publish).toHaveBeenCalledOnce());
+  expect(reader.outbox.snapshot()).toEqual([]);
+  expect(await reader.outbox.recovery(recovery.key)).toMatchObject({
+    event: { id },
+    recovery,
+  });
+  expect(reader.outbox.snapshot()).toEqual([]);
+  expect(reader.publish).not.toHaveBeenCalled();
+});
+
+it("forgets a dismissed hydrated receipt without saving it back to the shared journal", async () => {
+  const store = memory();
+  const original = setup(
+    store,
+    vi.fn(async () => {
+      throw new PublishRejected("Refused");
+    }),
+  );
+  await original.outbox.ready();
+  const id = original.outbox.send(input, recovery);
+  await vi.waitFor(() => expect(store.load()[0]?.delivery).toBe("failed"));
+  const save = vi.spyOn(store, "save");
+  const stale = setup(store);
+  await stale.outbox.ready();
+  await original.outbox.dismiss(id);
+  save.mockClear();
+  expect(await stale.outbox.recovery(recovery.key)).toBeUndefined();
+  expect(stale.outbox.snapshot()).toEqual([]);
+  expect(save).not.toHaveBeenCalled();
+  expect(store.load()).toEqual([]);
+});
+
+it("preserves locally owned intent when its first save fails", async () => {
+  const h = setup({
+    load: () => [],
+    save: async () => {
+      throw new Error("Disk full");
+    },
+  });
+  await h.outbox.ready();
+  const id = h.outbox.send(input, recovery);
+  await vi.waitFor(() =>
+    expect(h.outbox.snapshot()[0]?.delivery).toBe("failed"),
+  );
+  expect(await h.outbox.recovery(recovery.key)).toMatchObject({
+    event: { id },
+  });
+  expect(h.publish).not.toHaveBeenCalled();
+});
+
+it("returns newer shared ownership instead of a stale hydrated receipt", async () => {
+  const store = memory();
+  const original = setup(
+    store,
+    vi.fn(async () => {
+      throw new PublishRejected("Refused");
+    }),
+  );
+  await original.outbox.ready();
+  const old = original.outbox.send(input, recovery);
+  await vi.waitFor(() => expect(store.load()[0]?.delivery).toBe("failed"));
+  const stale = setup(store);
+  await stale.outbox.ready();
+  await original.outbox.dismiss(old);
+  const next = original.outbox.send(
+    { ...input, content: "New intent" },
+    recovery,
+  );
+  await vi.waitFor(() => expect(store.load()[0]?.event.id).toBe(next));
+  expect(await stale.outbox.recovery(recovery.key)).toMatchObject({
+    event: { id: next },
+  });
+  expect(stale.outbox.snapshot()).toEqual([]);
+  expect(stale.publish).not.toHaveBeenCalled();
+});
+
+it("keeps newly attached recovery ownership after a hydrated operation's save fails", async () => {
+  const store = memory();
+  const original = setup(
+    store,
+    vi.fn(async () => {
+      throw new PublishRejected("Refused");
+    }),
+  );
+  await original.outbox.ready();
+  const id = original.outbox.send(input);
+  await vi.waitFor(() => expect(store.load()[0]?.delivery).toBe("failed"));
+  const h = setup({
+    ...store,
+    save: async () => {
+      throw new Error("Disk full");
+    },
+  });
+  await h.outbox.ready();
+  await expect(h.outbox.recover(id, recovery)).rejects.toThrow("Disk full");
+  expect(await h.outbox.recovery(recovery.key)).toMatchObject({
+    event: { id },
+    recovery,
+  });
+});
+
+it("keeps a hydrated operation locally owned once Retry starts", async () => {
+  const store = memory();
+  const original = setup(
+    store,
+    vi.fn(async () => {
+      throw new PublishRejected("Refused");
+    }),
+  );
+  await original.outbox.ready();
+  const id = original.outbox.send(input, recovery);
+  await vi.waitFor(() => expect(store.load()[0]?.delivery).toBe("failed"));
+  const h = setup({
+    ...store,
+    save: async () => {
+      throw new Error("Disk full");
+    },
+  });
+  await h.outbox.ready();
+  await original.outbox.dismiss(id);
+  h.outbox.retry(id);
+  expect(await h.outbox.recovery(recovery.key)).toMatchObject({
+    event: { id },
+    recovery,
+  });
+});
+
+function legacyAddition(age = 901) {
+  const event = signed(viewer, {
+    kind: 9000,
+    content: "",
+    tags: [
+      ["h", "channel"],
+      ["p", "person"],
+    ],
+    created_at: Math.floor(Date.now() / 1000) - age,
+  });
+  const recovery = { key: "member-add:channel:person", value: "1" };
+  let records: readonly OutgoingEvent[] = [
+    { event, signed: event, delivery: "unknown", recovery },
+  ];
+  const store = {
+    load: () => structuredClone(records),
+    save: (next: readonly OutgoingEvent[]) => {
+      records = structuredClone(next);
+    },
+  };
+  return { event, recovery, store };
+}
+it("fences replay and replacement until an expired legacy invitation is durably resolved", async () => {
+  const { event, recovery, store } = legacyAddition();
+  const h = setup(store);
+  await h.outbox.ready();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const verify = vi.fn(async () => {
+    await gate;
+    return undefined;
+  });
+  const retire = h.outbox.acknowledge(event.id, verify);
+  try {
+    await vi.waitFor(() => expect(verify).toHaveBeenCalledOnce());
+    h.outbox.retry(event.id);
+    expect(() =>
+      h.outbox.send(
+        {
+          kind: 9000,
+          content: "",
+          tags: [
+            ["h", "channel"],
+            ["p", "person"],
+            ["role", "member"],
+          ],
+        },
+        recovery,
+      ),
+    ).toThrow(/Recover the earlier/);
+    expect(store.load()[0]?.acknowledged).toBeUndefined();
+  } finally {
+    release();
+  }
+  await retire;
+  expect(h.publish).not.toHaveBeenCalled();
+  expect(store.load()[0]).toMatchObject({
+    acknowledged: true,
+    delivery: "unknown",
+  });
+  expect(h.outbox.snapshot()).toEqual([]);
+});
+it("cannot retire a still-active delivery after its intake window expires", async () => {
+  const { event, store } = legacyAddition(0);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const publish = vi.fn(async () => {
+    await gate;
+  });
+  const h = setup(store, publish);
+  await h.outbox.ready();
+  h.outbox.retry(event.id);
+  try {
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce());
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime((event.created_at + 901) * 1000);
+    const verify = vi.fn(async () => undefined);
+    await expect(h.outbox.acknowledge(event.id, verify)).rejects.toThrow(
+      /may still arrive/,
+    );
+    expect(verify).not.toHaveBeenCalled();
+    expect(store.load()[0]?.acknowledged).toBeUndefined();
+  } finally {
+    release();
+  }
+  await vi.waitFor(() =>
+    expect(h.outbox.snapshot()[0]?.delivery).toBe("accepted"),
+  );
+});
+it("retains a legacy receipt when an echo arrives during negative verification", async () => {
+  const { event, store } = legacyAddition();
+  const h = setup(store);
+  await h.outbox.ready();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const verify = vi.fn(async () => {
+    await gate;
+    return undefined;
+  });
+  const retire = h.outbox.acknowledge(event.id, verify);
+  const rejected = expect(retire).rejects.toThrow(/changed while checking/);
+  try {
+    await vi.waitFor(() => expect(verify).toHaveBeenCalledOnce());
+    h.observe([event]);
+  } finally {
+    release();
+  }
+  await rejected;
+  expect(h.outbox.snapshot()[0]).toMatchObject({
+    delivery: "seen",
+    recovery: { key: "member-add:channel:person" },
+  });
+  expect(store.load()[0]?.acknowledged).toBeUndefined();
+  expect(h.publish).not.toHaveBeenCalled();
+});
+
+it("atomically hands legacy recovery to a durable Member invitation before publication", async () => {
+  const { event, recovery, store } = legacyAddition();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const save = vi.fn(async (records: readonly OutgoingEvent[]) => {
+    await gate;
+    store.save(records);
+  });
+  const h = setup({ ...store, save });
+  await h.outbox.ready();
+  const queued = vi.fn();
+  const handoff = h.outbox.acknowledge(event.id, async () => undefined, {
+    input: () => ({
+      kind: 9000,
+      content: "",
+      tags: [
+        ["h", "channel"],
+        ["p", "person"],
+        ["role", "member"],
+      ],
+    }),
+    queued,
+  });
+  try {
+    await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
+    const transaction = save.mock.calls[0]?.[0];
+    expect(
+      transaction?.find((item) => item.event.id === event.id),
+    ).toMatchObject({ acknowledged: true, recovery: undefined });
+    expect(
+      transaction?.find((item) => item.event.id !== event.id),
+    ).toMatchObject({ recovery, delivery: "sending" });
+    expect(store.load()[0]?.acknowledged).toBeUndefined();
+    expect(h.outbox.snapshot().length).toBeGreaterThan(0);
+    expect(h.publish).not.toHaveBeenCalled();
+    expect(queued).not.toHaveBeenCalled();
+  } finally {
+    release();
+  }
+  await handoff;
+  expect(queued).toHaveBeenCalledOnce();
+  const replacement = queued.mock.calls[0]?.[0];
+  expect(
+    store.load().find((item) => item.event.id === replacement)?.recovery,
+  ).toEqual(recovery);
+  h.dispose();
+  const restored = setup(store);
+  await restored.outbox.ready();
+  expect(restored.outbox.snapshot()).toMatchObject([
+    { event: { id: replacement }, recovery },
+  ]);
+  expect(restored.publish).not.toHaveBeenCalled();
+  restored.outbox.retry(replacement);
+  await vi.waitFor(() => expect(restored.publish).toHaveBeenCalledOnce());
+  expect(restored.publish.mock.calls[0]?.[0].id).toBe(replacement);
+});
+
+it("keeps only the original recoverable intent when an atomic handoff cannot be saved", async () => {
+  const { event, store } = legacyAddition();
+  const h = setup({
+    ...store,
+    save: async () => {
+      throw new Error("Disk full");
+    },
+  });
+  await h.outbox.ready();
+  const queued = vi.fn();
+  await expect(
+    h.outbox.acknowledge(event.id, async () => undefined, {
+      input: () => ({
+        kind: 9000,
+        content: "",
+        tags: [
+          ["h", "channel"],
+          ["p", "person"],
+          ["role", "member"],
+        ],
+      }),
+      queued,
+    }),
+  ).rejects.toThrow("Disk full");
+  expect(h.outbox.snapshot()).toMatchObject([
+    { event: { id: event.id }, recovery: { key: "member-add:channel:person" } },
+  ]);
+  expect(h.outbox.snapshot()).toHaveLength(1);
+  expect(store.load()[0]?.acknowledged).toBeUndefined();
+  expect(queued).not.toHaveBeenCalled();
+  expect(h.publish).not.toHaveBeenCalled();
+});
+
+it("does not expose replacement intent to an earlier queued save", async () => {
+  const { event, recovery, store } = legacyAddition();
+  // Attach recovery to an unowned receipt so both calls exercise queued saves.
+  // An already durable matching recovery deliberately performs no write.
+  store.save(store.load().map(({ recovery: _recovery, ...item }) => item));
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const transactions: (readonly OutgoingEvent[])[] = [];
+  const save = vi.fn(async (records: readonly OutgoingEvent[]) => {
+    await held;
+    transactions.push(structuredClone(records));
+    store.save(records);
+  });
+  const h = setup({ ...store, save });
+  await h.outbox.ready();
+  const first = h.outbox.recover(event.id, recovery);
+  await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
+  const changed = vi.fn();
+  const stop = h.outbox.subscribe(changed);
+  const earlier = h.outbox.recover(event.id, recovery);
+  await vi.waitFor(() => expect(changed).toHaveBeenCalledOnce());
+  const input = vi.fn(() => ({
+    kind: 9000,
+    content: "",
+    tags: [
+      ["h", "channel"],
+      ["p", "person"],
+      ["role", "member"],
+    ],
+  }));
+  const queued = vi.fn();
+  const handoff = h.outbox.acknowledge(event.id, async () => undefined, {
+    input,
+    queued,
+  });
+  try {
+    await vi.waitFor(() => expect(input).toHaveBeenCalledOnce());
+    expect(h.outbox.snapshot()).toHaveLength(1);
+  } finally {
+    release();
+    stop();
+  }
+  await Promise.all([first, earlier, handoff]);
+  const replacement = queued.mock.calls[0]?.[0];
+  expect(replacement).toBeDefined();
+  for (const records of transactions) {
+    if (records.some((item) => item.event.id === replacement))
+      expect(
+        records.find((item) => item.event.id === event.id)?.acknowledged,
+      ).toBe(true);
+  }
 });

@@ -26,6 +26,13 @@ export function channelIcon(
   return channel?.private ? LockIcon : HashIcon;
 }
 
+/** What `channelIcon` shows, in words, for readers who can't see it. */
+export function channelIconLabel(channel: Parameters<typeof channelIcon>[0]) {
+  if (channel?.channelType === "solo") return "Chat";
+  if (channel?.channelType === "dm") return "Direct message";
+  return channel?.private ? "Private channel" : "Public channel";
+}
+
 /** The channel's name as plain text, `#`-prefixed only where its icon is a hash. */
 export function channelText(channel: ChannelLabel) {
   return channelIcon(channel) === HashIcon ? `#${channel.name}` : channel.name;

@@ -33,6 +33,12 @@ export type ToolReply = {
 
 /** Codex's answer refusing a request, which it therefore did not carry out. */
 export class Refused extends Error {}
+/** A line over the connection's frame, which closes it. */
+export class Oversized extends Error {
+  constructor() {
+    super("Codex output frame is too large");
+  }
+}
 
 /** One request owner for the JSONL app-server connection. No Node sidecar. */
 export class AppServer {
@@ -50,13 +56,23 @@ export class AppServer {
   private buffer = "";
   private stderr = "";
   private listeners = new Set<(message: Wire) => void>();
-  private closing?: Promise<void>;
+  private closing?: Promise<void> | undefined;
+  private gone = false;
+  private opened?: [Spawn, string | undefined, boolean];
 
   constructor(
     private readonly toolCall?: (call: ToolCall) => Promise<ToolReply>,
   ) {}
 
-  async open(spawn: Spawn, cwd?: string) {
+  /** The credential for only this agent's commands, never app-server's own
+   * environment. */
+  toolCredential(agent: Readonly<{ pubkey: string; relay: string }>) {
+    return this.process?.toolCredential?.(agent);
+  }
+
+  async open(spawn: Spawn, cwd?: string, protectedRuntime = false) {
+    if (this.failure) throw this.failure;
+    this.opened = [spawn, cwd, protectedRuntime];
     this.process = await spawn("app-server", {
       ...(cwd ? { cwd } : {}),
       onStdout: (data) => this.read(data),
@@ -64,35 +80,62 @@ export class AppServer {
         this.stderr = (this.stderr + data).slice(-4000);
       },
     });
-    void this.process.exited.then((code) =>
+    void this.process.exited.then((code) => {
+      this.gone = true;
       this.fail(
         new Error(this.stderr.trim() || `Codex exited (${code ?? "signal"})`),
-      ),
-    );
+      );
+    });
     if (this.failure) {
       await this.close();
       throw this.failure;
     }
-    await this.request("initialize", {
-      clientInfo: {
-        name: "buzz_codex_plugin",
-        title: "Buzz Codex",
-        version: "0.1.0",
+    const initialized = await this.request<{ userAgent?: string }>(
+      "initialize",
+      {
+        clientInfo: {
+          name: "buzz_codex_plugin",
+          title: "Buzz Codex",
+          version: "0.1.0",
+        },
+        capabilities: {
+          experimentalApi: true,
+          optOutNotificationMethods: [
+            "item/agentMessage/delta",
+            "item/reasoning/summaryTextDelta",
+            "item/reasoning/textDelta",
+            "item/plan/delta",
+            "item/commandExecution/outputDelta",
+            "item/fileChange/outputDelta",
+          ],
+        },
       },
-      capabilities: {
-        experimentalApi: true,
-        optOutNotificationMethods: [
-          "item/agentMessage/delta",
-          "item/reasoning/summaryTextDelta",
-          "item/reasoning/textDelta",
-          "item/plan/delta",
-          "item/commandExecution/outputDelta",
-          "item/fileChange/outputDelta",
-        ],
-      },
-    });
+    );
+    if (
+      protectedRuntime &&
+      !initialized.userAgent?.includes("buzz-protection-v2")
+    ) {
+      await this.close();
+      throw new Error("This Codex build lacks mandatory security hooks");
+    }
     await this.send({ method: "initialized" });
     return this;
+  }
+  /** Closes this connection and opens a fresh app-server as before. */
+  async reopen() {
+    if (!this.opened) throw new Error("Codex is not connected");
+    const [spawn, cwd, protectedRuntime] = this.opened;
+    await this.close();
+    delete this.process;
+    delete this.failure;
+    this.closing = undefined;
+    this.gone = false;
+    this.buffer = this.stderr = "";
+    return this.open(spawn, cwd, protectedRuntime);
+  }
+  /** Whether the process has exited. */
+  get exited() {
+    return this.gone;
   }
   onMessage(listener: (message: Wire) => void) {
     this.listeners.add(listener);
@@ -107,8 +150,7 @@ export class AppServer {
       this.buffer += data;
       let newline = this.buffer.indexOf("\n");
       while (newline >= 0) {
-        if (newline > 4 * 1024 * 1024)
-          throw new Error("Codex output frame is too large");
+        if (newline > 4 * 1024 * 1024) throw new Oversized();
         const line = this.buffer.slice(0, newline);
         this.buffer = this.buffer.slice(newline + 1);
         newline = this.buffer.indexOf("\n");
@@ -140,8 +182,7 @@ export class AppServer {
           }).catch((error) => this.fail(error));
         } else this.emit(message);
       }
-      if (this.buffer.length > 4 * 1024 * 1024)
-        throw new Error("Codex output frame is too large");
+      if (this.buffer.length > 4 * 1024 * 1024) throw new Oversized();
     } catch (error) {
       this.fail(error instanceof Error ? error : new Error(String(error)));
       void this.close();
@@ -221,7 +262,7 @@ export class AppServer {
     if (!this.process) return Promise.resolve();
     if (this.closing) return this.closing;
     const process = this.process;
-    this.closing = (async () => {
+    const closing = (async () => {
       // EOF lets Codex stop its separately grouped background terminals.
       const timer = setTimeout(() => void process.kill(), 3000);
       try {
@@ -231,7 +272,12 @@ export class AppServer {
         clearTimeout(timer);
       }
     })();
-    return this.closing;
+    this.closing = closing;
+    // A close that failed to stop the process is attempted again by the next.
+    void closing.catch(() => {
+      if (this.closing === closing) this.closing = undefined;
+    });
+    return closing;
   }
 }
 

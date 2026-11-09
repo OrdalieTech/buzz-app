@@ -1,9 +1,11 @@
 import {
+  VERIFIED_PROFILE_MAX_SYNCS,
   verifiedProfileFilter,
   type VerifiedProfileFilter,
   type VerifiedProfileSink,
 } from "./verified-profile.ts";
 import { getLogger } from "../developer/logging.ts";
+import { CHANNEL_KINDS } from "./channel-kinds.ts";
 import { logSocketFrame, relayLabel } from "../developer/traffic.ts";
 
 import {
@@ -34,8 +36,17 @@ import {
 export const LIVE_CHANNEL_CAPACITY = 1022;
 export const LIVE_BATCH_SIZE = 2048; // Relay limit for explicit channel IDs per REQ.
 const REPLAY_BATCH_SIZE = 10; // Relay limit for filters per REQ.
+/** Channels one combined replay filter names. A combined replay that reaches
+ * `LIVE_REPLAY_LIMIT` delivered everything after its oldest event, so the next
+ * page asks for the rest from there, without the channels that already have
+ * `LIVE_REPLAY_LIMIT` events: each channel still replays its newest ones. */
+const COMBINED_REPLAY_CHANNELS = 256;
 export const LIVE_REPLAY_LIMIT = 500;
 export const LIVE_RECOVERY_INTERVAL = 60_000;
+/** How long a socket asked to prove itself (`check`) has to answer. */
+export const LIVE_CHECK_TIMEOUT_MS = 5_000;
+/** A probe answered this recently already proves the socket; `check` skips. */
+const LIVE_CHECK_FRESH_MS = 15_000;
 /** A live batch is re-sent after this long even with no grant, in case a
  * grant notice never arrived (a dropped frame, or a duplicate notice the
  * relay stored once and did not fan out again). */
@@ -64,6 +75,15 @@ export const RELAY_TIMESTAMP_DRIFT_SECS = 900;
  * pod can trail its peers), the client clock's skew from the relay's, and the
  * relay's replica read budget for the unread repair, which uses the same margin. */
 export const LIVE_RESUME_LAG = RELAY_TIMESTAMP_DRIFT_SECS + 60;
+/** A continuous replay starts `LIVE_RESUME_LAG` before the drop, so it closes
+ * the gap only back to then. A live frame the relay dropped earlier (a full
+ * send buffer drops it without a notice) is not in it; only a read after that
+ * frame brings it back. So a view resumes with no read only when the read its
+ * rows came from started at most this long (milliseconds) before the drop; any
+ * other view reads again. The batch refresh reads each open window's head and
+ * open thread about this often. The minute under the lag absorbs read latency
+ * and clock skew. */
+export const RESUME_READ_AGE = (LIVE_RESUME_LAG - 60) * 1000;
 /** Signature proofs a live subscription keeps across its reconnects. Each resume
  * replays `LIVE_RESUME_LAG` of events the subscription already verified; a
  * fresh signature check costs about 1 ms of main thread per event, a proof hit
@@ -221,6 +241,19 @@ export function liveGlobal(value: unknown): LiveGlobal | undefined {
     return undefined;
   return Object.freeze({ route, continuous });
 }
+/** Host-relayed continuous channels: only well-formed IDs of the channels
+ * established with them. Anything else reports none, so each channel catches
+ * up as if its replay was cut. */
+export function liveContinuous(
+  value: unknown,
+  channels: readonly string[],
+): string[] {
+  return Array.isArray(value)
+    ? [...new Set(value)].filter(
+        (id): id is string => typeof id === "string" && channels.includes(id),
+      )
+    : [];
+}
 export type LiveCallbacks = {
   /** Legacy/missing provenance reconciles quietly; it is never implicitly fresh. */
   receive(events: readonly VerifiedEvent[], provenance?: LiveProvenance): void;
@@ -230,8 +263,15 @@ export type LiveCallbacks = {
   observer?(frame: ObserverFrame, generation: number): void;
   presence?(event: VerifiedEvent): void;
   state(snapshot: LiveSnapshot): void;
-  /** A global route (no channels) also reports whether it stayed continuous. */
-  established(channels?: string | readonly string[], global?: LiveGlobal): void;
+  /** A global route (no channels) also reports whether it stayed continuous.
+   * A channel route reports in `continuous` the channels whose replay resumed
+   * from an earlier connection's cursor and ended below the limit: it
+   * delivered every event in them since that connection last heard the relay. */
+  established(
+    channels?: string | readonly string[],
+    global?: LiveGlobal,
+    continuous?: readonly string[],
+  ): void;
   /** Periodic repair hint, not membership or historical-completeness evidence. */
   recover?(): void;
   denied(channelId: string, reason: string): void;
@@ -265,6 +305,10 @@ export type LiveSubscription = {
     sink: VerifiedProfileSink,
   ): () => void;
   retry(): void;
+  /** A hint (wake, network, focus) that an open socket may have died unseen:
+   * probe it now and replace it if it does not answer in time. `network`: the
+   * network changed, so an earlier answer no longer proves this socket. */
+  check?(network?: boolean): void;
   dispose(): void;
 };
 /** Demand-scoped ephemeral authors, never a channel/history interest. */
@@ -301,11 +345,22 @@ export function liveJoined(
   return joined;
 }
 
+type ReplayPage = {
+  /** Events each channel received on earlier pages of this replay. */
+  counts: ReadonlyMap<string, number>;
+  /** Only events at or before this time; absent on the first page. */
+  until?: number;
+  /** This page's oldest event and its newer-than-`until` events per channel. */
+  oldest: number;
+  got: Map<string, number>;
+};
 type Route = {
   id: string;
   channelId?: string;
   channelIds?: readonly string[];
   history?: boolean;
+  /** A history route that replays its channels through one filter. */
+  page?: ReplayPage;
   status: LiveRoute["status"];
   replay: LiveRoute["replay"];
   error?: string;
@@ -320,9 +375,21 @@ type Route = {
   /** Live on the socket a planned renewal replaced, over the same scope. Its
    * replay resumes from the cursor, so its EOSE needs no catch-up. */
   carried?: boolean;
-  /** Every key had a cursor when the route was created, so its replay starts
-   * where an earlier connection's delivery could have stopped. */
+  /** Every key had a cursor and the replay covers its full resume lag. */
   resumed?: boolean;
+  /** Channels with a cursor whose full resume lag is covered by the replay. */
+  resumedChannels?: ReadonlySet<string>;
+  /** Replay events per channel: each channel has its own filter and limit, so
+   * `count`, the route's total, cannot tell which one the limit cut. */
+  counts?: Map<string, number>;
+  /** Channels whose replay does not close their gap even below the limit: it
+   * carried an edit or reaction that arrived before its target, a reply or
+   * a deletion (they change a thread summary the relay never stores), or an
+   * event the session could not apply. Present but empty on a global route,
+   * which then owes its repair read too. */
+  repairs?: Set<string>;
+  /** Events an edit or reaction in this replay refers to. */
+  targets?: Set<string>;
   quotaRetries: number;
   /** Its REQ was sent before a grant for one of its channels arrived, so the
    * relay may have left that channel out. Re-send at its EOSE. */
@@ -334,10 +401,7 @@ type Route = {
   retryAt?: number;
   deadline?: ReturnType<typeof setTimeout>;
 };
-export const CHANNEL_KINDS = [
-  9, 40002, 40008, 45001, 45003, 40099, 40100, 40003, 5, 9005, 7, 39000, 39002,
-  39005, 20002, 45010, 48100, 48101, 48102, 48103,
-];
+export { CHANNEL_KINDS } from "./channel-kinds.ts";
 /** The browser socket and native header-capable facade share only frame transport. */
 export interface LiveSocket {
   readonly readyState: number;
@@ -400,6 +464,10 @@ export function subscribeRelayTraffic(
   let tickedAt = 0;
   let provenAt = 0;
   let probe: string | undefined;
+  // A `check` waiting for a probe answer, and when a probe was last answered.
+  // Only a probe answer proves the socket: other frames may predate a sleep.
+  let checkDeadline: ReturnType<typeof setTimeout> | undefined;
+  let answeredAt = 0;
   let unresponsive: ((reason: string) => void) | undefined;
   // A policy close (1008) gets one fresh-evidence reconnect; only NIP-42
   // admission restores it, so a post-admission denial cannot loop.
@@ -433,6 +501,13 @@ export function subscribeRelayTraffic(
   // established it last heard the relay. A later connection that never
   // establishes it leaves the cursor, so flapping does not lose it.
   const cursors = new Map<string, LiveCursor>();
+  // Channels granted since a stream that holds them last started. The relay
+  // may have left such a channel out of every earlier stream, so it has no
+  // cursor until a REQ sent after its grant reaches EOSE.
+  const grantsOwed = new Set<string>();
+  // Channels of an established batch whose replay a history route still runs:
+  // each establishes when its replay ends, with that replay's continuity.
+  const awaitingReplay = new Set<string>();
   // Outlives each socket, so a reconnect's replay reuses the proofs.
   const verify = createEventVerifier(LIVE_PROOF_ENTRIES, signatures);
   const cursorKeys = (route: Route) =>
@@ -449,20 +524,55 @@ export function subscribeRelayTraffic(
         return cursor ? liveResumeSince(original, cursor) : route.since;
       }),
     );
+  // A replay resumes the stream `key` names when it starts from that stream's
+  // cursor and covers the full backdate allowance before it. The startup floor
+  // can truncate that allowance even when the replay ends below the limit.
+  const covered = (route: Route, key: string) => {
+    const cursor = cursors.get(key);
+    return !!cursor && route.since <= cursor.liveUntil - LIVE_RESUME_LAG;
+  };
   type SyncWire = {
     filter: ArtifactSyncFilter | VerifiedProfileFilter;
     sink: ArtifactSyncSink;
     wire?: string;
   };
   const syncs = new Set<SyncWire>();
+  // Artifact and verified-profile syncs share the wire budget but are admitted
+  // from separate pools, so a large roster cannot refuse an artifact view.
+  const profileSyncs = new Set<SyncWire>();
   const syncWires = new Map<string, SyncWire>();
   function endSync(sync: SyncWire, reason: string) {
+    profileSyncs.delete(sync);
     if (!syncs.delete(sync)) return;
     if (sync.wire) syncWires.delete(sync.wire);
     sync.sink.closed(reason);
     syncInterests();
   }
   const replayQueue = new Map<string, number>();
+  /** Channels whose history replay is queued or in progress. */
+  const replaying = () => {
+    const ids = new Set(replayStopped ? [] : replayQueue.keys());
+    for (const route of routes.values())
+      if (route.history && route.status === "pending")
+        for (const id of scope(route)) ids.add(id);
+    return ids;
+  };
+  /** Channels a live route streams now, or its established predecessor does
+   * while a re-send is in flight. */
+  const streaming = () =>
+    new Set(
+      [...routes.values()]
+        .filter((route) => !route.history)
+        .flatMap((route) =>
+          route.status === "live"
+            ? scope(route)
+            : route.previous?.status === "live"
+              ? (route.previousChannels ?? [])
+              : [],
+        ),
+    );
+  // Channels whose combined replay reached the limit; they replay one filter each.
+  const splitReplay = new Set<string>();
   let routeSnapshots = new Map<string, LiveRoute>();
   let replayStopped = false;
   const setupState = () => {
@@ -531,6 +641,16 @@ export function subscribeRelayTraffic(
         ...(connectionError ? { error: connectionError } : {}),
       }),
     );
+    // A history replay that ended without its EOSE (it failed, stopped or no
+    // longer applies) proves nothing: its channels establish now and catch up.
+    if (!awaitingReplay.size) return;
+    // A channel no route streams establishes at its route's next EOSE instead.
+    const pending = replaying();
+    const streamed = streaming();
+    const released = [...awaitingReplay].filter((id) => !pending.has(id));
+    for (const id of released) awaitingReplay.delete(id);
+    const ready = released.filter((id) => streamed.has(id));
+    if (ready.length) callbacks.established(ready);
   };
   const send = (value: unknown) => {
     if (!closed && socket?.readyState === 1) {
@@ -580,9 +700,12 @@ export function subscribeRelayTraffic(
       status: "pending",
       liveOnly: !replayChannels?.length,
       count: 0,
+      counts: new Map(),
       quotaRetries: 0,
       ...(previous ? { previous, previousChannels } : {}),
     };
+    delete next.repairs;
+    delete next.targets;
     delete next.replayChannels;
     if (replayChannels?.length) next.replayChannels = replayChannels;
     delete next.wire;
@@ -602,19 +725,47 @@ export function subscribeRelayTraffic(
   // granted channel. A batch whose REQ is in flight may have been checked
   // before the grant, so it is re-sent once at its EOSE. A forged notice
   // costs one extra REQ, nothing more.
+  /** A grant's re-send of `route` proves no channel of it continuous,
+   * including one whose replay a history route still runs. */
+  function regrant(route: Route) {
+    const channels = scope(route);
+    for (const other of routes.values())
+      if (other.history && other.resumedChannels)
+        other.resumedChannels = new Set(
+          [...other.resumedChannels].filter(
+            (channel) => !channels.includes(channel),
+          ),
+        );
+    replace(route);
+  }
   function grant(id: string) {
+    cursors.delete(`channel:${id}`);
+    grantsOwed.add(id);
     let sent = false;
     for (const route of [...routes.values()]) {
       if (!route.channelIds?.includes(id)) continue;
       if (route.status === "live" && !route.previous) {
-        replace(route);
+        regrant(route);
         sent = true;
-      } else if (route.status === "pending" && route.wire)
-        route.regranted = true;
+        continue;
+      }
+      // A route not live yet resumes from a cursor of a stream the relay may
+      // have left this channel out of, even if its REQ follows the grant
+      // (one that waits to retry), so the channel catches up.
+      if (route.resumedChannels?.has(id))
+        route.resumedChannels = new Set(
+          [...route.resumedChannels].filter((other) => other !== id),
+        );
+      if (route.status === "pending" && route.wire) route.regranted = true;
     }
     if (!sent) return;
     pump();
     notify();
+  }
+  function sendProbe() {
+    if (probe) send(["CLOSE", probe]);
+    probe = `probe-${++serial}`;
+    send(["REQ", probe, { kinds: [44100], "#p": [viewer], limit: 0 }]);
   }
   function recover() {
     if (closed || !authenticated) return;
@@ -625,9 +776,7 @@ export function subscribeRelayTraffic(
     // no answer at all means the socket is dead, so replace it. A probe is a
     // request too: during a relay cooldown it waits for a later silent minute.
     if (!heard && !admission.delay()) {
-      if (probe) send(["CLOSE", probe]);
-      probe = `probe-${++serial}`;
-      send(["REQ", probe, { kinds: [44100], "#p": [viewer], limit: 0 }]);
+      sendProbe();
       clearTimeout(deadline);
       deadline = setTimeout(
         () => unresponsive?.("Live connection stopped answering"),
@@ -687,7 +836,10 @@ export function subscribeRelayTraffic(
     const interested = new Set(interests);
     const members = new Set(joined);
     for (const id of replayQueue.keys())
-      if (!interested.has(id) || !members.has(id)) replayQueue.delete(id);
+      if (!interested.has(id) || !members.has(id)) {
+        replayQueue.delete(id);
+        splitReplay.delete(id);
+      }
     const ranked = [
       ...new Set([
         ...priority.filter((id) => interested.has(id)),
@@ -789,7 +941,10 @@ export function subscribeRelayTraffic(
         route.liveOnly = true;
         for (const id of ids) replayQueue.set(id, route.since);
       }
-      route.resumed = cursorKeys(route).every((key) => cursors.has(key));
+      route.resumed = cursorKeys(route).every((key) => covered(route, key));
+      route.resumedChannels = new Set(
+        scope(route).filter((id) => covered(route, `channel:${id}`)),
+      );
       // Presence and observer feeds establish nothing, so carry no obligation.
       if (
         carrying &&
@@ -940,6 +1095,12 @@ export function subscribeRelayTraffic(
     pump();
     settle();
   }
+  /** A replay event leaves `channels` owed their catch-up. */
+  const owesRepair = (route: Route, channels: readonly string[]) => {
+    if (route.status !== "pending" || route.liveOnly) return;
+    route.repairs ??= new Set();
+    for (const id of channels) route.repairs.add(id);
+  };
   const establish = (route: Route) => {
     if (route.id === "profiles" || route.id === "membership")
       callbacks.established(
@@ -948,13 +1109,40 @@ export function subscribeRelayTraffic(
           route: route.id,
           // The count covers every filter of the route, so any filter the
           // limit cut marks it. A retry keeps the route's original since; a
-          // live-only replacement replays nothing.
+          // live-only replacement replays nothing. A replay event the session
+          // could not decode owes the route its repair read.
           continuous:
-            !!route.resumed && !route.liveOnly && route.replay !== "limited",
+            !!route.resumed &&
+            !route.liveOnly &&
+            route.replay !== "limited" &&
+            !route.repairs,
         }),
       );
-    else if (route.id !== "observer" && route.id !== "presence")
-      callbacks.established(route.channelIds ?? route.channelId);
+    else if (route.id !== "observer" && route.id !== "presence") {
+      // A live-only route sends no replay, so it closes no gap; nor does a
+      // channel outside a re-sent route's replay subset.
+      const continuous = route.liveOnly
+        ? []
+        : scope(route).filter(
+            (id) =>
+              route.resumedChannels?.has(id) &&
+              (!route.replayChannels || route.replayChannels.includes(id)) &&
+              (route.counts?.get(id) ?? 0) < LIVE_REPLAY_LIMIT &&
+              !route.repairs?.has(id),
+          );
+      // A batch over `REPLAY_BATCH_SIZE` channels replays through history
+      // routes, so a channel whose replay has not ended establishes at its end.
+      const pending = route.channelIds ? replaying() : new Set<string>();
+      for (const id of scope(route))
+        if (pending.has(id)) awaitingReplay.add(id);
+      const channels = route.channelIds
+        ? route.channelIds.filter((id) => !pending.has(id))
+        : route.channelId;
+      if (!channels?.length) return;
+      if (continuous.length)
+        callbacks.established(channels, undefined, continuous);
+      else callbacks.established(channels);
+    }
   };
   /** A renewal stays quiet only while every carried route keeps continuity.
    * Once one fails or stops, is replaced or replays a cut window, no
@@ -1019,7 +1207,6 @@ export function subscribeRelayTraffic(
           route.status === "pending" && (!route.history || !route.wire),
       )
     ) {
-      const iterator = replayQueue.entries();
       for (
         let slot = active;
         slot < setupConcurrency &&
@@ -1028,26 +1215,41 @@ export function subscribeRelayTraffic(
       ) {
         const ids: string[] = [];
         let since = Infinity;
-        for (let i = 0; i < REPLAY_BATCH_SIZE; i++) {
-          const entry = iterator.next();
-          if (entry.done) break;
-          const [id, time] = entry.value;
+        let split: boolean | undefined;
+        for (const [id, time] of replayQueue) {
+          const single = splitReplay.has(id);
+          split ??= single;
+          if (single !== split) continue;
+          if (
+            ids.length >= (split ? REPLAY_BATCH_SIZE : COMBINED_REPLAY_CHANNELS)
+          )
+            break;
           replayQueue.delete(id);
+          splitReplay.delete(id);
           ids.push(id);
           since = Math.min(since, time);
         }
         if (!ids.length) break;
         const id = `replay:${++serial}`;
-        routes.set(id, {
+        const route: Route = {
           id,
           channelIds: ids,
           history: true,
+          ...(split
+            ? {}
+            : {
+                page: { counts: new Map(), oldest: Infinity, got: new Map() },
+              }),
           status: "pending",
           replay: "limited",
           count: 0,
           quotaRetries: 0,
           since,
-        });
+        };
+        route.resumedChannels = new Set(
+          ids.filter((channel) => covered(route, `channel:${channel}`)),
+        );
+        routes.set(id, route);
       }
     }
     const rank = (route: Route) => {
@@ -1084,6 +1286,10 @@ export function subscribeRelayTraffic(
       route.wire = wire;
       delete route.regranted; // This REQ is sent after every earlier grant.
       route.sentAt = Date.now();
+      if (route.page) {
+        route.page.oldest = Infinity;
+        route.page.got = new Map();
+      }
       wires.set(wire, route);
       route.deadline = setTimeout(() => {
         if (wires.get(wire) === route)
@@ -1096,7 +1302,7 @@ export function subscribeRelayTraffic(
       active++;
       if (route.id === "observer") route.since = Math.floor(Date.now() / 1000);
       const filters = scope(route).length
-        ? (route.liveOnly
+        ? (route.liveOnly || route.page
             ? [scope(route)]
             : scope(route).map((id) => [id])
           ).map((ids) => ({ kinds: CHANNEL_KINDS, "#h": ids }))
@@ -1119,6 +1325,9 @@ export function subscribeRelayTraffic(
           ...filter,
           // Survivor filters stay live-only so replay cannot suppress a fresh alert.
           since: route.since,
+          ...(route.page?.until !== undefined
+            ? { until: route.page.until }
+            : {}),
           ...(route.id === "observer"
             ? {}
             : {
@@ -1179,6 +1388,11 @@ export function subscribeRelayTraffic(
       const liveUntil = Math.floor(
         Math.min(heardAt, pendingSince ?? heardAt) / 1000,
       );
+      // A channel whose replay has not ended closed no gap on this connection,
+      // so it keeps the cursor of the last connection that did.
+      const unproven = new Set([...awaitingReplay, ...replayQueue.keys()]);
+      for (const route of routes.values())
+        if (route.history) for (const id of scope(route)) unproven.add(id);
       for (const route of routes.values()) {
         const { previous } = route;
         const source =
@@ -1191,6 +1405,8 @@ export function subscribeRelayTraffic(
               : undefined;
         if (!source) continue;
         const kept = new Set(cursorKeys(source));
+        for (const id of grantsOwed) kept.delete(`channel:${id}`);
+        for (const id of unproven) kept.delete(`channel:${id}`);
         for (const key of cursorKeys(route))
           if (kept.has(key)) cursors.set(key, { liveUntil });
       }
@@ -1203,8 +1419,12 @@ export function subscribeRelayTraffic(
     clearTimeout(dispatchTimer);
     clearTimeout(recoveryTimer);
     clearTimeout(deadline);
+    clearTimeout(checkDeadline);
+    checkDeadline = undefined;
     for (const route of routes.values()) clearTimeout(route.deadline);
+    awaitingReplay.clear();
     replayQueue.clear();
+    splitReplay.clear();
     replayStopped = false;
     wires.clear();
     requests.clear();
@@ -1245,6 +1465,8 @@ export function subscribeRelayTraffic(
     }
     const used = new Set([...routes.values()].flatMap(cursorKeys));
     for (const key of cursors.keys()) if (!used.has(key)) cursors.delete(key);
+    for (const id of grantsOwed)
+      if (!used.has(`channel:${id}`)) grantsOwed.delete(id);
     const current = generation;
     const valid = () => !closed && current === generation;
     heard = false;
@@ -1408,6 +1630,9 @@ export function subscribeRelayTraffic(
           admission.pause(hint ? Math.min(Number(hint[1]), 86400) : 5);
         }
         probe = undefined;
+        clearTimeout(checkDeadline);
+        checkDeadline = undefined;
+        answeredAt = Date.now();
         return;
       }
       if (
@@ -1532,8 +1757,9 @@ export function subscribeRelayTraffic(
           sync.sink.event(checked);
         } else if (data[0] === "EOSE") sync.sink.eose();
         else if (data[0] === "CLOSED") {
+          // `disconnected:` is reserved for local socket loss.
           const reason =
-            typeof data[2] === "string"
+            typeof data[2] === "string" && !data[2].startsWith("disconnected:")
               ? data[2].slice(0, 512)
               : "error: relay closed the sync";
           // The quota is shared: the view's restart and every other queued
@@ -1563,6 +1789,10 @@ export function subscribeRelayTraffic(
         if (!checked) {
           // One undecodable event must not take the route (or its batch) down.
           log.warn(`${peer} dropped an undecodable live event`);
+          // It still took a slot in the relay's limit, so a full replay must
+          // not look complete.
+          if (route.status === "pending" && !route.liveOnly) route.count++;
+          owesRepair(route, scope(route));
           return;
         }
         const incoming = checked;
@@ -1584,8 +1814,12 @@ export function subscribeRelayTraffic(
           ids.length &&
           tags.length &&
           !tags.some(([, id]) => id && ids.includes(id))
-        )
+        ) {
+          // The relay stored it in one of these channels and spent that
+          // channel's replay slot on it.
+          owesRepair(route, ids);
           return;
+        }
         if (previous) {
           const retained = currentRoute.previousChannels ?? scope(currentRoute);
           // Untagged auxiliary events cannot inherit a narrowed scope. Preserve
@@ -1605,7 +1839,44 @@ export function subscribeRelayTraffic(
           (!route.replayChannels ||
             !channelId ||
             route.replayChannels.includes(channelId));
-        if (replaying) route.count++;
+        if (replaying) {
+          route.count++;
+          // An event that names no single channel of the scope counts against
+          // each of them, so no channel's count is ever too low.
+          route.counts ??= new Map();
+          for (const id of channelId ? [channelId] : ids)
+            route.counts.set(id, (route.counts.get(id) ?? 0) + 1);
+          const owners = channelId ? [channelId] : ids;
+          const targets = incoming.tags.flatMap(([name, value]) =>
+            name === "e" && value ? [value] : [],
+          );
+          // The replay is newest first: an edit or reaction to a message sent
+          // in the outage arrives before its target, and the session drops it.
+          if (route.targets?.has(incoming.id)) owesRepair(route, owners);
+          if (incoming.kind === 7 || incoming.kind === 40003)
+            for (const id of targets) {
+              route.targets ??= new Set();
+              route.targets.add(id);
+            }
+          // A reply or a deletion changes a thread summary, which the relay
+          // never stores, so no replay carries it.
+          else if (
+            targets.length ||
+            incoming.kind === 5 ||
+            incoming.kind === 9005
+          )
+            owesRepair(route, owners);
+        }
+        if (replaying && route.page) {
+          const { page } = route;
+          page.oldest = Math.min(page.oldest, incoming.created_at);
+          // An event at `until` may repeat the last page; never count it twice.
+          if (
+            channelId &&
+            (page.until === undefined || incoming.created_at < page.until)
+          )
+            page.got.set(channelId, (page.got.get(channelId) ?? 0) + 1);
+        }
         if (route.id === "presence") {
           if (
             incoming.kind === 20001 &&
@@ -1641,8 +1912,86 @@ export function subscribeRelayTraffic(
         }
       } else if (data[0] === "EOSE" && route.status === "pending") {
         if (route.history) {
+          const { page } = route;
+          let rest: string[] = [];
+          if (page && route.count >= LIVE_REPLAY_LIMIT) {
+            const counts = new Map(page.counts);
+            for (const [id, n] of page.got)
+              counts.set(id, (counts.get(id) ?? 0) + n);
+            rest = scope(route).filter(
+              (id) =>
+                route.count > LIVE_REPLAY_LIMIT ||
+                (counts.get(id) ?? 0) < LIVE_REPLAY_LIMIT,
+            );
+            // Extra frames may be live fan-out (including duplicates or
+            // backdated events), so neither counts nor cutoff prove a prefix.
+            // A full page within one second, or without a decodable event,
+            // also cannot move the cutoff.
+            if (
+              route.count > LIVE_REPLAY_LIMIT ||
+              !(page.oldest < (page.until ?? Infinity))
+            )
+              for (const id of rest) {
+                replayQueue.set(id, route.since);
+                splitReplay.add(id);
+              }
+            else if (rest.length) {
+              const id = `replay:${++serial}`;
+              // The next page continues this replay, older events first, so
+              // it keeps what this one learned about each channel.
+              const repairs = rest.filter((channel) =>
+                route.repairs?.has(channel),
+              );
+              routes.set(id, {
+                id,
+                channelIds: rest,
+                history: true,
+                page: {
+                  counts,
+                  until: page.oldest,
+                  oldest: Infinity,
+                  got: new Map(),
+                },
+                status: "pending",
+                replay: "limited",
+                count: 0,
+                quotaRetries: 0,
+                since: route.since,
+                resumedChannels: new Set(
+                  rest.filter((channel) => route.resumedChannels?.has(channel)),
+                ),
+                ...(route.targets ? { targets: route.targets } : {}),
+                ...(repairs.length ? { repairs: new Set(repairs) } : {}),
+              });
+            }
+          }
+          // A channel whose replay ended here establishes now. One combined
+          // filter is complete only on a page below the limit; a channel of a
+          // split replay has its own filter.
+          // One no live route streams now establishes at that route's next
+          // EOSE, which replays nothing.
+          const streamed = streaming();
+          const ready = scope(route).filter(
+            (id) =>
+              !rest.includes(id) &&
+              awaitingReplay.delete(id) &&
+              streamed.has(id),
+          );
+          const continuous = ready.filter(
+            (id) =>
+              route.resumedChannels?.has(id) &&
+              (page
+                ? route.count < LIVE_REPLAY_LIMIT
+                : (route.counts?.get(id) ?? 0) < LIVE_REPLAY_LIMIT) &&
+              !route.repairs?.has(id),
+          );
           const failed = route.error !== undefined;
           remove(route);
+          const current = generation;
+          if (continuous.length)
+            callbacks.established(ready, undefined, continuous);
+          else if (ready.length) callbacks.established(ready);
+          if (closed || generation !== current) return;
           if (failed) notify();
           pump();
           return;
@@ -1653,14 +2002,24 @@ export function subscribeRelayTraffic(
         route.status = "live";
         delete route.error;
         delete route.refusals;
+        // A channel whose replay the session cannot apply alone still owes
+        // the session a read. (A carried route holds no granted channel: a
+        // grant ends that channel's cursor, and a route is carried only when
+        // every cursor it resumes was live.)
+        const owed = !!route.repairs?.size;
+        // Its stream holds every channel granted before its REQ was sent. A
+        // grant while it was in flight marks it regranted; its re-send clears.
+        if (!route.regranted)
+          for (const id of scope(route)) grantsOwed.delete(id);
         route.replay =
           route.count >= LIVE_REPLAY_LIMIT ||
           (route.liveOnly && scope(route).length > REPLAY_BATCH_SIZE)
             ? "limited"
             : "unknown";
         // A carried route's replay covered the renewal unless the limit cut it.
-        const caughtUp = route.carried && route.replay !== "limited";
-        if (route.carried && !caughtUp) broken = true;
+        // One that owes a read establishes, so the session reads what it owes.
+        const caughtUp = route.carried && route.replay !== "limited" && !owed;
+        if (route.carried && route.replay === "limited") broken = true;
         delete route.carried;
         notify();
         if (!valid()) return;
@@ -1675,7 +2034,7 @@ export function subscribeRelayTraffic(
           routes.get(route.id) === route &&
           route.status === "live"
         ) {
-          replace(route);
+          regrant(route);
           notify();
         }
         if (valid()) pump();
@@ -1734,7 +2093,7 @@ export function subscribeRelayTraffic(
         );
         return () => {};
       }
-      if (syncs.size >= ARTIFACT_SYNC_MAX_VIEWS) {
+      if (syncs.size - profileSyncs.size >= ARTIFACT_SYNC_MAX_VIEWS) {
         queueMicrotask(() =>
           sink.closed("error: artifact sync capacity reached"),
         );
@@ -1760,15 +2119,17 @@ export function subscribeRelayTraffic(
         );
         return () => {};
       }
-      if (syncs.size >= ARTIFACT_SYNC_MAX_VIEWS) {
+      if (profileSyncs.size >= VERIFIED_PROFILE_MAX_SYNCS) {
         queueMicrotask(() =>
           sink.closed("error: profile sync capacity reached"),
         );
         return () => {};
       }
       syncs.add(sync);
+      profileSyncs.add(sync);
       syncInterests();
       return () => {
+        profileSyncs.delete(sync);
         if (!syncs.delete(sync)) return;
         if (sync.wire) {
           syncWires.delete(sync.wire);
@@ -1912,11 +2273,25 @@ export function subscribeRelayTraffic(
           if (route.status !== "error") continue;
           route.status = "pending";
           route.count = 0;
+          route.counts = new Map();
+          delete route.repairs;
+          delete route.targets;
           route.quotaRetries = 0;
         }
         pump();
         notify();
       } else connect();
+    },
+    check(network = false) {
+      // A socket not yet admitted has its own deadline; a cooldown forbids requests.
+      if (closed || !authenticated || checkDeadline || admission.delay())
+        return;
+      if (!network && Date.now() - answeredAt < LIVE_CHECK_FRESH_MS) return;
+      sendProbe();
+      checkDeadline = setTimeout(() => {
+        checkDeadline = undefined;
+        unresponsive?.("Live connection did not answer a wake check");
+      }, LIVE_CHECK_TIMEOUT_MS);
     },
     dispose() {
       if (closed) return;
@@ -1924,6 +2299,7 @@ export function subscribeRelayTraffic(
       clearTimeout(retryTimer);
       const ending = [...syncs];
       syncs.clear();
+      profileSyncs.clear();
       clearSocket();
       routes.clear();
       routeSnapshots.clear();

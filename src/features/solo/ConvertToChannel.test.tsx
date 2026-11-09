@@ -9,12 +9,13 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
 import { finalizeEvent, getPublicKey, type EventTemplate } from "nostr-tools";
 import { createChannelDetails } from "../relay/channel-details";
 import { createRelaySession } from "../relay/session";
 import { PublishRejected } from "../relay/outbox";
 import { SOLO_LABEL } from "./labels";
-import { chatConversion } from "./conversion";
+import { chatConversion, conversionLabel } from "./conversion";
 import { ConvertToChannel, canConvertToChannel } from "./ConvertToChannel";
 
 const id = "11111111-1111-4111-8111-111111111111";
@@ -27,11 +28,16 @@ afterEach(() => {
   cleanup();
   for (const close of dispose.splice(0)) close();
 });
-function setup(solo = true) {
+function setup(
+  solo = true,
+  initialVisibility: "private" | "public" = "private",
+  initialJoinRole: "member" | "guest" | undefined = undefined,
+) {
   let clock = 100,
     role = "owner",
     name = "Original",
-    visibility = "private";
+    visibility = initialVisibility,
+    joinRole = initialJoinRole;
   let labels = solo ? [SOLO_LABEL, "work"] : ["work"];
   const record = (kind: number, tags: string[][]) =>
     finalizeEvent(
@@ -45,6 +51,7 @@ function setup(solo = true) {
       ["t", "stream"],
       ...labels.map((label) => ["t", label]),
       [visibility],
+      ...(joinRole ? [["join_role", joinRole]] : []),
       ["ttl", "86400"],
     ]);
   const read = vi.fn(async () => [
@@ -62,6 +69,8 @@ function setup(solo = true) {
     if (written.length) labels = written.filter(Boolean);
     const choice = event.tags.find(([tag]) => tag === "visibility")?.[1];
     if (choice) visibility = choice === "open" ? "public" : "private";
+    const admission = event.tags.find(([tag]) => tag === "join_role")?.[1];
+    if (admission === "member" || admission === "guest") joinRole = admission;
     clock++;
   });
   const details = createChannelDetails({
@@ -133,31 +142,78 @@ function setup(solo = true) {
       name = "Changed";
       clock++;
     },
-    converted: (next = "private") => {
+    admission: (next: "member" | "guest") => {
+      joinRole = next;
+      clock++;
+    },
+    converted: (
+      next: "private" | "public" = "private",
+      admission: "member" | "guest" | undefined = next === "public"
+        ? "member"
+        : joinRole,
+    ) => {
       labels = labels.filter((label) => label !== SOLO_LABEL);
       visibility = next;
+      joinRole = admission;
       clock++;
     },
   };
 }
 const confirm = () =>
   screen.getByRole("button", { name: "Convert to channel" });
+const accessControl = () =>
+  screen.getByRole("combobox", { name: "General access" });
+async function selectAccess(label: string) {
+  const user = userEvent.setup();
+  await user.click(accessControl());
+  await user.click(await screen.findByRole("option", { name: label }));
+}
 async function ready() {
   await waitFor(() => expect(confirm()).toBeEnabled());
 }
+it("starts on Cancel so Enter does not convert or publish", async () => {
+  const h = setup();
+  await ready();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus(),
+  );
+  await userEvent.setup().keyboard("{Enter}");
+  await waitFor(() => expect(h.close).toHaveBeenCalledOnce());
+  expect(h.publish).not.toHaveBeenCalled();
+  expect(h.unfile).not.toHaveBeenCalled();
+});
+
+it("preselects View only and preserves Guest admission when converting a view-only Solo chat", async () => {
+  const h = setup(true, "public", "guest");
+  await ready();
+  expect(accessControl()).toHaveTextContent("View only");
+  fireEvent.click(confirm());
+  await waitFor(() => expect(h.close).toHaveBeenCalledOnce());
+  expect(h.publish).toHaveBeenCalledOnce();
+  expect(h.sign.mock.calls[0]?.[0].tags).not.toContainEqual([
+    "visibility",
+    "private",
+  ]);
+  expect(await h.details.capability.load(id)).toMatchObject({
+    visibility: "public",
+    joinRole: "guest",
+    labels: ["work"],
+    ttlSeconds: 86400,
+  });
+});
 it.each(["private", "public"])(
   "converts through signed kind 9002 with explicit %s visibility and unchanged TTL",
   async (visibility) => {
     const h = setup();
     await ready();
-    expect(screen.getByRole("radio", { name: "Private" })).toBeChecked();
+    expect(accessControl()).toHaveTextContent("Private");
+    const user = userEvent.setup();
+    await user.click(accessControl());
     expect(
-      screen.getByRole("radio", { name: "Public" }),
-    ).toHaveAccessibleDescription(
-      "Everyone in this community will be able to view this channel’s full history.",
-    );
-    if (visibility === "public")
-      fireEvent.click(screen.getByRole("radio", { name: "Public" }));
+      await screen.findByRole("option", { name: "Public" }),
+    ).toHaveAccessibleDescription("Anyone in the community can participate.");
+    await user.keyboard("{Escape}");
+    if (visibility === "public") await selectAccess("Public");
     expect(h.sign).not.toHaveBeenCalled();
     fireEvent.click(confirm());
     await waitFor(() => expect(h.close).toHaveBeenCalledOnce());
@@ -187,6 +243,154 @@ it.each(["private", "public"])(
     });
   },
 );
+
+const policies = [
+  { label: "Private", visibility: "private", joinRole: "guest" },
+  { label: "View only", visibility: "public", joinRole: "guest" },
+  { label: "Public", visibility: "public", joinRole: "member" },
+] as const;
+it.each(policies.flatMap((from) => policies.map((to) => ({ from, to }))))(
+  "converts $from.label → $to.label with the selected admission policy",
+  async ({ from, to }) => {
+    const h = setup(true, from.visibility, from.joinRole);
+    await ready();
+    expect(accessControl()).toHaveTextContent(from.label);
+    const user = userEvent.setup();
+    await user.click(accessControl());
+    expect(await screen.findAllByRole("option")).toHaveLength(3);
+    expect(
+      screen.getByRole("option", { name: "View only" }),
+    ).toHaveAccessibleDescription("Anyone in the community can read.");
+    await user.click(screen.getByRole("option", { name: to.label }));
+    const disclosure = screen.queryByText(
+      "Everyone in this community will be able to read this chat’s full history and Canvas, including its workspace folders and agent instructions.",
+      { exact: false },
+    );
+    if (from.visibility === "private" && to.visibility === "public") {
+      expect(disclosure).toBeVisible();
+      expect(screen.getByRole("dialog")).toHaveAccessibleDescription(
+        disclosure?.textContent,
+      );
+    } else expect(disclosure).not.toBeInTheDocument();
+    if (from.visibility === "public" && to.visibility === "private") {
+      expect(screen.getByRole("dialog")).toHaveAccessibleDescription(
+        from.joinRole === "guest"
+          ? "People who joined while it was View only are members and keep reading until you remove them in People."
+          : "People who already joined remain members and keep their access until you remove them in People.",
+      );
+    }
+    expect(h.publish).not.toHaveBeenCalled();
+    fireEvent.click(confirm());
+    await waitFor(() => expect(h.close).toHaveBeenCalledOnce());
+    expect(h.publish).toHaveBeenCalledOnce();
+    expect(await h.details.capability.load(id)).toMatchObject({
+      visibility: to.visibility,
+      joinRole: to.visibility === "private" ? from.joinRole : to.joinRole,
+      labels: ["work"],
+      ttlSeconds: 86400,
+    });
+  },
+);
+
+it("preselects Public when the open chat has the default Member admission", async () => {
+  setup(true, "public", undefined);
+  await ready();
+  expect(accessControl()).toHaveTextContent("Public");
+});
+
+it("retires superseded View-only recovery after Finish rejects changed admission and reload/remount", async () => {
+  const h = setup(true, "public", "member");
+  await ready();
+  await selectAccess("View only");
+  h.publish.mockRejectedValueOnce(new Error("lost acknowledgment"));
+  fireEvent.click(confirm());
+  await screen.findByRole("alert");
+  h.mounted.unmount();
+  h.converted("public", "guest");
+  await h.session.channelDetails.check(id);
+  render(<ConvertToChannel session={h.session} id={id} close={h.close} />);
+  const finish = await screen.findByRole("button", {
+    name: "Finish conversion",
+  });
+  expect(accessControl()).toHaveTextContent("View only");
+  h.admission("member");
+  fireEvent.click(finish);
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "settings changed",
+  );
+  expect(h.unfile).not.toHaveBeenCalled();
+  expect(chatConversion(h.session, id)).toBeUndefined();
+  fireEvent.click(screen.getByRole("button", { name: "Reload chat details" }));
+  await screen.findByText("Only a Solo chat can be converted.");
+  expect(
+    screen.queryByRole("button", { name: "Finish conversion" }),
+  ).toBeNull();
+  expect(confirm()).toBeDisabled();
+  cleanup();
+  render(<ConvertToChannel session={h.session} id={id} close={h.close} />);
+  await screen.findByText("Only a Solo chat can be converted.");
+  expect(
+    screen.queryByRole("button", { name: "Finish conversion" }),
+  ).toBeNull();
+  expect(conversionLabel(h.session, id)).toBe("Convert to channel");
+  expect(
+    canConvertToChannel(h.session, {
+      id,
+      name: "Original",
+      channelType: "stream",
+    }),
+  ).toBe(false);
+  expect(h.close).not.toHaveBeenCalled();
+  expect(h.unfile).not.toHaveBeenCalled();
+  expect(h.publish).toHaveBeenCalledOnce();
+});
+
+it("does not offer completion when the confirmed conversion has different admission", async () => {
+  const h = setup(true, "public", "guest");
+  await ready();
+  h.publish.mockRejectedValueOnce(new Error("lost acknowledgment"));
+  fireEvent.click(confirm());
+  await screen.findByRole("alert");
+  h.mounted.unmount();
+  h.converted("public", "guest");
+  await h.session.channelDetails.check(id);
+  h.admission("member");
+  render(<ConvertToChannel session={h.session} id={id} close={h.close} />);
+  await screen.findByText("Only a Solo chat can be converted.");
+  expect(
+    screen.queryByRole("button", { name: "Finish conversion" }),
+  ).toBeNull();
+  expect(confirm()).toBeDisabled();
+  expect(h.unfile).not.toHaveBeenCalled();
+  expect(chatConversion(h.session, id)).toBeUndefined();
+});
+
+it("keeps Finish recovery after a transient read failure and completes without republishing", async () => {
+  const h = setup(true, "public", "guest");
+  await ready();
+  h.publish.mockRejectedValueOnce(new Error("lost acknowledgment"));
+  fireEvent.click(confirm());
+  await screen.findByRole("alert");
+  h.mounted.unmount();
+  h.converted("public", "guest");
+  await h.session.channelDetails.check(id);
+  render(<ConvertToChannel session={h.session} id={id} close={h.close} />);
+  const finish = await screen.findByRole("button", {
+    name: "Finish conversion",
+  });
+  const receipt = chatConversion(h.session, id);
+  h.read.mockRejectedValueOnce(new Error("Details unavailable"));
+  fireEvent.click(finish);
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Details unavailable",
+  );
+  expect(chatConversion(h.session, id)).toBe(receipt);
+  await waitFor(() => expect(finish).toBeEnabled());
+  fireEvent.click(finish);
+  await waitFor(() => expect(h.close).toHaveBeenCalledOnce());
+  expect(h.publish).toHaveBeenCalledOnce();
+  expect(h.unfile).toHaveBeenCalledOnce();
+});
 it.each(["authority", "conflict"])(
   "fresh %s prevents conversion and reload explicitly recovers",
   async (change) => {
@@ -215,14 +419,13 @@ it.each(["authority", "conflict"])(
 it.each([
   { visibility: "private", failedRead: false },
   { visibility: "public", failedRead: true },
-])(
+] as const)(
   "unknown $visibility conversion checks status without resending after remount, failed initial read=$failedRead",
   async ({ visibility, failedRead }) => {
     const h = setup();
     h.publish.mockRejectedValueOnce(new Error("lost acknowledgement"));
     await ready();
-    if (visibility === "public")
-      fireEvent.click(screen.getByRole("radio", { name: "Public" }));
+    if (visibility === "public") await selectAccess("Public");
     fireEvent.click(confirm());
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "may have been saved",
@@ -239,48 +442,24 @@ it.each([
       expect(confirm()).toBeDisabled();
       expect(screen.queryByRole("button", { name: "Check status" })).toBeNull();
       expect(h.details.capability.snapshot(id)).toBe(pending);
-      expect(
-        screen.getByRole("radio", {
-          name: visibility === "public" ? "Public" : "Private",
-        }),
-      ).toBeChecked();
-      expect(screen.getByRole("radio", { name: "Public" })).toHaveAttribute(
-        "aria-disabled",
-        "true",
+      expect(accessControl()).toHaveTextContent(
+        visibility === "public" ? "Public" : "Private",
       );
-      expect(screen.getByRole("radio", { name: "Private" })).toHaveAttribute(
-        "aria-disabled",
-        "true",
-      );
+      expect(accessControl()).toBeDisabled();
       fireEvent.click(
         screen.getByRole("button", { name: "Reload chat details" }),
       );
     }
     const check = await screen.findByRole("button", { name: "Check status" });
     expect(h.details.capability.snapshot(id)).toBe(pending);
-    expect(
-      screen.getByRole("radio", {
-        name: visibility === "public" ? "Public" : "Private",
-      }),
-    ).toBeChecked();
-    expect(screen.getByRole("radio", { name: "Public" })).toHaveAttribute(
-      "aria-disabled",
-      "true",
+    expect(accessControl()).toHaveTextContent(
+      visibility === "public" ? "Public" : "Private",
     );
-    expect(screen.getByRole("radio", { name: "Private" })).toHaveAttribute(
-      "aria-disabled",
-      "true",
+    expect(accessControl()).toBeDisabled();
+    fireEvent.keyDown(accessControl(), { key: "ArrowDown" });
+    expect(accessControl()).toHaveTextContent(
+      visibility === "public" ? "Public" : "Private",
     );
-    fireEvent.click(
-      screen.getByRole("radio", {
-        name: visibility === "public" ? "Private" : "Public",
-      }),
-    );
-    expect(
-      screen.getByRole("radio", {
-        name: visibility === "public" ? "Public" : "Private",
-      }),
-    ).toBeChecked();
     expect(h.sign).toHaveBeenCalledOnce();
     expect(h.publish).toHaveBeenCalledOnce();
     fireEvent.click(check);
@@ -373,7 +552,7 @@ it("retries only project unfiling after confirmed conversion and remount", async
   const h = setup();
   h.unfile.mockRejectedValueOnce(new Error("Projects save unavailable"));
   await ready();
-  fireEvent.click(screen.getByRole("radio", { name: "Public" }));
+  await selectAccess("Public");
   fireEvent.click(confirm());
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Projects save unavailable",
@@ -402,7 +581,7 @@ it("retries only project unfiling after confirmed conversion and remount", async
       "Channel converted. Finish removing it from its Solo workspace.",
     ),
   ).toBeVisible();
-  expect(screen.getByRole("radio", { name: "Public" })).toBeChecked();
+  expect(accessControl()).toHaveTextContent("Public");
   fireEvent.click(screen.getByRole("button", { name: "Finish conversion" }));
   await waitFor(() => expect(h.convertedCallback).toHaveBeenCalledOnce());
   expect(h.publish).toHaveBeenCalledOnce();

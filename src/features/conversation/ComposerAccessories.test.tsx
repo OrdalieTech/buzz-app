@@ -78,74 +78,95 @@ it("revokes navigation after contribution removal, replacement and composer unmo
   expect(canOpen).toHaveBeenCalledTimes(1);
 });
 
-it("keeps message accessories out of the composer and revokes commands on message changes", () => {
-  const commands: ComposerAccessoryProps[] = [];
-  const entry: Contribution<ComposerAccessory> = {
-    id: "activity",
-    key: "test:message",
-    pluginId: "test",
-    revision: "one",
-    title: "Activity",
-    placement: "message",
-    component: function MessageAccessory(props) {
-      useLayoutEffect(() => {
-        commands.push(props);
-      });
-      return <span>Message activity</span>;
-    },
-  };
-  const entries = [entry];
-  const registry = { snapshot: () => entries, subscribe: () => () => {} };
-  const props = {
-    registry,
-    session: {} as RelaySession,
-    scope: "scope",
-    channelId: "channel",
-    canOpen: () => true,
-    open: vi.fn(() => true),
-    openThread: vi.fn(() => true),
-    onFocusedRemoval: vi.fn(),
-  };
-  const message = {
-    id: "one",
-    channelId: "channel",
-    authorId: "human",
-    content: "request",
-    createdAt: 1,
-    mentions: [],
-    attachments: [],
-    reactions: [],
-    participants: [],
-    replyCount: 0,
-  };
-  const view = render(<ComposerAccessories {...props} />);
-  expect(screen.queryByText("Message activity")).toBeNull();
-  view.rerender(<ComposerAccessories {...props} message={message} />);
-  expect(screen.getByText("Message activity")).toBeTruthy();
-  const original = commands.at(-1);
-  if (!original) throw new Error("Missing accessory commands");
-  expect(original.message?.id).toBe("one");
-  expect(original.openThread?.()).toBe(true);
-  original.onFocusedRemoval?.();
-  expect(props.onFocusedRemoval).toHaveBeenCalledOnce();
-  expect(original.open("target")).toBe(true);
-  view.rerender(
-    <ComposerAccessories {...props} message={{ ...message, id: "two" }} />,
-  );
-  expect(original.open("target")).toBe(false);
-  expect(original.openThread?.()).toBe(false);
-  original.onFocusedRemoval?.();
-  expect(props.onFocusedRemoval).toHaveBeenCalledOnce();
-  expect(commands.at(-1)?.openThread?.()).toBe(true);
-  expect(commands.at(-1)?.message?.id).toBe("two");
-  expect(commands.at(-1)?.open("target")).toBe(true);
-  view.unmount();
-  expect(commands.at(-1)?.open("target")).toBe(false);
-  expect(commands.at(-1)?.openThread?.()).toBe(false);
-  commands.at(-1)?.onFocusedRemoval?.();
-  expect(props.onFocusedRemoval).toHaveBeenCalledOnce();
-  expect(props.openThread).toHaveBeenCalledTimes(2);
-});
+it.each(["message", "response"] as const)(
+  "keeps %s accessories in their own slot and revokes commands on message changes",
+  (placement) => {
+    const commands: ComposerAccessoryProps[] = [];
+    const entry: Contribution<ComposerAccessory> = {
+      id: "activity",
+      key: "test:message",
+      pluginId: "test",
+      revision: "one",
+      title: "Activity",
+      placement,
+      component: function MessageAccessory(props) {
+        useLayoutEffect(() => {
+          commands.push(props);
+        });
+        return <span>Message activity</span>;
+      },
+    };
+    const entries = [entry];
+    const registry = { snapshot: () => entries, subscribe: () => () => {} };
+    const props = {
+      registry,
+      session: {} as RelaySession,
+      scope: "scope",
+      channelId: "channel",
+      canOpen: () => true,
+      open: vi.fn(() => true),
+      openThread: vi.fn(() => true),
+      onFocusedRemoval: vi.fn(),
+    };
+    const message = {
+      id: "one",
+      channelId: "channel",
+      authorId: "human",
+      content: "request",
+      createdAt: 1,
+      mentions: [],
+      attachments: [],
+      reactions: [],
+      participants: [],
+      replyCount: 0,
+    };
+    const view = render(<ComposerAccessories {...props} />);
+    expect(screen.queryByText("Message activity")).toBeNull();
+    view.rerender(
+      <ComposerAccessories
+        {...props}
+        placement={placement === "response" ? "message" : "response"}
+        message={message}
+      />,
+    );
+    expect(screen.queryByText("Message activity")).toBeNull();
+    view.rerender(
+      <ComposerAccessories
+        {...props}
+        placement={placement}
+        message={message}
+      />,
+    );
+    expect(screen.getByText("Message activity")).toBeTruthy();
+    const original = commands.at(-1);
+    if (!original) throw new Error("Missing accessory commands");
+    expect(original.message?.id).toBe("one");
+    expect(original.openThread?.()).toBe(true);
+    original.onFocusedRemoval?.();
+    expect(props.onFocusedRemoval).toHaveBeenCalledOnce();
+    expect(original.open("target")).toBe(true);
+    view.rerender(
+      <ComposerAccessories
+        {...props}
+        placement={placement}
+        message={{ ...message, id: "two" }}
+      />,
+    );
+    expect(original.open("target")).toBe(false);
+    expect(original.openThread?.()).toBe(false);
+    original.onFocusedRemoval?.();
+    expect(props.onFocusedRemoval).toHaveBeenCalledOnce();
+    expect(commands.at(-1)?.openThread?.()).toBe(true);
+    expect(commands.at(-1)?.message?.id).toBe("two");
+    expect(commands.at(-1)?.open("target")).toBe(true);
+    view.unmount();
+    expect(commands.at(-1)?.open("target")).toBe(false);
+    expect(commands.at(-1)?.openThread?.()).toBe(false);
+    commands.at(-1)?.onFocusedRemoval?.();
+    expect(props.onFocusedRemoval).toHaveBeenCalledOnce();
+    expect(props.openThread).toHaveBeenCalledTimes(2);
+  },
+);
 
 it("gives only one decorator the host summary and restores the fallback on removal", () => {
   const renderMessageSummary = vi.fn(() => (

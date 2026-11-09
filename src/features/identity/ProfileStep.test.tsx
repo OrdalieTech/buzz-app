@@ -28,20 +28,16 @@ function step(props: Partial<ComponentProps<typeof ProfileStep>> = {}) {
   const onContinue = vi.fn<ComponentProps<typeof ProfileStep>["onContinue"]>(
     () => Promise.resolve(),
   );
-  const onSkip = vi.fn<ComponentProps<typeof ProfileStep>["onSkip"]>(() =>
-    Promise.resolve(),
-  );
   render(
     <ProfileStep
       found={found}
       read={none}
       defaultName="ada"
       onContinue={onContinue}
-      onSkip={onSkip}
       {...props}
     />,
   );
-  return { onContinue, onSkip, user: userEvent.setup() };
+  return { onContinue, user: userEvent.setup() };
 }
 afterEach(() => {
   cleanup();
@@ -49,24 +45,23 @@ afterEach(() => {
 });
 
 it("suggests and focuses the default name, needs a name to continue, and hands the trimmed profile to Continue", async () => {
-  const { onContinue, onSkip, user } = step();
+  const { onContinue, user } = step();
   const name = screen.getByRole("textbox", { name: "Display name" });
+  expect(screen.getByText(found.url)).toBeVisible();
   expect(name).toHaveValue("ada");
   expect(name).toHaveFocus();
   await user.clear(name);
   expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
   await user.type(name, " Ada ");
-  await user.type(
-    screen.getByRole("textbox", { name: "Profile description (optional)" }),
-    "Hi ",
-  );
+  expect(
+    screen.queryByRole("textbox", { name: "Profile description (optional)" }),
+  ).toBeNull();
   await user.click(screen.getByRole("button", { name: "Continue" }));
   expect(onContinue).toHaveBeenCalledExactlyOnceWith({
     name: "Ada",
     picture: "",
-    about: "Hi",
+    about: "",
   });
-  expect(onSkip).not.toHaveBeenCalled();
 });
 
 it("prefills a relay profile and hands it to Continue as it is", async () => {
@@ -82,16 +77,16 @@ it("prefills a relay profile and hands it to Continue as it is", async () => {
   expect(onContinue).toHaveBeenCalledExactlyOnceWith(profile);
 });
 
-it("holds both buttons while Continue runs, and a rejection stays on the step with the error inline and the draft kept", async () => {
+it("holds Continue while Continue runs, and a rejection stays on the step with the error inline and the draft kept", async () => {
   const gate = deferred();
-  const { onContinue, onSkip, user } = step();
+  const { onContinue, user } = step();
   onContinue.mockReturnValueOnce(gate.promise);
   const name = screen.getByRole("textbox", { name: "Display name" });
   await user.clear(name);
   await user.type(name, "Ada{Enter}");
   expect(onContinue).toHaveBeenCalledOnce();
   expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
-  expect(screen.getByRole("button", { name: "Skip for now" })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "Go back" })).toBeNull();
   expect(name).toBeDisabled();
   gate.reject(
     new Error(
@@ -104,29 +99,18 @@ it("holds both buttons while Continue runs, and a rejection stays on the step wi
   expect(name).toHaveValue("Ada");
   expect(name).toBeEnabled();
   expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
-  expect(screen.getByRole("button", { name: "Skip for now" })).toBeEnabled();
-  expect(onSkip).not.toHaveBeenCalled();
+  expect(screen.queryByRole("button", { name: "Go back" })).toBeNull();
 });
 
-it("classifies a denied read, and Skip for now hands off without the draft and keeps the step when it fails", async () => {
-  const { onContinue, onSkip, user } = step();
-  onContinue.mockRejectedValueOnce(
-    Object.assign(new Error("Relay read failed (403)"), {}),
-  );
+it("keeps the draft after denied access without offering a misleading Back action", async () => {
+  const { onContinue, user } = step();
+  onContinue.mockRejectedValueOnce(new Error("Relay read failed (403)"));
   await user.click(screen.getByRole("button", { name: "Continue" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "relay.example.com no longer admits this key. Skip for now and ask a community administrator.",
+    "relay.example.com no longer admits this key. Ask a community administrator to restore your access.",
   );
-  onSkip.mockRejectedValueOnce(
-    new Error("Could not save this community on this device. Try again."),
+  expect(screen.queryByRole("button", { name: "Go back" })).toBeNull();
+  expect(screen.getByRole("textbox", { name: "Display name" })).toHaveValue(
+    "ada",
   );
-  await user.click(screen.getByRole("button", { name: "Skip for now" }));
-  expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Could not save this community on this device. Try again.",
-  );
-  expect(onSkip).toHaveBeenCalledExactlyOnceWith();
-  expect(screen.getByRole("button", { name: "Skip for now" })).toBeEnabled();
-  await user.click(screen.getByRole("button", { name: "Skip for now" }));
-  expect(onSkip).toHaveBeenCalledTimes(2);
-  expect(screen.queryByRole("alert")).toBeNull();
 });

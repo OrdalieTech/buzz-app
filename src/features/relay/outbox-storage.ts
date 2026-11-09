@@ -52,9 +52,19 @@ export async function purgeOutboxStorage(scope: string) {
 export function browserOutboxStorage(scope: string): OutboxStorage {
   let database: Promise<IDBDatabase> | undefined;
   let persisted = new Map<string, OutgoingEvent>();
+  let ownershipRevision = 0;
+  const forgotten = new Map<string, number>();
   const open = () => (database ??= openDatabase());
   return {
-    async load() {
+    async lock(id, run) {
+      if (!navigator.locks) throw new Error("Window ownership is unavailable.");
+      return navigator.locks.request(`buzz-outbox:${scope}:${id}`, run);
+    },
+    forget(id) {
+      forgotten.set(id, ++ownershipRevision);
+      persisted.delete(id);
+    },
+    async load(options) {
       const db = await open();
       let migrated = false;
       const records = await new Promise<readonly OutgoingEvent[]>(
@@ -89,12 +99,14 @@ export function browserOutboxStorage(scope: string): OutboxStorage {
         },
       );
       // A first save migrates legacy records into the per-event store.
-      persisted = migrated
-        ? new Map(records.map((item) => [item.event.id, item]))
-        : new Map();
+      if (!options?.readOnly)
+        persisted = migrated
+          ? new Map(records.map((item) => [item.event.id, item]))
+          : new Map();
       return records;
     },
-    async save(operations) {
+    async save(operations, options) {
+      const revision = ownershipRevision;
       const db = await open();
       const next = new Map(operations.map((item) => [item.event.id, item]));
       await new Promise<void>((resolve, reject) => {
@@ -105,6 +117,7 @@ export function browserOutboxStorage(scope: string): OutboxStorage {
         for (const [id, operation] of next) {
           const old = persisted.get(id);
           if (
+            id !== options?.force &&
             old &&
             old.delivery === operation.delivery &&
             old.error === operation.error &&
@@ -122,7 +135,11 @@ export function browserOutboxStorage(scope: string): OutboxStorage {
           if (!next.has(id)) events.delete([scope, id]);
         tx.objectStore("partitions").put(true, scope);
         tx.oncomplete = () => {
-          persisted = next;
+          // A read can relinquish an ID while this transaction is pending.
+          // Do not let completion reclaim deletion ownership of that ID.
+          persisted = new Map(
+            [...next].filter(([id]) => (forgotten.get(id) ?? 0) <= revision),
+          );
           resolve();
         };
         tx.onabort = () =>

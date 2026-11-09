@@ -41,7 +41,7 @@ type Node = {
 
 /** Only source-verified delimiters are protected before Markdown parsing. Escaped
  * pipes, entities, code and table syntax can never become spoilers after decoding. */
-export function remarkSpoilers(delimiter: string) {
+export function remarkSpoilers(delimiter: string, hideUnclosed = false) {
   return (tree: Node) => {
     const visit = (node: Node) => {
       if (!node.children || ["code", "inlineCode", "html"].includes(node.type))
@@ -74,7 +74,12 @@ export function remarkSpoilers(delimiter: string) {
           if (value) add({ type: "text", value });
         });
       }
-      if (hidden) output.push({ type: "text", value: "||" }, ...hidden);
+      if (hidden) {
+        // A bounded preview may stop before the closing delimiter. Never
+        // expose the remainder of a spoiler just because its source was cut.
+        if (hideUnclosed) output.push({ type: "spoiler", children: hidden });
+        else output.push({ type: "text", value: "||" }, ...hidden);
+      }
       node.children = output;
     };
     visit(tree);

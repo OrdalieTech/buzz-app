@@ -26,12 +26,16 @@ import { createNavigationController } from "../features/navigation/controller";
 import { createMemoryHistory } from "../features/navigation/history";
 import { registerAppShortcuts, registerNavigationShortcuts } from "./shortcuts";
 import { PageSearch, type SearchServices } from "./shell/PageSearch";
+import { setSendWithModEnterPreference } from "../features/messages/send-key-preference";
+import { setEditWithUpArrowPreference } from "../features/messages/edit-key-preference";
 
 vi.mock("@tauri-apps/api/core", () => ({ isTauri: vi.fn(() => false) }));
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  setEditWithUpArrowPreference(false);
+  setSendWithModEnterPreference(false);
   vi.mocked(isTauri).mockReturnValue(false);
   localStorage.clear();
 });
@@ -96,7 +100,10 @@ async function harness() {
   shortcuts.registerHost({
     id: "global-search",
     title: "Search Buzz",
-    binding: { key: "k", mod: true },
+    binding: [
+      { key: "k", mod: true },
+      { key: "t", mod: true },
+    ],
     order: 70,
     run: runs.search,
   });
@@ -163,6 +170,15 @@ async function harness() {
   };
 }
 const row = (title: string) => screen.getByRole("article", { name: title });
+/** Rebindable rows: everything outside the read-only Message formatting group. */
+const appRows = () =>
+  screen
+    .getAllByRole("article")
+    .filter(
+      (article) =>
+        article.closest("section")?.querySelector("h3")?.textContent !==
+        "Message formatting",
+    );
 const change = (title: string) =>
   screen.getByRole("button", { name: `Change shortcut for ${title}` });
 const capture = (title: string) =>
@@ -185,14 +201,19 @@ it("lists live host and plugin shortcuts without search or intro text and follow
     const groups = screen
       .getAllByRole("heading", { level: 3 })
       .map((heading) => heading.textContent);
-    expect(groups).toEqual(["Buzz", "Shortcut counter", "Terminal"]);
+    expect(groups).toEqual([
+      "Sending messages",
+      "Editing messages",
+      "Buzz",
+      "Shortcut counter",
+      "Terminal",
+      "Message formatting",
+    ]);
     expect(
-      screen
-        .getAllByRole("article")
-        .map(
-          (article) =>
-            within(article).getByRole("heading", { level: 4 }).textContent,
-        ),
+      appRows().map(
+        (article) =>
+          within(article).getByRole("heading", { level: 4 }).textContent,
+      ),
     ).toEqual([
       "Increase interface size",
       "Search Buzz",
@@ -209,6 +230,16 @@ it("lists live host and plugin shortcuts without search or intro text and follow
       "data-binding",
       "⌘=",
     );
+    // Layout aliases of one key (⌘= ⌘+ ⇧⌘= ⇧⌘+) show once.
+    expect(grow.querySelectorAll(".buzz-keyboard-shortcut")).toHaveLength(1);
+    // Distinct chords each show, in order.
+    const search = row("Search Buzz");
+    expect(
+      [...search.querySelectorAll(".buzz-keyboard-shortcut")].map((chord) =>
+        chord.getAttribute("data-binding"),
+      ),
+    ).toEqual(["⌘K", "⌘T"]);
+    expect(within(search).getByText("or")).toBeInTheDocument();
     expect(
       within(row("Increment shortcut counter")).getByText("Shift Command K"),
     ).toBeInTheDocument();
@@ -228,7 +259,7 @@ it("lists live host and plugin shortcuts without search or intro text and follow
     expect(
       screen.queryByRole("heading", { name: "Terminal" }),
     ).not.toBeInTheDocument();
-    expect(screen.getAllByRole("article")).toHaveLength(5);
+    expect(appRows()).toHaveLength(5);
     act(() => h.setActive("buzz.terminal", true));
     expect(row("Toggle channel terminal")).toBeInTheDocument();
   } finally {
@@ -273,12 +304,10 @@ it("presents actual host registrations in navigation, interface sizing, search/s
       </>,
     );
     expect(
-      screen
-        .getAllByRole("article")
-        .map(
-          (article) =>
-            within(article).getByRole("heading", { level: 4 }).textContent,
-        ),
+      appRows().map(
+        (article) =>
+          within(article).getByRole("heading", { level: 4 }).textContent,
+      ),
     ).toEqual([
       "Home",
       "Go back",
@@ -290,8 +319,15 @@ it("presents actual host registrations in navigation, interface sizing, search/s
       "Search this conversation",
       "Open Settings",
       "Show keyboard shortcuts",
+      "Set a status",
       "Focus message box",
       "Focus next pane",
+      "Edit selected message",
+      "React to selected message",
+      "React to latest message",
+      "Reply in thread to selected message",
+      "Mark unread from selected message",
+      "Delete selected message",
       "Reload Buzz",
     ]);
   } finally {
@@ -330,12 +366,10 @@ it("orders plugin rows by metadata then contribution key without merging duplica
       />,
     );
     expect(
-      screen
-        .getAllByRole("article")
-        .map(
-          (article) =>
-            within(article).getByRole("heading", { level: 4 }).textContent,
-        ),
+      appRows().map(
+        (article) =>
+          within(article).getByRole("heading", { level: 4 }).textContent,
+      ),
     ).toEqual([
       "Increase interface size",
       "Search Buzz",
@@ -436,23 +470,23 @@ it("captures a chord, refuses conflicts and bare keys, applies overrides to the 
     expect(h.bindings.snapshot().overrides).toEqual({});
     expect(capture(title)).toBe(input);
 
-    await user.keyboard("{Control>}{Shift>}u{/Shift}{/Control}");
+    await user.keyboard("{Control>}{Shift>}j{/Shift}{/Control}");
     expect(screen.queryByRole("textbox", { name: /New shortcut/ })).toBeNull();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(within(row(title)).getByText("Modified")).toBeInTheDocument();
-    expect(within(row(title)).getByText("Control Shift U")).toBeInTheDocument();
+    expect(within(row(title)).getByText("Control Shift J")).toBeInTheDocument();
     expect(change(title)).toHaveFocus();
     expect(h.bindings.snapshot().overrides).toEqual({
-      "example.counter/increment": { key: "u", mod: true, shift: true },
+      "example.counter/increment": { key: "j", mod: true, shift: true },
     });
     expect(localStorage.getItem(SHORTCUT_BINDINGS_KEY)).toBe(
       JSON.stringify({
-        "example.counter/increment": { key: "u", mod: true, shift: true },
+        "example.counter/increment": { key: "j", mod: true, shift: true },
       }),
     );
     expect(h.press("k", { shiftKey: true })).toBe(true);
     expect(h.runs.increment).not.toHaveBeenCalled();
-    expect(h.press("u", { shiftKey: true })).toBe(false);
+    expect(h.press("j", { shiftKey: true })).toBe(false);
     expect(h.runs.increment).toHaveBeenCalledTimes(1);
     await user.click(
       screen.getByRole("button", { name: `Reset shortcut for ${title}` }),
@@ -946,7 +980,15 @@ it("keeps the host group distinct from a plugin whose manifest id is buzz", asyn
       screen
         .getAllByRole("heading", { level: 3 })
         .map((heading) => heading.textContent),
-    ).toEqual(["Buzz", "Buzz plugin", "Shortcut counter", "Terminal"]);
+    ).toEqual([
+      "Sending messages",
+      "Editing messages",
+      "Buzz",
+      "Buzz plugin",
+      "Shortcut counter",
+      "Terminal",
+      "Message formatting",
+    ]);
     expect(row("Ping")).toBeInTheDocument();
     expect(error).not.toHaveBeenCalled();
   } finally {
@@ -1045,3 +1087,141 @@ it("shows desktop Close as reserved and read-only while other actions remain edi
     await root.fiber.dispose();
   }
 });
+
+it("lists the message editor's formatting keys read-only and warns when a shortcut takes one", async () => {
+  const h = await harness();
+  try {
+    render(
+      <ShortcutSettings
+        shortcuts={h.shortcuts}
+        bindings={h.bindings}
+        plugins={h.plugins}
+      />,
+    );
+    // Said once under the section heading, not on every row.
+    expect(
+      screen.getByText(
+        "Built into the message editor. These work while you type and can't be changed.",
+      ),
+    ).toBeVisible();
+    const code = row("Code");
+    expect(within(code).queryByText(/Built into/)).toBeNull();
+    expect(
+      within(code).queryByRole("button", { name: /Change shortcut/ }),
+    ).toBeNull();
+    expect(
+      [...code.querySelectorAll(".buzz-keyboard-shortcut")].map((chord) =>
+        chord.getAttribute("data-binding"),
+      ),
+    ).toEqual(["Ctrl+E", "Ctrl+Shift+C"]);
+    expect(row("Add or edit link")).toBeInTheDocument();
+    const user = userEvent.setup();
+    const title = "Increment shortcut counter";
+    await user.click(change(title));
+    await user.keyboard("{Control>}{Shift>}u{/Shift}{/Control}");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "The message editor handles Ctrl+Shift+U itself while you are typing",
+    );
+  } finally {
+    await h.dispose();
+  }
+});
+
+it("switches sending to Ctrl+Enter and shows the editor keys that follow", async () => {
+  const h = await harness();
+  try {
+    render(
+      <ShortcutSettings
+        shortcuts={h.shortcuts}
+        bindings={h.bindings}
+        plugins={h.plugins}
+      />,
+    );
+    const chords = (title: string) =>
+      [...row(title).querySelectorAll(".buzz-keyboard-shortcut")].map((chord) =>
+        chord.getAttribute("data-binding"),
+      );
+    const toggle = screen.getByRole("switch", { name: "Send with Ctrl+Enter" });
+    expect(toggle).not.toBeChecked();
+    expect(chords("Send message")).toEqual(["Enter"]);
+    expect(chords("New line")).toEqual(["Shift+Enter"]);
+    await userEvent.setup().click(toggle);
+    expect(toggle).toBeChecked();
+    expect(localStorage.getItem("buzz-send-with-mod-enter.v1")).toBe("on");
+    expect(chords("Send message")).toEqual(["Ctrl+Enter"]);
+    expect(chords("New line")).toEqual(["Enter", "Shift+Enter"]);
+  } finally {
+    await h.dispose();
+  }
+});
+
+it("saves the Up Arrow editing choice and restores it when settings remounts", async () => {
+  const h = await harness();
+  const settings = () =>
+    render(
+      <ShortcutSettings
+        shortcuts={h.shortcuts}
+        bindings={h.bindings}
+        plugins={h.plugins}
+      />,
+    );
+  try {
+    const view = settings();
+    const toggle = screen.getByRole("switch", {
+      name: "Edit last message with Up Arrow",
+    });
+    expect(toggle).not.toBeChecked();
+    await userEvent.setup().click(toggle);
+    expect(toggle).toBeChecked();
+    expect(localStorage.getItem("buzz-edit-with-up-arrow.v1")).toBe("on");
+    view.unmount();
+    settings();
+    const restored = screen.getByRole("switch", {
+      name: "Edit last message with Up Arrow",
+    });
+    expect(restored).toBeChecked();
+    await userEvent.setup().click(restored);
+    expect(restored).not.toBeChecked();
+    expect(localStorage.getItem("buzz-edit-with-up-arrow.v1")).toBe("off");
+  } finally {
+    await h.dispose();
+  }
+});
+
+it.each([
+  ["Edit last message with Up Arrow", "buzz-edit-with-up-arrow.v1"],
+  ["Send with Ctrl+Enter", "buzz-send-with-mod-enter.v1"],
+])(
+  "keeps %s active on a storage failure and retries saving",
+  async (label, key) => {
+    const h = await harness();
+    try {
+      render(
+        <ShortcutSettings
+          shortcuts={h.shortcuts}
+          bindings={h.bindings}
+          plugins={h.plugins}
+        />,
+      );
+      const storage = vi
+        .spyOn(Storage.prototype, "setItem")
+        .mockImplementationOnce(() => {
+          throw new Error("full");
+        });
+      const toggle = screen.getByRole("switch", {
+        name: label,
+      });
+      await userEvent.setup().click(toggle);
+      expect(toggle).toBeChecked();
+      expect(screen.getByRole("alert")).toHaveTextContent("could not be saved");
+      storage.mockRestore();
+      await userEvent
+        .setup()
+        .click(screen.getByRole("button", { name: /^Retry saving$/ }));
+      expect(localStorage.getItem(key)).toBe("on");
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    } finally {
+      await h.dispose();
+    }
+  },
+);

@@ -1,6 +1,10 @@
 import { defineConfig } from "@playwright/test";
 
-const measurementFiles = ["channel-opening.spec.mjs", "scroll.spec.mjs"];
+const measurementFiles = [
+  "channel-opening.spec.mjs",
+  "profile-roster-scale.spec.mjs",
+  "scroll.spec.mjs",
+];
 // Cases that need a scrollbar that takes space. Headless Chromium passes
 // --hide-scrollbars by default and only Linux guarantees classic scrollbars,
 // so they run in their own Chromium project and never in the engine projects.

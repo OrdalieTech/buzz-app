@@ -78,6 +78,7 @@ it("projects safe brief tool status from exact current owner-visible work only",
   const live = snapshot();
   expect(project(live).get(agent)).toEqual({
     label: "Editing index.html",
+    detailAvailability: "available",
     roots: [root],
   });
   expect(project(live, root).get(agent)?.label).toBe("Editing index.html");
@@ -95,7 +96,11 @@ it("drops owner-only work when not listening without hiding valid public typing"
     currentActivity(live, entries, new Set([agent]), "channel", root).get(
       agent,
     ),
-  ).toEqual({ label: "Working", roots: [root] });
+  ).toEqual({
+    label: "Working",
+    detailAvailability: "typing-only",
+    roots: [root],
+  });
   expect(currentActivity(live, entries, new Set(), "channel").size).toBe(0);
 });
 
@@ -106,7 +111,7 @@ it.each([
   ],
   [{ title: "unknown", kind: "other" }, "Running a tool"],
   [{ status: "pending" }, "Preparing a tool"],
-  [{ status: "completed" }, "Working"],
+  [{ status: "completed" }, "Working", "no-current-step"],
   [
     { rawInput: { path: "C:\\private\\report\u202e.txt" } },
     "Editing report.txt",
@@ -119,9 +124,15 @@ it.each([
     },
     "Reading report.txt",
   ],
-])("keeps compact labels safe: %j", (tool, expected) => {
-  expect(project(snapshot(tool)).get(agent)?.label).toBe(expected);
-});
+])(
+  "keeps compact labels safe: %j",
+  (tool, expected, unavailable = "available") => {
+    expect(project(snapshot(tool)).get(agent)).toMatchObject({
+      label: expected,
+      detailAvailability: unavailable,
+    });
+  },
+);
 
 it.each(["__proto__", "constructor", "toString", "hasOwnProperty"])(
   "treats inherited dictionary key %s as telemetry, not a label mapping",
@@ -151,7 +162,11 @@ it("does not merge labels or ownership across roots or expired turns", () => {
     currentActivity(live, entries, new Set([agent]), "channel", otherRoot).get(
       agent,
     ),
-  ).toEqual({ label: "Working", roots: [otherRoot] });
+  ).toEqual({
+    label: "Working",
+    detailAvailability: "typing-only",
+    roots: [otherRoot],
+  });
   expect(
     project({
       ...live,
@@ -207,4 +222,92 @@ it("does not resurrect a transcript's terminal turn from stale working evidence"
       records: [{ ...record, plaintext: JSON.stringify(batch) }],
     }).size,
   ).toBe(0);
+});
+
+it("keeps known thread work out of the channel flow without hiding channel work", () => {
+  const thread = snapshot();
+  expect(
+    currentActivity(thread, [], new Set(), "channel", undefined, false).size,
+  ).toBe(0);
+  expect(
+    currentActivity(thread, [], new Set(), "channel", root, false).has(agent),
+  ).toBe(true);
+  expect(
+    currentActivity(
+      snapshot({}, null),
+      [],
+      new Set(),
+      "channel",
+      undefined,
+      false,
+    ).has(agent),
+  ).toBe(true);
+  const local = {
+    scope: "test",
+    agent,
+    channelId: "channel",
+    messageId: root,
+    threadRootId: root,
+    state: "working" as const,
+    startedAt: 1,
+  };
+  expect(
+    currentActivity(
+      { ...base, local: [{ ...local, thread: true }] },
+      [],
+      new Set(),
+      "channel",
+      undefined,
+      false,
+    ).size,
+  ).toBe(0);
+  expect(
+    currentActivity(
+      { ...base, local: [local] },
+      [],
+      new Set(),
+      "channel",
+      undefined,
+      false,
+    ).has(agent),
+  ).toBe(true);
+});
+
+it("moves channel-started local work into its observed reply thread", () => {
+  const live = {
+    ...base,
+    local: [
+      {
+        scope: "test",
+        agent,
+        channelId: "channel",
+        messageId: root,
+        threadRootId: root,
+        state: "working" as const,
+        startedAt: 1,
+      },
+    ],
+  };
+  expect(
+    currentActivity(
+      live,
+      [],
+      new Set(),
+      "channel",
+      undefined,
+      false,
+      new Set([root]),
+    ).size,
+  ).toBe(0);
+  expect(
+    currentActivity(
+      live,
+      [],
+      new Set(),
+      "channel",
+      root,
+      false,
+      new Set([root]),
+    ).has(agent),
+  ).toBe(true);
 });

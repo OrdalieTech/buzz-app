@@ -1,7 +1,8 @@
 import { templateAgentChoices } from "../agents/choices";
 import type { KitEntry, Lineup, Template } from "../channel-templates/model";
 import {
-  CANVAS_BYTES,
+  LIVE_CANVAS_BYTES,
+  LIVE_CANVAS_LIMIT,
   parseKitRecord,
   parseLineup,
   resolveLineup,
@@ -50,8 +51,8 @@ export function validateWorkspace(value: Workspace): Workspace {
 /** Workspace preferences remain ordinary Canvas instructions, as in the reference workflow. */
 export function workspaceCanvas(input: Workspace): string {
   const value = validateWorkspace(input);
-  if (new TextEncoder().encode(value.canvas).length > CANVAS_BYTES)
-    throw new Error("Keep Canvas below 24 KiB.");
+  if (new TextEncoder().encode(value.canvas).length > LIVE_CANVAS_BYTES)
+    throw new Error(`Keep Canvas below ${LIVE_CANVAS_LIMIT}.`);
   if (!value.folders.length) return value.canvas;
   const metadata = JSON.stringify({
     folders: value.folders,
@@ -83,8 +84,10 @@ export function workspaceCanvas(input: Workspace): string {
     "",
     value.canvas,
   ].join("\n");
-  if (new TextEncoder().encode(canvas).length > CANVAS_BYTES)
-    throw new Error("Keep Canvas and workspace instructions below 24 KiB.");
+  if (new TextEncoder().encode(canvas).length > LIVE_CANVAS_BYTES)
+    throw new Error(
+      `Keep Canvas and workspace instructions below ${LIVE_CANVAS_LIMIT}.`,
+    );
   return canvas;
 }
 

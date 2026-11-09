@@ -1,3 +1,4 @@
+import { interestPaused } from "./attention";
 // Lifecycle for plugin producers. The host owns registration, cancellation and delivery;
 // plugins own execution. A resolved run is terminal until its watch is edited.
 import type { ComponentType } from "react";
@@ -35,6 +36,9 @@ export type AttentionSource = Readonly<{
       watch: SourceWatch;
       signal: AbortSignal;
       /** Runs a declared process as this watch's agent and destination.
+       * On macOS and Linux, only one instance of each declared process may run
+       * per agent, provider and watch, including across Buzz builds. A concurrent
+       * instance waits for its predecessor to stop. Await `process.exited` before respawning.
        * Buzz revokes access when this run returns, throws or is cancelled. */
       spawn(
         process: string,
@@ -84,6 +88,7 @@ export class AttentionSources {
           value.type === "source" &&
           value.provider === provider &&
           value.enabled &&
+          !interestPaused(agent.attention, value.interest_id) &&
           agent.attention[`interest/${value.interest_id}`]?.value.type ===
             "interest"
         )

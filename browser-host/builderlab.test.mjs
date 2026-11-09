@@ -137,7 +137,7 @@ it("completes browser sign-in through a loopback callback without exposing the c
   });
   expect(JSON.stringify(auth)).not.toContain("secret");
   expect(h.opened().pathname).toBe("/api/goose/v1/auth/login");
-  expect(h.opened().searchParams.get("product")).toBe("builderlab");
+  expect(h.opened().searchParams.get("product")).toBe("buzz");
   const exchange = JSON.parse(h.requests[0].init.body);
   expect(exchange.code).toBe("one-time");
   const { createHash } = await import("node:crypto");
@@ -711,13 +711,21 @@ it("requires the agents OAuth state and reuses their branded callback page", asy
     `${callback}?state=${opened.searchParams.get("state")}&code=x`,
   );
   expect(response.status).toBe(200);
-  expect(await response.text()).toContain("Signing you in…");
+  const body = await response.text();
   expect(response.headers.get("content-security-policy")).toContain(
     "script-src 'sha256-",
   );
   expect(response.headers.get("cache-control")).toBe("no-store");
   await login;
   h.builderlab.signOut();
+  expect(body).toContain("Signing you in…");
+  expect(body).toContain("<title>Builderlab sign-in</title>");
+  expect(body).toContain('data-provider="Builderlab"');
+  expect(body).toContain('class="brand" role="img" aria-label="Builderlab"');
+  expect(body).toContain('src="data:image/webp;base64,');
+  expect(body).toContain('id="closing-hint"');
+  expect(body).toContain('id="close-hint">You can close this window.</span>');
+  expect(body).not.toContain("{{");
 });
 
 it.each(["secret\ncredential", "secret credential"])(

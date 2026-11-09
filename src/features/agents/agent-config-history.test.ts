@@ -8,6 +8,8 @@ import {
   type History,
   lineDiff,
   loadOlder,
+  recalledHistory,
+  rememberHistory,
   revertTemplate,
   revisionProblem,
   segments,
@@ -334,4 +336,27 @@ describe("revert", () => {
     expect(template.tags).not.toContainEqual(["client", "gone"]);
     expect(() => revertTemplate(expected, rev("r2", "r1"), deleted)).toThrow();
   });
+});
+
+it("reuses loaded pages only for the same session, subject, head and history version", async () => {
+  const head = rev("r1", "r0");
+  const { read } = relay([head, rev("r0")]);
+  const expected = { channel, d, type: "buzz.agent.instructions" } as const;
+  const history = await loadOlder(read, channel, d, emptyHistory);
+  rememberHistory(read, expected, head, 0, history);
+  expect(recalledHistory(read, expected, head, 0)).toBe(history);
+  expect(recalledHistory(read, expected, head, 1)).toBeUndefined();
+  expect(recalledHistory(read, expected, rev("r2", "r1"), 0)).toBeUndefined();
+  expect(
+    recalledHistory(relay([head]).read, expected, head, 0),
+  ).toBeUndefined();
+  expect(
+    recalledHistory(read, { ...expected, channel: "other" }, head, 0),
+  ).toBeUndefined();
+  rememberHistory(read, { ...expected, d: "second" }, head, 0, history);
+  rememberHistory(read, { ...expected, d: "third" }, head, 0, history);
+  expect(recalledHistory(read, expected, head, 0)).toBeUndefined();
+  expect(recalledHistory(read, { ...expected, d: "second" }, head, 0)).toBe(
+    history,
+  );
 });

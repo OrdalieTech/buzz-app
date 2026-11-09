@@ -1,6 +1,14 @@
 import { expect, it, vi } from "vitest";
 import type { Host, HostProcessOptions } from "../../features/host/service";
-import { GhUnavailable, GitHubError, gitHubCli, parseAnswer } from "./gh";
+import {
+  GhUnavailable,
+  GitHubError,
+  gitHubCli,
+  gitHubDiff,
+  MAX_DIFF_CHARS,
+  OutputTooLarge,
+  parseAnswer,
+} from "./gh";
 
 type HostSpawn = NonNullable<Host["spawn"]>;
 
@@ -119,4 +127,103 @@ it("treats a gh that cannot start as unavailable", async () => {
     },
   });
   await expect(gh?.("query{}", {})).rejects.toThrow(GhUnavailable);
+});
+
+function diffSpawn(stdout: readonly string[], code: number, stderr = "") {
+  const kill = vi.fn(async () => {});
+  const spawn = vi.fn(async (_id: string, options?: HostProcessOptions) => {
+    let exit!: (code: number | null) => void;
+    const exited = new Promise<number | null>((resolve) => {
+      exit = resolve;
+    });
+    kill.mockImplementation(async () => exit(null));
+    return {
+      write: async () => {},
+      end: async () => {
+        for (const piece of stdout) options?.onStdout?.(piece);
+        if (stderr) options?.onStderr?.(stderr);
+        exit(code);
+      },
+      kill,
+      exited,
+    };
+  });
+  return { spawn, kill };
+}
+
+it("reads the diff from the base branch to the head a review names", async () => {
+  expect(gitHubDiff({})).toBeUndefined();
+  const { spawn } = diffSpawn(["diff --git a/x b/x\n", "@@ -1 +1 @@\n"], 0);
+  const diff = gitHubDiff({ spawn });
+  expect(
+    await diff?.({
+      repository: "block/buzz",
+      base: "release/1.0",
+      head: "abc123",
+    }),
+  ).toBe("diff --git a/x b/x\n@@ -1 +1 @@\n");
+  expect(spawn).toHaveBeenCalledWith("diff", {
+    args: ["repos/block/buzz/compare/release/1.0...abc123"],
+    onStdout: expect.any(Function),
+    onStderr: expect.any(Function),
+  });
+  await expect(
+    diff?.({ repository: "block/buzz", base: "main", head: "HEAD;rm" }),
+  ).rejects.toThrow(GitHubError);
+});
+
+it("reads a merged pull request's own diff, since its head is in the base by then", async () => {
+  const { spawn } = diffSpawn(["diff --git a/x b/x\n"], 0);
+  const diff = gitHubDiff({ spawn });
+  await diff?.({
+    repository: "block/buzz",
+    base: "main",
+    head: "abc123",
+    merged: 42,
+  });
+  expect(spawn).toHaveBeenCalledWith("diff", {
+    args: ["repos/block/buzz/pulls/42"],
+    onStdout: expect.any(Function),
+    onStderr: expect.any(Function),
+  });
+  await expect(
+    diff?.({
+      repository: "block/buzz",
+      base: "main",
+      head: "abc123",
+      merged: 0,
+    }),
+  ).rejects.toThrow(GitHubError);
+});
+
+it("gives GitHub's reason a diff was refused, and stops gh past the size the panel shows", async () => {
+  const refused = gitHubDiff(
+    diffSpawn(['{"message":"Not Found"}'], 1, "gh: Not Found (HTTP 404)"),
+  );
+  await expect(
+    refused?.({ repository: "block/buzz", base: "main", head: "abc123" }),
+  ).rejects.toThrow(new GitHubError("Not Found (HTTP 404)"));
+  const escaped = gitHubDiff(
+    diffSpawn(
+      [],
+      1,
+      "the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway",
+    ),
+  );
+  await expect(
+    escaped?.({ repository: "block/buzz", base: "main", head: "abc123" }),
+  ).rejects.toThrow(GitHubError);
+  const signedOut = gitHubDiff(diffSpawn([], 4, "gh auth login"));
+  await expect(
+    signedOut?.({ repository: "block/buzz", base: "main", head: "abc123" }),
+  ).rejects.toThrow(GhUnavailable);
+  const { spawn, kill } = diffSpawn(["x".repeat(MAX_DIFF_CHARS), "y"], 0);
+  await expect(
+    gitHubDiff({ spawn })?.({
+      repository: "block/buzz",
+      base: "main",
+      head: "abc123",
+    }),
+  ).rejects.toThrow(OutputTooLarge);
+  expect(kill).toHaveBeenCalled();
 });

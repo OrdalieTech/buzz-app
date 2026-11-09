@@ -9,13 +9,11 @@ import {
   type ReactNode,
   type Ref,
 } from "react";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { useAgentChoices } from "../../features/agents/use-choices";
+import { SafeMarkdown } from "../../features/messages/SafeMarkdown";
 import { useIdentityNames } from "../../features/identity-names/react";
 import {
   MAX_MARKDOWN_LENGTH,
-  safeLinkUrl,
   scanMarkdown,
 } from "../../features/relay/message-content";
 import { PanelWorkspace } from "../../features/panels/PanelWorkspace";
@@ -63,6 +61,8 @@ import styles from "./NotesPage.module.css";
 import { formatPublicKey } from "../../shared/identity/public-key";
 import type { PageProps } from "../../features/pages/service";
 import type { Navigation } from "../../features/navigation/controller";
+import { buzzLinkTarget } from "../../features/navigation/buzz-links";
+import type { NavigationScope } from "../../features/navigation/targets";
 import { notesRoute, notesTarget, type NotesRoute } from "./routes";
 import type { Panels, RegisteredPanel } from "../../features/panels/service";
 import { profileTarget } from "../../features/profiles/target";
@@ -167,31 +167,35 @@ export function NotesPage({
     () => navigation?.forSession(relay, connection),
     [navigation, relay, connection],
   );
+  const scope = useMemo(
+    () =>
+      connection.viewer && connection.scope
+        ? {
+            viewer: connection.viewer,
+            communityOrigin: connection.scope.slice(
+              0,
+              -(connection.viewer.length + 1),
+            ),
+          }
+        : undefined,
+    [connection.viewer, connection.scope],
+  );
   useEffect(() => {
     if (
       request?.target.kind !== "page" ||
       request.target.scope !== undefined ||
       connection.status !== "ready" ||
-      !connection.viewer ||
-      !connection.scope
+      !scope
     )
       return;
-    request.resolve({
-      ...request.target,
-      scope: {
-        viewer: connection.viewer,
-        communityOrigin: connection.scope.slice(
-          0,
-          -(connection.viewer.length + 1),
-        ),
-      },
-    });
-  }, [request, connection]);
+    request.resolve({ ...request.target, scope });
+  }, [request, connection.status, scope]);
   if (connection.status === "ready")
     return (
       <NotesCommunity
         key={`${connection.scope}:${connection.generation}`}
         session={connection.session}
+        scope={scope}
         navigation={request}
         navigator={navigator}
         panels={panels}
@@ -216,10 +220,14 @@ export function NotesPage({
 
 export function NotesCommunity({
   session,
+  scope,
   navigation,
   navigator,
   panels,
-}: { session: RelaySession } & NotesNavigation) {
+}: {
+  session: RelaySession;
+  scope?: NavigationScope | undefined;
+} & NotesNavigation) {
   const choices = useAgentChoices(session);
   const resolveName = useIdentityNames(session.names);
   const candidates = useMemo(
@@ -245,6 +253,7 @@ export function NotesCommunity({
     <NoteCollection
       key={authors}
       session={session}
+      scope={scope}
       navigation={navigation}
       navigator={navigator}
       panels={panels}
@@ -262,6 +271,7 @@ export function NotesCommunity({
 
 function NoteCollection({
   session,
+  scope,
   authors,
   agents: ownedAgents,
   pending,
@@ -273,6 +283,7 @@ function NoteCollection({
   panels,
 }: NotesNavigation & {
   session: RelaySession;
+  scope?: NavigationScope | undefined;
   authors: string;
   agents: readonly {
     pubkey: string;
@@ -332,7 +343,7 @@ function NoteCollection({
   const [author, setAuthor] = useState("");
   const [opened, setOpened] = useState<EventData[]>([]);
   const [selected, setSelected] = useState("");
-  const split = usePanelSplit(448, 320);
+  const split = usePanelSplit(session.scope, "notes", 448, 320);
   const origin = useRef<HTMLElement | null>(null);
   const refreshRef = useRef<HTMLButtonElement>(null);
   const preserveControlFocus = useCallback((node: HTMLButtonElement | null) => {
@@ -547,6 +558,12 @@ function NoteCollection({
     setProfile("");
     setSelected(noteActive);
     visit({ author, note: noteActive }, true);
+  };
+  const openLink = (url: string) => {
+    const target = scope && buzzLinkTarget(url, scope);
+    if (!target || !navigator) return false;
+    void navigator.open(target);
+    return true;
   };
   const canProfile = (pubkey: string) =>
     !!panels?.resolve(profileTarget(pubkey, { agent: true }) ?? "");
@@ -855,6 +872,8 @@ function NoteCollection({
                   content: (
                     <NoteBody
                       note={note}
+                      session={session}
+                      openLink={openLink}
                       openProfile={
                         canProfile(note.pubkey)
                           ? () => openProfile(note.pubkey)
@@ -944,12 +963,16 @@ function NoteTime({ note }: { note: EventData }) {
 
 function NoteBody({
   note,
+  session,
+  openLink,
   author,
   picture,
   openProfile,
 }: {
   openProfile?: (() => void) | undefined;
   note: EventData;
+  session: RelaySession;
+  openLink(url: string): boolean;
   author: string;
   picture?: string | undefined;
 }) {
@@ -968,28 +991,11 @@ function NoteBody({
         {plain ? (
           <pre>{note.content}</pre>
         ) : (
-          <Markdown
-            remarkPlugins={[remarkGfm]}
-            urlTransform={(url) => safeLinkUrl(url) ?? null}
-            components={{
-              img: ({ alt }) => alt ?? null,
-              a: ({ children, href, title }) =>
-                href ? (
-                  <a
-                    href={href}
-                    title={title}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    {children}
-                  </a>
-                ) : (
-                  children
-                ),
-            }}
-          >
-            {note.content}
-          </Markdown>
+          <SafeMarkdown
+            content={note.content}
+            openLink={openLink}
+            session={session}
+          />
         )}
       </div>
     </article>

@@ -1,27 +1,39 @@
+import { BackupError } from "./backup";
 import type { Communities } from "../communities/service";
-import type { FirstRunAccount, OwnedCommunity } from "./builderlab-account";
+import type {
+  CommunityList,
+  FirstRunAccount,
+  OwnedCommunity,
+} from "./builderlab-account";
 import { type Restored, restoreKnown } from "./restore-communities";
 import type { Identity } from "./service";
 
-/** A step may pick where setup rests afterwards, overriding the caller's `then`. */
+/**
+ * A step may pick where setup rests afterwards, overriding the caller's
+ * `then`, or the steps that run next, ahead of the rest.
+ */
 export type SetupStep = Readonly<{
   label: string;
-  run: () => Promise<void> | Promise<Resting | undefined>;
+  run: () => Promise<void> | Promise<Resting | Next | undefined>;
   /** Links the key on this device to the account: skipping it leaves the key unlinked. */
   links?: boolean;
+  /** Only backup steps may be continued when the deployment lacks support. */
+  backup?: boolean;
 }>;
+/** Steps a step decided on once it ran, as an account check does. */
+export type Next = Readonly<{ next: readonly SetupStep[] }>;
 /**
- * Where setup rests for a decision: the connect choice for a found
- * community that is not Builderlab-hosted, the key choice, an import, the backup offer after an import,
+ * Where setup rests for a decision: replacing another account's key that
+ * isn't backed up, the connect choice for a found
+ * community that is not Builderlab-hosted, an import,
  * or the returning-user pages (Welcome back, a restore from backup, the
  * start-over page for a lost key).
  */
 export type SetupPause =
+  | "replace-key"
   | "connect-choice"
-  | "key-choice"
   | "key-import"
   | "welcome-back"
-  | "backup-offer"
   | "key-restore"
   | "key-lost";
 export type SetupSnapshot = Readonly<
@@ -35,6 +47,9 @@ export type SetupSnapshot = Readonly<
       retryable: boolean;
       /** Continuing past the failure skips the link, so the key stays unlinked. */
       skipsLink: boolean;
+      /** Builderlab refused the link for good, so Try again cannot help. */
+      bound: boolean;
+      unsupportedBackup?: boolean;
     }
   | { status: "done" }
 >;
@@ -43,6 +58,18 @@ export type Resting = Extract<
   SetupSnapshot,
   { status: "idle" | "paused" | "done" }
 >;
+
+/**
+ * Builderlab's refusal of a link because the key is another account's, or the
+ * account holds another key: asking again gets the same answer.
+ */
+export function boundElsewhere(error: unknown) {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  return (
+    error.code === "pubkey_already_bound" ||
+    error.code === "identity_already_bound"
+  );
+}
 
 /** The key now on this device, which the account steps act on. */
 function viewer(identity: Identity) {
@@ -62,11 +89,110 @@ function saved(identity: Identity) {
   );
 }
 
+/**
+ * Native leaves a key already on this device in place, so creating or
+ * importing over it would "succeed" as that other key. Refuse first, before
+ * any account step (Start over's unlink) acts on the result.
+ */
+function vacant(identity: Identity) {
+  if (identity.snapshot().status === "ready")
+    throw new Error(
+      "This Mac already has a different Buzz key. Sign out of Buzz on this Mac first, or use a different account.",
+    );
+}
+
+/**
+ * Set while a first run links old Buzz's key and has not saved it yet, so only
+ * a run that stopped in between (a failed save, or Buzz quit) brings up the OS
+ * prompt for old Buzz's storage after a later sign-in.
+ */
+const LEGACY_LINK = "buzz.legacy-link-pending.v1";
+
+function noteLegacyLink(pending: boolean) {
+  try {
+    if (pending) localStorage.setItem(LEGACY_LINK, "1");
+    else localStorage.removeItem(LEGACY_LINK);
+  } catch {
+    // Storage refused: a later sign-in won't recover an unsaved link by itself.
+  }
+}
+
+function legacyLinkPending(): boolean {
+  try {
+    return localStorage.getItem(LEGACY_LINK) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The key for an account that has none: old Buzz's, when it was used on this
+ * device, so someone who used Buzz before stays the same person; otherwise a
+ * new one. Old Buzz's key is linked first and saved only once the account
+ * holds it, so a key kgoose refuses as another account's never lands here:
+ * then, as when it can't be read, a new key is made rather than stopping
+ * setup. Reading old Buzz's secure storage may bring up an OS prompt.
+ */
+export function keyForAccount(
+  identity: Identity,
+  account: FirstRunAccount,
+): SetupStep {
+  return {
+    label: "Preparing your identity…",
+    run: async () => {
+      vacant(identity);
+      if (await identity.legacyAvailable().catch(() => false)) {
+        // A failure from here may leave old Buzz's key linked, so the note
+        // stays until the key is saved or was never linked.
+        noteLegacyLink(true);
+        const linked = await account.bindLegacy();
+        if (linked) {
+          // Pinned: native saves only the key the account now holds.
+          await identity.importLegacy(linked);
+          // A refused save reports its own reason, such as a denied read.
+          saved(identity);
+          if (viewer(identity) !== linked)
+            throw new Error("Your key could not be saved on this device.");
+          noteLegacyLink(false);
+          return;
+        }
+        noteLegacyLink(false);
+      }
+      await identity.create();
+      saved(identity);
+    },
+  };
+}
+
+/**
+ * Saves old Buzz's key when it is `linked`, the key the account holds but this
+ * device lacks: a first run that linked it and stopped before saving it (a
+ * failed save, or Buzz quit in between) leaves exactly that. Only after such a
+ * run, so no other sign-in brings up the OS prompt for old Buzz's storage.
+ * Another key, no old Buzz, or a refused read saves nothing, and the account's
+ * pages follow.
+ */
+export async function adoptLinkedLegacy(
+  identity: Identity,
+  linked: string,
+): Promise<boolean> {
+  if (!legacyLinkPending()) return false;
+  if (identity.snapshot().status !== "missing") return false;
+  if (!(await identity.legacyAvailable().catch(() => false))) return false;
+  await identity.importLegacy(linked);
+  const here = identity.snapshot();
+  const adopted = here.status === "ready" && here.viewer === linked;
+  // Old Buzz's key is not this account's: that run linked nothing it holds.
+  if (adopted || here.status === "missing") noteLegacyLink(false);
+  return adopted;
+}
+
 /** Creates a key on this device, which the account steps then act on. */
 export function createKey(identity: Identity): SetupStep {
   return {
-    label: "Creating keys…",
+    label: "Creating your key…",
     run: async () => {
+      vacant(identity);
       await identity.create();
       saved(identity);
     },
@@ -79,6 +205,7 @@ export function createKey(identity: Identity): SetupStep {
  * under the import page's field, not on the failed page.
  */
 export async function importKey(identity: Identity, nsec: string) {
+  vacant(identity);
   await identity.importKey(nsec);
   saved(identity);
 }
@@ -86,7 +213,7 @@ export async function importKey(identity: Identity, nsec: string) {
 /**
  * Real: the key bound to the signed-in account picks the lane. Binding is 1:1
  * and enforced, so a linked account must never be given a second key: it rests
- * on Welcome back instead of the key choice, and later steps still run. The
+ * on Welcome back instead of being set up, and later steps still run. The
  * destinations saved to the account are read alongside, under the same label;
  * that list never fails setup and is reported as `undefined` when it did.
  */
@@ -94,6 +221,8 @@ export function checkAccount(
   account: FirstRunAccount,
   onLinked: (pubkey: string) => void,
   onKnown: (known: readonly string[] | undefined) => void,
+  /** The key already on this device: when it is the linked one, nothing is left to choose. */
+  onDevice?: string,
 ): SetupStep {
   return {
     label: "Checking your account…",
@@ -105,7 +234,9 @@ export function checkAccount(
       onKnown(known);
       if (!pubkey) return undefined;
       onLinked(pubkey);
-      return { status: "paused", at: "welcome-back" };
+      return pubkey === onDevice
+        ? undefined
+        : { status: "paused", at: "welcome-back" };
     },
   };
 }
@@ -157,7 +288,29 @@ export function backUp(
 ): SetupStep {
   return {
     label: "Backing up your key…",
+    backup: true,
     run: () => account.backUp(viewer(identity)),
+  };
+}
+
+/**
+ * Real: a key the account already holds a backup of stays backed up. Only its
+ * automatic choice is saved, unless one already is, so setup uploads nothing
+ * and no backup prompt asks about it later. A build whose uploader cannot back
+ * up to Builderlab (a dev account seed's backups) has no choice to save.
+ * Rejects with a `BackupError`.
+ */
+export function keepBackup(identity: Identity): SetupStep {
+  return {
+    label: "Backing up your key…",
+    run: async () => {
+      if ((await identity.backup.ready()).builderlab)
+        await identity
+          .setBackupChoice(viewer(identity), true, true)
+          .catch(() => {
+            throw new BackupError("interrupted");
+          });
+    },
   };
 }
 
@@ -166,15 +319,59 @@ export function backUp(
  * and the start-over page. Runs only once a key is on the device and the
  * account is linked (the list is meaningless otherwise). A failed list is
  * reported as `undefined`, not a failed setup: the pages work without it.
+ *
+ * With `onCreatable`, the same list also answers `checkCreation`. Only for a
+ * lane whose key on this device is the linked one, which proves the binding.
  */
 export function findCommunities(
   account: FirstRunAccount,
   onFound: (owned: readonly OwnedCommunity[] | undefined) => void,
+  onCreatable?: (list: CommunityList | undefined) => void,
 ): SetupStep {
   return {
     label: "Finding communities…",
     run: () =>
-      account.ownedCommunities().then(onFound, () => onFound(undefined)),
+      account.communityList().then(
+        (list) => {
+          onFound(list.owned);
+          onCreatable?.(list.canCreate ? list : undefined);
+        },
+        () => {
+          onFound(undefined);
+          onCreatable?.(undefined);
+        },
+      ),
+  };
+}
+
+/**
+ * Real: whether Join a community offers Create a community, for an account at
+ * the public Builderlab: the account must be bound to the key now on this
+ * device, and its community list must allow one (`canCreate`). `onChecked`
+ * receives that list, for the create's quota copy, or `undefined` when it
+ * refuses. A failed check is `undefined` too, not a failed setup: joining
+ * works without it.
+ */
+export function checkCreation(
+  identity: Identity,
+  account: FirstRunAccount,
+  onChecked: (list: CommunityList | undefined) => void,
+): SetupStep {
+  return {
+    label: "Finding communities…",
+    run: async () => {
+      try {
+        const [bound, list] = await Promise.all([
+          account.linkedKey(),
+          account.communityList(),
+        ]);
+        onChecked(
+          bound === viewer(identity) && list.canCreate ? list : undefined,
+        );
+      } catch {
+        onChecked(undefined);
+      }
+    },
   };
 }
 
@@ -203,7 +400,7 @@ export function restoreCommunities(
 
 /**
  * Real: the keys the signed-in account holds a backup of, which decide whether
- * Welcome back offers a restore and an import still needs the backup offer.
+ * Welcome back offers a restore and an import still needs backup.
  * Reported as `undefined` where backup status is unavailable (most Builderlab
  * deployments today) or failed, never as a failed setup: the pages work without it, and
  * no copy implies the user lost a backup.
@@ -227,8 +424,8 @@ export function checkBackup(
  * done, or a pause the caller resumes with another `start` — unless a step
  * picked another resting state. No steps means "nothing more to do" and
  * rests at once. A failed setup may also be resumed: by `retry` from the
- * failed step, or once a key exists, by Continue from the failed page, which
- * skips the steps left and rests on the Join page rather than the landing.
+ * failed step. Only explicitly unsupported backup can be continued without;
+ * unfinished linking and transient backup failures cannot be skipped.
  */
 export function createSetup() {
   let state: SetupSnapshot = { status: "idle" };
@@ -242,13 +439,17 @@ export function createSetup() {
     state = next;
     for (const listener of listeners) listener();
   };
-  async function run(steps: readonly SetupStep[], then: Resting) {
+  async function run(planned: readonly SetupStep[], then: Resting) {
     let rest = then;
-    for (const [index, step] of steps.entries()) {
+    const steps = [...planned];
+    for (let index = 0; index < steps.length; index++) {
+      const step = steps[index] as SetupStep;
       publish({ status: "running", label: step.label });
       try {
         const picked = await step.run();
-        if (picked) rest = picked;
+        if (picked && "next" in picked)
+          steps.splice(index + 1, 0, ...picked.next);
+        else if (picked) rest = picked;
       } catch (error) {
         const left = steps.slice(index);
         failed = { steps: left, rest };
@@ -261,6 +462,13 @@ export function createSetup() {
             "retryable" in error &&
             error.retryable === true,
           skipsLink: left.some((step) => step.links === true),
+          bound: boundElsewhere(error),
+          ...(step.backup &&
+          !left.some((step) => step.links) &&
+          error instanceof BackupError &&
+          (error.kind === "unavailable" || error.kind === "not_offered")
+            ? { unsupportedBackup: true }
+            : {}),
         });
         return;
       }
@@ -289,6 +497,16 @@ export function createSetup() {
       if (!from) return;
       failed = undefined;
       await run(from.steps, from.rest);
+    },
+    /** Continue only an unsupported backup, preserving every subsequent step. */
+    async continueWithoutBackup() {
+      const from =
+        state.status === "failed" && state.unsupportedBackup
+          ? failed
+          : undefined;
+      if (!from) return;
+      failed = undefined;
+      await run(from.steps.slice(1), from.rest);
     },
     reset() {
       if (state.status === "running") return;

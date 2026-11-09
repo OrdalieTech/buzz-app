@@ -29,6 +29,7 @@ export function useSearchHighlight({
   wrap = false,
   pending = false,
   isAction,
+  initial,
 }: {
   query: string;
   /** Row keys, in display order. */
@@ -51,22 +52,26 @@ export function useSearchHighlight({
   /** Whether a row acts on the search, such as narrowing it, rather than
    * being a result. */
   isAction?: ((key: string) => boolean) | undefined;
+  /** The row highlighted as the picker mounts, such as the one highlighted
+   * when it last closed; "" highlights none until the keyboard, pointer or
+   * query does. Read once. */
+  initial?: string;
 }) {
   const id = useId();
-  const [selection, setSelection] = useState({
+  const [selection, setSelection] = useState(() => ({
     query,
-    key: "",
+    key: initial ?? "",
     pointer: false,
     /** The row highlighted before the pointer took over, restored when the
      * pointer leaves. */
     resting: "",
     /** The pointer left with no keyboard row to return to: nothing is
      * highlighted until the query, keyboard or pointer says otherwise. */
-    cleared: false,
+    cleared: initial === "",
     /** Counts keyboard moves, so each one reveals its row, even the same row
      * after the list was scrolled away from it. */
     moves: 0,
-  });
+  }));
   const valid =
     selection.query === query &&
     (selection.cleared || keys.includes(selection.key));
@@ -163,6 +168,16 @@ export function useSearchHighlight({
     active,
     select,
     choose,
+    /** Highlight nothing until the keyboard, pointer or query picks a row. */
+    clear: () =>
+      setSelection((previous) => ({
+        ...previous,
+        query,
+        key: "",
+        pointer: false,
+        resting: "",
+        cleared: true,
+      })),
     listId: id,
     rowId,
     /** Spread on the search field. */

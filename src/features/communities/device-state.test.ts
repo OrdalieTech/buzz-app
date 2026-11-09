@@ -3,7 +3,6 @@ import { afterEach, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import type { RelaySession } from "../relay/session";
 import { useChannelTabState } from "../../bundled/channels/useChannelTabState";
-import { recordReaction } from "../messages/quick-reactions";
 import { readView, writeView } from "../../shared/view-state";
 import { purgeCommunityDeviceState } from "./device-state";
 import { localCommunityNameKey } from "./names";
@@ -33,6 +32,13 @@ vi.mock("../relay/read-state-storage", () => ({
 }));
 vi.mock("../relay/outbox-storage", () => ({
   purgeOutboxStorage: (scope: string) => record("outbox", scope),
+}));
+
+vi.mock("../messages/solo-model-picks-storage", () => ({
+  purgeSoloModelPicks: (scope: string) =>
+    typeof indexedDB === "undefined"
+      ? Promise.resolve()
+      : record("model choices", scope),
 }));
 
 vi.mock("../artifact-storage/store", () => ({
@@ -71,8 +77,11 @@ it("forgets every store partitioned to the left community and viewer, and nothin
   writeView(`${origin}:${other}`, "draft:general", "another viewer");
   // A scope that merely extends the left one is a different partition.
   writeView(`${scope}0`, "draft:general", "longer viewer");
-  recordReaction(scope, "🎉");
-  recordReaction(`${kept}:${viewer}`, "🎉");
+  localStorage.setItem(reactions(scope), '[{"emoji":"🎉","count":1,"used":1}]');
+  localStorage.setItem(
+    reactions(`${kept}:${viewer}`),
+    '[{"emoji":"🎉","count":1,"used":1}]',
+  );
   localStorage.setItem(receipt(scope), "1");
   localStorage.setItem(receipt(`${kept}:${viewer}`), "1");
   localStorage.setItem(follows(scope), "[]");
@@ -108,7 +117,7 @@ it("forgets every store partitioned to the left community and viewer, and nothin
 it("clears the remaining stores when one is unavailable and reports each failure by store", async () => {
   const scope = `${origin}:${viewer}`;
   writeView(scope, "draft:general", "unsent");
-  recordReaction(scope, "🎉");
+  localStorage.setItem(reactions(scope), '[{"emoji":"🎉","count":1,"used":1}]');
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   // Key enumeration fails, which the view and channel-setup sweeps rely on.
   const denied = new Error("denied");
@@ -140,6 +149,7 @@ it("purges the relay's heads, read state and outbox for the exact partition, in 
     ["read state", `${origin}:${viewer}`],
     ["outbox", `${origin}:${viewer}`],
     ["artifacts", viewer, origin],
+    ["model choices", `${origin}:${viewer}`],
   ]);
 });
 
@@ -157,14 +167,17 @@ it("reports each failed relay store by name, closes heads and still clears the o
   const heads = new Error("heads blocked");
   const reads = new Error("read state blocked");
   const artifacts = new Error("artifacts blocked");
+  const choices = new Error("choices blocked");
   relay.fail
     .set("heads.clear", heads)
     .set("read state", reads)
-    .set("artifacts", artifacts);
+    .set("artifacts", artifacts)
+    .set("model choices", choices);
   expect(await purgeCommunityDeviceState(origin, viewer)).toEqual([
     { store: "channel heads", error: heads },
     { store: "read state", error: reads },
     { store: "artifacts", error: artifacts },
+    { store: "model and effort choices", error: choices },
   ]);
   expect(relay.calls.map(([name]) => name)).toEqual([
     "heads",
@@ -173,11 +186,16 @@ it("reports each failed relay store by name, closes heads and still clears the o
     "read state",
     "outbox",
     "artifacts",
+    "model choices",
   ]);
   expect(warn.mock.calls).toEqual([
     [`Couldn't clear channel heads for ${origin} on this device`, heads],
     [`Couldn't clear read state for ${origin} on this device`, reads],
     [`Couldn't clear artifacts for ${origin} on this device`, artifacts],
+    [
+      `Couldn't clear model and effort choices for ${origin} on this device`,
+      choices,
+    ],
   ]);
 });
 

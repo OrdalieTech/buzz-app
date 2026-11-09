@@ -46,16 +46,22 @@
     background: none;
     box-shadow: none;
   }
+  /* Top-anchored popups share the steps' top edge: centering them in the
+     crossfade's taller grid snaps the remaining step when the other unmounts.
+     A centered compact popup keeps centered steps, which stay put. */
   .buzz-dialog-step {
     grid-area: 1 / 1;
     display: flex;
     flex-direction: column;
     min-height: 0;
-    align-self: center;
+    align-self: start;
     min-width: 0;
     max-height: inherit;
     overflow: auto;
     overscroll-behavior: none;
+  }
+  .buzz-dialog[data-size="compact"] > .buzz-dialog-step {
+    align-self: center;
   }
   .buzz-dialog-step[inert] {
     pointer-events: none;
@@ -239,6 +245,9 @@
     padding: var(--space-1);
     margin: calc(-1 * var(--space-1));
   }
+  .buzz-dialog-action-row {
+    display: contents;
+  }
   /* This gutter stays outside the scrollport when long content is clipped. */
   :where(.buzz-dialog-body) + .buzz-dialog-actions {
     padding-top: calc(var(--space-4) + var(--space-1));
@@ -415,6 +424,15 @@
   .buzz-tooltip-positioner {
     z-index: var(--layer-tooltip);
   }
+  /* A hint over a top-layer surface keeps Base UI's geometry, not popover UA chrome. */
+  .buzz-tooltip-positioner[popover] {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    overflow: visible;
+    background: transparent;
+    color: inherit;
+  }
   .buzz-tooltip {
     @apply text-caption;
     max-width: min(24rem, calc(100vw - 2rem), var(--available-width, 100vw));
@@ -458,6 +476,7 @@
   .buzz-tooltip[data-ending-style] {
     transition-duration: var(--duration-fast);
   }
+  .buzz-tooltip[data-hint="dock"],
   .buzz-tooltip[data-instant],
   html[data-keyboard-navigation] .buzz-tooltip {
     transition: none;
@@ -531,7 +550,7 @@
     .buzz-dialog {
       --dialog-padding: var(--space-4);
     }
-    .buzz-dialog-actions > .buzz-button {
+    :is(.buzz-dialog-actions, .buzz-dialog-action-row) > .buzz-button {
       flex: 1 0 auto;
     }
   }
@@ -566,6 +585,15 @@
 .buzz-toast-viewport[data-sonner-toaster][data-x-position="right"] {
   left: auto;
   right: max(var(--space-4), env(safe-area-inset-right));
+}
+/* Above any docked composer (useToastClearance), never over its controls. */
+.buzz-toast-viewport[data-sonner-toaster][data-y-position="bottom"] {
+  bottom: max(var(--offset-bottom), var(--buzz-toast-clearance, 0px));
+}
+@media (max-width: 600px) {
+  .buzz-toast-viewport[data-sonner-toaster][data-y-position="bottom"] {
+    bottom: max(var(--mobile-offset-bottom), var(--buzz-toast-clearance, 0px));
+  }
 }
 .buzz-toast-viewport[data-sonner-toaster] [data-sonner-toast] {
   position: relative;
@@ -602,6 +630,30 @@ html[data-keyboard-navigation]
   overflow-wrap: anywhere;
 }
 @layer components {
+  .buzz-toast:has(.buzz-toast-open) {
+    position: relative;
+    isolation: isolate;
+  }
+  .buzz-toast-open {
+    position: absolute;
+    inset: 0;
+    border: 0;
+    border-radius: inherit;
+    background: none;
+    cursor: pointer;
+  }
+  .buzz-toast-open:hover {
+    box-shadow: inset 0 0 0 1px var(--border-prominent);
+  }
+  html[data-keyboard-navigation] .buzz-toast-open:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 2px;
+  }
+  .buzz-toast:has(.buzz-toast-open)
+    :is(.buzz-toast-dismiss, .buzz-toast-actions > *) {
+    position: relative;
+    z-index: 1;
+  }
   .buzz-toast-heading {
     display: flex;
     align-items: start;
@@ -706,12 +758,38 @@ html[data-keyboard-navigation]
       padding-bottom: var(--space-6);
     }
 
+    > .buzz-dialog-header:has(
+        + .buzz-dialog-content[data-header-gap="compact"]
+      ) {
+      padding-bottom: 0;
+    }
+
     > .buzz-dialog-actions {
-      /* Preserve access to oversized actions at narrow widths/enlarged text. */
-      overflow-x: auto;
+      /* Only the gradient gutter passes input through to the form beneath it. */
+      display: block;
+      pointer-events: none;
+      padding-inline: 0;
       bottom: calc(-1 * var(--dialog-padding));
       margin-bottom: calc(-1 * var(--dialog-padding));
-      padding-bottom: var(--dialog-padding);
+      padding-bottom: 0;
+
+      @media (prefers-reduced-transparency: reduce), (forced-colors: active) {
+        /* ScrollEdgeMaterial is fully opaque, including its former fade gutter. */
+        pointer-events: auto;
+      }
+
+      > .buzz-dialog-action-row {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        justify-content: safe end;
+        gap: var(--space-3);
+        pointer-events: auto;
+        /* Keep ring space, the opaque bottom band and overflow input in this row. */
+        overflow-x: auto;
+        margin-top: calc(-1 * var(--space-1));
+        padding: var(--space-1) var(--dialog-padding) var(--dialog-padding);
+      }
     }
   }
 }

@@ -4,6 +4,10 @@
 // into Buzz.
 import type { ModelChoice } from "../../features/agents/ModelPicker";
 import type {
+  ProtectedSpawn,
+  ReviewPrompt,
+} from "../../features/agent-protection/models";
+import type {
   AgentProviderSnapshot,
   Models,
 } from "../../features/agents/service";
@@ -13,6 +17,10 @@ import {
   type Choice,
   type GooseHost,
 } from "./goose";
+import {
+  type ConfigValue,
+  valuesOf,
+} from "../../features/agent-harness/acp/session";
 
 export type ConfigKey = Readonly<{
   name: string;
@@ -58,7 +66,7 @@ type ConfigOptions = {
   configOptions?: {
     category?: string | null;
     currentValue?: string;
-    options?: { value: string }[];
+    options?: ConfigValue[];
   }[];
 };
 
@@ -108,6 +116,21 @@ export function modelFilter(value: unknown): (id: string) => boolean {
   const matcher = new RegExp(`^(?:${patterns.map(glob).join("|")})$`, "s");
   return (id) => matcher.test(id);
 }
+
+/** Providers Goose reviews refuse: contained agents can write Copilot's sign-in
+ * cache, which sets its API address, and, going by their source, the settings
+ * the `codex` and `cursor-agent` command-line agents run on. */
+export const REVIEW_REFUSED: ReadonlySet<string> = new Set([
+  "github_copilot",
+  "codex",
+  "cursor-agent",
+]);
+const refused = (provider = "") =>
+  new Error(
+    provider
+      ? `Goose reviews cannot use ${provider}, whose settings contained agents may be able to change`
+      : "Goose has no default provider and model to review with",
+  );
 
 const TEST_PROMPT = "Reply with exactly: OK";
 const TEST_TIMEOUT_MS = 60_000;
@@ -311,6 +334,66 @@ export class GooseSetup {
     return this.listing;
   }
 
+  review(
+    model: { provider?: string; id: string },
+    prompt: ReviewPrompt,
+    signal: AbortSignal,
+    spawn?: ProtectedSpawn,
+  ) {
+    signal.throwIfAborted();
+    const host = this.host;
+    if (!spawn || !host)
+      throw new Error("Protected Goose review worker is unavailable");
+    if (REVIEW_REFUSED.has(model.provider ?? "")) throw refused(model.provider);
+    return (async () => {
+      const cwd = await host.resolveDirectory("~");
+      signal.throwIfAborted();
+      const goose = await GooseProcess.start(
+        (_id, options) => spawn(options ?? {}),
+        { cwd, protected: true, signal },
+      );
+      const cancel = () => void goose.kill();
+      signal.addEventListener("abort", cancel, { once: true });
+      try {
+        // goose's defaults, read in this worker, name an unnamed provider.
+        const defaults = model.provider
+          ? {}
+          : ((await goose.request(
+              "_goose/unstable/defaults/read",
+              {},
+              REQUEST_TIMEOUT_MS,
+            )) as { providerId?: string | null; modelId?: string | null });
+        const provider = model.provider || defaults.providerId || "";
+        const id = model.provider ? model.id : model.id || defaults.modelId;
+        if (REVIEW_REFUSED.has(provider)) throw refused(provider);
+        if (!provider || (!id && !model.provider)) throw refused();
+        signal.throwIfAborted();
+        const result = (await goose.request(
+          "_buzz/security/review",
+          {
+            provider,
+            id,
+            // Goose's native review takes text only and rejects other fields,
+            // so the schema can only be stated in the trusted instructions.
+            prompt: {
+              system: prompt.outputSchema
+                ? `${prompt.system}\n\nReply with only JSON that matches this JSON Schema, and no other text:\n${JSON.stringify(prompt.outputSchema)}`
+                : prompt.system,
+              input: prompt.input,
+            },
+          },
+          65_000,
+        )) as { text: string; model: { provider: string; id: string } };
+        signal.throwIfAborted();
+        return result;
+      } finally {
+        signal.removeEventListener("abort", cancel);
+        await goose.kill();
+        await goose.exited;
+      }
+    })();
+  }
+
   /** Databricks catalogs can lag its endpoints and AI Gateway services;
    * configured providers use live discovery for both Databricks versions.
    * A provider not set up offers none: its catalog's would not run. */
@@ -421,7 +504,7 @@ export class GooseSetup {
               );
               found.set(model, {
                 current: option?.currentValue ?? "",
-                levels: (option?.options ?? []).map(({ value }) => value),
+                levels: valuesOf(option?.options),
               });
             } catch (error) {
               // One model goose cannot move to does not cost the others.
@@ -540,17 +623,20 @@ export class GooseSetup {
 }
 
 /** Runs `run` against a `goose-acp` started for it in the home folder, and
- * stops it after. It serves no Buzz tools. */
+ * stops it after. It serves no Buzz tools; `signal` stops its startup. */
 export async function briefly<T>(
   host: GooseHost | undefined,
   run: (goose: GooseProcess, cwd: string) => Promise<T>,
   env: Readonly<Record<string, string>> = {},
+  signal?: AbortSignal,
 ): Promise<T> {
   if (!host) throw new Error("goose runs only in the desktop app");
   const cwd = await host.resolveDirectory("~");
+  signal?.throwIfAborted();
   const goose = await GooseProcess.start(host.spawn, {
     cwd,
     env,
+    ...(signal && { signal }),
   });
   try {
     return await run(goose, cwd);

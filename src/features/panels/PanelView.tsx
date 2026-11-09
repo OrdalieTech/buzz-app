@@ -4,11 +4,18 @@ import type { PanelProps, RegisteredPanel } from "./service";
 // Pages own placement and closing; this boundary contains a plugin's render errors.
 export function PanelView({
   panel,
+  contentKey,
   ...props
-}: PanelProps & { panel: RegisteredPanel }) {
+}: PanelProps & {
+  panel: RegisteredPanel;
+  /** Host-owned identity when several addresses inspect the same content. */
+  contentKey?: string | undefined;
+}) {
   const Content = panel.component;
   return (
-    <PanelBoundary key={`${panel.key}:${panel.revision}:${props.target}`}>
+    <PanelBoundary
+      key={`${panel.key}:${panel.revision}:${contentKey ?? props.target}`}
+    >
       <Content {...props} />
     </PanelBoundary>
   );

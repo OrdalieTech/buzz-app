@@ -96,6 +96,8 @@ type ActivityAgent = {
   channelId: string;
   agent: string;
   trigger: HTMLElement | null;
+  /** The one conversation the agent works in, whose transcript to open. */
+  transcript?: { rootId?: string };
 };
 type Handoff = State & {
   menuActions: ReturnType<typeof createMenuActions>;
@@ -360,6 +362,7 @@ export function ChannelNavigationProvider({
             noun={lifecycleNoun(state.lifecycleDialog.channel)}
             action={state.lifecycleDialog.action}
             confirmed={state.lifecycleDialog.confirmed ?? false}
+            autoJoin={state.lifecycleDialog.channel.autoJoin ?? false}
             undo={() => {
               // The toast outlives this dialog: Undo restores the channel it archived.
               if (archived) value.undoArchive(archived);

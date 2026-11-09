@@ -2,6 +2,10 @@
 import { TERMINAL_KEY_EVENT } from "./terminal-key-event";
 import { Service, type Context } from "@deepseek-ai/cordis";
 import {
+  activeModal,
+  behindActiveOverlay,
+} from "../../shared/design-system/overlayLayer";
+import {
   createContributions,
   type Contribution,
 } from "../../plugins/contributions";
@@ -32,6 +36,32 @@ declare module "@deepseek-ai/cordis" {
   }
 }
 
+const MODAL = 'dialog[open], [aria-modal="true"]';
+/** No modal, an addressable dialog that is its own navigation visit, or any other modal. */
+type Modal = false | "visit" | true;
+function eligibleIn(shortcut: Shortcut, editable: boolean, modal: Modal) {
+  try {
+    return (
+      (!editable || shortcut.allowInEditable) &&
+      (!modal ||
+        shortcut.allowInModal ||
+        (modal === "visit" && shortcut.allowInVisit)) &&
+      (!shortcut.when || shortcut.when())
+    );
+  } catch (error) {
+    console.error(`Shortcut predicate failed: ${shortcut.id}`, error);
+    return false;
+  }
+}
+function runShortcut(shortcut: Shortcut) {
+  try {
+    void Promise.resolve(shortcut.run()).catch((error) =>
+      console.error(`Shortcut failed: ${shortcut.id}`, error),
+    );
+  } catch (error) {
+    console.error(`Shortcut failed: ${shortcut.id}`, error);
+  }
+}
 export class ShortcutsService extends Service implements Shortcuts {
   private readonly contributions;
   private readonly hostBindings = new Map<string, NormalizedShortcut>();
@@ -64,24 +94,13 @@ export class ShortcutsService extends Service implements Shortcuts {
       )
         return;
       const editable = inEditable(event);
-      const modalSelector = 'dialog[open], [aria-modal="true"]';
       const modal =
-        !!host?.document.querySelector(modalSelector) ||
+        modalOpen() ||
         event
           .composedPath()
-          .some((target) => (target as Element).matches?.(modalSelector));
-      const eligible = (shortcut: Shortcut) => {
-        try {
-          return (
-            (!editable || shortcut.allowInEditable) &&
-            (!modal || shortcut.allowInModal) &&
-            (!shortcut.when || shortcut.when())
-          );
-        } catch (error) {
-          console.error(`Shortcut predicate failed: ${shortcut.id}`, error);
-          return false;
-        }
-      };
+          .some((target) => (target as Element).matches?.(MODAL));
+      const eligible = (shortcut: Shortcut) =>
+        eligibleIn(shortcut, editable, modal);
       // Host chords are reserved even while unavailable (e.g. Settings behind a modal).
       const reserved = [...this.hostBindings.values()].find((shortcut) =>
         matches(bindingsFor(shortcut, shortcut.id), event, apple),
@@ -100,13 +119,25 @@ export class ShortcutsService extends Service implements Shortcuts {
       if (!shortcut) return;
       event.preventDefault();
       if (event.repeat && !shortcut.repeat) return;
-      try {
-        void Promise.resolve(shortcut.run()).catch((error) =>
-          console.error(`Shortcut failed: ${shortcut.id}`, error),
-        );
-      } catch (error) {
-        console.error(`Shortcut failed: ${shortcut.id}`, error);
-      }
+      runShortcut(shortcut);
+    };
+    const modalOpen = (): Modal => {
+      if (!host?.document.querySelector(MODAL)) return false;
+      // Only the topmost modal can be the current navigation visit, and
+      // not while a menu or popover over it holds the interaction.
+      const modal = activeModal(host.document);
+      return modal?.matches("[data-navigation-visit]") &&
+        !behindActiveOverlay(modal)
+        ? "visit"
+        : true;
+    };
+    // A non-keyboard request for a host shortcut, such as macOS mouse
+    // back/forward: the chord's own eligibility, outside any editable.
+    this.runHost = (id: string) => {
+      const shortcut = this.hostBindings.get(id);
+      if (!shortcut || !eligibleIn(shortcut, false, modalOpen())) return false;
+      runShortcut(shortcut);
+      return true;
     };
     // Only xterm needs an early handoff: ordinary editors still handle keys first.
     const terminalKey = (event: Event) =>
@@ -122,6 +153,8 @@ export class ShortcutsService extends Service implements Shortcuts {
       };
     });
   }
+  /** Host composition only: runs a host shortcut if it is eligible now. */
+  readonly runHost: (id: string) => boolean;
   snapshot = () => this.contributions.snapshot();
   subscribe = (listener: () => void) => this.contributions.subscribe(listener);
   register(shortcut: Shortcut) {

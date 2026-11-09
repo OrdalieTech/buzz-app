@@ -1,4 +1,5 @@
 import type { EventTemplate } from "nostr-tools";
+import type { ChannelSummary } from "./contracts.ts";
 import { newer, type RelayEvent } from "./events.ts";
 
 export type ChannelLifecycleAction =
@@ -7,8 +8,13 @@ export type ChannelLifecycleAction =
   | "delete"
   | "leave"
   | "hide";
-/** Join is not a confirmed member action: it starts from a nonmember preview. */
-export type ChannelLifecycleCommand = ChannelLifecycleAction | "join";
+/** Join is not a confirmed member action: it starts from a nonmember preview.
+ * The auto-join switch is a relay owner/admin metadata edit without confirmation. */
+export type ChannelLifecycleCommand =
+  | ChannelLifecycleAction
+  | "join"
+  | "auto-join-on"
+  | "auto-join-off";
 export const CHANNEL_LIFECYCLE_KINDS = [9002, 9008, 9021, 9022, 41012] as const;
 export const DM_VISIBILITY_KIND = 30622;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -27,6 +33,8 @@ export function lifecycleTemplate(
   const kind = {
     archive: 9002,
     unarchive: 9002,
+    "auto-join-on": 9002,
+    "auto-join-off": 9002,
     delete: 9008,
     join: 9021,
     leave: 9022,
@@ -40,7 +48,9 @@ export function lifecycleTemplate(
       ["h", lifecycleChannelId(channelId)],
       ...(action === "archive" || action === "unarchive"
         ? [["archived", action === "archive" ? "true" : "false"]]
-        : []),
+        : action === "auto-join-on" || action === "auto-join-off"
+          ? [["auto_join", action === "auto-join-on" ? "true" : "false"]]
+          : []),
     ],
   };
   validateLifecycleTemplate(event);
@@ -64,12 +74,14 @@ export function validateLifecycleTemplate(event: EventTemplate): void {
   lifecycleChannelId(event.tags[0]?.[1] ?? "");
   if (
     event.kind === 9002 &&
-    !["true", "false"].some(
-      (value) =>
-        JSON.stringify(event.tags[1]) === JSON.stringify(["archived", value]),
+    !["archived", "auto_join"].some((name) =>
+      ["true", "false"].some(
+        (value) =>
+          JSON.stringify(event.tags[1]) === JSON.stringify([name, value]),
+      ),
     )
   )
-    throw new Error("Only archive metadata may be changed here");
+    throw new Error("Only archive or auto-join metadata may be changed here");
 }
 
 export function exactLifecycleTag(event: RelayEvent, name: string) {
@@ -167,25 +179,99 @@ export function lifecycleSettings(
   }
   if (!members.has(viewer))
     throw new Error("You are no longer a channel member");
-  const role = roles.get(viewer);
-  const lastOwner =
-    role === "owner" &&
-    [...roles.values()].filter((value) => value === "owner").length === 1;
   const archived = exactLifecycleTag(metadata, "archived");
   if (archived !== undefined && archived !== "true" && archived !== "false")
     throw new Error("Malformed channel archive state");
+  return lifecycleRules(
+    id,
+    type,
+    archived === "true",
+    roles.get(viewer),
+    [...roles.values()].filter((value) => value === "owner").length,
+  );
+}
+
+/**
+ * Actions to offer from the session's live channel state, without a read:
+ * the signed roster's role hints match its administrator record. `run`
+ * still checks fresh relay state before publishing, and the relay decides.
+ */
+export function lifecycleOffer(
+  channel: ChannelSummary,
+  viewer: string,
+  agentOwner: boolean,
+): ChannelLifecycleSettings | undefined {
+  const type = channel.channelType === "solo" ? "stream" : channel.channelType;
+  // Restored membership is display-only until the relay confirms it, and a
+  // revoked roster stays read-only (guests read through their membership).
+  if (
+    !type ||
+    channel.cached ||
+    (channel.readOnly && channel.viewerRole !== "guest") ||
+    !UUID.test(channel.id) ||
+    !channel.owners ||
+    !channel.members?.includes(viewer)
+  )
+    return;
+  const archived = !!channel.archived;
+  const settings = lifecycleRules(
+    channel.id,
+    type,
+    archived,
+    channel.viewerRole,
+    channel.owners.length,
+  );
+  return agentOwner && type !== "dm"
+    ? ownerAgentGrant(settings, archived)
+    : settings;
+}
+
+const noOwners: readonly string[] = Object.freeze([]);
+
+/** Owners whose verified agent profile could grant the viewer more: none
+ * where nothing is offered or a direct role already permits Delete or, if
+ * archived, Unarchive. */
+export function ownerEvidence(
+  channel: ChannelSummary,
+  viewer: string,
+): readonly string[] {
+  const offer = lifecycleOffer(channel, viewer, false);
+  return !offer ||
+    offer.channelType === "dm" ||
+    offer.canDelete ||
+    offer.canUnarchive
+    ? noOwners
+    : (channel.owners ?? noOwners);
+}
+
+/** An owner-role agent's human may archive, unarchive and delete like an owner. */
+export function ownerAgentGrant(
+  settings: ChannelLifecycleSettings,
+  archived: boolean,
+): ChannelLifecycleSettings {
+  return Object.freeze({
+    ...settings,
+    canArchive: !archived,
+    canUnarchive: archived,
+    canDelete: !archived,
+  });
+}
+
+function lifecycleRules(
+  id: string,
+  type: ChannelLifecycleSettings["channelType"],
+  archived: boolean,
+  role: string | undefined,
+  owners: number,
+): ChannelLifecycleSettings {
+  const lastOwner = role === "owner" && owners === 1;
+  const admin = role === "owner" || role === "admin";
   return Object.freeze({
     channelId: id,
     channelType: type,
-    canArchive:
-      type !== "dm" &&
-      archived !== "true" &&
-      (role === "owner" || role === "admin"),
-    canUnarchive:
-      type !== "dm" &&
-      archived === "true" &&
-      (role === "owner" || role === "admin"),
-    canDelete: type !== "dm" && archived !== "true" && role === "owner",
+    canArchive: type !== "dm" && !archived && admin,
+    canUnarchive: type !== "dm" && archived && admin,
+    canDelete: type !== "dm" && !archived && role === "owner",
     canLeave: type !== "dm" && !lastOwner,
     canHide: type === "dm",
     ...(lastOwner && type !== "dm"

@@ -4,6 +4,7 @@ import type {
 } from "../agent-protection/service";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { eventsDto, type RelayEvent } from "../relay/events";
+import { importedEmojiPicture } from "./import-picture";
 
 /** A plugin agent's identity in one community as native custody reports it;
  * never the key. The saved identities are the agent list: one for each
@@ -41,8 +42,15 @@ export type Membership = Readonly<{ pubkey: string; relay: string }>;
  * harness agents, or the installed or development build of old Buzz. */
 export type PortSource = "harness" | "installed" | "development";
 /** An identity an earlier agent system saved, which Agents can take over. */
+export type SavedConnection = Readonly<{
+  runtime: string;
+  provider?: string;
+  model?: string;
+  effort?: string;
+}>;
 export type PortableAgent = Readonly<{
   source: PortSource;
+  connection?: SavedConnection;
   pubkey: string;
   name: string;
   picture?: string;
@@ -225,14 +233,29 @@ export const nativeAgents = (): AgentsNative | undefined =>
         create: (destination, owner, agentType, name) =>
           invoke("app_agent_create", { destination, owner, agentType, name }),
         portable: () => invoke("app_agent_portable"),
-        port: (source, pubkey, destination, owner, agentType) =>
-          invoke("app_agent_port", {
+        port: async (source, pubkey, destination, owner, agentType) => {
+          // Preparation is optional; native reports a skipped picture if it fails.
+          let convertedPicture: Awaited<
+            ReturnType<typeof importedEmojiPicture>
+          >;
+          try {
+            const found = await invoke<PortableAgents>("app_agent_portable");
+            const picture = found.agents.find(
+              (agent) => agent.source === source && agent.pubkey === pubkey,
+            )?.picture;
+            convertedPicture = await importedEmojiPicture(picture);
+          } catch {
+            // A picture failure must not prevent taking over the identity.
+          }
+          return invoke("app_agent_port", {
             source,
             pubkey,
             destination,
             owner,
             agentType,
-          }),
+            convertedPicture,
+          });
+        },
         protectionDefaults: (owner) =>
           invoke("app_agent_protection_defaults", { owner }),
         setProtectionDefaults: (owner, revision, provider, policy) =>

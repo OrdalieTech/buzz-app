@@ -1,10 +1,16 @@
 @layer components {
   .search-palette {
     --search-palette-outset: var(--space-2);
+    --search-palette-results-max: min(
+      55vh,
+      calc(100dvh - var(--dialog-top) - 8rem)
+    );
     min-width: 0;
   }
 
   .search-palette-author-prefix {
+    display: flex;
+    gap: var(--space-1);
     flex: 0 1 auto;
     min-width: 0;
     max-width: 45%;
@@ -12,7 +18,8 @@
 
   .search-palette-author-chip {
     display: block;
-    width: 100%;
+    flex: 0 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -53,7 +60,7 @@
   }
 
   .search-palette-scroll {
-    max-height: min(55vh, calc(100dvh - var(--dialog-top) - 8rem));
+    max-height: var(--search-palette-results-max);
     overflow-y: auto;
     /* Align heading and icon slots; keep room for keyboard focus rings. */
     margin-block: var(--space-2) 0;
@@ -78,8 +85,21 @@
   }
 
   .search-palette-group-empty,
-  .search-palette-status {
+  .search-palette-status,
+  .search-palette-footer {
     padding-inline: var(--space-control-inset);
+  }
+
+  /* A footer stays below the results, outside their scrollport, and takes
+     its room from them so both fit the dialog. */
+  .search-palette[data-search-footer] {
+    --search-palette-results-max: min(
+      55vh,
+      calc(100dvh - var(--dialog-top) - 13rem)
+    );
+  }
+  .search-palette-footer {
+    padding-block: var(--space-2) var(--space-3);
   }
 
   .search-palette-group-empty {
@@ -112,6 +132,28 @@
 }
 
 @layer components {
+  .search-palette-centered {
+    display: grid;
+    flex: 1;
+    place-content: center;
+    justify-items: center;
+    gap: var(--space-1);
+    padding: var(--space-4);
+    color: var(--text-subtle);
+    font-size: var(--text-body-sm);
+    line-height: var(--text-body-sm--line-height);
+    text-align: center;
+  }
+  .search-palette-centered > :first-child {
+    color: var(--text-secondary);
+  }
+
+  .search-palette-views {
+    margin-top: var(--space-2);
+    /* The tab list adds its own inset; this lines labels up with headings. */
+    padding-inline: var(--space-2);
+  }
+
   .search-palette-height {
     position: relative;
     overflow: clip;
@@ -125,11 +167,32 @@
     background: linear-gradient(to bottom, var(--surface-panel), transparent);
     pointer-events: none;
   }
+  .search-palette[data-search-footer] .search-palette-height::before {
+    content: "";
+    position: absolute;
+    inset: auto 0 0;
+    height: var(--space-2);
+    background: linear-gradient(to top, var(--surface-panel), transparent);
+    pointer-events: none;
+    z-index: 1;
+  }
   .search-palette-height[data-measured] {
     transition: height 180ms ease-in-out;
   }
   .search-palette-height > .search-palette-scroll {
     margin-block: 0;
+  }
+  /* With views to switch between, the results keep one height, so a short,
+     loading or empty view doesn't shrink the palette under the tabs. */
+  .search-palette[data-search-views] .search-palette-scroll {
+    display: flex;
+    flex-direction: column;
+    min-height: var(--search-palette-results-max);
+  }
+  .search-palette[data-search-views] .search-palette-status {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
   }
   @media (prefers-reduced-motion: reduce) {
     .search-palette-height[data-measured] {
@@ -156,5 +219,18 @@
     .settings-search-highlight {
       animation-timing-function: steps(1, end);
     }
+  }
+}
+
+@layer components {
+  /* A row's count: an icon and a number, quiet at the row's end. Its width
+     is held before the count arrives, enough for "1,234". */
+  .search-palette-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-1);
+    min-inline-size: 8ch;
+    font-variant-numeric: tabular-nums;
   }
 }

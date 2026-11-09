@@ -15,6 +15,7 @@ import {
   type RefObject,
 } from "react";
 import { OwnedContribution } from "../../plugins/OwnedContribution";
+import { NavigationSectionHeading } from "../../shared/design-system/ui/NavigationSection";
 import { SidebarSection } from "../../bundled/channels/SidebarSection";
 import styles from "../../bundled/channels/Channels.module.css";
 import { orderContributedSidebarSections } from "../../bundled/channels/sidebar-sections";
@@ -34,7 +35,6 @@ import {
   MenuRadioItem,
   MenuGroup,
   MenuGroupLabel,
-  MenuSeparator,
 } from "../../shared/design-system/ui/Menu";
 import type { Navigation } from "../navigation/controller";
 import type { OpenTarget } from "../navigation/targets";
@@ -58,9 +58,9 @@ export function SoloRegions({
   sidebar,
   scope,
   ordinary,
-  ordinaryActions,
-  creationTrigger,
   fallback,
+  groupDisclosure,
+  hidePrimaryHeading = false,
   pendingClick: sharedPendingClick,
 }: {
   session: RelaySession;
@@ -69,9 +69,16 @@ export function SoloRegions({
   scope: string;
   sidebar: ReturnType<typeof useSidebarView>;
   ordinary?: ReactNode;
-  ordinaryActions?: ReactNode;
-  creationTrigger?: RefObject<HTMLButtonElement | null> | undefined;
   fallback?: ReactNode;
+  hidePrimaryHeading?: boolean;
+  groupDisclosure?:
+    | {
+        sectionKey: string;
+        title: string;
+        open: boolean;
+        onToggle(open: boolean): void;
+      }
+    | undefined;
   pendingClick?: RefObject<ReturnType<typeof setTimeout> | undefined>;
 }) {
   const localPendingClick = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -87,38 +94,97 @@ export function SoloRegions({
     })),
     sidebar.contributionOrder,
   ).map(({ region }) => region);
-  if (!service) return fallback ?? null;
   const primary = regions.findIndex((region) => region.source);
+  const current = target.kind === "conversation" ? target.channelId : undefined;
+  const currentChannel = current
+    ? session.channels.list().channels.find((channel) => channel.id === current)
+    : undefined;
+  const fallbackOwnsCurrent =
+    primary < 0 &&
+    currentChannel?.channelType === "solo" &&
+    !snapshot.excluded.has(currentChannel.id);
+  const fallbackSectionKey = groupDisclosure?.sectionKey;
+  const fallbackOpen = groupDisclosure?.open;
+  useLayoutEffect(
+    () =>
+      sidebar.beforeReveal((location) => {
+        if (
+          !fallbackSectionKey ||
+          fallbackOpen ||
+          !fallbackOwnsCurrent ||
+          !current ||
+          location !== `conversation:${current}`
+        )
+          return true;
+        sidebar.toggle(fallbackSectionKey, true);
+        return false;
+      }),
+    [
+      current,
+      fallbackOpen,
+      fallbackOwnsCurrent,
+      fallbackSectionKey,
+      sidebar.beforeReveal,
+      sidebar.toggle,
+    ],
+  );
+  const fallbackContents = groupDisclosure ? (
+    <SidebarSection
+      sectionKey={groupDisclosure.sectionKey}
+      title={groupDisclosure.title}
+      open={groupDisclosure.open}
+      onToggle={groupDisclosure.onToggle}
+      hideMoreActions
+      persistentChevron
+    >
+      {ordinary}
+    </SidebarSection>
+  ) : hidePrimaryHeading ? (
+    // Like Team, the Solo tab names its list, so the rows sit directly in it.
+    (ordinary ?? null)
+  ) : (
+    (fallback ?? null)
+  );
+  if (!service) return fallbackContents;
   return (
     <>
       {regions.map((region, index) => (
-        <RegionFrame
+        <div
           key={`${region.key}:${snapshot.binding?.incarnation ?? "recovery"}`}
-          region={region}
-          service={service}
-          session={session}
-          scope={scope}
-          navigator={navigator}
-          pendingClick={pendingClick}
-          target={target}
-          sidebar={sidebar}
-          move={(offset) => {
-            const ids = regions.map((item) => `solo-region:${item.key}`);
-            ids.splice(index, 1);
-            ids.splice(index + offset, 0, `solo-region:${region.key}`);
-            sidebar.setContributionOrder([
-              ...sidebar.contributionOrder.filter((key) => !ids.includes(key)),
-              ...ids,
-            ]);
-          }}
-          first={index === 0}
-          last={index === regions.length - 1}
-          ordinary={index === primary ? ordinary : undefined}
-          ordinaryActions={index === primary ? ordinaryActions : undefined}
-          creationTrigger={index === primary ? creationTrigger : undefined}
-        />
+          hidden={
+            !!groupDisclosure && !groupDisclosure.open && index !== primary
+          }
+        >
+          <RegionFrame
+            region={region}
+            service={service}
+            session={session}
+            scope={scope}
+            navigator={navigator}
+            pendingClick={pendingClick}
+            target={target}
+            sidebar={sidebar}
+            move={(offset) => {
+              const ids = regions.map((item) => `solo-region:${item.key}`);
+              ids.splice(index, 1);
+              ids.splice(index + offset, 0, `solo-region:${region.key}`);
+              sidebar.setContributionOrder([
+                ...sidebar.contributionOrder.filter(
+                  (key) => !ids.includes(key),
+                ),
+                ...ids,
+              ]);
+            }}
+            first={index === 0}
+            last={index === regions.length - 1}
+            ordinary={index === primary ? ordinary : undefined}
+            groupDisclosure={index === primary ? groupDisclosure : undefined}
+            groupSectionKey={groupDisclosure?.sectionKey}
+            hideHeading={hidePrimaryHeading && index === primary}
+          />
+        </div>
       ))}
-      {primary < 0 ? fallback : null}
+      {primary < 0 ? fallbackContents : null}
     </>
   );
 }
@@ -135,8 +201,9 @@ function RegionFrame({
   first,
   last,
   ordinary,
-  ordinaryActions,
-  creationTrigger,
+  groupDisclosure,
+  groupSectionKey,
+  hideHeading,
   pendingClick,
 }: {
   scope: string;
@@ -151,8 +218,16 @@ function RegionFrame({
   first: boolean;
   last: boolean;
   ordinary?: ReactNode;
-  ordinaryActions?: ReactNode;
-  creationTrigger?: RefObject<HTMLButtonElement | null> | undefined;
+  groupDisclosure?:
+    | {
+        sectionKey: string;
+        title: string;
+        open: boolean;
+        onToggle(open: boolean): void;
+      }
+    | undefined;
+  groupSectionKey?: string | undefined;
+  hideHeading?: boolean;
 }) {
   const binding = service.snapshot().binding;
   const source = region.source;
@@ -218,11 +293,20 @@ function RegionFrame({
       )
         return true;
       prepared = true;
+      if (groupSectionKey) toggle(groupSectionKey, true);
       toggle(sectionKey, true);
       service.reveal(current, false);
       return false; // Retry against the expanded source path after its commit.
     });
-  }, [sidebar.beforeReveal, current, ownsCurrent, sectionKey, toggle, service]);
+  }, [
+    sidebar.beforeReveal,
+    current,
+    ownsCurrent,
+    sectionKey,
+    toggle,
+    service,
+    groupSectionKey,
+  ]);
   useLayoutEffect(() => {
     if (sidebar.collapsed.includes(sectionKey)) return;
     if (revealRequest?.explicit && revealRequest.id === current) revealAgain();
@@ -231,6 +315,7 @@ function RegionFrame({
   });
   const reveal = useEffectEvent((id: string, explicit: boolean) => {
     if (!region.channels.some((channel) => channel.id === id)) return false;
+    if (groupSectionKey) toggle(groupSectionKey, true);
     toggle(sectionKey, true);
     setRevealRequest({ id, explicit });
     return true;
@@ -299,6 +384,52 @@ function RegionFrame({
       ))}
     </>
   );
+  // The region's own create action trails its other actions.
+  const create = actions.find((action) => action.icon === "plus");
+  const headerActions = (
+    <>
+      {actions
+        .filter((action) => action.icon !== "plus")
+        .map((action) => (
+          <RegionAction key={action.id} action={action} run={run} />
+        ))}
+      {create && <RegionAction action={create} run={run} />}
+    </>
+  );
+  const headerNotice = actionError && (
+    <p className={styles.contributionFeedback} role="alert">
+      The action could not run.
+    </p>
+  );
+  const body = (
+    <>
+      {source &&
+      binding &&
+      presentation &&
+      region.snapshot?.status === "ready" &&
+      !region.reason ? (
+        <OwnedContribution
+          entry={source}
+          registry={{ snapshot: service.sources }}
+          fallback={recovery}
+        >
+          {(entry) => (
+            <entry.component
+              binding={binding}
+              snapshot={region.snapshot as SoloRegionProps["snapshot"]}
+              live={region.live}
+              {...(current ? { current } : {})}
+              {...presentation}
+              ui={destinationUi}
+            />
+          )}
+        </OwnedContribution>
+      ) : (
+        recovery
+      )}
+    </>
+  );
+  const hasActions = actions.length > 0;
   return (
     <RegionDestinationContext.Provider
       value={{
@@ -313,77 +444,41 @@ function RegionFrame({
       }}
     >
       <div ref={root}>
-        <SidebarSection
-          sectionKey={sectionKey}
-          title={region.title}
-          icon={source?.icon}
-          open={!sidebar.collapsed.includes(sectionKey)}
-          onToggle={(open) => sidebar.toggle(sectionKey, open)}
-          move={{
-            ...(!first ? { up: () => move(-1) } : {}),
-            ...(!last ? { down: () => move(1) } : {}),
-          }}
-          hideMoreActions={first && last}
-          headerActions={
-            <>
-              {actions
-                .filter((action) => action.icon !== "plus")
-                .map((action) => (
-                  <RegionAction key={action.id} action={action} run={run} />
-                ))}
-              {(actions.some((action) => action.icon === "plus") ||
-                ordinaryActions) && (
-                <RegionAction
-                  action={
-                    actions.find((action) => action.icon === "plus") ?? {
-                      id: "create",
-                      label: "Create",
-                      icon: "plus",
-                      onSelect() {},
-                      menu: () => [],
-                    }
-                  }
-                  run={run}
-                  extraItems={ordinaryActions}
-                  triggerRef={creationTrigger}
-                />
-              )}
-            </>
-          }
-          headerNotice={
-            actionError && (
-              <p className={styles.contributionFeedback} role="alert">
-                The action could not run.
-              </p>
-            )
-          }
-        >
-          {source &&
-          binding &&
-          presentation &&
-          region.snapshot?.status === "ready" &&
-          !region.reason ? (
-            <OwnedContribution
-              entry={source}
-              registry={{ snapshot: service.sources }}
-              fallback={recovery}
-            >
-              {(entry) => (
-                <entry.component
-                  binding={binding}
-                  snapshot={region.snapshot as SoloRegionProps["snapshot"]}
-                  live={region.live}
-                  {...(current ? { current } : {})}
-                  {...presentation}
-                  ui={destinationUi}
-                />
-              )}
-            </OwnedContribution>
-          ) : (
-            recovery
-          )}
-        </SidebarSection>
-        {ordinary}
+        {hideHeading ? (
+          // The tab already names this region, so it has no title row. Its
+          // actions, when it has any, take a headingless row in the flow.
+          <>
+            {hasActions && <NavigationSectionHeading actions={headerActions} />}
+            {headerNotice}
+            {body}
+            {groupDisclosure ? ordinary : null}
+          </>
+        ) : (
+          <SidebarSection
+            sectionKey={sectionKey}
+            title={groupDisclosure?.title ?? region.title}
+            icon={source?.icon}
+            open={
+              groupDisclosure?.open ?? !sidebar.collapsed.includes(sectionKey)
+            }
+            onToggle={
+              groupDisclosure?.onToggle ??
+              ((open) => sidebar.toggle(sectionKey, open))
+            }
+            move={{
+              ...(!first ? { up: () => move(-1) } : {}),
+              ...(!last ? { down: () => move(1) } : {}),
+            }}
+            hideMoreActions={first && last}
+            persistentChevron={!!groupDisclosure}
+            headerActions={headerActions}
+            headerNotice={headerNotice}
+          >
+            {body}
+            {groupDisclosure ? ordinary : null}
+          </SidebarSection>
+        )}
+        {groupDisclosure ? null : ordinary}
       </div>
     </RegionDestinationContext.Provider>
   );
@@ -392,17 +487,12 @@ function RegionFrame({
 function RegionAction({
   action,
   run,
-  extraItems,
-  triggerRef,
 }: {
   action: SoloRegionAction;
-  extraItems?: ReactNode;
-  triggerRef?: RefObject<HTMLButtonElement | null> | undefined;
   run(action: Pick<SoloRegionAction, "onSelect">): Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
-  const localTrigger = useRef<HTMLButtonElement>(null);
-  const anchor = triggerRef ?? localTrigger;
+  const anchor = useRef<HTMLButtonElement>(null);
   const afterClose = useRef<Pick<SoloRegionAction, "onSelect"> | undefined>(
     undefined,
   );
@@ -422,8 +512,7 @@ function RegionAction({
           typeof item.onSelect === "function",
       );
   } catch {
-    if (!extraItems) return null;
-    items = [];
+    return null;
   }
   const icon =
     action.icon === "plus" ? (
@@ -442,7 +531,7 @@ function RegionAction({
       title={action.label}
     />
   );
-  if (!items && !extraItems)
+  if (!items)
     return (
       <IconButton
         size="compact"
@@ -453,7 +542,7 @@ function RegionAction({
       />
     );
   items ??= [{ id: action.id, label: action.label, onSelect: action.onSelect }];
-  if (!items.length && !extraItems) return null;
+  if (!items.length) return null;
   const groups = [...new Set(items.map((item) => item.group ?? ""))];
   return (
     <MenuRoot
@@ -506,8 +595,6 @@ function RegionAction({
             </MenuGroup>
           );
         })}
-        {!!items.length && extraItems && <MenuSeparator />}
-        {extraItems}
       </MenuPopup>
     </MenuRoot>
   );

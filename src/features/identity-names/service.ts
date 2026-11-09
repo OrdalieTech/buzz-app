@@ -9,7 +9,9 @@ import { createContributions } from "../../plugins/contributions";
 export type NamingPolicy = {
   id: string;
   /** Compare all displayed aliases across distinct keys; return each key's last
-   * supplied alias. Repeated configurations of one key are not namesakes. */
+   * supplied alias. Repeated configurations of one key are not namesakes.
+   * With `candidates`, the directory passes only the rows `scopeKeys` selects
+   * (the candidates and their agents' owners), not the whole cache. */
   resolve(
     identities: readonly NamingIdentity[],
     viewer?: string,

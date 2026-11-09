@@ -70,6 +70,7 @@ it("one bottom dwell in a DM reads only through the newest message it saw", asyn
       },
     },
     {
+      readStateFloor: () => 0,
       readStateStorage: storage,
       readPublisherLock: async (_signal, work) => work(),
     },

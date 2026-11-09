@@ -1,7 +1,7 @@
 import { afterEach, assert, expect, it, vi } from "vitest";
 import type { ReadFilter, RelayEvent } from "./events";
 import type { LiveCallbacks } from "./live";
-import { createRelaySession } from "./session";
+import { createRelaySession, UNREAD_BACKSTOP_INTERVAL } from "./session";
 import { readJournal, type ReadJournal } from "./read-state-storage";
 import { keypair, message, metadata, roster, signed } from "./testing";
 
@@ -16,7 +16,7 @@ function deferred() {
   });
   return { promise, release };
 }
-function setup(count = 1) {
+function setup(count = 1, snapshot = false) {
   const viewer = keypair(),
     relay = keypair(),
     peer = keypair();
@@ -60,7 +60,19 @@ function setup(count = 1) {
       relayAuthor: relay.pubkey,
       query,
       media: () => undefined,
-      readState: { decode: async () => [] },
+      readState: {
+        decode: async () => [],
+        ...(snapshot ? { communityId: "test-community" } : {}),
+      },
+      ...(snapshot
+        ? {
+            readStateSnapshot: (signal: AbortSignal) =>
+              query(
+                [{ kinds: [30078], authors: [viewer.pubkey], limit: 500 }],
+                signal,
+              ),
+          }
+        : {}),
       subscribe(callbacks) {
         live = callbacks;
         receive = callbacks.receive;
@@ -68,6 +80,7 @@ function setup(count = 1) {
       },
     },
     {
+      readStateFloor: () => 0,
       readStateStorage: {
         async update(change) {
           journal = readJournal(change(journal), viewer.pubkey);
@@ -104,6 +117,18 @@ function setup(count = 1) {
       live.state({ status: "retrying", routes: [] });
       live.state({ status: "connected", routes: [] });
       live.established();
+    },
+    /** A reconnect whose membership replay was continuous. */
+    reconnectCovered() {
+      assert(live);
+      live.state({ status: "retrying", routes: [] });
+      live.state({ status: "connected", routes: [] });
+      live.established(undefined, { route: "membership", continuous: true });
+    },
+    /** The live recovery tick, once a minute on a healthy connection. */
+    recover() {
+      assert(live);
+      live.recover?.();
     },
     holdProfile() {
       holdProfile = true;
@@ -179,6 +204,31 @@ it("evidence gets its own deadline after a failed marker read; marker errors sta
   await h.session.unread.refresh();
   expect(h.session.unread.sync().status).toBe("reconciled");
 });
+
+it.each([false, true])(
+  "finishes read-state retry across a roster change (snapshot: %s)",
+  async (snapshot) => {
+    const h = setup(1, snapshot);
+    await h.session.unread.ensure();
+    const release = h.holdMarker();
+    const before = h.trace.length;
+    const retry = h.session.unread.retrySync();
+    try {
+      await vi.waitFor(() =>
+        expect(h.trace.slice(before).map(({ kind }) => kind)).toEqual([30078]),
+      );
+      h.receive([roster(h.relay, "other", [], 20)]);
+      expect(h.session.channels.get?.("other")).toBeUndefined();
+    } finally {
+      release();
+      await retry;
+    }
+    expect(h.session.unread.sync()).toMatchObject({
+      status: "reconciled",
+      error: undefined,
+    });
+  },
+);
 
 it("queries all 278 membership IDs with sequential relay-legal batches and publishes each batch", async () => {
   const h = setup(278);
@@ -861,6 +911,290 @@ it("transient startup failure recovers on live reconnect without an automatic re
     }),
   );
   expect(h.snapshot().error).toBeUndefined();
+});
+
+it("the recovery tick repairs unread only as a slow backstop after a connection's own repair", async () => {
+  vi.useFakeTimers({ toFake: ["Date"], now: 1_700_000_000_000 });
+  try {
+    const h = setup();
+    const answer = h.query.getMockImplementation();
+    assert(answer);
+    // The reconnect's roster read keeps the joined channel.
+    h.query.mockImplementation(async (filters, signal) =>
+      filters[0]?.kinds?.includes(39002)
+        ? [
+            roster(h.relay, "other", [h.viewer.pubkey], 10),
+            metadata(h.relay, "other", "other", 10),
+          ]
+        : answer(filters, signal),
+    );
+    await h.session.unread.ensure();
+    const evidence = () => h.trace.filter(({ kind }) => kind === 9).length;
+    const before = evidence();
+    h.reconnect();
+    await vi.waitFor(() => expect(evidence()).toBe(before + 1));
+    // The fake clock still runs; the repair was asked at or before this.
+    const repaired = Date.now();
+    // A healthy minute: the live stream carried every unread change.
+    for (let minute = 1; minute < 15; minute++) {
+      vi.setSystemTime(repaired + minute * 60_000 - 1000);
+      h.recover();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(evidence()).toBe(before + 1);
+    vi.setSystemTime(repaired + UNREAD_BACKSTOP_INTERVAL);
+    h.recover();
+    await vi.waitFor(() => expect(evidence()).toBe(before + 2));
+    h.recover();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(evidence()).toBe(before + 2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("the recovery tick retries a failed unread repair at once, not after the backstop interval", async () => {
+  vi.useFakeTimers({ toFake: ["Date"], now: 1_700_000_000_000 });
+  try {
+    const h = setup();
+    let fail = false;
+    h.query.mockImplementation(async (filters) => {
+      if (filters[0]?.kinds?.includes(39002))
+        return [
+          roster(h.relay, "other", [h.viewer.pubkey], 10),
+          metadata(h.relay, "other", "other", 10),
+        ];
+      if (!filters[0]?.kinds?.includes(9)) return [];
+      if (fail) throw new Error("Transient evidence failure");
+      return [h.row];
+    });
+    await h.session.unread.ensure();
+    fail = true;
+    h.reconnect();
+    await vi.waitFor(() =>
+      expect(h.snapshot()).toMatchObject({
+        freshness: "stale",
+        error: "Transient evidence failure",
+      }),
+    );
+    fail = false;
+    vi.setSystemTime(Date.now() + 60_000);
+    h.recover();
+    await vi.waitFor(() =>
+      expect(h.snapshot()).toMatchObject({
+        observedCount: 1,
+        freshness: "observed",
+      }),
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("a live message after a failed unread repair does not cancel its retry", async () => {
+  vi.useFakeTimers({ toFake: ["Date"], now: 1_700_000_000_000 });
+  try {
+    const h = setup();
+    let fail = false;
+    h.query.mockImplementation(async (filters) => {
+      if (filters[0]?.kinds?.includes(39002))
+        return [
+          roster(h.relay, "other", [h.viewer.pubkey], 10),
+          metadata(h.relay, "other", "other", 10),
+        ];
+      if (!filters[0]?.kinds?.includes(9)) return [];
+      if (fail) throw new Error("Transient evidence failure");
+      return [h.row];
+    });
+    // The repair's read, not a lookup for one message.
+    const evidence = () =>
+      h.query.mock.calls.filter(
+        ([filters]) =>
+          filters[0]?.include_aux && filters[0]?.kinds?.includes(40002),
+      ).length;
+    await h.session.unread.ensure();
+    fail = true;
+    h.reconnect();
+    await vi.waitFor(() =>
+      expect(h.snapshot()).toMatchObject({
+        freshness: "stale",
+        error: "Transient evidence failure",
+      }),
+    );
+    fail = false;
+    // Live traffic marks the evidence observed, but other channels may still
+    // miss what the failed repair would have read.
+    h.receive([message(h.peer, "other", "live", 12)]);
+    expect(h.snapshot()).toMatchObject({ freshness: "observed" });
+    const before = evidence();
+    vi.setSystemTime(Date.now() + 60_000);
+    h.recover();
+    await vi.waitFor(() => expect(evidence()).toBe(before + 1));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("a failed read-state snapshot is retried at once even when the evidence repair succeeds", async () => {
+  vi.useFakeTimers({ toFake: ["Date"], now: 1_700_000_000_000 });
+  try {
+    const h = setup();
+    let fail = false;
+    h.query.mockImplementation(async (filters) => {
+      if (filters[0]?.kinds?.includes(39002))
+        return [
+          roster(h.relay, "other", [h.viewer.pubkey], 10),
+          metadata(h.relay, "other", "other", 10),
+        ];
+      if (filters[0]?.kinds?.includes(30078) && fail)
+        throw new Error("Transient snapshot failure");
+      return filters[0]?.kinds?.includes(9) ? [h.row] : [];
+    });
+    const snapshots = () =>
+      h.query.mock.calls.filter(([filters]) =>
+        filters[0]?.kinds?.includes(30078),
+      ).length;
+    await h.session.unread.ensure();
+    fail = true;
+    const before = snapshots();
+    // The backstop's snapshot read fails; its evidence read succeeds.
+    vi.setSystemTime(Date.now() + UNREAD_BACKSTOP_INTERVAL);
+    h.recover();
+    await vi.waitFor(() => expect(snapshots()).toBe(before + 1));
+    await vi.waitFor(() =>
+      expect(h.session.unread.sync()).toMatchObject({ status: "error" }),
+    );
+    await vi.waitFor(() =>
+      expect(h.snapshot()).toMatchObject({ freshness: "observed" }),
+    );
+    fail = false;
+    vi.setSystemTime(Date.now() + 60_000);
+    h.recover();
+    await vi.waitFor(() => expect(snapshots()).toBe(before + 2));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+/** The recovery tick's own reads: unread evidence repairs and marker snapshots. */
+function tickReads(h: ReturnType<typeof setup>) {
+  const count = (match: (filter: ReadFilter) => boolean) =>
+    h.query.mock.calls.filter(([filters]) => filters[0] && match(filters[0]))
+      .length;
+  return {
+    evidence: count(
+      (filter) => !!filter.include_aux && !!filter.kinds?.includes(40002),
+    ),
+    snapshots: count((filter) => !!filter.kinds?.includes(30078)),
+  };
+}
+
+it("an evidence overflow is repaired on the next recovery tick", async () => {
+  vi.useFakeTimers({ toFake: ["Date"], now: 1_700_000_000_000 });
+  try {
+    const h = setup();
+    const answer = h.query.getMockImplementation();
+    assert(answer);
+    h.query.mockImplementation(async (filters, signal) =>
+      filters[0]?.kinds?.includes(39002)
+        ? [
+            roster(h.relay, "other", [h.viewer.pubkey], 10),
+            metadata(h.relay, "other", "other", 10),
+          ]
+        : answer(filters, signal),
+    );
+    await h.session.unread.ensure();
+    // The connection's own repair starts the backstop interval.
+    h.reconnect();
+    await vi.waitFor(() =>
+      expect(tickReads(h)).toEqual({ evidence: 2, snapshots: 2 }),
+    );
+    h.receive(
+      Array.from({ length: 19 }, (_, i) =>
+        message(h.peer, "other", "x".repeat(450000), i + 20),
+      ),
+    );
+    expect(h.snapshot()).toMatchObject({
+      error: "Unread observation capacity reached; refresh available",
+    });
+    const before = tickReads(h).evidence;
+    vi.setSystemTime(Date.now() + 60_000);
+    h.recover();
+    await vi.waitFor(() => expect(tickReads(h).evidence).toBe(before + 1));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("a covered reconnect pays the drop's debt: the next recovery tick reads nothing", async () => {
+  vi.useFakeTimers({ toFake: ["Date"], now: 1_700_000_000_000 });
+  try {
+    const h = setup();
+    const answer = h.query.getMockImplementation();
+    assert(answer);
+    h.query.mockImplementation(async (filters, signal) =>
+      filters[0]?.kinds?.includes(39002)
+        ? [
+            roster(h.relay, "other", [h.viewer.pubkey], 10),
+            metadata(h.relay, "other", "other", 10),
+          ]
+        : answer(filters, signal),
+    );
+    await h.session.unread.ensure();
+    h.reconnect();
+    await vi.waitFor(() =>
+      expect(tickReads(h)).toEqual({ evidence: 2, snapshots: 2 }),
+    );
+    h.reconnectCovered();
+    // It resumes the markers and repairs the evidence.
+    await vi.waitFor(() =>
+      expect(tickReads(h)).toEqual({ evidence: 3, snapshots: 2 }),
+    );
+    await vi.waitFor(() =>
+      expect(h.session.unread.sync().status).toBe("reconciled"),
+    );
+    const before = tickReads(h);
+    vi.setSystemTime(Date.now() + 60_000);
+    h.recover();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(tickReads(h)).toEqual(before);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("a covered reconnect does not postpone the recovery tick's full unread repair", async () => {
+  vi.useFakeTimers({ toFake: ["Date"], now: 1_700_000_000_000 });
+  try {
+    const h = setup();
+    const answer = h.query.getMockImplementation();
+    assert(answer);
+    h.query.mockImplementation(async (filters, signal) =>
+      filters[0]?.kinds?.includes(39002)
+        ? [
+            roster(h.relay, "other", [h.viewer.pubkey], 10),
+            metadata(h.relay, "other", "other", 10),
+          ]
+        : answer(filters, signal),
+    );
+    await h.session.unread.ensure();
+    // A full repair reads the read-state snapshot; a covered one resumes it.
+    const snapshots = () => h.trace.filter(({ kind }) => kind === 30078).length;
+    const evidence = () => h.trace.filter(({ kind }) => kind === 9).length;
+    h.reconnect();
+    await vi.waitFor(() => expect(snapshots()).toBe(2));
+    const repaired = Date.now();
+    vi.setSystemTime(repaired + 10 * 60_000);
+    const before = evidence();
+    h.reconnectCovered();
+    await vi.waitFor(() => expect(evidence()).toBe(before + 1));
+    expect(snapshots()).toBe(2);
+    vi.setSystemTime(repaired + UNREAD_BACKSTOP_INTERVAL);
+    h.recover();
+    await vi.waitFor(() => expect(snapshots()).toBe(3));
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it("capacity failure stops batching and remains visible rather than becoming success", async () => {

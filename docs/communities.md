@@ -15,13 +15,14 @@ Configure `BUZZ_DEV_VIEWER` with your existing Buzz public key in `.env.local`
 development broker runs on macOS and Linux and refuses an OS-store identity
 that does not match your explicit public pin.
 Click the avatar → **Settings → Profile**. With a community selected in the
-header's community picker, Save updates only your profile in that community;
+dock's community switcher, Save updates only your profile in that community;
 there is no separate profile-destination selector. In Personal space, Save edits
-the local default for new communities without publishing. Open the header's
-community picker, choose **Join a community** and type a **Community URL**. With
-no community saved, the picker is labeled **Communities**; otherwise it shows the
-selected community's icon or the Personal space globe. There
-is no destination dropdown. Accepts `wss://` or `https://` origins, for example
+the local default for new communities without publishing. Open the dock's
+community switcher, choose **Join a community** and type a **Community URL**. The
+switcher's trigger is an icon-only button: the selected community's icon, or a
+globe in Personal space or with no community saved. Its tooltip names the
+selected community, or reads **Personal space**, or **Communities** when none is
+saved. There is no destination dropdown. Accepts `wss://` or `https://` origins, for example
 `wss://relay.example.com` or `wss://other.example.com`, and other
 Buzz-compatible community relays. No community is pre-joined; a packaged build
 that sets [`BUZZ_DEFAULT_COMMUNITY_URL`](configuration.md) only preselects one.
@@ -56,7 +57,29 @@ restore of the account's [known communities](#known-communities) joins each
 admitted destination through the same read and call. `Welcome` is also the
 second caller of the invite intent (`invite-intent.ts`) beside OS deep links:
 an address typed on the welcome screen that the restore did not admit opens
-this dialog, prefilled, as the app opens.
+this dialog, prefilled, as the app opens. Builderlab's Settings **Create
+community** is the third: through the `communityJoin` capability it opens this
+dialog on the community just created, marked submitted, so it connects at once
+as first run's **Create a community** does, without Continue. The relay adds a member newly admitted
+by an invite claim to the community's starter channels, so they are already in
+the sidebar and Messages opens the first of them. An open community needs no
+claim: there the relay adds each person, though not agents, to the starter
+channels they have never been in each time they connect, so those channels
+appear a moment later. See [local-first launch](channels.md#local-first-launch).
+
+A brand-new community has no channels. When its owner opens Messages there,
+having joined no channel, the client reads at most 20 stream or forum metadata
+events (`anyChannel`). Solo chats, DMs and system channels don't count, since
+the Bestie tab can open one first. Only when none of the rest come back, so the
+community has no stream or forum at all, open, private or archived, does it
+create one open `general` and make it a starter channel. A full batch of 20
+Solo chats counts as not empty, so it creates nothing and stops checking. It
+does this at most
+once per community on each device (a view-state marker) and once per app run,
+and the relay's unique open channel names refuse a second `general` from
+another device. Admins and members never create it, and it joins no one and
+posts nothing: Messages then opens it as the first channel. The relay is
+expected to take this over (block/buzz#9108).
 
 
 
@@ -85,7 +108,7 @@ re-reads the effective name/picture/description after the accepted receipt; a fa
 conflicting current profile retains the draft for explicit Save retry instead of
 reporting success. This confirmation is not a transaction against other clients.
 
-Use the header's community picker to select a saved community or Personal
+Use the dock's community switcher to select a saved community or Personal
 space. Personal space
 clears selection without forgetting memberships. Its **Join a community** item opens the
 existing join dialog; displaying saved communities reads relay metadata but does not open sessions for them.
@@ -343,7 +366,13 @@ relay-enforced, used by the bundled `buzz.moderation` plugin), metadata, protect
 media and live traffic stay bound to the captured destination.
 HTTP authority discovery and other upstream fetches reject redirects.
 
-The broker keeps its loopback Host check, requires exact local Origin on POSTs,
+When a viewer pin enables the broker, Vite configuration rejects non-loopback
+listeners, including CLI `--host` overrides, before loading the signing identity.
+Use the default listener or `--host 127.0.0.1`; unpinned fixture servers do not
+load an identity and retain Vite's normal host options. Packaged builds exclude
+the broker.
+
+The broker also checks the loopback Host, requires exact local Origin on POSTs,
 and rejects mismatched Origin or non-same-origin Fetch Metadata on GETs too.
 This establishes **trusted-app-origin intent, not a human gesture**; same-origin
 plugins and local processes remain trusted, not sandboxed. User-directed HTTPS
@@ -471,3 +500,9 @@ while keeping the local name unchanged. No remote membership, profile, or policy
 acceptance is created by this fixture. Live validation with an authorized identity can restore existing profiles and
 read selected communities without posting test messages. The fixture itself is
 not evidence of live access; see [manual fixture setup](contributing.md#manual-browser-fixtures).
+
+First-run profile setup preserves an existing relay profile, including one without
+a display name, and skips editing it. When restoring multiple saved communities
+without a requested destination, Buzz prefers one with an existing profile. After
+admission, new-profile setup offers Continue without a Back action: returning to
+selection would not undo the membership already granted by the community.

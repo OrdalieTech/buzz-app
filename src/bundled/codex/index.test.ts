@@ -1,3 +1,4 @@
+import type { AgentExecutionBinding } from "../../features/agents/execution";
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AgentType } from "../../features/agents/service";
@@ -20,13 +21,17 @@ afterEach(() => {
 });
 
 /** Applies the plugin to a stand-in context and returns the registered type. */
-function applied() {
+function applied(binding?: AgentExecutionBinding) {
   let type: AgentType | undefined;
   const subscribe = () => () => undefined;
   const ctx = {
+    agentProtection: { registerModels: vi.fn() },
     pluginOwner: { id: "buzz.codex", revision: "r1" },
-    host: { spawn: vi.fn(), request: vi.fn() },
+    host: { spawn: vi.fn(), readFile: vi.fn(), request: vi.fn() },
     agents: {
+      executionBinding: () => binding,
+      inspectExecution: async () => binding,
+      execution: async () => undefined,
       register: (registered: AgentType) => {
         type = registered;
       },
@@ -124,9 +129,13 @@ it("stops agents that stop running even when the agent list could not be read", 
   let state = { status: "ready", agents: [agent], running: [agent] };
   let notify = () => undefined;
   apply({
+    agentProtection: { registerModels: vi.fn() },
     pluginOwner: { id: "buzz.codex" },
     host: { spawn: vi.fn(), request: vi.fn() },
     agents: {
+      executionBinding: () => undefined,
+      inspectExecution: async () => undefined,
+      execution: async () => undefined,
       register: () => undefined,
       snapshot: () => state,
       relay: () => undefined,
@@ -188,9 +197,13 @@ it("starts the server once Codex is updated and checked, only while a Codex agen
   };
   let cleanup: () => void = () => undefined;
   apply({
+    agentProtection: { registerModels: vi.fn() },
     pluginOwner: { id: "buzz.codex" },
     host: { spawn: vi.fn(), request: vi.fn() },
     agents: {
+      executionBinding: () => undefined,
+      inspectExecution: async () => undefined,
+      execution: async () => undefined,
       register: () => undefined,
       snapshot: () => state,
       relay: () => undefined,
@@ -284,4 +297,17 @@ it("preserves a compatible shared Codex model", () => {
   expect(type?.importShared?.(shared ?? { model: "" })).toMatchObject({
     model: "gpt-shared",
   });
+});
+
+it("reports remote usage as unavailable before reading desktop history", async () => {
+  const type = applied({
+    provider: "test/guest",
+  });
+  if (!type?.usage) throw new Error("Codex usage is not registered");
+  await expect(
+    type.usage({ key: "a".repeat(64) } as never, {
+      since: 0,
+      signal: new AbortController().signal,
+    }),
+  ).rejects.toThrow("Usage is unavailable for remote Codex agents");
 });

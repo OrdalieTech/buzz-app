@@ -7,6 +7,7 @@ import {
   type PullDetails,
   type PullStates,
 } from "./pull-states";
+import { parseGitHubReference } from "./references";
 
 /** The panel's facts, such as files changed, as plain values under
  * snake_case keys. */
@@ -73,7 +74,11 @@ export function addPullStateTool(
       additionalProperties: false,
     },
     async call(_client, _context, args) {
-      if (typeof args.url !== "string")
+      // The store reads issues' state too, for links; this is pull requests'.
+      if (
+        typeof args.url !== "string" ||
+        parseGitHubReference(args.url)?.kind !== "pull"
+      )
         throw new Error("url must be a GitHub pull request URL");
       const { state, readAt, error } = await states.read(args.url, {
         maxAge: args.fresh === true ? 0 : PULL_REFRESH_MS,

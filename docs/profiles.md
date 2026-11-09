@@ -10,6 +10,23 @@ the app's Delete action, from `features/agents` (`useAgent`, `agentSections`).
 Its settings, attention and identity are edited there or on the Agents page;
 Profiles adds no second editor, runtime view or process control.
 
+## Display names
+
+Kind-0 display names and handles are trimmed at the shared profile projection.
+Names containing control, line/paragraph separator, bidi-control, or interlinear
+annotation characters (U+FFF9–U+FFFB) fall back to a safe handle or the public-key
+fragment. Script joiners and variation selectors remain in displayed names,
+including Persian ZWNJ and ideographic variation sequences. Signed profile events
+are retained unchanged.
+
+Verified-name collision comparisons also ignore default-ignorable characters
+on both sides, then trim whitespace, so a hidden character or visually inert
+emoji selector cannot avoid the public-key suffix. This comparison can
+conservatively qualify visually different names. It does not provide
+general Unicode confusable detection: canonical-equivalent accents and repeated
+interior whitespace retain the existing naming policy. Names never replace keys
+as identity or authorization evidence.
+
 ## Agent activity
 
 Opening an agent's activity (`buzz:profile?agent=<key>&tab=activity`, from a
@@ -56,7 +73,8 @@ performs DNS verification. Ordinary human profiles have no agent fields.
 
 ## Boundaries
 
-- Shared message UI recognizes author-avatar targets and identity-bound mentions.
+- Shared message UI recognizes author-avatar and byline-name targets and
+  identity-bound mentions.
   Ordinary `canOpenLink` / `onOpenLink` props advertise availability and dispatch.
   Channels resolves active contributions at click time and owns the right slot.
 - `nostr:npub…` is the exact public-key target, with no relay hint or authority.

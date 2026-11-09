@@ -12,17 +12,17 @@ use zeroize::Zeroizing;
 #[cfg(all(not(test), target_os = "macos", debug_assertions))]
 mod dev_helper;
 
-/// Debug-only access to the selected local helper for the agent store.
-/// `None` means no helper is configured. A helper failure never permits OS access.
+/// Debug-only: the selected local helper's answer for one item, or `None` when
+/// no helper is configured. A helper failure never permits OS access.
 #[cfg(all(not(test), target_os = "macos", debug_assertions))]
-pub fn dev_agent_store(
+pub fn dev_item(
     operation: &str,
     service: &str,
     account: &str,
     value: &[u8],
 ) -> Option<Result<Zeroizing<Vec<u8>>>> {
     std::env::var_os("BUZZ_DEV_CREDENTIAL_HELPER")
-        .map(|helper| dev_helper::agent(&helper, operation, service, account, value))
+        .map(|helper| dev_helper::item(&helper, operation, service, account, value))
 }
 
 pub const HUMAN_ACCOUNT: &str = "human";
@@ -297,14 +297,49 @@ fn optional(result: Result<Zeroizing<Vec<u8>>>) -> Result<Option<Zeroizing<Vec<u
     }
 }
 
-/// Read only the human identity used by the desktop app; never create or select
-/// another key. One saved before 1.0 is copied to the current service first.
+/// Whether this is a debug build `just desktop me` started, which signs in with
+/// the release build's human key. Only that launcher sets the variable.
+pub fn reads_release_human() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("BUZZ_DEV_RELEASE_KEY").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+/// The human identity the desktop app signs with. A `just desktop me` build reads
+/// the release build's key, read-only: it never copies, replaces or deletes it,
+/// and creates, imports and Sign out still use only its own item. With no release
+/// key saved it falls back to its own.
 #[cfg(not(test))]
 pub fn read_human() -> Result<Zeroizing<Vec<u8>>> {
-    #[cfg(all(target_os = "macos", debug_assertions))]
-    if let Some(helper) = std::env::var_os("BUZZ_DEV_CREDENTIAL_HELPER") {
-        return dev_helper::read(&helper);
+    release_or_own(
+        reads_release_human(),
+        |service| read(service, HUMAN_ACCOUNT),
+        read_own_human,
+    )
+}
+
+/// The release key, under its current service or the one from before 1.0, else
+/// this build's own. Only absence falls through: a denied or broken read of the
+/// release key never swaps in another key.
+fn release_or_own(
+    release: bool,
+    read: impl Fn(&str) -> Result<Zeroizing<Vec<u8>>>,
+    own: impl FnOnce() -> Result<Zeroizing<Vec<u8>>>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    if release {
+        for service in [human_service(false), human_store(false)] {
+            match read(service) {
+                Err(Error::Absent) => {}
+                result => return result,
+            }
+        }
     }
+    own()
+}
+
+/// Read only this build's own human identity; never create or select another
+/// key. One saved before 1.0 is copied to the current service first.
+#[cfg(not(test))]
+pub fn read_own_human() -> Result<Zeroizing<Vec<u8>>> {
     read_or_copy(
         || optional(read(HUMAN_SERVICE, HUMAN_ACCOUNT)),
         || copy(PREVIOUS_HUMAN_SERVICE, HUMAN_SERVICE, HUMAN_ACCOUNT),
@@ -332,6 +367,10 @@ pub fn read_previous_human() -> Result<Zeroizing<Vec<u8>>> {
 /// Read an exact service/account from the default Keychain, which `add` writes.
 #[cfg(all(not(test), target_os = "macos"))]
 pub fn read(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
+    #[cfg(debug_assertions)]
+    if let Some(result) = dev_item("read", service, account, &[]) {
+        return result;
+    }
     use security_framework::os::macos::keychain::SecKeychain;
     SecKeychain::default()
         .map_err(mac_error)?
@@ -343,11 +382,35 @@ pub fn read(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
 /// Add a credential; Keychain refuses to replace a saved one.
 #[cfg(all(not(test), target_os = "macos"))]
 pub fn add(service: &str, account: &str, value: &[u8]) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if let Some(result) = dev_item("add", service, account, value) {
+        return result.map(|_| ());
+    }
     use security_framework::os::macos::keychain::SecKeychain;
     SecKeychain::default()
         .map_err(mac_error)?
         .add_generic_password(service, account, value)
         .map_err(mac_error)
+}
+
+/// Write a credential whether or not one is saved, updating a saved item in
+/// place so a failed write keeps it. For settings, never for identities.
+#[cfg(all(not(test), target_os = "macos"))]
+pub fn replace(service: &str, account: &str, value: &[u8]) -> Result<()> {
+    use security_framework::os::macos::keychain::SecKeychain;
+    let _lock = acquire(&lock_root()?, service, account)?;
+    #[cfg(debug_assertions)]
+    if let Some(result) = dev_item("replace", service, account, value) {
+        return result.map(|_| ());
+    }
+    let keychain = SecKeychain::default().map_err(mac_error)?;
+    match keychain.find_generic_password(service, account) {
+        Ok((_, mut item)) => item.set_password(value).map_err(mac_error),
+        Err(error) if mac_error(error) == Error::Absent => keychain
+            .add_generic_password(service, account, value)
+            .map_err(mac_error),
+        Err(error) => Err(mac_error(error)),
+    }
 }
 
 /// Delete only the exact credential, under the same lock as [`copy`], and
@@ -356,6 +419,10 @@ pub fn add(service: &str, account: &str, value: &[u8]) -> Result<()> {
 pub fn delete(service: &str, account: &str) -> Result<()> {
     use security_framework::os::macos::keychain::SecKeychain;
     let _lock = acquire(&lock_root()?, service, account)?;
+    #[cfg(debug_assertions)]
+    if let Some(result) = dev_item("delete", service, account, &[]) {
+        return result.map(|_| ());
+    }
     let keychain = SecKeychain::default().map_err(mac_error)?;
     let (_, item) = keychain
         .find_generic_password(service, account)
@@ -407,6 +474,10 @@ pub fn delete_session(service: &str, account: &str) -> Result<()> {
         return Err(Error::Denied);
     }
     let _lock = acquire(&lock_root()?, service, account)?;
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    if let Some(result) = dev_item("delete", service, account, &[]) {
+        return result.map(|_| ());
+    }
     #[cfg(target_os = "macos")]
     return security_framework::passwords::delete_generic_password(service, account)
         .map_err(mac_error);
@@ -437,7 +508,20 @@ pub fn compare_session(
     if current.as_deref().map(|v| v.as_slice()) != expected {
         return Err(Error::Changed);
     }
-    session_write(service, account, replacement)
+    let result = session_write(service, account, replacement);
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    if result == Err(Error::Unavailable) && std::env::var_os("BUZZ_DEV_CREDENTIAL_HELPER").is_some()
+    {
+        let stored = match read_session(service, account) {
+            Ok(value) => Some(value),
+            Err(Error::Absent) => None,
+            Err(_) => return result,
+        };
+        if stored.as_deref().map(|value| value.as_slice()) == replacement {
+            return Ok(());
+        }
+    }
+    result
 }
 
 #[cfg(all(not(test), any(target_os = "windows", target_os = "linux")))]
@@ -459,6 +543,10 @@ fn session_write(service: &str, account: &str, value: Option<&[u8]>) -> Result<(
 
 #[cfg(all(not(test), target_os = "macos"))]
 pub fn read_session(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> {
+    #[cfg(debug_assertions)]
+    if let Some(result) = dev_item("read", service, account, &[]) {
+        return result;
+    }
     use security_framework::os::macos::keychain::SecKeychain;
     SecKeychain::default()
         .map_err(mac_error)?
@@ -469,6 +557,18 @@ pub fn read_session(service: &str, account: &str) -> Result<Zeroizing<Vec<u8>>> 
 
 #[cfg(all(not(test), target_os = "macos"))]
 fn session_write(service: &str, account: &str, value: Option<&[u8]>) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if let Some(result) = dev_item(
+        if value.is_some() { "replace" } else { "delete" },
+        service,
+        account,
+        value.unwrap_or_default(),
+    ) {
+        return match result {
+            Err(Error::Absent) if value.is_none() => Ok(()),
+            result => result.map(|_| ()),
+        };
+    }
     use security_framework::os::macos::keychain::SecKeychain;
     let keychain = SecKeychain::default().map_err(mac_error)?;
     match (keychain.find_generic_password(service, account), value) {

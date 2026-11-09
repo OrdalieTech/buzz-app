@@ -22,7 +22,10 @@ describe("parseFirstRunAccountSeed", () => {
     if (!seed) throw new Error("unreachable");
     const account = seededAccount(seed, noImport);
     expect(await account.linkedKey()).toBeNull();
-    expect(await account.ownedCommunities()).toEqual([]);
+    expect(await account.communityList()).toEqual({
+      owned: [],
+      canCreate: false,
+    });
     expect(await account.knownCommunities()).toEqual([]);
     await expect(account.backUp(pubkey)).resolves.toBeUndefined();
     await expect(account.bind(pubkey)).resolves.toBeUndefined();

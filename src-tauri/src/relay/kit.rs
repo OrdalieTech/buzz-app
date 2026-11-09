@@ -6,6 +6,9 @@ const ME_KIT_TAG: &str = "buzz-me-kit-v1";
 const MANIFEST_TAG: &str = "buzz-channel-kit-v2";
 const PAYLOAD_TAG: &str = "buzz-team-payload-v1";
 const TEXT_TAG: &str = "buzz-team-text-v1";
+/// Canvas a channel template may carry. Mirrors `TEMPLATE_CANVAS_BYTES` in
+/// `channel-templates/model.ts`; live Canvases have their own limit.
+const TEMPLATE_CANVAS_BYTES: usize = 24 * 1024;
 /// `v1:` plus at most 128 KiB of UTF-8 team instructions.
 const TEXT_MANIFEST_BYTES: std::ops::RangeInclusive<u64> = 3..=3 + 128 * 1024;
 fn portable(value: &Value) -> bool {
@@ -96,10 +99,10 @@ fn keys(value: Option<&Value>, max: usize, ids: bool) -> bool {
 fn lineup(value: &Value) -> bool {
     keys(value.get("teamIds"), 100, true)
         && keys(value.get("agents"), 200, false)
-        && text(value.get("canvas"), 24 * 1024, false)
+        && text(value.get("canvas"), TEMPLATE_CANVAS_BYTES, false)
         && value["canvas"]
             .as_str()
-            .is_some_and(|s| s.len() <= 24 * 1024)
+            .is_some_and(|s| s.len() <= TEMPLATE_CANVAS_BYTES)
 }
 fn only(value: &Value, allowed: &[&str]) -> bool {
     value

@@ -15,7 +15,9 @@ export const KIT_TAG = "buzz-channel-kit-v1";
 /** Separate discovery prevents older clients from rejecting the whole catalog. */
 export const ME_KIT_TAG = "buzz-me-kit-v1";
 export const KIT_RECORD_BYTES = 16 * 1024;
-export const CANVAS_BYTES = 24 * 1024;
+/** Canvas content a channel template may carry. */
+export const TEMPLATE_CANVAS_BYTES = 24 * 1024;
+export { LIVE_CANVAS_BYTES, LIVE_CANVAS_LIMIT } from "./canvas-limits.ts";
 export type Lineup = { teamIds: string[]; agents: string[]; canvas: string };
 export type Team = {
   type: "team";
@@ -114,9 +116,11 @@ function keys(value: unknown, pattern: RegExp, max: number): string[] {
 }
 export function parseLineup(raw: unknown): Lineup {
   const v = object(raw);
-  const canvas = text(v.canvas, CANVAS_BYTES);
-  if (new TextEncoder().encode(canvas).length > CANVAS_BYTES)
-    throw new Error("Canvas is too large (24 KiB maximum)");
+  const canvas = text(v.canvas, TEMPLATE_CANVAS_BYTES);
+  if (new TextEncoder().encode(canvas).length > TEMPLATE_CANVAS_BYTES)
+    throw new Error(
+      `Canvas is too large (${TEMPLATE_CANVAS_BYTES / 1024} KiB maximum)`,
+    );
   return {
     teamIds: keys(v.teamIds, idPattern, 100),
     agents: keys(v.agents, keyPattern, 200),

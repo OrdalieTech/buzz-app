@@ -173,6 +173,60 @@ it("waits for a cold Settings provider address until its plugin registers", asyn
   expect(await screen.findByText(pageFailure)).toBeVisible();
 });
 
+it("Back closes a Settings provider while leaving Settings open and Forward reopens it", async () => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  activation.release();
+  const current = createServices();
+  services = current;
+  render(<App services={current} />);
+  await waitFor(() =>
+    expect(current.navigation.snapshot().status).not.toBe("pending"),
+  );
+  void current.navigation.open({
+    version: 1,
+    kind: "settings",
+    section: "agents",
+  });
+  const trigger = await screen.findByRole("button", {
+    name: "Gated provider, ready",
+  });
+  const agentSetup = current.navigation.snapshot().entry.target;
+  expect(agentSetup).not.toHaveProperty("provider");
+  fireEvent.click(trigger);
+  const provider = await screen.findByRole("dialog", {
+    name: "Gated provider",
+  });
+  expect(provider).toHaveAttribute("data-navigation-visit");
+  expect(current.navigation.snapshot().entry.target).toEqual({
+    ...agentSetup,
+    provider: "test.gated/provider",
+  });
+  expect(fireEvent.keyDown(provider, { ctrlKey: true, key: "[" })).toBe(false);
+  await waitFor(() =>
+    expect(screen.queryByRole("dialog", { name: "Gated provider" })).toBeNull(),
+  );
+  expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+  expect(current.navigation.snapshot().entry.target).toEqual(agentSetup);
+  fireEvent.keyDown(screen.getByRole("dialog", { name: "Settings" }), {
+    ctrlKey: true,
+    key: "]",
+  });
+  expect(
+    await screen.findByRole("dialog", { name: "Gated provider" }),
+  ).toBeVisible();
+  expect(current.navigation.snapshot().entry.target).toEqual({
+    ...agentSetup,
+    provider: "test.gated/provider",
+  });
+});
+
 it("reports a settled plugin's absent Settings provider as unavailable", async () => {
   vi.stubGlobal(
     "ResizeObserver",
@@ -652,4 +706,163 @@ it("opens removed Messages settings links at Appearance without adding a navigat
     section: "appearance",
   });
   expect(screen.queryByRole("button", { name: "Messages" })).toBeNull();
+});
+
+it("keeps a return path for addressed plugin settings through Back and Forward", async () => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  activation.release();
+  const current = createServices();
+  services = current;
+  render(<App services={current} />);
+  await waitFor(() =>
+    expect(current.navigation.snapshot().status).not.toBe("pending"),
+  );
+  const target = {
+    version: 1,
+    kind: "settings",
+    section: "plugins",
+    pluginId: "buzz.pairing",
+    scope: null,
+  } as const;
+  const list = {
+    version: 1,
+    kind: "settings",
+    section: "plugins",
+    scope: null,
+  } as const;
+  void current.navigation.open(list);
+  await screen.findByRole("dialog", { name: "Settings" });
+  await waitFor(() =>
+    expect(current.navigation.snapshot().status).toBe("opened"),
+  );
+  void current.navigation.open(target);
+  expect(
+    await screen.findByRole("complementary", { name: "Pair mobile details" }),
+  ).toBeVisible();
+  current.navigation.back();
+  await waitFor(() =>
+    expect(current.navigation.snapshot().entry.target).toEqual(list),
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("complementary", { name: "Pair mobile details" }),
+    ).not.toBeInTheDocument(),
+  );
+  current.navigation.forward();
+  expect(
+    await screen.findByRole("complementary", { name: "Pair mobile details" }),
+  ).toBeVisible();
+});
+
+it("retires every visit to addressed plugin settings on Close", async () => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  activation.release();
+  const current = createServices();
+  services = current;
+  render(<App services={current} />);
+  await waitFor(() =>
+    expect(current.navigation.snapshot().status).not.toBe("pending"),
+  );
+  const target = {
+    version: 1,
+    kind: "settings",
+    section: "plugins",
+    pluginId: "buzz.pairing",
+    scope: null,
+  } as const;
+  const list = {
+    version: 1,
+    kind: "settings",
+    section: "plugins",
+    scope: null,
+  } as const;
+  void current.navigation.open(list);
+  await screen.findByRole("dialog", { name: "Settings" });
+  await waitFor(() =>
+    expect(current.navigation.snapshot().status).toBe("opened"),
+  );
+  // An earlier details visit stays behind Appearance; Close must retire it too.
+  void current.navigation.open(target);
+  await screen.findByRole("complementary", { name: "Pair mobile details" });
+  const appearance = { ...list, section: "appearance" };
+  void current.navigation.open(appearance);
+  await waitFor(() =>
+    expect(current.navigation.snapshot().status).toBe("opened"),
+  );
+  void current.navigation.open(target);
+  await screen.findByRole("complementary", { name: "Pair mobile details" });
+  fireEvent.click(screen.getByRole("button", { name: "Close plugin details" }));
+  await waitFor(() =>
+    expect(current.navigation.snapshot().entry.target).toEqual({
+      version: 1,
+      kind: "settings",
+      section: "plugins",
+      scope: null,
+    }),
+  );
+  current.navigation.back();
+  await waitFor(() =>
+    expect(current.navigation.snapshot().entry.target).toEqual(appearance),
+  );
+  current.navigation.back();
+  await waitFor(() =>
+    expect(current.navigation.snapshot().entry.target).toEqual(list),
+  );
+  expect(
+    screen.queryByRole("complementary", { name: "Pair mobile details" }),
+  ).not.toBeInTheDocument();
+});
+
+it("Back closes Settings onto the view beneath and Forward reopens it; other shortcuts stay blocked", async () => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  activation.release();
+  const current = createServices();
+  services = current;
+  render(<App services={current} />);
+  // Whatever view the app settles on first lies beneath Settings.
+  await waitFor(() =>
+    expect(current.navigation.snapshot().status).not.toBe("pending"),
+  );
+  const beneath = current.navigation.snapshot().entry.target;
+  const settings = { version: 1, kind: "settings", scope: null } as const;
+  void current.navigation.open(settings);
+  const dialog = await screen.findByRole("dialog", { name: "Settings" });
+  expect(dialog).toHaveAttribute("data-navigation-visit");
+  const key = (init: KeyboardEventInit) =>
+    fireEvent.keyDown(screen.getByRole("button", { name: "Close Settings" }), {
+      ctrlKey: true,
+      ...init,
+    });
+  // Home is not a Back/Forward shortcut: Settings keeps today's modal policy.
+  key({ key: "o", shiftKey: true });
+  await act(async () => {});
+  expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+  key({ key: "[" });
+  await waitFor(() =>
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull(),
+  );
+  expect(current.navigation.snapshot().entry.target).toEqual(beneath);
+  fireEvent.keyDown(document.body, { ctrlKey: true, key: "]" });
+  expect(await screen.findByRole("dialog", { name: "Settings" })).toBeVisible();
 });

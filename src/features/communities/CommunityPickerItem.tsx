@@ -48,6 +48,18 @@ export type SelectedSession = {
 
 const noSubscription = () => () => {};
 
+/** Marks every conversation read and reports the outcome in a toast. Shared by
+ * the menu item and the Shift+Escape shortcut. */
+export function markAllRead(
+  unread: Pick<UnreadCapability, "markAllChannelsRead">,
+  notify: ReturnType<typeof useToastNotification>,
+) {
+  return unread.markAllChannelsRead().then(
+    () => notify("Marked all as read.", "success"),
+    () => notify("Couldn’t mark everything as read.", "error"),
+  );
+}
+
 /** One picker row and its context menu. Selection stays with the picker. */
 export function CommunityPickerItem({
   membership,
@@ -279,10 +291,7 @@ function MarkAllReadItem({
         aria-describedby={reason ? noteId : undefined}
         onClick={() => {
           if (!unread || reason) return;
-          void unread.markAllChannelsRead().then(
-            () => notify("Marked all as read.", "success"),
-            () => notify("Couldn’t mark everything as read.", "error"),
-          );
+          void markAllRead(unread, notify);
         }}
       >
         <MenuIcon>

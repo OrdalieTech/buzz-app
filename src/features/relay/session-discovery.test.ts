@@ -2,7 +2,7 @@ import { expect, it } from "vitest";
 import { DiscoveryState } from "./discovery";
 import { keypair, roster, signed } from "./testing";
 import { SOLO_LABEL } from "../solo/labels";
-it("recognizes only relay-authorized private streams with the Solo label", () => {
+it("recognizes relay-authorized streams with the Solo label independently of visibility", () => {
   const viewer = keypair(),
     relay = keypair();
   const discovery = new DiscoveryState(viewer.pubkey, relay.pubkey);
@@ -28,7 +28,7 @@ it("recognizes only relay-authorized private streams with the Solo label", () =>
   discovery.accept(metadata(viewer, true, 1));
   expect(discovery.isSolo("work")).toBe(false);
   discovery.accept(metadata(relay, false, 1));
-  expect(discovery.isSolo("work")).toBe(false);
+  expect(discovery.isSolo("work")).toBe(true);
   discovery.accept(metadata(relay, true, 2));
   expect(discovery.channels()[0]).toMatchObject({
     channelType: "solo",

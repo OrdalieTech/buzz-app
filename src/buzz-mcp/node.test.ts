@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bytesToHex } from "nostr-tools/utils";
 import { keypair, signed } from "../features/relay/testing";
+import { LIVE_CANVAS_BYTES } from "../features/channel-templates/canvas-limits.ts";
 import { nodeClient, relayAuthority, relayAuthorityLookup } from "./node";
 import { callTool, memoryVersion } from "./tools";
 
@@ -308,4 +309,24 @@ describe("relayAuthority", () => {
     expect(await lookup()).toBe(key);
     expect(fetch).toHaveBeenCalledTimes(2);
   });
+});
+
+it("refuses a Canvas whose escaped signed event would exceed the relay frame", async () => {
+  const buzz = client();
+  const tags = [["h", "c"]];
+  await buzz.publish({
+    kind: 40100,
+    content: "x".repeat(LIVE_CANVAS_BYTES),
+    tags,
+  });
+  expect(stored).toHaveLength(1);
+  await expect(
+    (async () =>
+      buzz.publish({
+        kind: 40100,
+        content: '"'.repeat(LIVE_CANVAS_BYTES),
+        tags,
+      }))(),
+  ).rejects.toThrow("too large to publish");
+  expect(stored).toHaveLength(1);
 });

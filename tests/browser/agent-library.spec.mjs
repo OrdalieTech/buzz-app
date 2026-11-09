@@ -1,6 +1,95 @@
 import { pauseClock } from "./clock.mjs";
 import { test, expect } from "./source-fixture.mjs";
 
+test("create-time Thinking uses each provider control in the Agents shell", async ({
+  page,
+}, info) => {
+  await page.setViewportSize({ width: 1280, height: 950 });
+  await page.goto("/tests/fixtures/agent-library.html?harness");
+  await page.getByRole("button", { name: "New agent" }).click();
+  await page
+    .getByRole("menuitem", { name: "Create a new agent", exact: true })
+    .click();
+  const baselineDialog = page.getByRole("dialog", { name: "Create agent" });
+  await expect(
+    baselineDialog.getByRole("combobox", { name: "Thinking" }),
+  ).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath("thinking-before.png") });
+
+  for (const provider of ["claude", "codex"]) {
+    for (const dark of [false, true]) {
+      for (const width of [1280, 390]) {
+        await page.setViewportSize({ width, height: 950 });
+        await page.goto(
+          `/tests/fixtures/agent-library.html?thinking=${provider}`,
+        );
+        await page.evaluate(
+          ({ dark, fontSize }) => {
+            document.documentElement.classList.toggle("dark", dark);
+            document.documentElement.style.fontSize = fontSize;
+          },
+          { dark, fontSize: width === 390 ? "20px" : "16px" },
+        );
+
+        await page.getByRole("button", { name: "New agent" }).click();
+        await page
+          .getByRole("menuitem", { name: "Create a new agent", exact: true })
+          .click();
+        const dialog = page.getByRole("dialog", { name: "Create agent" });
+        await expect(dialog).toBeVisible();
+        const thinking = dialog.getByRole("combobox", { name: "Thinking" });
+        await expect(thinking).toBeVisible();
+        await expect(thinking).toBeEnabled();
+        await expect(thinking).toContainText(
+          provider === "codex" ? "Low · Default" : "Automatic · Default",
+        );
+
+        await thinking.focus();
+        await expect(thinking).toBeFocused();
+        const clearsStickyFooter = await thinking.evaluate((element) => {
+          const footer = element
+            .closest(".buzz-dialog")
+            ?.querySelector(".buzz-dialog-actions");
+          return (
+            footer != null &&
+            element.getBoundingClientRect().bottom <=
+              footer.getBoundingClientRect().top
+          );
+        });
+        expect(clearsStickyFooter).toBe(true);
+        await page.keyboard.press("Enter");
+        const defaultOption =
+          provider === "codex" ? "Low · Default" : "Automatic · Default";
+        await expect(
+          page.getByRole("option", { name: defaultOption }),
+        ).toBeFocused();
+        await page.keyboard.press("ArrowDown");
+        await expect(
+          page.getByRole("option", { name: "Low", exact: true }),
+        ).toBeFocused();
+        await page.keyboard.press("ArrowDown");
+        await expect(
+          page.getByRole("option", { name: "High", exact: true }),
+        ).toBeFocused();
+        await page.keyboard.press("Enter");
+        await expect(thinking).toContainText("High");
+        if (
+          (provider === "claude" && dark === false && width === 1280) ||
+          (provider === "claude" && dark === true && width === 390) ||
+          (provider === "codex" && dark === false && width === 390) ||
+          (provider === "codex" && dark === true && width === 1280)
+        ) {
+          await page.screenshot({
+            path: info.outputPath(
+              `thinking-${provider}-${dark ? "dark" : "light"}-${width}.png`,
+            ),
+          });
+        }
+      }
+    }
+  }
+});
+
 // Real grid/flex sizing decides whether the slug truncates; jsdom cannot measure it.
 test("long memory labels truncate within the agent pane", async ({ page }) => {
   const slug = `mem/${Array.from({ length: 3 }, () => "long-memory-label".repeat(3)).join("/")}`;
@@ -441,6 +530,16 @@ test("agent cards expose selection and creation preserves focus and avatar choic
   const dialog = page.getByRole("dialog");
   const name = dialog.getByRole("textbox", { name: "Name", exact: true });
   await expect(name).toBeFocused();
+  const create = dialog.getByRole("button", {
+    name: "Create agent",
+    exact: true,
+  });
+  await expect(create).toBeDisabled();
+  await name.fill("Nova");
+  await expect(create).toBeEnabled();
+  await name.fill("   ");
+  await expect(create).toBeDisabled();
+  await name.fill("");
   await expect
     .poll(() =>
       name.evaluate((field) => getComputedStyle(field).borderBottomColor),
@@ -528,10 +627,16 @@ test("agent cards expose selection and creation preserves focus and avatar choic
       }),
     )
     .toBe(true);
+  // Ordinary creation is gated; a direct submit still reveals invalid fields.
+  await expect(create).toBeDisabled();
+  await expect(name).not.toBeFocused();
   await dialog
-    .getByRole("button", { name: "Create agent", exact: true })
-    .click();
+    .getByRole("form", { name: "New agent", exact: true })
+    .evaluate((form) => form.requestSubmit());
   await expect(name).toBeFocused();
+  await expect(
+    dialog.getByText("Add a name to create your agent", { exact: true }),
+  ).toBeVisible();
   await expect
     .poll(() =>
       name.evaluate((field) => {
@@ -773,7 +878,7 @@ test("team imports explain scope before running and restore the trigger on cance
       exact: true,
     });
     await expect(
-      dialog.getByRole("button", { name: "Cancel", exact: true }),
+      dialog.getByRole("button", { name: "Import", exact: true }),
     ).toBeFocused();
     await expect(
       dialog.getByRole("figure", { name: /^From community-/ }),

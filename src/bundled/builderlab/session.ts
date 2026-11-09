@@ -8,8 +8,11 @@ export type Account = Readonly<{
   canUseRemoteAgents: boolean;
   canUseBuilderlabDecisions: boolean;
 }>;
-/** One sign-in. A new sign-in is a new object, so identity tells a change. */
-export type Credential = Readonly<{ account: Account }>;
+/**
+ * One sign-in: the NIP-FI session's public revision and its account. A new
+ * sign-in is a new object, so identity tells a change. Never a token.
+ */
+export type Credential = Readonly<{ revision: string; account: Account }>;
 export type LoginSnapshot = Readonly<{
   status: "signed-out" | "pending" | "signed-in";
   account?: Account;
@@ -17,6 +20,8 @@ export type LoginSnapshot = Readonly<{
   /** Pending with no browser step, such as restoring a saved sign-in or
    * reading its account; it cannot be cancelled. */
   checking?: boolean;
+  /** Signing out a rejected account failed; Try again retries it. */
+  retrySignOut?: boolean;
 }>;
 /** A call under the Builderlab API root; `path` starts with `/`. */
 export type BuilderlabRequest = Readonly<{
@@ -27,9 +32,9 @@ export type BuilderlabRequest = Readonly<{
 }>;
 
 /**
- * Builderlab's sign-in: the legacy in-memory OAuth credential, or in an FI
- * build the native NIP-FI session, whose token stays in OS secure storage
- * and survives restarts. Neither hands its token to consumers.
+ * Builderlab's sign-in: the native NIP-FI session, whose token stays in OS
+ * secure storage and survives restarts, or in live development the broker's.
+ * Neither hands its token to consumers.
  */
 export type BuilderlabSession = Readonly<{
   snapshot(): LoginSnapshot;
@@ -40,8 +45,6 @@ export type BuilderlabSession = Readonly<{
     credential: Credential,
     input: BuilderlabRequest,
   ): Promise<HostResponse>;
-  /** Builderlab answered a call by `credential` with HTTP 401. */
-  expired(credential: Credential): void;
   viewerSession(): BuilderlabViewerSession;
   /** Creation joins a login that is already running; it never cancels it. */
   ensureSignedIn(signal: AbortSignal): Promise<void>;
@@ -70,6 +73,41 @@ export async function accountStorage(subject: string) {
 export const nativeBuilderlab = () =>
   import.meta.env.VITE_BUZZ_FEDERATED_IDENTITY === "1";
 
+/**
+ * The current NIP-FI session's account from Builderlab's `GET v1/auth/me`,
+ * through the native forwarder, or undefined for any answer that is not one.
+ * Rejects when the call or its JSON fails.
+ */
+export async function federatedAccount(
+  identity: Pick<FederatedIdentity, "snapshot" | "request">,
+): Promise<Account | undefined> {
+  const authority = identity.snapshot().authority;
+  if (!authority) return undefined;
+  const response = await identity.request({
+    path: `${authority.apiBasePath}v1/auth/me`,
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
+  if (response.status < 200 || response.status >= 300) return undefined;
+  const value = JSON.parse(response.body) as {
+    subject?: unknown;
+    email?: unknown;
+    capabilities?: {
+      can_use_remote_agents?: unknown;
+      can_use_builderlab_decisions?: unknown;
+    };
+  };
+  if (typeof value?.subject !== "string" || !value.subject.trim())
+    return undefined;
+  return Object.freeze({
+    subject: value.subject,
+    email: typeof value.email === "string" ? value.email.trim() : "",
+    canUseRemoteAgents: value.capabilities?.can_use_remote_agents === true,
+    canUseBuilderlabDecisions:
+      value.capabilities?.can_use_builderlab_decisions === true,
+  });
+}
+
 const ACCOUNT_FAILED = "Could not load your Builderlab account. Try again.";
 
 /**
@@ -81,7 +119,7 @@ const ACCOUNT_FAILED = "Could not load your Builderlab account. Try again.";
 export function createNativeSession(
   identity: FederatedIdentity,
 ): BuilderlabSession {
-  type Native = Credential & Readonly<{ revision: string; storage: string }>;
+  type Native = Credential & Readonly<{ storage: string }>;
   let credential: Native | undefined;
   let viewer: BuilderlabViewerSession | undefined;
   let viewerLifetime: AbortController | undefined;
@@ -123,33 +161,8 @@ export function createNativeSession(
     let account: Account | undefined;
     let storage = "";
     try {
-      const authority = identity.snapshot().authority;
-      if (!authority) throw new Error(ACCOUNT_FAILED);
-      const response = await identity.request({
-        path: `${authority.apiBasePath}v1/auth/me`,
-        method: "GET",
-        headers: { Accept: "application/json" },
-      });
-      if (response.status >= 200 && response.status < 300) {
-        const value = JSON.parse(response.body) as {
-          subject?: unknown;
-          email?: unknown;
-          capabilities?: {
-            can_use_remote_agents?: unknown;
-            can_use_builderlab_decisions?: unknown;
-          };
-        };
-        if (typeof value?.subject === "string" && value.subject.trim())
-          account = Object.freeze({
-            subject: value.subject,
-            email: typeof value.email === "string" ? value.email.trim() : "",
-            canUseRemoteAgents:
-              value.capabilities?.can_use_remote_agents === true,
-            canUseBuilderlabDecisions:
-              value.capabilities?.can_use_builderlab_decisions === true,
-          });
-        if (account) storage = await accountStorage(account.subject);
-      }
+      account = await federatedAccount(identity);
+      if (account) storage = await accountStorage(account.subject);
     } catch {
       // Fails closed below; signing in again retries.
     }
@@ -220,7 +233,6 @@ export function createNativeSession(
         path: `${authority.apiBasePath}${input.path.slice(1)}`,
       });
     },
-    expired: () => {},
     viewerSession() {
       if (disposed || !viewer) throw new Error("Sign in to Builderlab first.");
       return viewer;

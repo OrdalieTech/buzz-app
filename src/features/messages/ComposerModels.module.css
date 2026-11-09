@@ -1,3 +1,10 @@
+/* One interpolated position keeps the handle, fill and clamped label together. */
+@property --composer-effort-position {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+
 /* Base UI positions the group; each agent owns one floating card. */
 .popup {
   display: grid;
@@ -24,10 +31,16 @@
   max-width: 100%;
 }
 .slider {
+  --composer-effort-position: var(--effort-progress);
   --thumb-width: var(--space-8);
   display: grid;
   min-width: 0;
   width: 100%;
+  transition: --composer-effort-position var(--duration-settle)
+    var(--easing-enter);
+  @starting-style {
+    --composer-effort-position: 0;
+  }
 }
 .control {
   position: relative;
@@ -58,7 +71,6 @@
   background: var(--affordance-prominent);
   overflow: hidden;
   transform: translateY(-50%);
-  transition: width var(--duration-settle) var(--easing-settle);
 }
 .slider[data-unknown] .indicator {
   visibility: hidden;
@@ -87,7 +99,6 @@
   height: var(--thumb-width);
   border: 0;
   border-radius: var(--radius-pill);
-  transition: inset-inline-start var(--duration-settle) var(--easing-settle);
 }
 .thumbFace {
   position: absolute;
@@ -125,16 +136,31 @@ html[data-keyboard-navigation] .thumb:focus-within {
     calc(
       var(--thumb-width) /
       2 +
-      var(--effort-progress) *
+      var(--composer-effort-position) *
       (100% - var(--thumb-width))
     ),
     calc(100% - var(--tether-half, 50%))
   );
   transform: translateX(-50%);
-  transition: left var(--duration-settle) var(--easing-settle);
 }
+/* Keep entrance transforms separate from the rubber track's transform. */
 .tetherSway {
   transform-origin: center bottom;
+  opacity: 1;
+  translate: 0 0;
+  scale: 1;
+  transition:
+    opacity var(--duration-state) var(--easing-enter)
+    calc(var(--duration-settle) - var(--duration-state)),
+    translate var(--duration-state) var(--easing-enter)
+    calc(var(--duration-settle) - var(--duration-state)),
+    scale var(--duration-state) var(--easing-enter)
+    calc(var(--duration-settle) - var(--duration-state));
+  @starting-style {
+    opacity: 0;
+    translate: 0 var(--space-1);
+    scale: 0.95;
+  }
 }
 .tetherSway button {
   max-width: 100%;
@@ -193,13 +219,14 @@ html[data-keyboard-navigation] .thumb:focus-within {
   height: calc(100% + 2 * var(--mesh-bleed));
   filter: blur(var(--mesh-blur));
 }
-.slider[data-pointer-moving] .thumb,
-.slider[data-pointer-moving] .indicator,
-.slider[data-pointer-moving] .tetherAnchor,
+.slider[data-pointer-moving],
+.slider[data-dragging] .tetherSway,
+html[data-keyboard-input] .slider,
 html[data-keyboard-input] .slider * {
   transition: none;
 }
 @media (prefers-reduced-motion: reduce) {
+  .slider,
   .slider * {
     transition: none;
   }

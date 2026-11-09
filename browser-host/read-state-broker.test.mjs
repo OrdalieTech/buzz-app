@@ -204,7 +204,7 @@ it("recovers expired saved state through broker HTTP, socket refusal and fresh c
     {
       slot: "b".repeat(32),
       createdAt: past,
-      blob: { v: 1, client_id: "fixture", contexts: { room: 12 } },
+      blob: { v: 1, client_id: "fixture", contexts: { room: past } },
     },
     h.key,
     past,
@@ -217,7 +217,7 @@ it("recovers expired saved state through broker HTTP, socket refusal and fresh c
       version: 1,
       slot: "b".repeat(32),
       clientId: "fixture",
-      state: { frontiers: { room: 13 }, overrides: {} },
+      state: { frontiers: { room: past + 1 }, overrides: {} },
       localUnread: {},
       revision: 2,
       acceptedRevision: 0,
@@ -252,7 +252,7 @@ it("recovers expired saved state through broker HTTP, socket refusal and fresh c
     (
       await h.transport.readState.decode(observed, new AbortController().signal)
     )[0].blob.contexts.room,
-  ).toBe(13);
+  ).toBe(past + 1);
 });
 it.each([false, true])(
   "reconciles legacy maximum-size NIP-44 records without widening writes (snapshot: %s)",

@@ -107,7 +107,11 @@ function Fixture() {
           row={{
             ...row,
             id: `membership-${target}`,
-            membership: { type: "member_joined", actor: agent, target },
+            membership: {
+              type: "member_joined",
+              actor: target === agent ? human : agent,
+              target,
+            },
           }}
           profiles={profiles}
           agentPubkeys={agentPubkeys}

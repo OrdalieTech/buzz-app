@@ -15,6 +15,7 @@ import { watchPageErrors } from "./page-errors.mjs";
 const test = base.extend({
   developmentReact: [false, { scope: "worker" }],
   builderlabLogin: [false, { scope: "worker" }],
+  federatedIdentity: [false, { scope: "worker" }],
   pluginFixtures: [false, { scope: "worker" }],
   companionFixture: [false, { scope: "worker" }],
   pairingFixture: [false, { scope: "worker" }],
@@ -220,6 +221,11 @@ const test = base.extend({
     const errors = watchPageErrors(page);
     await page.addInitScript(
       ({ viewer }) => {
+        if (!localStorage.getItem("buzzodz.plugins.v1"))
+          localStorage.setItem(
+            "buzzodz.plugins.v1",
+            JSON.stringify({ version: 3, enabled: { "buzz.workflows": true } }),
+          );
         const key = `buzz-client.v1:${viewer}`;
         if (!localStorage.getItem(key))
           localStorage.setItem(
@@ -312,6 +318,7 @@ const test = base.extend({
   },
 });
 async function startNewMessage(page) {
+  await openPage(page, "Messages");
   const sidebar = page.getByRole("navigation", { name: "Subscribed channels" });
   const messages = sidebar.locator('[data-sidebar-section="dms"] summary');
   await messages.hover();
@@ -645,7 +652,10 @@ test("empty compose, keyboard selection, pagination, removal effects, retry, the
   const mentions = page.getByRole("dialog", {
     name: "Mention a member or agent",
   });
-  const averyMention = mentions.getByRole("button", { name: /^Avery Chen / });
+  const averyMention = mentions.getByRole("button", {
+    name: "Avery Chen",
+    exact: true,
+  });
   await expect(mentions.getByRole("button")).toHaveCount(1);
   await averyMention.click();
   await expect(composer).toHaveText("@Avery Chen ");
@@ -660,7 +670,7 @@ test("empty compose, keyboard selection, pagination, removal effects, retry, the
   });
   await expect(suggestions.getByRole("option")).toHaveCount(1);
   await expect(
-    suggestions.getByRole("option", { name: /^Avery Chen / }),
+    suggestions.getByRole("option", { name: "Avery Chen", exact: true }),
   ).toBeVisible();
   expect(app.commands).toHaveLength(0);
   await composer.press("Enter");
@@ -823,7 +833,7 @@ test("profile Message opens a fresh DM and restores a hidden one", async ({
   await sidebarDm.click({ button: "right" });
   await page
     .getByRole("menu", { name: "Actions for Avery Chen" })
-    .getByRole("menuitem", { name: "Remove from Team", exact: true })
+    .getByRole("menuitem", { name: "Close conversation", exact: true })
     .click();
   await expect(sidebarDm).toHaveCount(0);
   await page.reload();

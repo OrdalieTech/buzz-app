@@ -1,4 +1,4 @@
-import type { Ref } from "react";
+import { useState, type Ref } from "react";
 import { Field } from "../../shared/design-system/ui/Field";
 import { Input } from "../../shared/design-system/ui/Input";
 import { AvatarEditor } from "../profiles/AvatarEditor";
@@ -31,6 +31,8 @@ export function ProfileFields({
   community,
   onBusyChange,
   showAvatar = true,
+  showAbout = true,
+  emptyAvatarStyle,
   autoFocus = false,
   nameRef,
   verifiedName,
@@ -41,18 +43,30 @@ export function ProfileFields({
   community?: string | undefined;
   onBusyChange?(busy: boolean): void;
   showAvatar?: boolean;
+  showAbout?: boolean;
+  emptyAvatarStyle?: "dotted-circle";
   /** Focuses the display name on mount, for pages whose only task is this form. */
   autoFocus?: boolean;
   nameRef?: Ref<HTMLInputElement>;
   /** A relay-verified name replaces the editable display name. */
   verifiedName?:
-    | { name: string; issuerLabel: string; status: VerifiedProfile["status"] }
+    | {
+        name: string;
+        username?: string;
+        issuerLabel: string;
+        status: VerifiedProfile["status"];
+      }
     | undefined;
 }) {
+  // A simplified form must still let people repair an invalid saved description.
+  const [repairAbout] = useState(
+    () => (profile.about?.length ?? 0) > PROFILE_ABOUT_MAX_LENGTH,
+  );
   return (
     <div className="grid gap-4">
       {showAvatar && (
         <AvatarEditor
+          emptyStyle={emptyAvatarStyle}
           value={profile.picture}
           name={profile.name}
           community={community}
@@ -65,15 +79,23 @@ export function ProfileFields({
         label="Display name"
         description={
           verifiedName
-            ? verifiedName.status === "checked"
-              ? `Name verified by ${verifiedName.issuerLabel}`
-              : `Cached verification from ${verifiedName.issuerLabel}`
+            ? `${
+                verifiedName.status === "checked"
+                  ? `Name verified by ${verifiedName.issuerLabel}`
+                  : `Cached verification from ${verifiedName.issuerLabel}`
+              }${
+                verifiedName.username &&
+                verifiedName.username !== verifiedName.name
+                  ? ` · @${verifiedName.username}`
+                  : ""
+              }`
             : undefined
         }
       >
         <Input
           ref={nameRef}
           autoComplete="nickname"
+          spellCheck={false}
           autoFocus={autoFocus}
           required
           disabled={disabled}
@@ -85,24 +107,26 @@ export function ProfileFields({
           }
         />
       </Field>
-      <Field
-        label="Profile description (optional)"
-        description={`${profile.about?.length ?? 0} of ${PROFILE_ABOUT_MAX_LENGTH} characters`}
-        error={
-          (profile.about?.length ?? 0) > PROFILE_ABOUT_MAX_LENGTH
-            ? `Shorten the description to ${PROFILE_ABOUT_MAX_LENGTH} characters before saving.`
-            : undefined
-        }
-      >
-        <Textarea
-          rows={3}
-          disabled={disabled}
-          value={profile.about ?? ""}
-          onChange={(event) =>
-            onChange({ ...profile, about: event.target.value })
+      {(showAbout || repairAbout) && (
+        <Field
+          label="Profile description (optional)"
+          description={`${profile.about?.length ?? 0} of ${PROFILE_ABOUT_MAX_LENGTH} characters`}
+          error={
+            (profile.about?.length ?? 0) > PROFILE_ABOUT_MAX_LENGTH
+              ? `Shorten the description to ${PROFILE_ABOUT_MAX_LENGTH} characters before saving.`
+              : undefined
           }
-        />
-      </Field>
+        >
+          <Textarea
+            rows={3}
+            disabled={disabled}
+            value={profile.about ?? ""}
+            onChange={(event) =>
+              onChange({ ...profile, about: event.target.value })
+            }
+          />
+        </Field>
+      )}
     </div>
   );
 }

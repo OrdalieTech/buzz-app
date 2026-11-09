@@ -1,18 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listedAddress } from "../../bundled/builderlab/known-communities/client";
-import {
-  type Credential,
-  oauthTarget,
-} from "../../bundled/builderlab/oauth/browser";
+import { oauthTarget } from "../../bundled/builderlab/oauth/browser";
+import type { Credential } from "../../bundled/builderlab/session";
 import {
   ApiFailure,
   boundKey,
   check,
+  quota,
   relayUrl,
   type Reply,
 } from "../../bundled/builderlab/communities/api";
 import { enteredRelayOrigin, relayAddress } from "../communities/destination";
-import type { Host, HostResponse } from "../host/service";
+import type { FederatedIdentity } from "../federated-identity/service";
+import type { HostResponse } from "../host/service";
 import { BackupError, backUpWith } from "./backup";
 import type { BackupFailureKind } from "./backup-failure";
 import type { FirstRunAccountSeed } from "./first-run-seed";
@@ -24,6 +24,20 @@ import {
 
 /** A community the signed-in account owns: its hostname and the canonical origin a join uses. */
 export type OwnedCommunity = Readonly<{ host: string; url: string }>;
+
+/**
+ * The account's community list. `canCreate` is the Builderlab communities
+ * section's verdict before it enables Create a community, short of which key
+ * is bound: the account is linked (no missing-mapping refusal), and the list's
+ * quota (`api.ts` `quota`) does not refuse. A list with no readable quota does
+ * not refuse, as there; kgoose still enforces its limit on create, and
+ * `quotaLimit`, when readable, words that refusal.
+ */
+export type CommunityList = Readonly<{
+  owned: readonly OwnedCommunity[];
+  canCreate: boolean;
+  quotaLimit?: number | undefined;
+}>;
 
 /**
  * The identity's native recovery, with the state it publishes while a restore
@@ -43,8 +57,20 @@ export type Recovery = Pick<
 export type FirstRunAccount = Readonly<{
   /** The hex key bound 1:1 to the account, or null when none is (a reply with no `identity`). */
   linkedKey(): Promise<string | null>;
-  /** The communities the account owns. Archived ones have no relay to join and are left out. */
-  ownedCommunities(): Promise<readonly OwnedCommunity[]>;
+  /**
+   * The account's community list: the communities it owns (archived ones
+   * have no relay to join and are left out), and whether it may create one.
+   */
+  communityList(): Promise<CommunityList>;
+  /** Whether `<name>.communities.buzz.xyz` is free to create: the section's availability check. */
+  communityAvailable(name: string): Promise<boolean>;
+  /**
+   * Creates `<name>.communities.buzz.xyz`, owned by the account's bound key,
+   * and resolves to the canonical origin a join uses. The section's create;
+   * kgoose provisions the relay before it answers. A limit refusal is worded
+   * with the list's `quotaLimit`, as the section words it.
+   */
+  createCommunity(name: string, quotaLimit?: number): Promise<string>;
   /**
    * The destinations saved to the account, `wss://host[:port]` in kgoose's
    * order: the list the Builderlab plugin's known-communities sync keeps.
@@ -66,6 +92,13 @@ export type FirstRunAccount = Readonly<{
    * verifies a signature by any other key.
    */
   bind(pubkey: string): Promise<void>;
+  /**
+   * Binds installed old Buzz's key, which native signs with straight from old
+   * Buzz's storage and never saves, and resolves to it; then it may be saved
+   * here. Resolves null when there is no usable old key: none can be read, or
+   * kgoose refuses it as another account's (`pubkey_already_bound`).
+   */
+  bindLegacy(): Promise<string | null>;
   /**
    * Unbinds `old`, the key the account held before starting over, so
    * `replacement`, the new key on this device, can be linked: kgoose's delete.
@@ -122,6 +155,10 @@ const notLinked = (reply: Reply) =>
   (typeof reply.error?.code === "string" &&
     reply.error.code.toLowerCase() === "missing_mapping");
 
+/** A reply `notLinked` read as null is the card's missing-mapping refusal. */
+const notBound = (reply: Reply | null, fallback: string) =>
+  reply ?? check({ error: { code: "missing_mapping" } }, fallback);
+
 /**
  * Names the step and the HTTP status so a failed page tells the account check
  * from the list, and a 403 text/plain from a JSON shape problem. Never the
@@ -147,6 +184,8 @@ const OTHER_KEY =
 
 const KEY_CHANGED =
   "The key on this device changed before it could be linked, so your Builderlab account wasn’t changed.";
+/** Native could not read old Buzz's key: there is none, access was denied, or it is malformed. */
+class LegacyUnusable extends Error {}
 
 /**
  * A transport failure (no status), a rate limit or a 5xx may clear on its own,
@@ -208,14 +247,14 @@ const ACCOUNT_ERRORS: Readonly<
  * kgoose's wording never reaches the failed page. So is its correlation ID,
  * which the card's `ApiFailure` would append to the copy; `call` keeps it.
  */
-function checked(reply: Reply, fallback: string) {
+function checked(reply: Reply, fallback: string, quotaLimit?: number) {
   if (!reply.error) return reply;
   const code = reply.error.code ?? "";
   const own = Object.hasOwn(ACCOUNT_ERRORS, code)
     ? ACCOUNT_ERRORS[code]
     : undefined;
   // Throws the card's copy: the reply has an error.
-  if (!own) return check({ error: { code } }, fallback);
+  if (!own) return check({ error: { code } }, fallback, quotaLimit);
   throw Object.assign(
     new ApiFailure(code, own.message ?? fallback),
     own.retryable ? { retryable: true } : {},
@@ -309,35 +348,65 @@ export async function backupOfferedFor(
 }
 
 /**
- * The real reads, binding and unlink, against the build URL's kgoose
- * (`<BUZZ_BUILDERLAB_URL>/api/goose`),
- * authenticated with the first-run session credential and sent through the
- * bundled plugin's native grant like the sign-in itself. Routes and reply
- * shapes are the communities section's (`communities/native.ts` ROUTES
- * `identity`, `list` and `unbind`, and its `bind`; `api.ts` parsers) and, for the saved
- * destinations, the Builderlab plugin's known-communities list and add;
- * neither owner's own client is touched. The backup goes through the native
- * uploader instead (`backup.ts`).
+ * The real reads, binding and unlink, against this build's kgoose through the
+ * bundled plugin's NIP-FI forwarder, which sends the native session as a
+ * Bearer token, each fenced to the session first run's sign-in returned
+ * (`firstRunCredential`). Routes and reply shapes are the communities
+ * section's (`communities/native.ts` ROUTES `identity`, `list` and `unbind`,
+ * and its `bind`; `api.ts` parsers) and, for the saved destinations, the
+ * Builderlab plugin's known-communities list and add; neither owner's own
+ * client is touched. The backup goes through the native uploader instead
+ * (`backup.ts`).
  */
-export function builderlabAccount(
-  credential: Credential,
-  request: Host["request"],
+export function federatedBuilderlabAccount(
+  credential: Pick<Credential, "revision">,
+  federated: Pick<FederatedIdentity, "snapshot" | "request">,
   identity: BackupIdentity,
 ): FirstRunAccount {
-  const target = oauthTarget();
-  const portal = new URL(target).origin;
+  return kgooseAccount(
+    (path, headers, body) => {
+      const session = federated.snapshot();
+      if (
+        session.status !== "signed-in" ||
+        session.revision !== credential.revision ||
+        !session.authority
+      )
+        return Promise.reject(new Error(SIGNED_OUT));
+      return federated.request({
+        path: `${session.authority.apiBasePath}${path.slice(1)}`,
+        method: "POST",
+        headers,
+        body,
+      });
+    },
+    credential.revision,
+    identity,
+  );
+}
+
+/** One JSON POST under the Builderlab API root; `path` starts with `/`. */
+type Post = (
+  path: string,
+  headers: Readonly<Record<string, string>>,
+  body: string,
+) => Promise<HostResponse>;
+
+function kgooseAccount(
+  send: Post,
+  revision: string,
+  identity: BackupIdentity,
+): FirstRunAccount {
+  const portal = new URL(oauthTarget()).origin;
   const post = (path: string, body: object = {}) =>
-    request({
-      url: `${target}${path}`,
-      method: "POST",
-      headers: {
+    send(
+      path,
+      {
         "Content-Type": "application/json",
-        "X-BB-Session-Credential": credential.value,
         // Binding requires the challenge origin to match this header.
         Origin: portal,
       },
-      body: JSON.stringify(body),
-    });
+      JSON.stringify(body),
+    );
   /**
    * One POST; `read` turns the parsed reply (null when not linked) into the
    * answer. Any refusal of the answer is logged in development with the
@@ -350,7 +419,10 @@ export function builderlabAccount(
     fallback: string,
     read: (reply: Reply | null, response: HostResponse) => T,
     body: object = {},
-    limit?: number,
+    {
+      limit,
+      quotaLimit,
+    }: { limit?: number; quotaLimit?: number | undefined } = {},
   ) => {
     const response = await post(path, body).catch((error: unknown) => {
       throw transient(asError(error));
@@ -359,7 +431,10 @@ export function builderlabAccount(
     try {
       if (response.status === 401) throw new Error(SIGNED_OUT);
       reply = parse(step, response, limit);
-      return read(notLinked(reply) ? null : checked(reply, fallback), response);
+      return read(
+        notLinked(reply) ? null : checked(reply, fallback, quotaLimit),
+        response,
+      );
     } catch (error) {
       const id = reply?.correlation_id;
       if (id && error instanceof Error)
@@ -389,57 +464,87 @@ export function builderlabAccount(
         return key;
       },
     );
+  /**
+   * kgoose's challenge, the native kind-24243 signer, then verify: binds
+   * `pubkey`, the key on this device, or without it old Buzz's key, and
+   * resolves to the key bound. Sends nothing more once the account already
+   * holds that key, so running it again after a failure never meets 409
+   * `pubkey_already_bound`.
+   */
+  async function link(pubkey?: string): Promise<string> {
+    const held = await linkedKey();
+    if (pubkey && held === pubkey) return pubkey;
+    const step = "account link";
+    const fallback = "Could not link your key to this Builderlab account.";
+    // The challenge refuses only with 403 `unauthorized` or `invalid_origin`,
+    // or 429 `too_many_attempts`.
+    const challenge = await call(
+      step,
+      "/v1/buzz/nostr-identities/challenge",
+      fallback,
+      (reply, response) => {
+        if (!reply) throw failure(step, response);
+        const { challenge_id, nonce, verification_code, origin, expires_at } =
+          reply as Record<string, unknown>;
+        if (origin !== portal)
+          throw failure(step, response, "challenge for another origin");
+        return { challenge_id, nonce, verification_code, origin, expires_at };
+      },
+      { origin: portal },
+    );
+    // Native code signs a well-formed challenge for production Builderlab
+    // or the build URL's origin, so the read above passes on only the
+    // latter. It signs with whatever key secure storage holds now, or old
+    // Buzz's while none is saved. Verify binds the signer, which linking
+    // again cannot undo, so only `pubkey`'s signature may reach kgoose.
+    // Old Buzz's key that can't be read answers null, so setup makes a new
+    // key. Any rejection, such as a challenge that expired, is a failure to
+    // retry: a retry still links old Buzz's key.
+    const event = await invoke<{ pubkey?: unknown } | null>(
+      "identity_sign_builderlab_binding",
+      pubkey ? { challenge } : { challenge, legacy: true },
+    ).catch((error: unknown) => {
+      throw asError(error);
+    });
+    if (event === null && !pubkey) throw new LegacyUnusable();
+    const signer = event?.pubkey;
+    if (typeof signer !== "string" || (pubkey && signer !== pubkey))
+      throw new Error(KEY_CHANGED);
+    if (held === signer) return signer;
+    // An account bound to another key is refused here, with 409
+    // `identity_already_bound`.
+    await call(
+      step,
+      "/v1/buzz/nostr-identities/verify",
+      fallback,
+      (reply, response) => {
+        if (boundKey(reply?.identity) !== signer)
+          throw failure(step, response, "link not confirmed");
+      },
+      {
+        challenge_id: challenge.challenge_id,
+        nonce: challenge.nonce,
+        signed_payload: JSON.stringify(event),
+      },
+    );
+    return signer;
+  }
   return {
     linkedKey,
     async bind(pubkey) {
-      // Re-running after a failure must not meet 409 `pubkey_already_bound`.
-      if ((await linkedKey()) === pubkey) return;
-      const step = "account link";
-      const fallback = "Could not link your key to this Builderlab account.";
-      // The challenge refuses only with 403 `unauthorized` or `invalid_origin`,
-      // or 429 `too_many_attempts`.
-      const challenge = await call(
-        step,
-        "/v1/buzz/nostr-identities/challenge",
-        fallback,
-        (reply, response) => {
-          if (!reply) throw failure(step, response);
-          const { challenge_id, nonce, verification_code, origin, expires_at } =
-            reply as Record<string, unknown>;
-          if (origin !== portal)
-            throw failure(step, response, "challenge for another origin");
-          return { challenge_id, nonce, verification_code, origin, expires_at };
-        },
-        { origin: portal },
-      );
-      // Native code signs a well-formed challenge for production Builderlab
-      // or the build URL's origin, so the read above passes on only the
-      // latter. It signs with whatever key secure storage holds now. Verify
-      // binds the signer, which linking again cannot undo, so only `pubkey`'s
-      // signature may reach kgoose.
-      const event = await invoke<{ pubkey?: unknown }>(
-        "identity_sign_builderlab_binding",
-        { challenge },
-      ).catch((error: unknown) => {
-        throw asError(error);
-      });
-      if (event.pubkey !== pubkey) throw new Error(KEY_CHANGED);
-      // An account bound to another key is refused here, with 409
-      // `identity_already_bound`.
-      await call(
-        step,
-        "/v1/buzz/nostr-identities/verify",
-        fallback,
-        (reply, response) => {
-          if (boundKey(reply?.identity) !== pubkey)
-            throw failure(step, response, "link not confirmed");
-        },
-        {
-          challenge_id: challenge.challenge_id,
-          nonce: challenge.nonce,
-          signed_payload: JSON.stringify(event),
-        },
-      );
+      await link(pubkey);
+    },
+    async bindLegacy() {
+      try {
+        return await link();
+      } catch (error) {
+        if (
+          error instanceof LegacyUnusable ||
+          (error instanceof ApiFailure && error.code === "pubkey_already_bound")
+        )
+          return null;
+        throw error;
+      }
     },
     async unbind(old, replacement) {
       // kgoose deletes whatever is bound, so check it is still the old key.
@@ -466,12 +571,46 @@ export function builderlabAccount(
           : OTHER_KEY,
       );
     },
-    ownedCommunities: () =>
+    communityList: () =>
       call(
         "community list",
         "/v1/buzz/communities/list",
         "Could not load the communities this account owns.",
-        (reply) => reply?.communities?.flatMap(owned) ?? [],
+        (reply) => {
+          const readable = reply && quota(reply);
+          return {
+            owned: reply?.communities?.flatMap(owned) ?? [],
+            canCreate: reply !== null && readable?.canCreate !== false,
+            quotaLimit: readable?.limit,
+          };
+        },
+      ),
+    communityAvailable: (name) =>
+      call(
+        "community availability",
+        "/v1/buzz/communities/availability",
+        "Could not check that address.",
+        (reply) =>
+          Boolean(notBound(reply, "Could not check that address.").available),
+        { name },
+      ),
+    createCommunity: (name, quotaLimit) =>
+      call(
+        "community create",
+        "/v1/buzz/communities",
+        "Could not create the community.",
+        (reply, response) => {
+          const { community } = notBound(
+            reply,
+            "Could not create the community.",
+          );
+          const relay = community && relayUrl(community);
+          if (!relay)
+            throw failure("community create", response, "no community address");
+          return enteredRelayOrigin(relay);
+        },
+        { name },
+        { quotaLimit },
       ),
     // The route consults no Nostr identity, so its refusals are plain strings
     // and `reply` is never null here; its rows are not the card's.
@@ -494,7 +633,7 @@ export function builderlabAccount(
         // Uncapped, as the plugin's own client reads it: kgoose holds about
         // 1,000 destinations of at most 512 characters, far inside the host
         // transport's cap.
-        Number.POSITIVE_INFINITY,
+        { limit: Number.POSITIVE_INFINITY },
       ),
     async saveCommunity(url) {
       await call(
@@ -505,7 +644,7 @@ export function builderlabAccount(
         { community_url: relayAddress(url) },
       );
     },
-    backUp: (pubkey) => backUpWith(identity, pubkey, credential.value),
+    backUp: (pubkey) => backUpWith(identity, pubkey, revision),
     // Backup routes answer plain text, not the card's reply shape, so only
     // the status and a 2xx body are read.
     async backupStatus() {
@@ -615,10 +754,17 @@ export function seededAccount(
   let failOnce = seed.backup === "fail-once";
   return {
     linkedKey: () => Promise.resolve(seed.linked),
-    ownedCommunities: () => Promise.resolve(seed.communities),
+    // The seed models no hosted communities to create.
+    communityList: () =>
+      Promise.resolve({ owned: seed.communities, canCreate: false }),
     knownCommunities: () => Promise.resolve(seed.known ?? []),
+    communityAvailable: () => Promise.resolve(false),
+    createCommunity: () =>
+      Promise.reject(new Error("The development seed creates no communities.")),
     saveCommunity: () => Promise.resolve(),
     bind: () => Promise.resolve(),
+    // The seed models no old Buzz key: setup makes a new one.
+    bindLegacy: () => Promise.resolve(null),
     unbind: () =>
       seed.unlink
         ? Promise.reject(

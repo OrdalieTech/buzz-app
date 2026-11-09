@@ -22,6 +22,7 @@ import {
   type UploadedAttachment,
 } from "../../src/features/relay/attachments";
 import { PublishRejected } from "../../src/features/relay/outbox";
+import { attachmentDraft } from "../../src/features/messages/attachment-draft";
 import "../../src/shared/styles/globals.css";
 
 const viewer = keypair(),
@@ -161,7 +162,8 @@ Object.assign(window, {
   voiceFixture: {
     report,
     media: (url: string) => urls.get(url),
-    session: owner.session,
+    attachmentDraft: (key: string, channelId: string) =>
+      attachmentDraft(owner.session, key, channelId),
     toggle: (enabled: boolean) => runtime.reconcile(enabled ? [plugin] : []),
   },
 });

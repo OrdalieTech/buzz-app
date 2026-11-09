@@ -36,11 +36,13 @@ test("video-only outgoing messages keep a readable, proportional preview", async
             .poll(async () => {
               const media = await preview.boundingBox();
               const bounds = await row.locator("[data-layout]").boundingBox();
-              // The layout reserves at least 60% of the row for message content.
-              // Measure that independent row, never the shrink-to-fit body.
+              // Allow 8.5rem for avatars, opposite-avatar clearance and
+              // surrounding spacing: a conservative readability floor for
+              // the new layout. Measure the independent row, never the
+              // shrink-to-fit body, so collapsed previews still fail.
               return (
                 media.width >=
-                Math.floor(Math.min(16 * rem, bounds.width * 0.6))
+                Math.floor(Math.min(16 * rem, bounds.width - 8.5 * rem))
               );
             })
             .toBe(true);

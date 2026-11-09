@@ -5,6 +5,17 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 import { CommunityLanding } from "./CommunityLanding";
 import type { Communities } from "./service";
+import { communityRequest, inspectProfile } from "./api";
+
+vi.mock("./api", async (actual) => ({
+  ...(await actual<typeof import("./api")>()),
+  communityRequest: vi
+    .fn()
+    .mockResolvedValue({ name: "Fixture", membershipRequired: true }),
+  inspectProfile: vi
+    .fn()
+    .mockRejectedValue(new Error("Relay read failed (403)")),
+}));
 
 afterEach(() => {
   cleanup();
@@ -57,9 +68,15 @@ it("opens the join steps from a pasted invite page link", async () => {
     "https://relay.example/invite/v2.invite",
   );
   await user.click(screen.getByRole("button", { name: "Join" }));
-  const dialog = await screen.findByRole("dialog");
+  const dialog = await screen.findByRole("main");
   expect(dialog).toBeVisible();
-  expect(screen.getByDisplayValue("https://relay.example")).toBeVisible();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(await within(dialog).findByLabelText("Invite code")).toHaveValue(
+    "v2.invite",
+  );
+  expect(
+    within(dialog).queryByLabelText("Community URL"),
+  ).not.toBeInTheDocument();
 });
 
 it("opens the join steps from a community address", async () => {
@@ -70,10 +87,16 @@ it("opens the join steps from a community address", async () => {
     "https://relay.example",
   );
   await user.click(screen.getByRole("button", { name: "Join" }));
-  const dialog = await screen.findByRole("dialog");
+  const dialog = await screen.findByRole("main");
+  expect(await within(dialog).findByLabelText("Invite code")).toBeVisible();
   expect(
-    within(dialog).getByDisplayValue("https://relay.example"),
-  ).toBeVisible();
+    within(dialog).queryByLabelText("Community URL"),
+  ).not.toBeInTheDocument();
+  await user.click(within(dialog).getByRole("button", { name: "Back" }));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("Invite link or community URL")).toHaveValue(
+    "https://relay.example",
+  );
 });
 
 it("asks for an invite link or community URL when the pasted value is neither", async () => {
@@ -95,7 +118,7 @@ it("presents an opened invite and clears it on close", async () => {
   const { onInviteClose } = landing({
     invite: { community: "https://relay.example", code: "x", requestId: 7 },
   });
-  await screen.findByRole("dialog");
+  await screen.findByRole("main");
   await user.click(screen.getByRole("button", { name: "Back" }));
   expect(onInviteClose).toHaveBeenCalledWith(7);
 });
@@ -105,4 +128,112 @@ it("offers creating a community where hosting is available", async () => {
   const { onCreate } = landing({ hosted: true });
   await user.click(screen.getByRole("button", { name: "Create a community" }));
   expect(onCreate).toHaveBeenCalledOnce();
+});
+
+it("lets a failed submitted lookup be corrected without losing the landing link", async () => {
+  vi.mocked(communityRequest).mockRejectedValueOnce(
+    new Error("Community unavailable"),
+  );
+  const user = userEvent.setup();
+  landing();
+  await user.type(
+    screen.getByLabelText("Invite link or community URL"),
+    "https://relay.example",
+  );
+  await user.click(screen.getByRole("button", { name: "Join" }));
+  const dialog = await screen.findByRole("main");
+  expect(
+    await within(dialog).findByText("Community unavailable"),
+  ).toBeVisible();
+  expect(within(dialog).getByLabelText("Community URL")).toHaveValue(
+    "https://relay.example",
+  );
+  await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+  expect(await within(dialog).findByLabelText("Invite code")).toBeVisible();
+});
+
+it("lets Back leave a submitted lookup the host never answers, keeping the landing link", async () => {
+  let lookup: AbortSignal | undefined;
+  vi.mocked(communityRequest).mockImplementationOnce(
+    (_id, _route, _body, signal) =>
+      new Promise((_, reject) => {
+        lookup = signal;
+        signal?.addEventListener("abort", () => reject(signal.reason));
+      }),
+  );
+  const user = userEvent.setup();
+  landing();
+  await user.type(
+    screen.getByLabelText("Invite link or community URL"),
+    "https://quiet.example",
+  );
+  await user.click(screen.getByRole("button", { name: "Join" }));
+  const dialog = await screen.findByRole("main");
+  expect(within(dialog).getByRole("status")).toHaveTextContent(
+    "Finding your community…",
+  );
+  const back = within(dialog).getByRole("button", { name: "Back" });
+  expect(back).toBeEnabled();
+  await user.click(back);
+  expect(lookup?.aborted).toBe(true);
+  expect(screen.getByLabelText("Invite link or community URL")).toHaveValue(
+    "https://quiet.example",
+  );
+});
+
+it("omits invite entry when the access check succeeds and keeps policy links inline", async () => {
+  vi.mocked(inspectProfile).mockResolvedValueOnce({
+    exists: false,
+    existing: {},
+    profile: { name: "", picture: "", about: "" },
+  });
+  vi.mocked(communityRequest).mockResolvedValueOnce({
+    name: "Open community",
+    policy: {
+      version: "1",
+      terms_markdown: "Terms",
+      privacy_markdown: "Privacy",
+      age_attestation_required: false,
+    },
+  });
+  const user = userEvent.setup();
+  landing();
+  await user.type(
+    screen.getByLabelText("Invite link or community URL"),
+    "https://relay.example",
+  );
+  await user.click(screen.getByRole("button", { name: "Join" }));
+  expect(await screen.findByText("Open community")).toBeVisible();
+  expect(screen.queryByLabelText("Invite code")).not.toBeInTheDocument();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("link", { name: "Terms of Service" }),
+  ).toHaveAttribute("href", "https://relay.example/api/join-policy/terms");
+  expect(screen.getByRole("link", { name: "Privacy Notice" })).toHaveAttribute(
+    "href",
+    "https://relay.example/api/join-policy/privacy",
+  );
+  expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+  await user.click(screen.getByRole("checkbox"));
+  expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
+});
+
+it("does not infer an invite requirement from denied access on an open relay", async () => {
+  vi.mocked(communityRequest).mockResolvedValueOnce({
+    name: "Open community",
+    membershipRequired: false,
+    policy: null,
+  });
+  vi.mocked(inspectProfile).mockRejectedValueOnce(
+    new Error("Relay read failed (403)"),
+  );
+  const user = userEvent.setup();
+  landing();
+  await user.type(
+    screen.getByLabelText("Invite link or community URL"),
+    "https://relay.example",
+  );
+  await user.click(screen.getByRole("button", { name: "Join" }));
+  expect(await screen.findByText("Open community")).toBeVisible();
+  expect(screen.queryByLabelText("Invite code")).not.toBeInTheDocument();
 });

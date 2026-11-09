@@ -2,11 +2,12 @@ import { nativeRelayRequest, relaySelf } from "../relay/native";
 import { communityIcon } from "./community-icon";
 import { joinPolicy, type JoinPolicy } from "./join-policy";
 
-/** Only what a relay publishes before admission: no name, owner or member count. */
+/** Public relay metadata available before admission; no owner or member count. */
 export type FoundCommunity = {
   /** Canonical secure origin. */
   url: string;
   host: string;
+  name?: string | undefined;
   icon?: string | undefined;
   /** The relay deployment's key (NIP-11 `self`), when it is well-formed. */
   self?: string | undefined;
@@ -57,6 +58,7 @@ export async function findCommunity(
   return {
     url,
     host: new URL(url).host,
+    name: typeof info.name === "string" ? info.name : undefined,
     icon: communityIcon(info.icon),
     self: relaySelf(info),
     policy: await policyAnswer(await policy),
@@ -75,8 +77,16 @@ async function policyAnswer(response: Response) {
   }
 }
 
+/** buzz-relay's NIP-11 answer for a host it maps to no community. */
+const NO_COMMUNITY = "relay: no community is configured for this host";
+
 async function relayInfo(response: Response) {
   if (response.status >= 500) throw new FindCommunityError("unreachable");
+  if (
+    response.status === 404 &&
+    (await response.text().catch(() => "")) === NO_COMMUNITY
+  )
+    throw new FindCommunityError("no-community");
   const body: unknown = response.ok
     ? await response.json().catch(() => undefined)
     : undefined;
@@ -92,12 +102,5 @@ async function relayInfo(response: Response) {
     )
   )
     throw new FindCommunityError("not-buzz");
-  // Host-bound fields are present only when the relay maps this host to a community.
-  if (
-    info.read_state_snapshot === undefined &&
-    info.icon === undefined &&
-    info.buzz_v1 === undefined
-  )
-    throw new FindCommunityError("no-community");
   return info;
 }

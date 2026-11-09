@@ -21,6 +21,37 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it("redacts spoilers before handing the preview to reminder storage", async () => {
+  const create = vi.fn(async () => {});
+  render(
+    <RemindDialog
+      message={
+        {
+          id: "m",
+          channelId: "c",
+          authorId: "a",
+          content: "The answer is ||Rosebud||",
+        } as ChannelMessage
+      }
+      session={{ reminders: { create } } as unknown as RelaySession}
+      close={() => {}}
+    />,
+  );
+  await userEvent
+    .setup()
+    .click(screen.getByRole("button", { name: "Set reminder" }));
+  expect(create).toHaveBeenCalledExactlyOnceWith(
+    {
+      eventId: "m",
+      channelId: "c",
+      authorPubkey: "a",
+      preview: "The answer is [Spoiler]",
+    },
+    expect.any(Number),
+    "",
+  );
+});
+
 it("saves a preview that never splits an emoji at the cap", async () => {
   const create = vi.fn(async () => {});
   // The emoji straddle UTF-16 unit 280, which a unit-based cut would halve.
@@ -172,8 +203,14 @@ it("lets a preset and note be chosen before saving, and keeps the draft after fa
     expect(screen.getByRole("combobox", { name: "When" })).toHaveFocus(),
   );
   await user.keyboard("{Enter}");
-  await screen.findByRole("option", { name: "In 1 hour" });
-  await user.keyboard("{ArrowDown}{Enter}");
+  await vi.waitFor(() =>
+    expect(screen.getByRole("option", { selected: true })).toHaveFocus(),
+  );
+  await user.keyboard("{ArrowDown}");
+  await vi.waitFor(() =>
+    expect(screen.getByRole("option", { name: "In 1 hour" })).toHaveFocus(),
+  );
+  await user.keyboard("{Enter}");
   expect(screen.getByRole("combobox", { name: "When" })).toHaveTextContent(
     "In 1 hour",
   );
@@ -220,7 +257,13 @@ it("reveals labelled custom fields and saves a future time with the note", async
   await vi.waitFor(() =>
     expect(screen.getByRole("option", { selected: true })).toHaveFocus(),
   );
-  await user.keyboard("{End}{Enter}");
+  await user.keyboard("{End}");
+  await vi.waitFor(() =>
+    expect(
+      screen.getByRole("option", { name: "Custom date & time" }),
+    ).toHaveFocus(),
+  );
+  await user.keyboard("{Enter}");
   fireEvent.change(screen.getByLabelText("Reminder date"), {
     target: { value: "" },
   });

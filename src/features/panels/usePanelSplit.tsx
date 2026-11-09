@@ -5,17 +5,76 @@ import {
   useState,
   type RefObject,
 } from "react";
+import {
+  clearView,
+  subscribeView,
+  viewRevision,
+  writeView,
+} from "../../shared/view-state";
 import { ResizeHandle } from "./ResizeHandle";
 import styles from "./Panels.module.css";
 
-// Each page owns its split; keep the preferred width while the dock is closed.
+// The revision records which saved value an in-memory width replaced or
+// became, so a failed save survives notifications about other keys.
+function loadSplit(scope: string | undefined, key: string) {
+  const revision = scope ? viewRevision(scope, key) : undefined;
+  let saved: unknown;
+  try {
+    saved = JSON.parse(revision ?? "null");
+  } catch {
+    // An unreadable record falls back to the default width.
+  }
+  const preferred =
+    typeof saved === "number" && Number.isFinite(saved) && saved > 0
+      ? saved
+      : undefined;
+  return { scope, key, revision, preferred };
+}
+
+/**
+ * Each page owns its split. The preferred width is saved per community and
+ * viewer workspace (`scope`) under the page's `name`, so it survives the dock
+ * closing, page switches and restarts; without a scope it stays in memory.
+ */
 export function usePanelSplit(
+  scope: string | undefined,
+  name: string,
   defaultWidth?: number,
   min = 316,
   primary?: { defaultWidth: number; maxRatio: number },
 ) {
   const ref = useRef<HTMLDivElement>(null);
-  const [preferred, setPreferred] = useState<number>();
+  const key = `panel-split:${name}`;
+  const [view, setView] = useState(() => loadSplit(scope, key));
+  // A workspace change reads that workspace's width without remounting the page.
+  if (view.scope !== scope || view.key !== key) setView(loadSplit(scope, key));
+  const { preferred } = view;
+  // Follow newer saves from another frame or window sharing this page's width.
+  useLayoutEffect(() => {
+    if (!scope) return;
+    return subscribeView(scope, () => {
+      const revision = viewRevision(scope, key);
+      setView((current) =>
+        revision === undefined ||
+        (current.scope === scope &&
+          current.key === key &&
+          current.revision === revision)
+          ? current
+          : loadSplit(scope, key),
+      );
+    });
+  }, [scope, key]);
+  const setPreferred = (width: number | undefined) => {
+    if (scope && width !== undefined) writeView(scope, key, width);
+    else if (scope)
+      try {
+        clearView(scope, key);
+      } catch {
+        // The default still applies until the page next mounts.
+      }
+    const revision = scope ? viewRevision(scope, key) : undefined;
+    setView({ scope, key, preferred: width, revision });
+  };
   return {
     ref,
     style: undefined,

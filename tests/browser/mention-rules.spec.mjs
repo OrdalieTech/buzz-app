@@ -17,7 +17,9 @@ test("Space commits a unique exact identity but leaves namesakes as prose", asyn
   // (README section 5), so typing straight on cannot race it.
   await page.evaluate(() => window.mentionFixture.holdSearches());
   await input.fill("@Mary Jane");
-  await expect(page.getByRole("option", { name: /^Mary Jane / })).toBeVisible();
+  await expect(
+    page.getByRole("option", { name: "Mary Jane", exact: true }),
+  ).toBeVisible();
   await expect
     .poll(() =>
       page.evaluate(() =>
@@ -47,7 +49,7 @@ test("Space commits a unique exact identity but leaves namesakes as prose", asyn
   expect(sent.event.tags).toContainEqual(["p", sent.key]);
   await page.goto("/tests/fixtures/mentions.html");
   await input.fill("@Honey");
-  await expect(page.getByRole("option", { name: /^Honey / })).toHaveCount(2);
+  await expect(page.getByRole("option", { name: /^Honey/ })).toHaveCount(2);
   await input.press("Space");
   await expect(input).toHaveJSProperty("value", "@Honey ");
   await expect(input.locator(".inline-chip")).toHaveCount(0);
@@ -70,11 +72,13 @@ test("an open list preserves keys and highlight when membership is revoked", asy
     .toBe(0);
   const rowKeys = () =>
     rows.evaluateAll((nodes) =>
-      nodes.map((n) => n.querySelector("small")?.textContent),
+      nodes.map((n) => n.getAttribute("data-completion-id")),
     );
   const before = await rowKeys();
   const revokedKey = await page.evaluate(() => window.mentionFixture.first);
-  const removed = page.getByRole("option", { name: new RegExp(revokedKey) });
+  const removed = page
+    .getByRole("option")
+    .and(page.locator(`[data-completion-id="${revokedKey}"]`));
   if ((await removed.getAttribute("aria-selected")) !== "true")
     await input.press("ArrowDown");
   await expect(removed).toHaveAttribute("aria-selected", "true");

@@ -32,8 +32,17 @@ export function archiveHides(
   pubkey: string,
   viewer: string | undefined,
 ) {
-  return pubkey !== viewer && !!archives?.snapshot().archived.includes(pubkey);
+  if (pubkey === viewer || !archives) return false;
+  const archived = archives.snapshot().archived;
+  let lookup = archivedSets.get(archived);
+  if (!lookup) {
+    lookup = new Set(archived);
+    archivedSets.set(archived, lookup);
+  }
+  return lookup.has(pubkey);
 }
+// Search and choosers ask once per candidate; snapshots freeze their list.
+const archivedSets = new WeakMap<readonly string[], ReadonlySet<string>>();
 const empty: readonly string[] = Object.freeze([]);
 const HEX = /^[0-9a-f]{64}$/;
 const MAX_BYTES = 2 * 1024 * 1024;

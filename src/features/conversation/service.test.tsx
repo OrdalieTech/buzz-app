@@ -49,6 +49,7 @@ it("registers both surfaces under the injecting plugin scope, removes and replac
       expect(conversation.ui.Composer).toBe(conversation.ui.Composer);
       expect(conversation.ui.Message).toBe(conversation.ui.Message);
       expect(conversation.ui.Thread).toBe(conversation.ui.Thread);
+      expect(conversation.ui.Conversation).toBe(conversation.ui.Conversation);
       // Plugins get the host's own labels; their output is tested at the owner.
       expect(conversation.format).toEqual({
         itemTimestamp: formatItemTimestamp,
@@ -238,6 +239,34 @@ it("rejects a link renderer order that is neither a number nor a function", asyn
   });
   h.runtime.reconcile([h.plugin]);
   await vi.waitFor(() => expect(h.service.links.snapshot()).toHaveLength(1));
+  expect(h.runtime.snapshot()[h.plugin.manifest.id]?.status).toBe("active");
+});
+
+it("rejects an attachment renderer order that is neither a number nor a function", async () => {
+  const h = harness({
+    inject: ["conversation"],
+    apply(ctx) {
+      const base = { id: "file", title: "File", matches: () => true };
+      for (const order of [null, "100", {}, true]) {
+        expect(() =>
+          ctx.conversation.registerAttachment({
+            ...base,
+            order,
+            component: Component,
+          } as never),
+        ).toThrow("order");
+      }
+      ctx.conversation.registerAttachment({
+        ...base,
+        order: (attachment) => (attachment.kind === "file" ? -10 : 0),
+        component: Component,
+      });
+    },
+  });
+  h.runtime.reconcile([h.plugin]);
+  await vi.waitFor(() =>
+    expect(h.service.attachments.snapshot()).toHaveLength(1),
+  );
   expect(h.runtime.snapshot()[h.plugin.manifest.id]?.status).toBe("active");
 });
 

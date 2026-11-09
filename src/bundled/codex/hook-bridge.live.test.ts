@@ -14,6 +14,7 @@ import type {
   HostMcpServer,
   HostMcpOptions,
 } from "../../features/host/service";
+import { nativeHookOutput } from "../hook-output";
 import { AppServer } from "./rpc";
 import { dispatchAgentHooks } from "../../features/agents/hooks";
 import { nativeHookState } from "./hooks";
@@ -113,6 +114,7 @@ it.skipIf(!binary).each([false, true])(
         closed: new Promise(() => {}),
       };
     };
+    const modelInputs: unknown[] = [];
     let requests = 0;
     let parentRequests = 0;
     let childRequests = 0;
@@ -124,6 +126,7 @@ it.skipIf(!binary).each([false, true])(
     const model = await listen(async (req, res) => {
       let payload = "";
       for await (const data of req) payload += data;
+      modelInputs.push(JSON.parse(payload));
       const input = JSON.parse(payload).input as {
         type?: string;
         call_id?: string;
@@ -236,6 +239,7 @@ it.skipIf(!binary).each([false, true])(
           [
             {
               id: "observer",
+              pluginId: "observer",
               harness: "codex",
               event,
               run: () => {
@@ -245,6 +249,7 @@ it.skipIf(!binary).each([false, true])(
             },
             {
               id: "policy",
+              pluginId: "policy",
               harness: "codex",
               event,
               run: () => policy(session, event, input),
@@ -257,6 +262,7 @@ it.skipIf(!binary).each([false, true])(
             typeof output === "object" &&
             Object.keys(output).length > 0,
           25000,
+          nativeHookOutput,
         )) as Record<string, unknown>) ?? {},
     );
     const rpc = new AppServer();
@@ -335,6 +341,9 @@ it.skipIf(!binary).each([false, true])(
       });
       await completed;
       expect(observed, stderr).toContain("PreToolUse");
+      expect(JSON.stringify(modelInputs)).toContain(
+        "[Buzz plugin: policy] Fixture blocks the command",
+      );
       expect(observed, stderr).toContain("Stop");
       expect(denied, stderr).toContain("call_parent");
       if (subagent) {

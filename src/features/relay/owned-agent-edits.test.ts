@@ -189,6 +189,13 @@ it.each(["member", "guest"])(
         profile(stranger, stranger),
       ]);
       await connection.session.outbox?.ready();
+      // A guest's edit is signed only once the directory's own attestation
+      // names its owner; editOwnedAgent's check can settle first.
+      await vi.waitFor(() =>
+        expect(connection.session.profiles.owner?.(agent.pubkey)).toBe(
+          owner.pubkey,
+        ),
+      );
       await expect(
         connection.session.messages.editOwnedAgent(
           foreign.id,
@@ -236,6 +243,111 @@ it.each(["member", "guest"])(
     }
   },
 );
+
+it("fails a guest's agent edit sent before the directory verifies its owner, and publishes the retry", async () => {
+  const owner = keypair(),
+    agent = keypair(),
+    relay = keypair();
+  const wire = scriptedTransport(owner.pubkey, relay.pubkey);
+  const published: RelayEvent[] = [];
+  let live!: LiveCallbacks;
+  const connection = createRelaySession(
+    {
+      ...wire.transport,
+      archiveAuthority: relay.pubkey,
+      writer: {
+        sign: async (template) => signed(owner, template),
+        publish: async (event) => {
+          published.push(event);
+        },
+      },
+      subscribe(callbacks) {
+        live = callbacks;
+        return { update() {}, retry() {}, dispose() {} };
+      },
+    },
+    { outboxStorage: { load: () => [], save() {} } },
+  );
+  const original = message(agent, "c", "Whole answer", 11);
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`nostr:agent-auth:${agent.pubkey}:`),
+  );
+  let verify!: (digest: ArrayBuffer) => void;
+  const verification = new Promise<ArrayBuffer>((resolve) => {
+    verify = resolve;
+  });
+  // Hold the directory's attestation; editOwnedAgent's own check still runs.
+  const attestation = vi
+    .spyOn(crypto.subtle, "digest")
+    .mockImplementationOnce(() => verification);
+  const { messages, outbox, profiles } = connection.session;
+  try {
+    connection.session.channels.ensure("c");
+    live.receive([
+      signed(relay, {
+        kind: 39002,
+        created_at: 1,
+        content: "",
+        tags: [
+          ["d", "c"],
+          ["p", owner.pubkey, "", "guest"],
+          ["p", agent.pubkey, "", "bot"],
+        ],
+      }),
+      original,
+      eventDto(
+        signed(agent, {
+          kind: 0,
+          created_at: 10,
+          content: "{}",
+          tags: [
+            [
+              "auth",
+              owner.pubkey,
+              "",
+              bytesToHex(schnorr.sign(new Uint8Array(digest), owner.secret)),
+            ],
+          ],
+        }),
+      ),
+    ]);
+    expect(attestation).toHaveBeenCalledOnce();
+    await outbox?.ready();
+    const id = await messages.editOwnedAgent(
+      original.id,
+      "Spoken",
+      original.id,
+    );
+    await vi.waitFor(() =>
+      expect(
+        outbox?.snapshot().find((item) => item.event.id === id),
+      ).toMatchObject({
+        delivery: "failed",
+        error: "You have read-only access to this channel.",
+      }),
+    );
+    expect(published).toEqual([]);
+    expect(profiles.owner?.(agent.pubkey)).toBeUndefined();
+    verify(digest);
+    await vi.waitFor(() =>
+      expect(profiles.owner?.(agent.pubkey)).toBe(owner.pubkey),
+    );
+    messages.retry(id);
+    await vi.waitFor(() =>
+      expect(published.map((event) => event.id)).toEqual([id]),
+    );
+    expect(published[0]).toMatchObject({
+      kind: 40003,
+      pubkey: owner.pubkey,
+      content: "Spoken",
+    });
+  } finally {
+    verify(digest);
+    attestation.mockRestore();
+    connection.dispose();
+  }
+});
 
 it("lets the original author preserve attachments from a verified owner edit", () => {
   const author = keypair(),
@@ -463,14 +575,17 @@ it.each(["actor", "p"])(
       relay = keypair();
     const wire = scriptedTransport(owner.pubkey, relay.pubkey);
     let live!: LiveCallbacks;
-    const connection = createRelaySession({
-      ...wire.transport,
-      archiveAuthority: relay.pubkey,
-      subscribe(callbacks) {
-        live = callbacks;
-        return { update() {}, retry() {}, dispose() {} };
+    const connection = createRelaySession(
+      {
+        ...wire.transport,
+        archiveAuthority: relay.pubkey,
+        subscribe(callbacks) {
+          live = callbacks;
+          return { update() {}, retry() {}, dispose() {} };
+        },
       },
-    });
+      { readStateFloor: () => 0 },
+    );
     const root = message(owner, "c", "Question", 10);
     const original = signed(relay, {
       kind: 9,
@@ -554,13 +669,16 @@ it("uses the same verified owner edit in the conversation, prompt history and un
     relay = keypair();
   const wire = scriptedTransport(owner.pubkey, relay.pubkey);
   let live!: LiveCallbacks;
-  const connection = createRelaySession({
-    ...wire.transport,
-    subscribe(callbacks) {
-      live = callbacks;
-      return { update() {}, retry() {}, dispose() {} };
+  const connection = createRelaySession(
+    {
+      ...wire.transport,
+      subscribe(callbacks) {
+        live = callbacks;
+        return { update() {}, retry() {}, dispose() {} };
+      },
     },
-  });
+    { readStateFloor: () => 0 },
+  );
   const root = message(owner, "c", "Question", 10);
   const original = signed(agent, {
     kind: 9,

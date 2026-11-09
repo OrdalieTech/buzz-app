@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import {
-  type Feature,
+  checkinHourly,
   featureState,
   hasFeature,
   memory,
@@ -8,8 +8,6 @@ import {
   withFeature,
 } from "./features";
 
-// Another feature, whose markers are not memory's.
-const another: Feature = { ...memory, id: "other", text: "other" };
 const OPEN = "<!-- buzz:bestie/memory v1 -->";
 const CLOSE = "<!-- /buzz:bestie/memory -->";
 
@@ -95,7 +93,9 @@ it("shows a section whose markers were edited, and adds no second one", () => {
   }
   expect(featureState("Be brief.", memory)).toBe("off");
   // Another feature's markers are not this one's.
-  expect(featureState(withFeature("", another, true), memory)).toBe("off");
+  expect(featureState(withFeature("", checkinHourly, true), memory)).toBe(
+    "off",
+  );
 });
 
 it("restores an edited section only where its markers show it was", () => {
@@ -126,7 +126,7 @@ it("restores an edited section only where its markers show it was", () => {
       memory,
     ),
   ).toBeUndefined();
-  const other = withFeature("", another, true);
+  const other = withFeature("", checkinHourly, true);
   expect(
     restoredFeature(
       `${OPEN.replace(" v1", "")}\nrules\n\n${other}\n${CLOSE.replace(" -->", "-->")}`,
@@ -174,4 +174,12 @@ it("keeps the owner's line ending, or its absence, through on and off", () => {
       false,
     ),
   ).toBe("Be brief.\n");
+});
+
+it("has the check-in read the private channels Bestie was added to", () => {
+  const load = checkinHourly.text
+    .split("\n")
+    .find((line) => line.startsWith("1. LOAD."));
+  expect(load).toContain("each private channel you have been added to");
+  expect(load).toContain("you are a guest there and can't post");
 });

@@ -8,6 +8,8 @@ export type PluginManifest = Readonly<{
   name: string;
   apiVersion: 1;
   description?: string;
+  /** Support Git update notices. The user's saved choice overrides this default. */
+  updates?: Readonly<{ defaultEnabled: boolean }>;
   /** Author-supplied browsing metadata. It never grants host capabilities. */
   discovery?: Readonly<{
     /** Stable category slug. Hosts may group unrecognized values under Other. */
@@ -19,6 +21,8 @@ export type PluginManifest = Readonly<{
   host?: Readonly<{
     /** Observe and influence native hook events for these agent type keys. */
     agentHooks?: readonly string[];
+    /** Offer execution targets for these native agent type keys. */
+    agentExecution?: readonly string[];
     commands?: readonly Readonly<{
       id: string;
       program: string;
@@ -27,6 +31,13 @@ export type PluginManifest = Readonly<{
       maxInputBytes?: number;
       /** Maximum UTF-8 stdout bytes; defaults to 4096, bounded at 1048576. */
       maxOutputBytes?: number;
+      /** Run an installed executable only when its bytes and declared sibling
+       * files match this descriptor, never a program found on PATH. */
+      artifact?: Readonly<{
+        path: string;
+        sha256: string;
+        siblings?: readonly Readonly<{ name: string; sha256: string }>[];
+      }>;
     }>[];
     networkOrigins?: readonly string[];
     /** Separate authority access; ordinary HTTPS grants never authorize a session. */
@@ -79,6 +90,7 @@ declare module "@deepseek-ai/cordis" {
       id: string;
       revision: string;
       agentHooks?: readonly string[];
+      agentExecution?: readonly string[];
     }>;
   }
 }

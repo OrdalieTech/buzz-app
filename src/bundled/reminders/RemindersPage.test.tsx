@@ -68,6 +68,24 @@ const sessionParts = {
     mediaUrl(url, (target) => target, "https://community", size),
 };
 
+it.each([
+  "The answer is ||Rosebud||",
+  "The answer is ||Rosebud…",
+  "The answer is ||decoy || Rosebud || more||",
+])("redacts the old saved preview: %s", (preview) => {
+  const state = {
+    status: "ready",
+    reminders: [reminder(preview, "pending", 1, now + 600)],
+  };
+  page({
+    snapshot: () => state,
+    subscribe: () => () => {},
+  } as unknown as Reminders);
+  const row = screen.getByRole("listitem");
+  expect(row).toHaveTextContent("The answer is [Spoiler]");
+  expect(row).not.toHaveTextContent("Rosebud");
+});
+
 it("lists finished reminders newest first in a collapsed Done group", () => {
   const state = {
     status: "ready" as const,
@@ -115,7 +133,7 @@ it("lists finished reminders newest first in a collapsed Done group", () => {
   ).toBeVisible();
   expect(overdue.querySelector("img")).toHaveAttribute(
     "src",
-    authorPicture.replace(/\.png$/, ".thumb.jpg"),
+    authorPicture.replace(/\.png$/, ".thumb.webp"),
   );
   // The row's open action still conveys what the reminder is and when.
   expect(

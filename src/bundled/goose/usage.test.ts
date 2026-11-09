@@ -26,8 +26,6 @@ const ask = (pubkey = agent) =>
     scope: "thread",
     context: [],
     total: 1,
-    label: "@mention",
-    name: () => undefined,
   });
 const user = (text: string, created = start, userVisible = true) => ({
   role: "user",

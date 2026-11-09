@@ -4,6 +4,7 @@ import {
 } from "./ConversationHost";
 import { ConversationPresentation } from "./ConversationPresentation";
 // @vitest-environment jsdom
+const emptyTyping: never[] = [];
 import "@testing-library/jest-dom/vitest";
 import {
   act,
@@ -142,12 +143,14 @@ function fixture(
     ],
   };
   const unread = {
+    revision: () => 0,
     sync: () => ({ capability: "unsupported" }),
     snapshot: () => undefined,
     subscribe: () => () => {},
     attention: () => ({ unread: false }),
     enterChannel: vi.fn(async () => {}),
     leaveChannel: vi.fn(),
+    setChannelActive: vi.fn(),
   };
   const outbox = {
     subscribe: () => () => {},
@@ -158,6 +161,7 @@ function fixture(
   };
   const session = {
     viewer,
+    directMessages: { available: false },
     thread: () => ({
       snapshot: () => thread,
       subscribe: () => () => {},
@@ -165,12 +169,17 @@ function fixture(
       loadMore: async () => {},
       dispose() {},
     }),
-    channels: { subscribeList: () => () => {}, list: () => channels },
+    channels: {
+      subscribeList: () => () => {},
+      list: () => channels,
+      window: () => ({ rows: [] }),
+    },
     profiles: {
       ensure: async () => {},
       snapshot: () => profiles,
       subscribe: () => () => {},
     },
+    typing: { subscribe: () => () => {}, snapshot: () => emptyTyping },
     agentChoices: createAgentLibrary(undefined).queries,
     messages: { retry() {}, canRetry: () => true },
     media: () => undefined,
@@ -338,14 +347,20 @@ it("selecting a channel supplies its readers without remounting the page below",
 it("keeps one channel visit while the thread is retargeted within a channel", () => {
   const h = fixture();
   const view = render(<EmbeddedThread {...h.props} />);
-  expect(h.unread.enterChannel).toHaveBeenCalledExactlyOnceWith("c");
+  expect(h.unread.enterChannel).toHaveBeenCalledExactlyOnceWith(
+    "c",
+    document.hasFocus(),
+  );
   view.rerender(<EmbeddedThread {...h.props} messageId={"c".repeat(64)} />);
   expect(h.unread.enterChannel).toHaveBeenCalledOnce();
   expect(h.unread.leaveChannel).not.toHaveBeenCalled();
   // Leaving the channel is the barrier: the visit does follow the channel.
   view.rerender(<EmbeddedThread {...h.props} channelId="d" />);
   expect(h.unread.leaveChannel).toHaveBeenCalledExactlyOnceWith("c");
-  expect(h.unread.enterChannel).toHaveBeenLastCalledWith("d");
+  expect(h.unread.enterChannel).toHaveBeenLastCalledWith(
+    "d",
+    document.hasFocus(),
+  );
 });
 
 it("offers recovery for a failed edit left in the outbox", () => {
@@ -365,9 +380,9 @@ it("offers recovery for a failed edit left in the outbox", () => {
     } as unknown as OutgoingEvent,
   ]);
   render(<EmbeddedThread {...h.props} />);
-  expect(screen.getByRole("status")).toHaveTextContent(
-    "Message edit: Relay refused the edit.",
-  );
+  expect(
+    screen.getByText("Message edit: Relay refused the edit."),
+  ).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "Retry message update" }));
   expect(h.outbox.retry).toHaveBeenCalledExactlyOnceWith("edit");
 });
@@ -412,4 +427,44 @@ it("the shared conversation host supplies live actions and retires them while it
   view.rerender(mount(true));
   fireEvent.click(screen.getByText("Open profile"));
   expect(screen.getByText("Linked content")).toBeVisible();
+});
+
+it("an open channel reserves profile room for its roster and returns it when it closes", () => {
+  const { props } = fixture();
+  const release = vi.fn();
+  const reserve = vi.fn(() => release);
+  const session = {
+    ...props.session,
+    profiles: { ...props.session.profiles, reserve },
+  } as RelaySession;
+  const interactions: ConversationInteractions = {
+    onOpenLink: () => true,
+    canOpenLink: () => false,
+    onOpenMediaReview: () => {},
+  };
+  const page = (id?: string, active?: boolean) => (
+    <ConversationChannel
+      session={session}
+      scope={props.scope}
+      extensions={props.extensions}
+      channel={id ? { id, name: "Channel" } : undefined}
+      active={active}
+      interactions={interactions}
+    >
+      <input aria-label="Page state" />
+    </ConversationChannel>
+  );
+  const view = render(page("c"));
+  expect(reserve).toHaveBeenCalledExactlyOnceWith(1);
+  view.rerender(page());
+  expect(release).toHaveBeenCalledOnce();
+  view.rerender(page("d"));
+  expect(reserve).toHaveBeenCalledTimes(2);
+  // A retained tab in the background gives the room back until it is shown.
+  view.rerender(page("d", false));
+  expect(release).toHaveBeenCalledTimes(2);
+  view.rerender(page("d", true));
+  expect(reserve).toHaveBeenCalledTimes(3);
+  view.unmount();
+  expect(release).toHaveBeenCalledTimes(3);
 });

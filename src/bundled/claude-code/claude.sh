@@ -6,14 +6,38 @@
 #   install VERSION PLATFORM SHA256  downloads a release, unless it is already
 #                                    downloaded, and checks it
 #   use VERSION                      makes a downloaded release the one in use
+#   review                           makes security reviews' folder and
+#                                    prints it
 set -eu
 
 # Shared by every Buzz build on this computer, so there is one download.
+# Security reviews keep their own Claude folder beside it (macOS only), which
+# Buzz Security hides from contained agents. The API key is not here: native
+# code keeps it in the OS credential store (`claude_key.rs`).
+review=""
 if [ "$(uname)" = Darwin ]; then
   dir="$HOME/Library/Application Support/Buzz/claude-code"
+  review="$HOME/Library/Application Support/Buzz/claude-code-review-home"
 else
   dir="${XDG_DATA_HOME:-$HOME/.local/share}/buzz/claude-code"
 fi
+
+# Refuses a review folder that is a link or not a folder.
+review_folder() {
+  if [ -h "$review" ] || { [ -e "$review" ] && [ ! -d "$review" ]; }; then
+    echo "The Claude review folder is not a folder" >&2
+    exit 1
+  fi
+}
+
+# Makes the review folder, private, unless something else is in its place.
+make_review() {
+  review_folder
+  mkdir -p "${review%/*}"
+  [ -d "$review" ] || mkdir -m 700 "$review"
+  review_folder
+  chmod 700 "$review"
+}
 
 # Versions name folders, so only digits and dots: no `..` or `/` escapes.
 valid() {
@@ -102,13 +126,21 @@ use)
   previous=$(cat "$dir/current" 2>/dev/null || true)
   printf %s "$version" >"$dir/current.$$"
   mv -f "$dir/current.$$" "$dir/current"
-  # Keep the new release, the one before it to fall back to, and any newer
-  # one, which another build may be testing; remove the rest.
+  # Keep the new release, the one before it to fall back to, any newer one,
+  # which another build may be testing, and the release protected agents run
+  # (`PROTECTED_CLAUDE_VERSION`); remove the rest.
   for folder in "$dir"/*/; do
     folder=$(basename "$folder")
-    [ "$folder" = "$version" ] || [ "$folder" = "$previous" ] ||
+    [ "$folder" = "$version" ] || [ "$folder" = "$previous" ] || [ "$folder" = "2.1.305" ] ||
       newer "$folder" "$version" || rm -rf "${dir:?}/$folder"
   done
+  ;;
+review)
+  # Reviews' own Claude folder, made on first use, which Buzz Security hides
+  # from contained agents.
+  [ -n "$review" ] || { echo "Claude security reviews need macOS" >&2; exit 2; }
+  make_review
+  printf '%s\n' "$review"
   ;;
 *)
   echo "Unknown command: $command" >&2

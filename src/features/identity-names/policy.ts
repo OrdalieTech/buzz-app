@@ -7,6 +7,21 @@ export type NamingIdentity = {
   ownerPubkey?: string;
 };
 
+/** A scope's naming input: its selected keys and the owners of selected
+ * agents. Rows outside it only supply those owners' names. `rowsOf` returns
+ * every row for a key. The name directory and this policy share this rule. */
+export function scopeKeys(
+  selection: Iterable<string>,
+  rowsOf: (key: string) => Iterable<NamingIdentity>,
+): Set<string> {
+  const selected = [...selection].map((key) => key.toLowerCase());
+  const keys = new Set(selected);
+  for (const key of selected)
+    for (const row of rowsOf(key))
+      if (row.ownerPubkey) keys.add(row.ownerPubkey.toLowerCase());
+  return keys;
+}
+
 /** Display policy only. Neither a readable owner nor a key suffix grants authority. */
 export function resolveIdentityNames(
   identities: readonly NamingIdentity[],
@@ -19,17 +34,13 @@ export function resolveIdentityNames(
   // Outside a selection, rows only supply agent owners' names. Drop the rest
   // first: callers pass the whole directory for scopes of a few keys.
   if (selected) {
-    const owners = new Set(
-      identities.flatMap((row) =>
-        row.ownerPubkey && selected.has(row.pubkey.toLowerCase())
-          ? [row.ownerPubkey.toLowerCase()]
-          : [],
-      ),
-    );
-    identities = identities.filter((row) => {
+    const byKey = new Map<string, NamingIdentity[]>();
+    for (const row of identities) {
       const key = row.pubkey.toLowerCase();
-      return selected.has(key) || owners.has(key);
-    });
+      byKey.set(key, [...(byKey.get(key) ?? []), row]);
+    }
+    const keys = scopeKeys(selected, (key) => byKey.get(key) ?? []);
+    identities = identities.filter((row) => keys.has(row.pubkey.toLowerCase()));
   }
   const unique = new Map(
     identities.map((row) => [

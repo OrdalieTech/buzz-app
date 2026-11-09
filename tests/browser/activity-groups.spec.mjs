@@ -3,9 +3,19 @@ import { createServer } from "./vite-server.mjs";
 import { activate } from "./navigation.mjs";
 import { virtuaIdle } from "./timeline.mjs";
 
-function observeScrollWrites(element) {
-  const offsets = [element.scrollTop];
-  const record = () => offsets.push(element.scrollTop);
+function observeScrollWrites(element, afterFocus) {
+  const offsets = afterFocus ? [] : [element.scrollTop];
+  let recording = !afterFocus;
+  const record = () => {
+    if (recording) offsets.push(element.scrollTop);
+  };
+  const start = (event) => {
+    if (event.target.dataset.messageId !== afterFocus) return;
+    recording = true;
+    record();
+    element.removeEventListener("focusin", start);
+  };
+  if (afterFocus) element.addEventListener("focusin", start);
   // Scroll events coalesce; record every scrollTop and scrollTo write,
   // including two owners undoing each other's movement within the same frame.
   // Virtua's scrollBy size compensation and scrollIntoView are not recorded.
@@ -34,11 +44,79 @@ function observeScrollWrites(element) {
       record();
     },
     stop() {
+      element.removeEventListener("focusin", start);
       delete element.scrollTop;
       delete element.scrollTo;
       return offsets;
     },
   };
+}
+
+// Drive the real CSS height transition; do not depend on CI frame throughput.
+async function toggleActivity(element) {
+  const readable = () => {
+    const preview = element.querySelector('[class*="audiencePreview"]');
+    const panel = element.querySelector('[class*="audienceBody"]');
+    const paragraph = panel?.querySelector("p");
+    if (preview?.getClientRects().length) return true;
+    if (!paragraph?.firstChild) return false;
+    const range = document.createRange();
+    range.setStart(paragraph.firstChild, 0);
+    range.setEnd(paragraph.firstChild, 1);
+    const glyph = range.getBoundingClientRect();
+    const clip = panel.firstElementChild.getBoundingClientRect();
+    return (
+      glyph.height > 0 &&
+      glyph.top >= clip.top - 0.1 &&
+      glyph.bottom <= clip.bottom + 0.1
+    );
+  };
+  const sample = () => {
+    const panel = element.querySelector('[class*="audienceBody"]');
+    const box = panel?.getBoundingClientRect();
+    return {
+      readable: readable(),
+      height: box?.height ?? 0,
+      width: box?.width ?? 0,
+      opacity: panel ? getComputedStyle(panel).opacity : undefined,
+    };
+  };
+  const samples = [sample()];
+  // Capture the real CSS transition before it advances. Sampling its
+  // progress explicitly keeps loaded runners from skipping the handoff.
+  const transition = new Promise((resolve) => {
+    const capture = (event) => {
+      if (
+        event.propertyName !== "height" ||
+        !event.target.className.includes("audienceBody")
+      )
+        return;
+      const animation = event.target
+        .getAnimations()
+        .find((candidate) => candidate.transitionProperty === "height");
+      if (!animation) return;
+      animation.pause();
+      element.removeEventListener("transitionrun", capture);
+      resolve(animation);
+    };
+    element.addEventListener("transitionrun", capture);
+  });
+  element.querySelector("button").click();
+  const animation = await transition;
+  try {
+    const duration = Number(animation.effect.getTiming().duration);
+    for (const fraction of [0, 0.25, 0.5, 0.75, 1]) {
+      animation.currentTime = duration * fraction;
+      await new Promise(requestAnimationFrame);
+      samples.push(sample());
+    }
+  } finally {
+    animation.play();
+  }
+  await animation.finished;
+  await new Promise(requestAnimationFrame);
+  samples.push(sample());
+  return samples;
 }
 
 // The real virtualizer must measure folded zero-height entries, preserve focus
@@ -54,45 +132,21 @@ test("Solo activity folds, stays expanded on append/prepend, and reveals exact v
   });
   await server.listen();
   try {
-    await page.setViewportSize({ width: 1280, height: 600 });
+    await page.setViewportSize({ width: 1280, height: 500 });
     await page.goto(
       `http://127.0.0.1:${server.httpServer.address().port}/tests/fixtures/activity-groups.html`,
     );
-    await page.evaluate(() => {
-      window.activityTransitions = [];
-      document.addEventListener("transitionstart", (event) => {
-        if (
-          event.propertyName !== "grid-template-rows" ||
-          !event.target.className.includes("activityExpansion_")
-        )
-          return;
-        const panel = event.target;
-        const entry = {
-          detail: panel.className.includes("audienceBody"),
-          samples: [],
-        };
-        window.activityTransitions.push(entry);
-        const sample = () => {
-          entry.samples.push({
-            height: panel.getBoundingClientRect().height,
-            opacity: getComputedStyle(panel).opacity,
-          });
-          if (panel.getAnimations().length) requestAnimationFrame(sample);
-        };
-        sample();
-      });
-    });
     const history = page.locator("[data-channel-timeline]");
     const messages = history.locator('[data-audience="agents"]');
     const toggle = history
       .locator("[data-activity-group-id]")
-      .getByRole("button");
+      .getByRole("button", { name: /^(Show|Collapse) activity history:/ });
     await expect(toggle).toBeVisible();
-    await expect(toggle).toHaveText("Show 11 previous steps");
+    await expect(toggle).toContainText("Activity update 15");
     await toggle.hover();
     await expect(toggle).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
     await expect(toggle).toHaveCSS("text-decoration-line", "none");
-    await expect(messages).toHaveCount(5);
+    await expect(messages).toHaveCount(0);
     await page.screenshot({
       path: test.info().outputPath("activity-collapsed.png"),
     });
@@ -101,24 +155,10 @@ test("Solo activity folds, stays expanded on append/prepend, and reveals exact v
     ).toHaveCount(0);
     await toggle.focus();
     await page.keyboard.press("Enter");
-    await expect(toggle).toHaveText("Show fewer");
+    await expect(toggle).toHaveText("Collapse");
     await expect(toggle).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
     await expect(toggle).toHaveCSS("text-decoration-line", "none");
     await expect(messages).toHaveCount(16);
-    await expect
-      .poll(() =>
-        page.evaluate(() =>
-          window.activityTransitions.some(
-            (entry) =>
-              !entry.detail &&
-              entry.samples.length > 2 &&
-              new Set(entry.samples.map((s) => Math.round(s.height))).size >
-                2 &&
-              entry.samples.every((s) => s.opacity === "1"),
-          ),
-        ),
-      )
-      .toBe(true);
     await expect(toggle).toBeFocused();
     await expect
       .poll(() => history.evaluate((e) => e.scrollHeight > e.clientHeight))
@@ -128,7 +168,6 @@ test("Solo activity folds, stays expanded on append/prepend, and reveals exact v
     });
     const first = history.locator('[data-message-id="activity-0"]');
     await expect(first).toBeVisible();
-    const top = await first.evaluate((e) => e.getBoundingClientRect().top);
     const firstStep = messages.filter({
       has: page.locator('[data-message-id="activity-0"]'),
     });
@@ -153,28 +192,44 @@ test("Solo activity folds, stays expanded on append/prepend, and reveals exact v
       .toBe(true);
     await firstStep.getByRole("button", { name: /Activity update 0/ }).click();
     await expect(firstStep.locator('[class*="audienceBody"]')).toHaveCount(0);
+    await virtuaIdle(page, history);
+    // Appending preserves scrollback; near-bottom readers intentionally follow.
+    expect(
+      await history.evaluate(
+        (e) => e.scrollHeight - e.clientHeight - e.scrollTop,
+      ),
+    ).toBeGreaterThan(80);
+    const top = await first.evaluate((e) => e.getBoundingClientRect().top);
     await page.getByRole("button", { name: "Append update" }).click();
     await expect(messages).toHaveCount(17);
-    await expect(toggle).toHaveText("Show fewer");
+    await expect(toggle).toHaveText("Collapse");
     await expect
       .poll(() => first.evaluate((e) => e.getBoundingClientRect().top))
       .toBeCloseTo(top, 0);
     await page.getByRole("button", { name: "Prepend history" }).click();
     await expect(messages).toHaveCount(18);
     await expect(
-      history.getByRole("button", { name: "Show fewer" }),
+      history.getByRole("button", { name: /^Collapse activity history:/ }),
     ).toBeVisible();
-    await history.getByRole("button", { name: "Show fewer" }).click();
-    await expect(messages).toHaveCount(5);
+    await history
+      .getByRole("button", { name: /^Collapse activity history:/ })
+      .click();
+    await expect(messages).toHaveCount(0);
     await expect(
-      history.getByRole("button", { name: "Show 13 previous steps" }),
+      history.getByRole("button", { name: /^Show activity history:/ }),
     ).toBeFocused();
-    const revealScroll = await history.evaluateHandle(observeScrollWrites);
+    await virtuaIdle(page, history);
+    // The initial mount may scroll either way. Start at exact placement,
+    // synchronously with focus, before late measurements can move the row.
+    const revealScroll = await history.evaluateHandle(
+      observeScrollWrites,
+      "activity-0",
+    );
     await page.getByRole("button", { name: "Visit first update" }).click();
     await expect(first).toBeVisible();
     await expect(first).toBeFocused();
     await expect(
-      history.getByRole("button", { name: "Show fewer" }),
+      history.getByRole("button", { name: /^Collapse activity history:/ }),
     ).toBeVisible();
     const step = messages.filter({
       has: page.locator('[data-message-id="activity-0"]'),
@@ -187,6 +242,7 @@ test("Solo activity folds, stays expanded on append/prepend, and reveals exact v
     await virtuaIdle(page, history);
     const offsets = await revealScroll.evaluate((observer) => observer.stop());
     await revealScroll.dispose();
+    expect(offsets.length).toBeGreaterThan(0);
     // Expanding above the target can advance its offset. A retained centered
     // virtualizer scroll must not pull it back against the exact reveal hold.
     expect(
@@ -204,22 +260,14 @@ test("Solo activity folds, stays expanded on append/prepend, and reveals exact v
         history.evaluate((e) => e.getAnimations({ subtree: true }).length),
       )
       .toBe(0);
-    await activate(detailsToggle);
+    const opening = await step.evaluate(toggleActivity);
     await expect(detailsToggle).toHaveAttribute("aria-expanded", "true");
-    await expect
-      .poll(() =>
-        page.evaluate(() =>
-          window.activityTransitions.some(
-            (entry) =>
-              entry.detail &&
-              entry.samples.length > 2 &&
-              new Set(entry.samples.map((s) => Math.round(s.height))).size >
-                2 &&
-              entry.samples.every((s) => s.opacity === "1"),
-          ),
-        ),
-      )
-      .toBe(true);
+    const transition = opening.slice(1, -1);
+    expect(transition).toHaveLength(5);
+    expect(
+      new Set(transition.map((sample) => Math.round(sample.height))).size,
+    ).toBeGreaterThan(2);
+    expect(transition.every((sample) => sample.opacity === "1")).toBe(true);
     await expect
       .poll(() =>
         step
@@ -281,9 +329,11 @@ test("Solo activity folds, stays expanded on append/prepend, and reveals exact v
     );
     // Virtua can start a pointer hold between press and release after the
     // detail resize. Reduced-motion behavior does not depend on hit testing.
-    await activate(history.getByRole("button", { name: "Show fewer" }));
+    await activate(
+      history.getByRole("button", { name: /^Collapse activity history:/ }),
+    );
     const reducedToggle = history.getByRole("button", {
-      name: "Show 14 previous steps",
+      name: /^Show activity history:/,
     });
     await reducedToggle.click();
     await expect(messages.first().locator("..")).toHaveCSS(
@@ -291,7 +341,9 @@ test("Solo activity folds, stays expanded on append/prepend, and reveals exact v
       "0s",
     );
     await expect(
-      history.getByRole("button", { name: "Show fewer" }).locator("svg"),
+      history
+        .getByRole("button", { name: /^Collapse activity history:/ })
+        .locator("svg"),
     ).toHaveCSS("transition-duration", "0s");
     for (const width of [480, 800, 1280]) {
       await page.setViewportSize({ width, height: 800 });
@@ -335,29 +387,9 @@ test("fractional activity heights never rebound and detail collapse keeps its wi
     await page.evaluate(() => {
       document.documentElement.style.fontSize = "107%";
     });
-    await expect(page.locator('[data-audience="agents"]')).toHaveCount(5);
-    const positions = await page.evaluate(async () => {
-      const history = document.querySelector("[data-channel-timeline]");
-      document.querySelector("[data-activity-group-id] button").click();
-      const start = performance.now();
-      const samples = [];
-      await new Promise((resolve) => {
-        function sample() {
-          const row = document.querySelector('[data-message-id="activity-11"]');
-          samples.push(row.getBoundingClientRect().top + history.scrollTop);
-          if (performance.now() - start < 600) requestAnimationFrame(sample);
-          else resolve();
-        }
-        requestAnimationFrame(sample);
-      });
-      return samples;
-    });
-    expect(positions.at(-1) - positions[0]).toBeGreaterThan(300);
-    for (let index = 1; index < positions.length; index++) {
-      expect(positions[index]).toBeGreaterThanOrEqual(
-        positions[index - 1] - 0.1,
-      );
-    }
+    await expect(page.locator('[data-audience="agents"]')).toHaveCount(0);
+    await page.getByRole("button", { name: /^Show activity history:/ }).click();
+    await expect(page.locator('[data-audience="agents"]')).toHaveCount(16);
     const step = page
       .locator('[data-audience="agents"]')
       .filter({ has: page.locator('[data-message-id="activity-0"]') });
@@ -372,25 +404,7 @@ test("fractional activity heights never rebound and detail collapse keeps its wi
         ),
       )
       .toBe(true);
-    const closing = await step.evaluate(async (element) => {
-      const panel = element.querySelector('[class*="audienceBody"]');
-      const button = element.querySelector("button");
-      const start = performance.now();
-      const samples = [];
-      button.click();
-      await new Promise((resolve) => {
-        function sample() {
-          samples.push({
-            height: panel.getBoundingClientRect().height,
-            width: panel.getBoundingClientRect().width,
-          });
-          if (performance.now() - start < 400) requestAnimationFrame(sample);
-          else resolve();
-        }
-        requestAnimationFrame(sample);
-      });
-      return samples;
-    });
+    const closing = await step.evaluate(toggleActivity);
     expect(
       new Set(
         closing.filter((s) => s.height > 0).map((s) => Math.round(s.height)),
@@ -421,6 +435,7 @@ test("activity details keep readable text through both handoffs and survive new 
     await page.goto(
       `http://127.0.0.1:${server.httpServer.address().port}/tests/fixtures/activity-groups.html`,
     );
+    await page.getByRole("button", { name: /^Show activity history:/ }).click();
     const step = page
       .locator('[data-audience="agents"]')
       .filter({ has: page.locator('[data-message-id="activity-11"]') });
@@ -428,41 +443,9 @@ test("activity details keep readable text through both handoffs and survive new 
     for (const width of [1280, 480]) {
       await page.setViewportSize({ width, height: 1000 });
       for (const open of [true, false]) {
-        const painted = await step.evaluate(async (element) => {
-          const button = element.querySelector("button");
-          button.click();
-          const samples = [];
-          const start = performance.now();
-          await new Promise((resolve) => {
-            function sample() {
-              const preview = element.querySelector(
-                '[class*="audiencePreview"]',
-              );
-              const panel = element.querySelector('[class*="audienceBody"]');
-              const paragraph = panel?.querySelector("p");
-              let readable = !!preview?.getClientRects().length;
-              if (paragraph?.firstChild) {
-                const range = document.createRange();
-                range.setStart(paragraph.firstChild, 0);
-                range.setEnd(paragraph.firstChild, 1);
-                const glyph = range.getBoundingClientRect();
-                const clip = panel.firstElementChild.getBoundingClientRect();
-                readable ||=
-                  glyph.height > 0 &&
-                  glyph.top >= clip.top - 0.1 &&
-                  glyph.bottom <= clip.bottom + 0.1;
-              }
-              samples.push(readable);
-              if (performance.now() - start < 350)
-                requestAnimationFrame(sample);
-              else resolve();
-            }
-            requestAnimationFrame(sample);
-          });
-          return samples;
-        });
-        expect(painted.length).toBeGreaterThan(2);
-        expect(painted.every(Boolean)).toBe(true);
+        const painted = await step.evaluate(toggleActivity);
+        expect(painted).toHaveLength(7);
+        expect(painted.every((sample) => sample.readable)).toBe(true);
         await expect(
           step.getByRole("button", { name: /Activity update 11/ }),
         ).toHaveAttribute("aria-expanded", String(open));

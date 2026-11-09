@@ -1,6 +1,10 @@
 import { expect, it, vi } from "vitest";
 import type { RelaySession } from "../relay/session";
-import { parseKitRecord } from "../channel-templates/model";
+import {
+  LIVE_CANVAS_BYTES,
+  LIVE_CANVAS_LIMIT,
+  parseKitRecord,
+} from "../channel-templates/model";
 import {
   validateWorkspace,
   loadChatSetup,
@@ -95,9 +99,15 @@ it("preserves ordinary Canvas and refuses malformed or manually changed workspac
   expect(() =>
     workspaceCanvas({ folders: ["/repo`\nunsafe"], canvas: "" }),
   ).toThrow("folders");
+  expect(
+    workspaceCanvas({ folders: [], canvas: "x".repeat(LIVE_CANVAS_BYTES) }),
+  ).toHaveLength(LIVE_CANVAS_BYTES);
   expect(() =>
-    workspaceCanvas({ folders: [], canvas: "x".repeat(24577) }),
-  ).toThrow("24 KiB");
+    workspaceCanvas({
+      folders: [],
+      canvas: "x".repeat(LIVE_CANVAS_BYTES + 1),
+    }),
+  ).toThrow(LIVE_CANVAS_LIMIT);
 });
 
 function fixture() {

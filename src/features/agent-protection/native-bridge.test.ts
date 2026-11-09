@@ -1,7 +1,7 @@
 import { expect, it, vi } from "vitest";
 import type { McpHandler } from "../host/service";
 import { nativeProtectionBridge } from "./native-bridge";
-import type { AgentProtection } from "./service";
+import { ProtectionDenied, type AgentProtection } from "./service";
 
 async function fixture(check: AgentProtection["check"]) {
   let handler!: McpHandler, closed!: () => void;
@@ -133,4 +133,82 @@ it("rejects saturation instead of admitting unchecked native actions", async () 
         (row as { result: { allowed: boolean } }).result.allowed === false,
     ),
   ).toBe(true);
+});
+
+it("keeps an explained model-input denial for Buzz, never for the runtime", async () => {
+  const check = vi.fn<AgentProtection["check"]>();
+  const f = await fixture(check);
+  const ask = (kind: string, session = "native-session") =>
+    f.handler({ ...call, params: { ...call.params, kind, session } });
+  const deny = (reason?: string) =>
+    check.mockRejectedValueOnce(new ProtectionDenied(reason));
+  const turn = f.bridge.explainer("native-session");
+  deny("It asks to reveal keys.");
+  expect(await ask("context")).toEqual({
+    jsonrpc: "2.0",
+    id: "native-1",
+    result: { allowed: false },
+  });
+  // A refused tool call or result does not end the turn, so needs no reason.
+  deny("A refused tool call.");
+  await ask("tool");
+  deny("A refused tool result.");
+  await ask("tool-result");
+  // Nor does a concurrent source that passed, or was refused unexplained.
+  check.mockResolvedValueOnce();
+  await ask("context");
+  deny();
+  await ask("context");
+  check.mockRejectedValueOnce(new Error("offline"));
+  await ask("context");
+  expect(turn()).toBe("It asks to reveal keys.");
+  expect(turn()).toBeUndefined();
+  // Explanations nobody takes age out, oldest first.
+  const turns = Array.from({ length: 17 }, (_, index) =>
+    f.bridge.explainer(`session-${index}`),
+  );
+  for (let index = 0; index <= 16; index++) {
+    deny(`Session ${index}.`);
+    await ask("context", `session-${index}`);
+  }
+  expect(turns[0]?.()).toBeUndefined();
+  expect(turns[1]?.()).toBe("Session 1.");
+  expect(turns[16]?.()).toBe("Session 16.");
+});
+
+it("explains a turn only by a refusal of a check that turn started", async () => {
+  const check = vi.fn<AgentProtection["check"]>();
+  const f = await fixture(check);
+  const ask = () =>
+    f.handler({ ...call, params: { ...call.params, kind: "context" } });
+  // A check from an interrupted turn is still with its reviewer.
+  const hold = () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    check.mockImplementationOnce(async () => {
+      await held;
+      throw new ProtectionDenied("An earlier turn's refusal.");
+    });
+    return release;
+  };
+  let release = hold();
+  const earlier = ask();
+  expect(check).toHaveBeenCalledTimes(1);
+  const turn = f.bridge.explainer("native-session");
+  check.mockRejectedValueOnce(new ProtectionDenied("This turn's refusal."));
+  await ask();
+  // Settling after this turn's refusal, it does not replace it.
+  release();
+  await earlier;
+  expect(turn()).toBe("This turn's refusal.");
+  // Nor does it explain a turn that ends for another reason.
+  release = hold();
+  const stale = ask();
+  expect(check).toHaveBeenCalledTimes(3);
+  const next = f.bridge.explainer("native-session");
+  release();
+  await stale;
+  expect(next()).toBeUndefined();
 });

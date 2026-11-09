@@ -33,6 +33,7 @@ const memoryStore = (): SessionStore & { all: Map<string, SavedSession> } => {
 function sessions(
   options: Partial<{
     known: Set<string>;
+    strictResume: boolean;
     store: ReturnType<typeof memoryStore>;
     /** Every process keeps its turns open until finished. */
     hold: boolean;
@@ -43,6 +44,8 @@ function sessions(
     /** The shared spare its new conversations look for. */
     spare: Spare;
     tools: ToolServer;
+    started: (sessionId: string, systemPrompt: string) => void;
+    agent: Readonly<{ pubkey: string; relay: string }>;
   }> = {},
 ) {
   const fake = fakeSpawn(options.known);
@@ -66,6 +69,7 @@ function sessions(
   };
   const pool = new AgentSessions({
     spawn,
+    strictResume: !!options.strictResume,
     ...(options.spare ? { spare: options.spare } : {}),
     store,
     launch: async () => {
@@ -76,10 +80,12 @@ function sessions(
         systemPrompt: "prompt",
         model: current,
         ...(options.tools ? { tools: options.tools } : {}),
+        ...(options.agent ? { agent: options.agent } : {}),
       };
     },
     fingerprint: () => model,
     newId: () => `new-${++ids}`,
+    ...(options.started ? { started: options.started } : {}),
   });
   const claudes = () =>
     fake.processes.filter((process) => process.id === "claude");
@@ -176,6 +182,19 @@ it("hands the spare's tools to the agent that takes it", async () => {
   expect(answered(process, "later")).toMatchObject({
     response: { mcp_response: { from: "agent" } },
   });
+});
+
+it("lets the spare's Buzz credential act as the agent that takes it", async () => {
+  const agent = { pubkey: "ab".repeat(32), relay: "wss://relay.example" };
+  const { pool, spare, claudes } = withSpare({ agent });
+  spare.warm({ cwd: "/work", model: "opus" });
+  await flush();
+  const [process] = claudes();
+  expect(process?.options.agentCredential).toBe(true);
+  // Started before any agent asked: it acts for no one yet.
+  expect(process?.actedAs).toEqual([]);
+  await pool.deliver("c/root", "hi", 1);
+  expect(process?.actedAs).toEqual([agent]);
 });
 
 it("hands over no spare that has run a turn without its prompt", async () => {
@@ -375,7 +394,8 @@ it("opens one process for messages that arrive together in a new conversation", 
 it("resumes a saved conversation after its process stops", async () => {
   vi.useFakeTimers();
   const store = memoryStore();
-  const { pool, claudes } = sessions({ store });
+  const started = vi.fn();
+  const { pool, claudes } = sessions({ store, started });
   await pool.deliver("c/root", "first", 1);
   const first = claudes()[0];
   vi.advanceTimersByTime(IDLE_MS + 1);
@@ -387,6 +407,8 @@ it("resumes a saved conversation after its process stops", async () => {
   expect(resumed?.options.args).toContain("new-1");
   expect(resumed?.prompts).toEqual(["later"]);
   expect(store.get("c/root")).toMatchObject({ id: "new-1", seen: 5 });
+  // Only the new session tells what it started with; the resume does not.
+  expect(started.mock.calls).toEqual([["new-1", "prompt"]]);
 });
 
 it("bounds a channel session's thread history while retaining recently used threads", async () => {
@@ -609,6 +631,90 @@ it("asks a one-off turn for its prompt only once its process is ready", async ()
   expect(claudes().some((process) => process.prompts.includes("wake"))).toBe(
     false,
   );
+});
+
+it("stops and waits for processes still starting when it shuts down", async () => {
+  let release!: () => void;
+  const initialized = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { pool, claudes } = sessions({ initialized });
+  const starting = [
+    pool.metadata(),
+    pool.deliver("c/root", "hi", 1),
+    pool.runOnce("timer/a", () => "work"),
+  ];
+  try {
+    await vi.waitFor(() => expect(claudes()).toHaveLength(3));
+    // The host only signals them; they exit later, as after a grace period.
+    for (const claude of claudes()) claude.exitOnKill = false;
+    let stopped = false;
+    const shutdown = pool.shutdown().then(() => {
+      stopped = true;
+    });
+    await flush();
+    expect(claudes().map((claude) => claude.killed)).toEqual([
+      true,
+      true,
+      true,
+    ]);
+    expect(stopped).toBe(false);
+    for (const claude of claudes()) claude.exit(null);
+    await shutdown;
+  } finally {
+    release();
+    await Promise.allSettled(starting);
+  }
+});
+
+it("stops and waits for a spare it took when it shuts down", async () => {
+  let release!: () => void;
+  const initialized = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { pool, spare, claudes } = withSpare({ initialized });
+  spare.warm({ cwd: "/work", model: "opus" });
+  await flush();
+  const [taken] = claudes();
+  if (!taken) throw new Error("no spare");
+  const delivering = pool.deliver("c/root", "hello", 10);
+  try {
+    // Taking it starts the next spare; the rest of the handover queues no
+    // timer, so it is initializing as the agent's after one turn of the loop.
+    await vi.waitFor(() => expect(claudes()).toHaveLength(2));
+    await flush();
+    taken.exitOnKill = false;
+    let stopped = false;
+    const shutdown = pool.shutdown().then(() => {
+      stopped = true;
+    });
+    await flush();
+    expect(taken.killed).toBe(true);
+    expect(stopped).toBe(false);
+    taken.exit(null);
+    await shutdown;
+  } finally {
+    release();
+    spare.dispose();
+    await delivering;
+  }
+});
+
+it("starts no process for a conversation still launching when it shuts down", async () => {
+  let release!: () => void;
+  const launched = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { pool, claudes } = sessions({ launched });
+  const delivering = pool.deliver("c/root", "hi", 1);
+  try {
+    await flush();
+    await pool.shutdown();
+  } finally {
+    release();
+  }
+  await expect(delivering).resolves.toMatchObject({ ok: false });
+  expect(claudes()).toEqual([]);
 });
 
 it("keeps a one-off turn's entry until its process has exited", async () => {
@@ -1094,5 +1200,155 @@ it("releases a conversation handover when its refresh fails", async () => {
     expect(f.live()[0]?.prompts).toEqual(["later mention"]);
   } finally {
     f.pool.dispose();
+  }
+});
+
+it("retains a missing remote session until the owner starts a new session", async () => {
+  const store = memoryStore();
+  store.set("room", { id: "missing", seen: 10, at: 1 });
+  const { pool, claudes } = sessions({ store, strictResume: true });
+  try {
+    await expect(pool.deliver("room", "continue", 20)).resolves.toMatchObject({
+      ok: false,
+      error:
+        "The remote Claude session cannot be restored. Start a new session to continue.",
+    });
+    expect(store.get("room")?.id).toBe("missing");
+    expect(claudes()).toHaveLength(1);
+    await pool.forget("room");
+    await expect(pool.deliver("room", "new", 30)).resolves.toEqual({
+      ok: true,
+    });
+    expect(store.get("room")?.id).toBe("new-1");
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+it("waits for a remote session save before it sends the first prompt", async () => {
+  const store = memoryStore();
+  let submitting = false;
+  let saved!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    saved = resolve;
+  });
+  const write = store.set;
+  store.set = (key, value) => {
+    if (value.pending) return write(key, value);
+    submitting = true;
+    return gate.then(() => write(key, value));
+  };
+  const { pool, claudes } = sessions({ store, strictResume: true });
+  const sent = pool.deliver("room", "hello", 10);
+  try {
+    await vi.waitFor(() => expect(submitting).toBe(true));
+    expect(store.get("room")?.pending).toBe(true);
+    expect(claudes()[0]?.prompts).toEqual([]);
+  } finally {
+    saved();
+  }
+  await expect(sent).resolves.toEqual({ ok: true });
+  expect(claudes()[0]?.prompts).toEqual(["hello"]);
+  await pool.shutdown();
+});
+
+it("retries an unsent remote session in the same pool after restart", async () => {
+  const store = memoryStore();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const write = store.set;
+  store.set = (key, value) => {
+    write(key, value);
+    return gate;
+  };
+  const first = sessions({ store, strictResume: true });
+  let current = true;
+  const unsent = first.pool.deliver("room", "old", 1, {
+    current: () => current,
+  });
+  try {
+    await vi.waitFor(() => expect(store.get("room")?.pending).toBe(true));
+    current = false;
+  } finally {
+    release();
+  }
+  await expect(unsent).resolves.toMatchObject({ ok: true, undelivered: true });
+  expect(first.claudes().flatMap((process) => process.prompts)).toEqual([]);
+  await first.pool.shutdown();
+  store.set = write;
+  const restored = sessions({ store, strictResume: true });
+  try {
+    await expect(restored.pool.deliver("room", "retry", 2)).resolves.toEqual({
+      ok: true,
+    });
+    expect(restored.claudes().flatMap((process) => process.prompts)).toEqual([
+      "retry",
+    ]);
+    expect(store.get("room")?.pending).toBeUndefined();
+  } finally {
+    await restored.pool.shutdown();
+  }
+});
+
+it("uses current settings after a remote session save waits", async () => {
+  const store = memoryStore();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const write = store.set;
+  store.set = (key, value) => {
+    write(key, value);
+    return gate;
+  };
+  const f = sessions({ store, strictResume: true });
+  const sent = f.pool.deliver("room", "hello", 1);
+  try {
+    await vi.waitFor(() => expect(store.get("room")?.pending).toBe(true));
+    f.setModel("haiku");
+    f.pool.reconfigure();
+  } finally {
+    release();
+  }
+  try {
+    await expect(sent).resolves.toEqual({ ok: true });
+    expect(
+      f
+        .claudes()
+        .filter((process) => process.prompts.length)
+        .map((process) => process.model),
+    ).toEqual(["haiku"]);
+  } finally {
+    await f.pool.shutdown();
+  }
+});
+
+it("settles a failed remote save and permits the next delivery", async () => {
+  const store = memoryStore();
+  const write = store.set;
+  let fail = true;
+  store.set = (key, value) => {
+    if (fail && !value.pending) {
+      return Promise.reject(new Error("disk unavailable"));
+    }
+    return write(key, value);
+  };
+  const f = sessions({ store, strictResume: true });
+  try {
+    await expect(f.pool.deliver("room", "one", 1)).resolves.toMatchObject({
+      ok: false,
+      error: "disk unavailable",
+    });
+    expect(f.pool.active("room")).toBe(false);
+    expect(f.claudes().flatMap((process) => process.prompts)).toEqual([]);
+    fail = false;
+    await expect(f.pool.deliver("room", "two", 2)).resolves.toEqual({
+      ok: true,
+    });
+    expect(f.claudes().flatMap((process) => process.prompts)).toEqual(["two"]);
+  } finally {
+    await f.pool.shutdown();
   }
 });

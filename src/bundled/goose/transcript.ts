@@ -2,9 +2,11 @@
 // and shown in the host's turn-transcript model. goose keeps the sessions in
 // its own database; nothing here writes or keeps them.
 import { isMessageTool } from "../../buzz-mcp/session-tools";
+import { readEventBody } from "../../features/agent-harness/turn-records";
 import {
   promptMessage,
   promptSections,
+  STEER,
   type ToolItem,
   type Transcript,
   type TranscriptItem,
@@ -20,7 +22,6 @@ export const TURN_LIMIT = 50;
 const SESSION_LIMIT = 10;
 /** The agent's recent sessions listed. */
 export const RECENT_LIMIT = 30;
-const STEER = "new-message-arrived-while-you-were-working";
 
 type Json = Record<string, unknown>;
 /** A message as goose saves it. */
@@ -67,18 +68,29 @@ const KINDS: Record<string, string> = {
   read_image: "read",
 };
 
-/** A Buzz prompt, or a steer wrapping one, as the turn's opening item. */
-function prompt(id: string, at: number, raw: string, steered: boolean) {
+/** A person's display name, if known. */
+type Names = (pubkey: string) => string | undefined;
+/** A Buzz prompt, or a steer, as the turn's opening item. */
+function prompt(
+  id: string,
+  at: number,
+  raw: string,
+  steered: boolean,
+  name?: Names,
+) {
   let sections = promptSections(raw);
   const steer = sections.find((section) => section.tag === STEER);
-  if (steer) sections = promptSections(steer.body);
-  const { text, author } = promptMessage(sections);
+  // An older steer wraps a whole turn.
+  if (steer && !readEventBody(steer.body))
+    sections = promptSections(steer.body);
+  const { text, author, authorPubkey } = promptMessage(sections, name);
   return {
     id,
     at,
     type: "prompt" as const,
     text: text || raw,
     ...(author ? { author } : {}),
+    ...(authorPubkey ? { authorPubkey } : {}),
     sections,
     steer: steered || !!steer,
   };
@@ -100,6 +112,7 @@ export function gooseTurns(
   messages: readonly Message[],
   conversation: Place & { sessionId: string },
   working: boolean,
+  name?: Names,
 ): TranscriptTurn[] {
   const turns: TranscriptTurn[] = [];
   const tools = new Map<string, ToolItem>();
@@ -136,7 +149,7 @@ export function gooseTurns(
     if (message.role === "user" && !responses.length) {
       const raw = texts(content);
       if (!raw.trim()) return;
-      const item = prompt(id, at, raw, message.metadata?.steer === true);
+      const item = prompt(id, at, raw, message.metadata?.steer === true, name);
       const current = item.steer ? turns.at(-1) : undefined;
       (current ?? turn(id, at, false)).items.push(item);
       last = at;
@@ -244,6 +257,8 @@ export function gooseTurns(
   });
   const current = turns.at(-1);
   if (current && !working) current.endedAt = Math.max(last, current.startedAt);
+  // goose returns a session's every message, from its start.
+  if (turns[0] && !turns[0].partial) turns[0].newSession = true;
   return turns;
 }
 
@@ -369,7 +384,12 @@ export type Lookup = Readonly<{
   agent: string;
   workspace: string;
   sessionId?: string;
+  /** The ids saved for `place`, read without searching goose. */
+  sessions?: readonly string[];
   place?: Place;
+  /** Also search goose's history for the place's sessions, which takes
+   * seconds; for one that saved no ids. */
+  search?: boolean;
   /** The session still working, whose last turn has not ended. */
   working?: string;
 }>;
@@ -377,22 +397,8 @@ export type Lookup = Readonly<{
 /** goose's history for an agent, each read in its own short-lived `goose-acp`. */
 export class GooseHistory {
   constructor(private readonly host: GooseHost | undefined) {}
-
-  /** The agent's latest sessions in `workspace`, newest first: those whose
-   * first prompt names its key, `agent`. */
-  recent(agent: string, workspace: string, signal: AbortSignal) {
-    return this.with(signal, async (goose, { resolveDirectory }) => {
-      const cwd = await absolute(resolveDirectory, workspace);
-      const rows: GooseSessionRow[] = [];
-      for (const row of await list(goose, cwd, agent)) {
-        if (rows.length >= RECENT_LIMIT) break;
-        signal.throwIfAborted();
-        const read = await listed(goose, row.sessionId);
-        if (opening(read)?.("Agent") === agent) rows.push(row);
-      }
-      return rows;
-    });
-  }
+  /** The last transcript read's messages, by session. */
+  private exported = new Map<string, Message[]>();
 
   /** Every session in `workspace` used since `since`, newest first, and the
    * messages of those `wanted` picks, all from one `goose-acp`: every agent
@@ -416,15 +422,22 @@ export class GooseHistory {
     });
   }
 
-  /** The agent's newest session for `place`, or undefined when goose has none
-   * for it in this workspace. */
-  find(agent: string, workspace: string, place: Place, signal: AbortSignal) {
+  /** The listed rows of `ids`, read from goose's sessions in `workspace`
+   * newest first, page by page, until every one is found or none are left:
+   * no search and no session's messages. */
+  listed(workspace: string, ids: ReadonlySet<string>, signal: AbortSignal) {
     return this.with(signal, async (goose, { resolveDirectory }) => {
       const cwd = await absolute(resolveDirectory, workspace);
-      for (const row of await candidates(goose, cwd, place))
-        if (startedFor(await messages(goose, row.sessionId), agent, place))
-          return row;
-      return undefined;
+      const found = new Map<string, GooseSessionRow>();
+      let cursor: string | undefined;
+      do {
+        const read = await page(goose, cwd, undefined, cursor);
+        for (const row of read.rows)
+          if (ids.has(row.sessionId)) found.set(row.sessionId, row);
+        cursor = read.next;
+        signal.throwIfAborted();
+      } while (cursor && found.size < ids.size);
+      return found;
     });
   }
 
@@ -433,28 +446,44 @@ export class GooseHistory {
   transcript(
     lookup: Lookup,
     signal: AbortSignal,
+    name?: Names,
+    reuse = false,
   ): Promise<GooseTranscript | undefined> {
     return this.with(signal, async (goose, { resolveDirectory }) => {
-      const ids = new Set(lookup.sessionId ? [lookup.sessionId] : []);
-      if (lookup.place) {
+      const saved = new Set(lookup.sessions);
+      const ids = new Set([
+        ...(lookup.sessionId ? [lookup.sessionId] : []),
+        ...saved,
+      ]);
+      if (lookup.place && lookup.search) {
         const cwd = await absolute(resolveDirectory, lookup.workspace);
         for (const row of await candidates(goose, cwd, lookup.place))
           ids.add(row.sessionId);
       }
       const turns: TranscriptTurn[] = [];
       let found = false;
+      // With `reuse`, while one session works, the others' messages are as
+      // last exported.
+      const exported = new Map<string, Message[]>();
       for (const sessionId of ids) {
         let read: Message[];
+        signal.throwIfAborted();
+        const kept = reuse && lookup.working && this.exported.get(sessionId);
         try {
-          read = await messages(goose, sessionId);
+          read =
+            kept && sessionId !== lookup.working
+              ? kept
+              : await messages(goose, sessionId);
         } catch (error) {
           if (/not found/i.test(String(error))) continue;
           throw error;
         }
         signal.throwIfAborted();
+        exported.set(sessionId, read);
         if (
           lookup.place &&
           sessionId !== lookup.sessionId &&
+          !saved.has(sessionId) &&
           !startedFor(read, lookup.agent, lookup.place)
         )
           continue;
@@ -464,9 +493,11 @@ export class GooseHistory {
             read,
             { sessionId, ...(lookup.place ?? { channelId: "" }) },
             sessionId === lookup.working,
+            name,
           ),
         );
       }
+      this.exported = exported;
       if (!found) return undefined;
       turns.sort((a, b) => a.startedAt - b.startedAt);
       return {
@@ -482,8 +513,17 @@ export class GooseHistory {
   ) {
     const { host } = this;
     if (!host) throw new Error("goose runs only in the desktop app");
-    // Cancelling rejects at once, and `briefly` then stops goose.
-    return briefly(host, (goose) => abortable(run(goose, host), signal));
+    // Cancelling rejects at once, and `briefly` then stops goose, or stops
+    // its startup.
+    return briefly(
+      host,
+      (goose) => {
+        signal.throwIfAborted();
+        return abortable(run(goose, host), signal);
+      },
+      {},
+      signal,
+    );
   }
 }
 

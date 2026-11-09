@@ -20,7 +20,8 @@
       "!!src-tauri/gen",
       "!!target",
       "!!test-results",
-      "!!tests/fixtures/design-system/flake-selection-*"
+      "!!tests/fixtures/design-system/flake-selection-*",
+      "!tests/fixtures/read-state-vectors.json"
     ]
   },
   "formatter": {

@@ -187,7 +187,6 @@ export function ConversationTab({
               viewer={session.viewer}
               cached={!!channel.cached}
               // The composer below mounts TypingIndicator for a live channel.
-              activityLane={!channel.cached}
               onOpenThread={onOpenThread}
               revealMessageId={sent}
               // Mount the list once, at the message, not while it is sought.

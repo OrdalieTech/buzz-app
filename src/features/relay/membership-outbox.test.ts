@@ -83,6 +83,16 @@ async function setup(
           : []),
       ],
     });
+  /** The relay's member-removed hint for `id`. */
+  const removal = (id: string) =>
+    signed(relay, {
+      kind: 44101,
+      content: "",
+      tags: [
+        ["p", viewer.pubkey],
+        ["h", id],
+      ],
+    });
   const sign = vi.fn(async (event: EventTemplate) => signed(viewer, event));
   const publish = vi.fn(async (event: RelayEvent) => {
     const id = event.tags.find(([name]) => name === "h")?.[1] ?? "";
@@ -179,17 +189,7 @@ async function setup(
       seen: "live removal" | "roster refresh" | "strong roster refresh",
     ) {
       end(id);
-      if (seen === "live removal")
-        receive([
-          signed(relay, {
-            kind: 44101,
-            content: "",
-            tags: [
-              ["p", viewer.pubkey],
-              ["h", id],
-            ],
-          }),
-        ]);
+      if (seen === "live removal") receive([removal(id)]);
       else
         owner.session.channels.refreshList?.(
           seen === "strong roster refresh" ? { consistency: "strong" } : {},
@@ -199,6 +199,12 @@ async function setup(
           owner.session.channels.list().channels.map((item) => item.id),
         ).not.toContain(id),
       );
+    },
+    /** The relay tells this device live that the viewer is no longer on `id`:
+     * its roster push, its removal hint, or closing the subscription. */
+    announce(id: string, how: "roster" | "hint" | "closed") {
+      if (how === "closed") deny(id, "restricted: not a channel member");
+      else receive([how === "roster" ? roster(id) : removal(id)]);
     },
     /** A roster read that changes nothing, through to its verified end. */
     async refresh() {
@@ -244,6 +250,42 @@ it.each(["leave", "live removal", "roster refresh"] as const)(
     else await h.remove(gone, how);
     const remaining = [unconfirmed.event.id, elsewhere.event.id];
     await vi.waitFor(() => expect(h.pending()).toEqual([remaining, remaining]));
+  },
+);
+
+it.each(["roster", "hint", "closed"] as const)(
+  "a leave the relay announces live by %s before acknowledging completes",
+  async (how) => {
+    const h = await setup();
+    const apply = h.publish.getMockImplementation();
+    assert.exists(apply);
+    // The relay runs a leave's side effects, live announcements included,
+    // before it acknowledges the publication.
+    h.publish.mockImplementationOnce(async (event) => {
+      await apply(event);
+      h.announce(gone, how);
+    });
+    // A hint's roster refresh revokes access once the leave's own
+    // confirmation read is running; hold that read so the refresh retires it.
+    const release = how === "hint" ? h.hold() : undefined;
+    const leaving = expect(
+      h.session.channelLifecycle.run("leave", gone),
+    ).resolves.toBeUndefined();
+    try {
+      await vi.waitFor(() =>
+        expect(
+          h.session.channels.list().channels.map((item) => item.id),
+        ).toEqual([kept]),
+      );
+    } finally {
+      release?.();
+    }
+    await leaving;
+    expect(h.publish).toHaveBeenCalledOnce();
+    // The hint's refresh retired the held confirmation; the leave read again.
+    expect(h.confirmations).toEqual(
+      how === "hint" ? [[gone], [gone]] : [[gone]],
+    );
   },
 );
 

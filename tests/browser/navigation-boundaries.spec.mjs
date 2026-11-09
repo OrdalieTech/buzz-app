@@ -1,7 +1,11 @@
 import { openPage, pageChoices, pageChoice } from "./navigation.mjs";
 import { test, expect } from "./fixture.mjs";
 import { open } from "./timeline.mjs";
-test.use({ pluginFixtures: true, historyCounts: { alpha: 1, beta: 0 } });
+test.use({
+  enabledPlugins: ["buzz.workflows"],
+  pluginFixtures: true,
+  historyCounts: { alpha: 1, beta: 0 },
+});
 
 async function expectPageChoice(page, name, count) {
   const choices = await pageChoices(page, "Settings");

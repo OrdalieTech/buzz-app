@@ -1,9 +1,25 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, expect, it, vi } from "vitest";
+import { createPortal } from "react-dom";
+import { afterEach, assert, expect, it, onTestFinished, vi } from "vitest";
 import { ChannelSettingsPanel } from "./ChannelSettingsPanel";
+import type { ChannelSummary } from "../../features/relay/contracts";
+import {
+  ChannelLifecycleUnconfirmed,
+  type ChannelLifecycleCapability,
+} from "../../features/relay/channel-lifecycle";
+import { PublishNotSent, PublishRejected } from "../../features/relay/outbox";
+import type { Role } from "../../features/communities/roster";
+import type { CommunityMembership } from "../moderation/membership";
 
 afterEach(() => {
   cleanup();
@@ -48,6 +64,9 @@ it("shows known channel details with diagnostics collapsed until requested", asy
 it("closes with Escape or its close button without swallowing other keys", async () => {
   const user = userEvent.setup();
   const close = vi.fn();
+  const windowKeyDown = vi.fn();
+  window.addEventListener("keydown", windowKeyDown);
+  onTestFinished(() => window.removeEventListener("keydown", windowKeyDown));
   render(
     <ChannelSettingsPanel
       scope="community:viewer"
@@ -59,8 +78,18 @@ it("closes with Escape or its close button without swallowing other keys", async
   );
   await user.keyboard("{ArrowDown}");
   expect(close).not.toHaveBeenCalled();
+  // Shift+Escape is Mark all as read; only plain Escape dismisses.
+  await user.keyboard("{Shift>}{Escape}{/Shift}");
+  expect(close).not.toHaveBeenCalled();
+  expect(windowKeyDown).toHaveBeenCalledWith(
+    expect.objectContaining({ key: "Escape", shiftKey: true }),
+  );
+  windowKeyDown.mockClear();
   await user.keyboard("{Escape}");
   expect(close).toHaveBeenCalledTimes(1);
+  expect(windowKeyDown).not.toHaveBeenCalledWith(
+    expect.objectContaining({ key: "Escape" }),
+  );
   await user.click(
     screen.getByRole("button", { name: "Close Channel settings tab" }),
   );
@@ -68,6 +97,27 @@ it("closes with Escape or its close button without swallowing other keys", async
   await user.click(screen.getByRole("tab", { name: "Channel settings" }));
   await user.keyboard("{Delete}");
   expect(close).toHaveBeenCalledTimes(3);
+});
+
+it("leaves Escape to descendants that handle it and to portalled layers", () => {
+  const close = vi.fn();
+  render(
+    <ChannelSettingsPanel
+      scope="community:viewer"
+      channel={undefined}
+      close={close}
+    >
+      <button type="button" onKeyDown={(event) => event.preventDefault()}>
+        Handled
+      </button>
+      {createPortal(<button type="button">Portalled</button>, document.body)}
+    </ChannelSettingsPanel>,
+  );
+  fireEvent.keyDown(screen.getByText("Handled"), { key: "Escape" });
+  fireEvent.keyDown(screen.getByText("Portalled"), { key: "Escape" });
+  expect(close).not.toHaveBeenCalled();
+  fireEvent.keyDown(screen.getByText("Diagnostics"), { key: "Escape" });
+  expect(close).toHaveBeenCalledOnce();
 });
 
 it("does not invent unknown metadata and still exposes diagnostics without a channel", async () => {
@@ -250,3 +300,311 @@ it.each(["resolve", "reject"])(
     );
   },
 );
+
+function lifecycle(available = true) {
+  return {
+    available,
+    load: vi.fn(),
+    run: vi.fn<ChannelLifecycleCapability["run"]>(async () => {}),
+    snapshot: () => ({ status: "ready", hidden: [] }),
+    subscribe: () => () => {},
+    observeRemoval: () => () => {},
+    refreshVisibility: async () => {},
+  } satisfies ChannelLifecycleCapability;
+}
+function membership(role: Role | undefined) {
+  const release = vi.fn();
+  return {
+    snapshot: () => ({
+      status: "ready",
+      members: [],
+      ...(role ? { role } : {}),
+      refreshing: false,
+    }),
+    subscribe: () => () => true,
+    ensure: vi.fn(() => release),
+    refresh: async () => {},
+    dispose: () => {},
+    release,
+  } satisfies CommunityMembership & { release: unknown };
+}
+const publicStream: ChannelSummary = {
+  id: "11111111-1111-4111-8111-111111111111",
+  name: "Alpha",
+  channelType: "stream",
+  visibility: "public",
+  members: ["one"],
+};
+function autoJoinPanel(
+  channel: ChannelSummary,
+  role: Role | undefined,
+  capability = lifecycle(),
+  roster: CommunityMembership | null = membership(role),
+) {
+  return (
+    <ChannelSettingsPanel
+      scope="community:viewer"
+      channel={channel}
+      lifecycle={capability}
+      membership={roster ?? undefined}
+      close={() => {}}
+    >
+      Diagnostics
+    </ChannelSettingsPanel>
+  );
+}
+const autoJoinSwitch = () =>
+  screen.getByRole("switch", { name: "Starter channel for new members" });
+const noAutoJoinSwitch = () =>
+  expect(
+    screen.queryByRole("switch", { name: "Starter channel for new members" }),
+  ).not.toBeInTheDocument();
+/** Every child of the details list is a `div` of terms then definitions. */
+const expectDefinitionRows = (node: Element) => {
+  const list = node.closest("dl");
+  assert(list);
+  for (const row of list.children)
+    expect(
+      `${row.tagName}:${[...row.children].map((child) => child.tagName).join(",")}`,
+    ).toMatch(/^DIV:DT(,DT)*(,DD)+$/);
+};
+
+// [case, channel, community role, switch shown, roster read held]
+it.each<[string, ChannelSummary, Role | undefined, boolean, boolean]>([
+  [
+    "a community owner on a public stream channel",
+    publicStream,
+    "owner",
+    true,
+    true,
+  ],
+  [
+    "a community admin on a public stream channel",
+    publicStream,
+    "admin",
+    true,
+    true,
+  ],
+  ["an ordinary community member", publicStream, "member", false, true],
+  ["an unknown community role", publicStream, undefined, false, true],
+  [
+    "a private channel",
+    { ...publicStream, visibility: "private" },
+    "owner",
+    false,
+    false,
+  ],
+  [
+    "unknown visibility",
+    { ...publicStream, visibility: undefined },
+    "owner",
+    false,
+    false,
+  ],
+  [
+    "a forum channel",
+    { ...publicStream, channelType: "forum" },
+    "owner",
+    false,
+    false,
+  ],
+  [
+    "an archived channel",
+    { ...publicStream, archived: true },
+    "owner",
+    false,
+    false,
+  ],
+  [
+    "a read-only preview",
+    { ...publicStream, readOnly: true },
+    "owner",
+    false,
+    false,
+  ],
+  [
+    "a cached channel",
+    { ...publicStream, cached: true },
+    "owner",
+    false,
+    false,
+  ],
+])(
+  "shows the auto-join switch for %s: %s",
+  (_, channel, role, shown, ensured) => {
+    const roster = membership(role);
+    const error = vi.spyOn(console, "error");
+    const { unmount } = render(
+      autoJoinPanel(channel, role, lifecycle(), roster),
+    );
+    if (shown) {
+      const control = autoJoinSwitch();
+      expect(control).toBeVisible();
+      expect(control).toHaveAccessibleDescription(
+        "New community members are added to this channel automatically.",
+      );
+      expect(control).not.toBeChecked();
+      // The label is the row's term; the switch belongs to its definition.
+      expect(control.closest("dd")?.previousElementSibling).toHaveTextContent(
+        "Starter channel for new members",
+      );
+      expectDefinitionRows(control);
+      expect(
+        screen.getByText("Description").compareDocumentPosition(control),
+      ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      expect(control.compareDocumentPosition(screen.getByText("Members"))).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      );
+    } else noAutoJoinSwitch();
+    // The row and the channel ID detail are siblings; their keys must differ.
+    expect(error).not.toHaveBeenCalledWith(
+      expect.stringContaining("same key"),
+      expect.anything(),
+    );
+    // The role read is held only while a channel-eligible row is mounted.
+    expect(roster.ensure).toHaveBeenCalledTimes(ensured ? 1 : 0);
+    unmount();
+    expect(roster.release).toHaveBeenCalledTimes(ensured ? 1 : 0);
+  },
+);
+
+it("hides the switch without a membership owner and reflects the signed flag", () => {
+  const { rerender } = render(
+    autoJoinPanel(publicStream, "owner", lifecycle(), null),
+  );
+  noAutoJoinSwitch();
+  rerender(autoJoinPanel({ ...publicStream, autoJoin: true }, "owner"));
+  expect(autoJoinSwitch()).toBeChecked();
+});
+
+it("runs the matching command, stays pending until it settles, then follows the metadata", async () => {
+  const user = userEvent.setup();
+  const capability = lifecycle();
+  let settle!: () => void;
+  capability.run.mockReturnValueOnce(
+    new Promise<void>((resolve) => {
+      settle = resolve;
+    }),
+  );
+  const { rerender } = render(autoJoinPanel(publicStream, "owner", capability));
+  // The visible term labels the switch.
+  await user.click(screen.getByText("Starter channel for new members"));
+  try {
+    expect(capability.run).toHaveBeenCalledExactlyOnceWith(
+      "auto-join-on",
+      publicStream.id,
+      expect.any(AbortSignal),
+    );
+    expect(autoJoinSwitch()).toHaveAttribute("aria-disabled", "true");
+    expect(autoJoinSwitch()).toHaveAttribute("aria-busy", "true");
+    // No optimistic state: the switch follows the signed metadata.
+    expect(autoJoinSwitch()).not.toBeChecked();
+  } finally {
+    await act(async () => settle());
+  }
+  expect(autoJoinSwitch()).not.toHaveAttribute("aria-disabled");
+  expect(autoJoinSwitch()).not.toHaveAttribute("aria-busy");
+  rerender(
+    autoJoinPanel({ ...publicStream, autoJoin: true }, "owner", capability),
+  );
+  expect(autoJoinSwitch()).toBeChecked();
+  await user.click(autoJoinSwitch());
+  expect(capability.run).toHaveBeenLastCalledWith(
+    "auto-join-off",
+    publicStream.id,
+    expect.any(AbortSignal),
+  );
+});
+
+it.each([
+  [
+    "the relay's own reason",
+    new PublishRejected("rejected", "invalid: actor not authorized"),
+    "invalid: actor not authorized",
+  ],
+  [
+    "the default reason",
+    new PublishRejected("rejected"),
+    "Only community owners and admins can change this.",
+  ],
+  [
+    "a retry for an unconfirmed outcome",
+    // As the lifecycle owner throws it when readback never shows the flag.
+    new ChannelLifecycleUnconfirmed(
+      new Error(
+        "The relay accepted the request, but the change is not confirmed. Refresh channels before trying again.",
+      ),
+    ),
+    "Saved, but not confirmed yet. Try again to check.",
+  ],
+  [
+    "a retry for a rate limit, not a refusal",
+    // As the transport maps a NIP-01 `rate-limited:` OK reply.
+    new PublishNotSent("rate-limited: slow down"),
+    "Not sent. Try again.",
+  ],
+])(
+  "reports %s and lets the switch be tried again",
+  async (_, failure, copy) => {
+    const user = userEvent.setup();
+    const capability = lifecycle();
+    capability.run.mockRejectedValueOnce(failure);
+    render(autoJoinPanel(publicStream, "owner", capability));
+    await user.click(autoJoinSwitch());
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(copy);
+    expectDefinitionRows(alert);
+    expect(autoJoinSwitch()).toHaveAccessibleDescription(
+      `New community members are added to this channel automatically. ${copy}`,
+    );
+    expect(autoJoinSwitch()).not.toHaveAttribute("aria-disabled");
+    expect(autoJoinSwitch()).not.toBeChecked();
+    await user.click(autoJoinSwitch());
+    await waitFor(() =>
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument(),
+    );
+    expect(autoJoinSwitch()).toHaveAccessibleDescription(
+      "New community members are added to this channel automatically.",
+    );
+    expect(capability.run).toHaveBeenCalledTimes(2);
+  },
+);
+
+it("drops an unconfirmed prompt once the signed flag shows the change landed", async () => {
+  const user = userEvent.setup();
+  const capability = lifecycle();
+  capability.run.mockRejectedValueOnce(
+    new ChannelLifecycleUnconfirmed(new Error("not confirmed")),
+  );
+  const { rerender } = render(autoJoinPanel(publicStream, "owner", capability));
+  await user.click(autoJoinSwitch());
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent(
+    "Saved, but not confirmed yet. Try again to check.",
+  );
+  expect(autoJoinSwitch().getAttribute("aria-describedby")).toContain(alert.id);
+  // A refresh that still lacks the flag keeps the prompt.
+  rerender(autoJoinPanel({ ...publicStream }, "owner", capability));
+  expect(screen.getByRole("alert")).toBe(alert);
+  // A later 39000 shows the flag on; "Try again" would now turn it off.
+  rerender(
+    autoJoinPanel({ ...publicStream, autoJoin: true }, "owner", capability),
+  );
+  expect(autoJoinSwitch()).toBeChecked();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(autoJoinSwitch().getAttribute("aria-describedby")).not.toContain(
+    alert.id,
+  );
+  expect(autoJoinSwitch()).toHaveAccessibleDescription(
+    "New community members are added to this channel automatically.",
+  );
+  // Another admin turning it off later does not bring the stale prompt back.
+  rerender(autoJoinPanel(publicStream, "owner", capability));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(capability.run).toHaveBeenCalledOnce();
+});
+
+it("disables the switch when channel actions are unavailable on this connection", () => {
+  render(autoJoinPanel(publicStream, "owner", lifecycle(false)));
+  expect(autoJoinSwitch()).toHaveAttribute("aria-disabled", "true");
+});

@@ -1,7 +1,11 @@
 // @vitest-environment jsdom
 import { expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { LockIcon, TableIcon } from "../../shared/design-system/icons/index";
+import {
+  HashIcon,
+  LockIcon,
+  TableIcon,
+} from "../../shared/design-system/icons/index";
 import styles from "../../shared/InlineReference.module.css";
 import { InlineLink, LinkLabel, linkKind } from "./InlineLink";
 import { apply } from "./index";
@@ -60,10 +64,25 @@ it("renders private channel links with the design-system lock icon", () => {
       <InlineLink href="buzz://channel/private">#private</InlineLink>
     </LinkChannelPrivateContext>,
   );
+  // A little apart from the name, where a public channel's hash sits flush.
   expect(markup).toContain(
-    renderToStaticMarkup(<LockIcon className={styles.icon} />),
+    renderToStaticMarkup(
+      <LockIcon className={`${styles.icon} ${styles.snug}`} />,
+    ),
   );
   expect(textOf(markup)).toBe("private");
+});
+
+it("renders public channel links with the hash flush against the name", () => {
+  const markup = renderToStaticMarkup(
+    <InlineLink href="buzz://channel/public">#public</InlineLink>,
+  );
+  expect(markup).toContain(
+    renderToStaticMarkup(
+      <HashIcon className={`${styles.icon} ${styles.flush}`} />,
+    ),
+  );
+  expect(textOf(markup)).toBe("public");
 });
 
 it("shows a supplied icon in place of the service's, with the label intact", () => {

@@ -4,7 +4,7 @@ type PanelProps<T extends ElementType> = {
   as?: T;
   children?: ReactNode;
   joined?: boolean;
-  shape?: "panel" | "capsule";
+  shape?: "panel" | "capsule" | "card";
 } & Omit<ComponentProps<T>, "as" | "children" | "className">;
 
 /**

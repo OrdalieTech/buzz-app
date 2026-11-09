@@ -145,6 +145,30 @@ async function fixture() {
   };
 }
 
+it("uses the configured Bestie avatar in the dock and follows selection changes", async () => {
+  const f = await fixture();
+  render(
+    <BestieNavigationProvider pages={[page]} relay={f.relay}>
+      <PageNavigation
+        pages={[page]}
+        selected={page.key}
+        onSelect={() => {}}
+        placement="dock"
+      />
+    </BestieNavigationProvider>,
+  );
+  act(() => setDefaultAgent(scope, pollen));
+  const pollenTab = await screen.findByRole("tab", { name: "Pollen" });
+  expect(pollenTab.querySelector("img")).toHaveAttribute(
+    "src",
+    portrait.preview,
+  );
+  act(() => setDefaultAgent(scope, fizz));
+  const fizzTab = await screen.findByRole("tab", { name: "Fizz" });
+  expect(fizzTab.querySelector("img")).toBeNull();
+  expect(fizzTab).toHaveTextContent("F");
+});
+
 it("shows the exact choice as Bestie in navigation and search", async () => {
   const f = await fixture();
   const select = vi.fn();
@@ -337,6 +361,7 @@ it("honors the promoted DM's mute and unread state through reads and Bestie repl
       },
     },
     {
+      readStateFloor: () => 0,
       readPublisherLock: async (_signal, work) => work(),
       readStateStorage: {
         async update(change) {
@@ -384,6 +409,7 @@ it("honors the promoted DM's mute and unread state through reads and Bestie repl
         <PageNavigation
           pages={[page]}
           selected={page.key}
+          placement="dock"
           onSelect={() => {}}
         />
       </PrimarySidebar>
@@ -397,10 +423,9 @@ it("honors the promoted DM's mute and unread state through reads and Bestie repl
     </StrictMode>
   );
   const view = render(tree());
-  const row = () => screen.getByRole("button", { name: /^Pollen/ });
+  const row = () => screen.getByRole("tab", { name: /^Pollen/ });
   const dmRow = () => document.querySelector(`[data-channel-id="${first}"]`);
   expect(row().querySelector("[data-channel-priority]")).toBeNull();
-  expect(row().querySelector("[data-bestie-unread]")).toBeNull();
   await waitFor(() =>
     expect(
       document.querySelector(`[data-channel-id="${second}"]`),
@@ -422,28 +447,16 @@ it("honors the promoted DM's mute and unread state through reads and Bestie repl
     within(row()).getByRole("img", { name: /1 observed unread messages/ }),
   ).toBeInTheDocument();
   expect(row().querySelector("[data-channel-priority]")).toBeNull();
-  expect(row().querySelector("[data-bestie-unread]")).toHaveAttribute(
-    "data-bestie-unread",
-    "true",
-  );
   expect(dmRow()).toBeNull();
   await act(async () => {
     muted = false;
     await preferences.queries.refresh();
   });
   expect(row().querySelector("[data-channel-activity]")).toBeInTheDocument();
-  expect(row().querySelector("[data-bestie-unread]")).toHaveAttribute(
-    "data-bestie-unread",
-    "true",
-  );
   await act(async () => {
     muted = true;
     await preferences.queries.refresh();
   });
-  expect(row().querySelector("[data-bestie-unread]")).toHaveAttribute(
-    "data-bestie-unread",
-    "true",
-  );
   expect(row().querySelector("[data-channel-activity]")).toBeNull();
   expect(row()).toHaveAccessibleName(/1 unread thread/);
   expect(dmRow()).toBeNull();
@@ -453,21 +466,16 @@ it("honors the promoted DM's mute and unread state through reads and Bestie repl
     await session.unread.markChannelRead(first);
   });
   expect(row().querySelector("[data-channel-priority]")).toBeNull();
-  expect(row().querySelector("[data-bestie-unread]")).toBeNull();
   await act(async () => {
     await session.unread.markUnreadLocal({ kind: "channel", channelId: first });
   });
   expect(
     within(row()).getByRole("img", { name: /Marked unread/ }),
   ).toBeInTheDocument();
-  expect(row().querySelector("[data-bestie-unread]")).toHaveAttribute(
-    "data-bestie-unread",
-    "true",
-  );
   act(() => {
     setDefaultAgent(currentScope, fizz);
   });
-  const replacement = screen.getByRole("button", { name: "Fizz" });
+  const replacement = screen.getByRole("tab", { name: "Fizz" });
   expect(replacement.querySelector("[data-channel-priority]")).toBeNull();
   act(() => {
     live?.receive([message(agent, first, "Old bestie message", 1_700_000_006)]);
@@ -486,7 +494,7 @@ it("honors the promoted DM's mute and unread state through reads and Bestie repl
   });
   expect(
     screen
-      .getByRole("button", { name: "Bestie" })
+      .getByRole("tab", { name: "Bestie" })
       .querySelector("[data-channel-priority]"),
   ).toBeNull();
 });

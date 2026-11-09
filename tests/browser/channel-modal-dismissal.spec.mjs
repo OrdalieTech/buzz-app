@@ -52,12 +52,23 @@ test("Canvas confirmation backdrop dismisses only the top layer and retains the 
       .getByRole("menuitem", { name: "View canvas", exact: true })
       .click();
   };
+  const openEdit = async () => {
+    await openCanvas();
+    await expect(
+      editor.getByRole("article", { name: "Saved Canvas" }),
+    ).toBeVisible();
+    await editor.getByRole("tab", { name: "Edit", exact: true }).click();
+  };
   await openCanvas();
   const editor = workspace.getByRole("tabpanel", {
     name: "Canvas",
     exact: true,
   });
   const text = editor.getByRole("textbox", { name: "Canvas Markdown" });
+  await expect(
+    editor.getByRole("article", { name: "Saved Canvas" }),
+  ).toBeVisible();
+  await editor.getByRole("tab", { name: "Edit", exact: true }).click();
   await expect(text).toHaveValue("Local draft");
   const reload = editor.getByRole("button", { name: "Reload saved Canvas" });
   await reload.click();
@@ -97,7 +108,7 @@ test("Canvas confirmation backdrop dismisses only the top layer and retains the 
   await expect(settingsTab).toHaveAttribute("aria-selected", "true");
   await expect(settingsTab).toBeFocused();
   await expect(settings).toBeVisible();
-  await openCanvas();
+  await openEdit();
   await expect(text).toHaveValue("Local draft");
   expect(app.report.lifecyclePublications ?? []).toEqual([]);
 });

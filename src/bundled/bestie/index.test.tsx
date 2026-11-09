@@ -1,15 +1,16 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { composerDOMFixture } from "../../features/messages/composer-testing";
-import type { ConversationExtensions } from "../../features/conversation/contracts";
-import type { ConversationHostServices } from "../../features/conversation/ConversationHost";
-import type { Navigation } from "../../features/navigation/controller";
-import { BestiePage } from "./index";
 import { deferred } from "../builderlab/test-helpers";
-import { bestieFixture, cleanups, HOME } from "./testing";
+import type { Agent } from "../../features/agents/service";
+import {
+  chooseDefaultAgent,
+  clearDefaultAgent,
+} from "../../features/solo/default-agent";
+import { bestieFixture, cleanups, COMMUNITY } from "./testing";
 
 const native = vi.hoisted(() => ({ isTauri: () => true, invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => native);
@@ -21,20 +22,9 @@ vi.stubGlobal(
     disconnect() {}
   },
 );
-HTMLElement.prototype.scrollIntoView = vi.fn();
 
 beforeEach(() => {
   vi.stubEnv("VITE_BUZZ_BUILDERLAB_URL", "https://builderlab.example");
-  Object.defineProperty(navigator, "platform", {
-    configurable: true,
-    value: "MacIntel",
-  });
-  let next = 0;
-  const randomUUID = crypto.randomUUID.bind(crypto);
-  vi.spyOn(crypto, "randomUUID").mockImplementation(() =>
-    next++ === 0 ? HOME : randomUUID(),
-  );
-  vi.spyOn(console, "warn").mockImplementation(() => {});
 });
 afterEach(async () => {
   cleanup();
@@ -43,29 +33,6 @@ afterEach(async () => {
   native.invoke.mockReset();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  Reflect.deleteProperty(navigator, "platform");
-});
-
-it("keeps Bestie's page with a route to plugin settings while Builderlab is off", async () => {
-  const open = vi.fn(async () => ({ status: "opened" }));
-  render(
-    <BestiePage
-      navigation={{ open } as unknown as Navigation}
-      extensions={{} as ConversationExtensions}
-      host={{} as ConversationHostServices}
-    />,
-  );
-  expect(screen.getByRole("status")).toHaveTextContent(
-    "Turn on the Builderlab plugin",
-  );
-  await userEvent.click(
-    screen.getByRole("button", { name: "Plugin settings" }),
-  );
-  expect(open).toHaveBeenCalledWith({
-    version: 1,
-    kind: "settings",
-    section: "plugins",
-  });
 });
 
 const renderPage = (h: Awaited<ReturnType<typeof bestieFixture>>) => {
@@ -73,16 +40,8 @@ const renderPage = (h: Awaited<ReturnType<typeof bestieFixture>>) => {
   if (!Page) throw new Error("Missing Bestie page");
   return render(<Page />);
 };
-const chooseModel = async () => {
-  const user = userEvent.setup();
-  await user.click(await screen.findByRole("combobox", { name: "Model" }));
-  await user.click(await screen.findByRole("option", { name: "Model A" }));
-  await user.click(screen.getByRole("combobox", { name: "Reasoning effort" }));
-  await user.click(await screen.findByRole("option", { name: "high" }));
-};
-const composer = () => screen.getByRole("textbox", { name: "Message #Bestie" });
 
-it("waits for the account choice before deciding whether to show setup", async () => {
+it("waits for the account choice before showing the chooser", async () => {
   const choice = deferred<string | undefined>();
   const h = await bestieFixture(native.invoke, {
     mainAgent: {
@@ -92,232 +51,59 @@ it("waits for the account choice before deciding whether to show setup", async (
   });
   renderPage(h);
   expect(await screen.findByRole("status")).toHaveTextContent(
-    "Loading your Bestie…",
+    "Reading your saved choice.",
   );
   expect(
-    screen.queryByRole("button", { name: "Set up Bestie" }),
+    screen.queryByRole("button", { name: "Create agent" }),
   ).not.toBeInTheDocument();
   await act(async () => choice.resolve(undefined));
   expect(
-    await screen.findByRole("button", { name: "Set up Bestie" }),
+    await screen.findByRole("button", { name: "Create agent" }),
   ).toBeVisible();
 });
 
-it("keeps setup hidden when the account choice read fails and retries it", async () => {
-  const first = deferred<string | undefined>();
-  const second = deferred<string | undefined>();
-  let reads = 0;
+it("replaces hosted setup with the manual Bestie chooser", async () => {
+  const h = await bestieFixture(native.invoke);
+  renderPage(h);
+  expect(
+    await screen.findByRole("heading", { name: "Choose your bestie agent" }),
+  ).toBeVisible();
+  expect(
+    screen.getByText(
+      "This is your primary agent in Buzz. They’ll get special placement and extra capabilities in the app.",
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText("Choose an eligible agent or create a new one:"),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Set up Bestie" }),
+  ).not.toBeInTheDocument();
+});
+
+it("keeps the registered Bestie tab in sync with the account choice", async () => {
   const h = await bestieFixture(native.invoke, {
-    mainAgent: {
-      read: () => (reads++ ? second.promise : first.promise),
-      write: async () => {},
-    },
+    mainAgent: { read: async () => undefined, write: async () => {} },
   });
-  await h.bestie.setup();
-  renderPage(h);
-  await act(async () => first.reject(new Error("Account temporarily offline")));
-  expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Account temporarily offline",
-  );
-  expect(
-    screen.queryByRole("button", { name: "Set up Bestie" }),
-  ).not.toBeInTheDocument();
-  await userEvent.click(screen.getByRole("button", { name: "Try again" }));
-  expect(await screen.findByRole("status")).toHaveTextContent(
-    "Loading your Bestie…",
-  );
-  await act(async () => second.resolve(h.agent));
-  expect(
-    await screen.findByText("This connection cannot start direct messages."),
-  ).toBeVisible();
-  expect(
-    screen.queryByRole("button", { name: "Set up Bestie" }),
-  ).not.toBeInTheDocument();
+  const tab = h.agents.addedTabs().find((item) => item.id === "bestie");
+  expect(tab).toBeDefined();
+  const agent = {
+    pubkey: h.agent,
+    relay: COMMUNITY,
+    owner: h.viewer,
+    place: "here",
+  } as Agent;
+  expect(tab?.when?.(agent)).toBe(false);
+  await chooseDefaultAgent(h.session(), h.session().scope, h.agent);
+  expect(tab?.when?.(agent)).toBe(true);
+  await clearDefaultAgent(h.session(), h.session().scope);
+  expect(tab?.when?.(agent)).toBe(false);
 });
 
-it("keeps a replacement connecting session out of hosted setup", async () => {
+it("opens the existing new-agent dialog from the chooser", async () => {
   const h = await bestieFixture(native.invoke);
   renderPage(h);
-  act(() => h.replaceWithConnectingSession());
-  expect(await screen.findByRole("status")).toHaveTextContent(
-    "Connecting to your Bestie…",
-  );
-  expect(
-    screen.queryByRole("button", { name: "Set up Bestie" }),
-  ).not.toBeInTheDocument();
-});
-
-it("routes an account-saved Bestie to its canonical DM instead of hosted setup", async () => {
-  const choice = deferred<string | undefined>();
-  const h = await bestieFixture(native.invoke, {
-    mainAgent: {
-      read: () => choice.promise,
-      write: async () => {},
-    },
-  });
-  await h.bestie.setup();
-  renderPage(h);
-  await act(async () => choice.resolve(h.agent));
-  expect(
-    await screen.findByText("This connection cannot start direct messages."),
-  ).toBeVisible();
-  expect(
-    screen.queryByRole("button", { name: "Set up Bestie" }),
-  ).not.toBeInTheDocument();
-});
-
-it("sets up Bestie on the model the owner chose and hands focus to its conversation", async () => {
-  const h = await bestieFixture(native.invoke);
-  renderPage(h);
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Set up Bestie" }),
-  );
-  // Builderlab offers no default model, so nothing is made before a choice.
-  const proceed = await screen.findByRole("button", {
-    name: "Continue setup",
-  });
-  expect(proceed).toBeDisabled();
-  expect(h.requests("register-agent")).toHaveLength(0);
-  await chooseModel();
-  await userEvent.click(proceed);
-  expect(
-    await screen.findByRole("region", { name: "Bestie conversation" }),
-  ).toBeInTheDocument();
-  await waitFor(() => expect(composer()).toHaveFocus());
-  expect(h.open).not.toHaveBeenCalled();
-  expect(h.requests("register-agent")).toHaveLength(1);
-  expect(h.rows[0]).toMatchObject({
-    model_id: "model-a",
-    reasoning_effort: "high",
-  });
-});
-
-it("leaves focus where the owner moved it while setup ran", async () => {
-  const h = await bestieFixture(native.invoke);
-  render(<button type="button">Elsewhere</button>);
-  renderPage(h);
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Set up Bestie" }),
-  );
-  await chooseModel();
-  const gate = h.holdRequest("register-agent");
-  await userEvent.click(screen.getByRole("button", { name: "Continue setup" }));
-  screen.getByRole("button", { name: "Elsewhere" }).focus();
-  gate.resolve();
-  expect(
-    await screen.findByRole("region", { name: "Bestie conversation" }),
-  ).toBeInTheDocument();
-  await waitFor(() => expect(composer()).toBeEnabled());
-  expect(screen.getByRole("button", { name: "Elsewhere" })).toHaveFocus();
-});
-
-it("opens the conversation with focus after a failed home read is retried", async () => {
-  const h = await bestieFixture(native.invoke);
-  await h.bestie.setup();
-  const stranger = "56".repeat(32);
-  h.addMember(stranger);
-  // The page's own setup reads the record when its agents change.
-  await h.agents.refresh();
-  renderPage(h);
-  expect(
-    await screen.findByText(/must be private and contain only you and Bestie/),
-  ).toBeInTheDocument();
-  h.removeMember(stranger);
-  await userEvent.click(
-    screen.getByRole("button", { name: "Open Bestie conversation" }),
-  );
-  expect(
-    await screen.findByRole("region", { name: "Bestie conversation" }),
-  ).toBeInTheDocument();
-  await waitFor(() => expect(composer()).toHaveFocus());
-});
-
-it("keeps a retry on the page after updating Bestie's instructions fails", async () => {
-  const h = await bestieFixture(native.invoke);
-  await h.bestie.setup();
-  // As if prompt.ts changed after this Bestie was set up.
-  const key = Object.keys(localStorage).find((name) =>
-    name.startsWith("buzz.remote-bestie.v2:"),
-  );
-  if (!key) throw new Error("Missing Bestie record");
-  localStorage.setItem(
-    key,
-    JSON.stringify({
-      ...JSON.parse(localStorage.getItem(key) ?? "{}"),
-      promptVersion: "remote-bestie-1",
-    }),
-  );
-  // The page's own setup reads the record when its agents change.
-  await h.agents.refresh();
-  renderPage(h);
-  h.reply("update-agent", 500, {});
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Update Bestie's instructions" }),
-  );
-  // The failure stays beside the conversation with its retry.
-  await screen.findByRole("button", {
-    name: "Retry updating Bestie's instructions",
-  });
-  expect(
-    screen.getByRole("region", { name: "Bestie conversation" }),
-  ).toBeInTheDocument();
-  await userEvent.click(
-    screen.getByRole("button", {
-      name: "Retry updating Bestie's instructions",
-    }),
-  );
-  expect(
-    await screen.findByText(/ask your Builderlab workspace admin/),
-  ).toBeInTheDocument();
-  expect(
-    screen.queryByRole("button", { name: /Bestie's instructions/ }),
-  ).not.toBeInTheDocument();
-});
-
-it("focuses the Model field when setup asks for a model", async () => {
-  const h = await bestieFixture(native.invoke);
-  renderPage(h);
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Set up Bestie" }),
-  );
-  const model = await screen.findByRole("combobox", { name: "Model" });
-  await waitFor(() => expect(model).toHaveFocus());
-});
-
-it("keeps focus on the setup button when submitting the model fails", async () => {
-  const h = await bestieFixture(native.invoke);
-  renderPage(h);
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Set up Bestie" }),
-  );
-  await chooseModel();
-  const gate = h.holdRequest("register-agent");
-  h.reply("register-agent", 500, {});
-  await userEvent.click(screen.getByRole("button", { name: "Continue setup" }));
-  // The chooser is gone while the submission runs, but focus has a home.
-  const busy = await screen.findByRole("button", { name: "Set up Bestie" });
-  await waitFor(() => expect(busy).toHaveFocus());
-  gate.resolve();
-  const retry = await screen.findByRole("button", {
-    name: "Retry Bestie setup",
-  });
-  expect(retry).toHaveFocus();
-});
-
-it("does not pull focus back from where the owner moved it during a failed model submission", async () => {
-  const h = await bestieFixture(native.invoke);
-  render(<button type="button">Elsewhere</button>);
-  renderPage(h);
-  await userEvent.click(
-    await screen.findByRole("button", { name: "Set up Bestie" }),
-  );
-  await chooseModel();
-  const gate = h.holdRequest("register-agent");
-  h.reply("register-agent", 500, {});
-  await userEvent.click(screen.getByRole("button", { name: "Continue setup" }));
-  await screen.findByRole("button", { name: "Set up Bestie" });
-  screen.getByRole("button", { name: "Elsewhere" }).focus();
-  gate.resolve();
-  await screen.findByRole("button", { name: "Retry Bestie setup" });
-  expect(screen.getByRole("button", { name: "Elsewhere" })).toHaveFocus();
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Create agent" }));
+  expect(screen.getByRole("dialog", { name: "Create agent" })).toBeVisible();
 });

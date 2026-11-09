@@ -116,6 +116,19 @@ it("edits the agent's settings with the proposed changes and saves what the owne
   );
 });
 
+it("starts from a proposed picture and saves it with the review", async () => {
+  const user = userEvent.setup();
+  const agents = fixture({ picture: "https://example.test/proposed.png" });
+  await screen.findByDisplayValue("Child");
+  await user.click(screen.getByRole("button", { name: /^Save changes$/ }));
+  await waitFor(() =>
+    expect(agents.approveUpdate).toHaveBeenCalledWith(
+      "draft",
+      expect.objectContaining({ picture: "https://example.test/proposed.png" }),
+    ),
+  );
+});
+
 it("previews a proposed harness change from the migrated settings", async () => {
   const user = userEvent.setup();
   const agents = fixture({ type: "test/other" });

@@ -1,7 +1,9 @@
+import { ActivityIndicatorPresentation } from "./typing-presentation";
 import {
   createContext,
   useCallback,
   useContext,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -23,6 +25,7 @@ import {
 } from "../messages/MessageManagement";
 import { MediaReviewViewer } from "../messages/MediaReviewViewer";
 import { ThreadPanel, type ThreadPanelProps } from "../messages/ThreadPanel";
+import { useListedChannel } from "../relay/listed-channel";
 import { ownSolo } from "../solo/labels";
 import { useSoloHasPeople } from "../solo/people";
 import {
@@ -139,6 +142,22 @@ type ChannelProps = Pick<Conversation, "session" | "scope" | "extensions"> & {
 export function ConversationChannel(props: ChannelProps) {
   const { session, scope, extensions, channel, active, children } = props;
   const channelName = props.channelName ?? channel?.name ?? "";
+  // While the channel is open the profile cache keeps room for its whole roster
+  // on top of its base; leaving gives the room back. A retained tab in the
+  // background and a preview that does not visit the channel hold none.
+  const members = useListedChannel(
+    session.channels,
+    channel?.id,
+    (listed) => listed?.members?.length ?? 0,
+  );
+  const held = active === false ? 0 : members;
+  const { profiles } = session;
+  // A layout effect runs before every passive effect in the commit, so a child
+  // such as the mention menu reads the grown limit when the roster arrives.
+  useLayoutEffect(
+    () => (held ? profiles.reserve?.(held) : undefined),
+    [profiles, held],
+  );
   // One stable element, so selecting a channel never remounts the page below.
   const provide = (
     interactions: ConversationInteractions,
@@ -233,7 +252,11 @@ function Provider({
       onOpenMediaReview,
     ],
   );
-  return <Context.Provider value={value}>{children}</Context.Provider>;
+  return (
+    <Context.Provider value={value}>
+      <ActivityIndicatorPresentation>{children}</ActivityIndicatorPresentation>
+    </Context.Provider>
+  );
 }
 
 function ConversationMediaReview(props: MediaReview) {
@@ -293,7 +316,6 @@ export function ConversationComposer(props: Own<MessageComposerProps>) {
             label: withPeople
               ? "Message this conversation"
               : "Message your agents",
-            activityClickOpensPanel: true,
           }
         : {})}
       chatPresentation={shared.ownSoloConversation}

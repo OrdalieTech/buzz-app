@@ -2,6 +2,7 @@ import { Tabs as BaseTabs } from "@base-ui/react/tabs";
 import { NavigationItem } from "./NavigationItem";
 import { IconButton } from "./IconButton";
 import { Input } from "./Input";
+import { Tooltip } from "./Tooltip";
 import {
   ContextMenuRoot,
   ContextMenuTrigger,
@@ -9,49 +10,16 @@ import {
   MenuPopup,
 } from "./Menu";
 import { XIcon } from "../icons";
+import { useScrollEdges } from "./useScrollEdges";
 import {
   useLayoutEffect,
   useRef,
   useState,
+  type ComponentPropsWithRef,
   type MouseEvent,
   type ReactNode,
+  type ReactElement,
 } from "react";
-
-/** Marks a scrolling strip's edges that have tabs past them, for the fade. */
-function useScrollEdges() {
-  const ref = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    const list = ref.current;
-    if (!list) return;
-    const update = () => {
-      // Right-to-left scroll offsets are negative.
-      const scrolled = Math.abs(list.scrollLeft);
-      const hidden = list.scrollWidth - list.clientWidth;
-      list.toggleAttribute("data-overflow-start", scrolled > 1);
-      list.toggleAttribute("data-overflow-end", hidden - scrolled > 1);
-    };
-    update();
-    list.addEventListener("scroll", update, { passive: true });
-    // Tabs added, removed or renamed change the strip without resizing it.
-    const content = new MutationObserver(update);
-    content.observe(list, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
-    const size =
-      typeof ResizeObserver === "undefined"
-        ? undefined
-        : new ResizeObserver(update);
-    size?.observe(list);
-    return () => {
-      list.removeEventListener("scroll", update);
-      content.disconnect();
-      size?.disconnect();
-    };
-  }, []);
-  return ref;
-}
 
 /** A host action in a tab's menu. */
 export type TabAction = { label: string; run(): void };
@@ -62,6 +30,10 @@ export type TabItem<Value extends string> = {
   icon?: ReactNode;
   disabled?: boolean;
   trailing?: ReactNode;
+  /** Compose an anchored surface around the actual tab trigger, replacing its default hint. */
+  renderTab?:
+    | ((tab: ReactElement<ComponentPropsWithRef<"button">>) => ReactElement)
+    | undefined;
   /** Link a retained, externally owned tab panel. */
   panelId?: string;
   /** Increment to briefly identify an already-open navigation tab. */
@@ -92,6 +64,7 @@ export type TabItem<Value extends string> = {
  */
 export type TabsVariant =
   | "chrome"
+  | "dock"
   | "panel"
   | "workspace"
   | "navigation"
@@ -106,6 +79,7 @@ export function Tabs<Value extends string>({
   onReselect,
   trailingAction,
   variant = "chrome",
+  orientation = "horizontal",
   size = "md",
   showSelection = true,
   previewValue,
@@ -132,6 +106,7 @@ export function Tabs<Value extends string>({
   onReselect?: (value: Value) => void;
   trailingAction?: ReactNode;
   variant?: TabsVariant;
+  orientation?: "horizontal" | "vertical";
   /** Segmented filter track size; other variants retain their own geometry. */
   size?: "sm" | "md";
   /** Hide the visual selection for a single-view header; tab semantics remain. */
@@ -141,33 +116,36 @@ export function Tabs<Value extends string>({
   /** Brief visual confirmation of a tab arriving after a completed move. */
   arrivalValue?: Value | undefined;
 }) {
-  const iconOnly = variant === "segmented-icons";
+  const iconOnly = variant === "segmented-icons" || variant === "dock";
   const [renaming, setRenaming] = useState<Value>();
   if (renaming !== undefined && !items.some((item) => item.value === renaming))
     setRenaming(undefined);
-  const list = useScrollEdges();
+  const list = useScrollEdges("inline");
   const strip = (
     <>
       <BaseTabs.List ref={list} className="buzz-tabs-list" aria-label={label}>
-        {showSelection && variant !== "navigation" && (
-          <BaseTabs.Indicator className="buzz-tabs-indicator" />
-        )}
-        {items.map((item) => (
-          <TabMenu
-            key={JSON.stringify([tabMenu?.key, item.value])}
-            label={item.label}
-            actions={item.actions}
-            closeAll={tabMenu?.closeAll}
-            closeOthers={
-              tabMenu?.closeOthers &&
-              (() => tabMenu.closeOthers?.(item.value) ?? false)
+        {showSelection && variant !== "navigation" && variant !== "dock" && (
+          <BaseTabs.Indicator
+            className="buzz-tabs-indicator"
+            render={
+              variant === "segmented" || iconOnly
+                ? (props, state) => (
+                    <SegmentedIndicator
+                      {...props}
+                      value={value}
+                      left={state.activeTabPosition?.left}
+                      width={state.activeTabSize?.width}
+                    />
+                  )
+                : undefined
             }
-            onClose={item.onClose}
-            onRename={item.onRename && (() => setRenaming(item.value))}
-          >
+          />
+        )}
+        {items.map((item) => {
+          const tab = (
             <BaseTabs.Tab
               value={item.value}
-              title={item.label}
+              title={variant === "dock" ? undefined : item.label}
               disabled={item.disabled}
               data-icon-only={iconOnly || undefined}
               render={
@@ -250,35 +228,69 @@ export function Tabs<Value extends string>({
                   <span className={iconOnly ? "sr-only" : undefined}>
                     {item.label}
                   </span>
-                  {item.trailing}
+                  {variant === "dock" && item.trailing ? (
+                    <span className="buzz-tabs-badge">{item.trailing}</span>
+                  ) : (
+                    item.trailing
+                  )}
                 </>
               )}
             </BaseTabs.Tab>
-            {item.onClose && (
-              <IconButton
-                size="xs"
-                aria-label={`Close ${item.label} tab`}
-                onClick={item.onClose}
-                icon={<XIcon size="1rem" aria-hidden="true" />}
-              />
-            )}
-            {item.onRename && renaming === item.value && (
-              <TabRename
-                label={item.label}
-                onDone={(name) => {
-                  setRenaming(undefined);
-                  if (name !== undefined) item.onRename?.(name);
-                }}
-              />
-            )}
-          </TabMenu>
-        ))}
+          );
+          return (
+            <TabMenu
+              key={JSON.stringify([tabMenu?.key, item.value])}
+              label={item.label}
+              actions={item.actions}
+              closeAll={tabMenu?.closeAll}
+              closeOthers={
+                tabMenu?.closeOthers &&
+                (() => tabMenu.closeOthers?.(item.value) ?? false)
+              }
+              onClose={item.onClose}
+              onRename={item.onRename && (() => setRenaming(item.value))}
+            >
+              {item.renderTab ? (
+                item.renderTab(tab)
+              ) : variant === "dock" ? (
+                <Tooltip
+                  content={item.label}
+                  hint="dock"
+                  side={orientation === "vertical" ? "right" : "bottom"}
+                >
+                  {tab}
+                </Tooltip>
+              ) : (
+                tab
+              )}
+              {item.onClose && (
+                <IconButton
+                  size="xs"
+                  aria-label={`Close ${item.label} tab`}
+                  onClick={item.onClose}
+                  icon={<XIcon size="1rem" aria-hidden="true" />}
+                />
+              )}
+              {item.onRename && renaming === item.value && (
+                <TabRename
+                  label={item.label}
+                  onDone={(name) => {
+                    setRenaming(undefined);
+                    if (name !== undefined) item.onRename?.(name);
+                  }}
+                />
+              )}
+            </TabMenu>
+          );
+        })}
       </BaseTabs.List>
       {trailingAction}
     </>
   );
   return (
     <BaseTabs.Root
+      orientation={orientation}
+      data-orientation={orientation}
       data-buzz-ui=""
       className={renderPanel ? "buzz-tab-panels" : "buzz-tabs"}
       data-variant={variant}
@@ -313,8 +325,34 @@ export function Tabs<Value extends string>({
   );
 }
 
+/** Base UI re-renders this on measurements as well as selection changes. */
+function SegmentedIndicator({
+  value,
+  left,
+  width,
+  ...props
+}: ComponentPropsWithRef<"span"> & {
+  value: string | null;
+  left: number | undefined;
+  width: number | undefined;
+}) {
+  const [layout, setLayout] = useState({ value, left, width, animate: false });
+  if (
+    layout.value !== value ||
+    layout.left !== left ||
+    layout.width !== width
+  ) {
+    // Keep the travelling selection, but apply geometry-only changes at once,
+    // including window resizing, text scaling and resizing during a slide.
+    setLayout({ value, left, width, animate: layout.value !== value });
+  }
+  return (
+    <span {...props} data-selection-change={layout.animate || undefined} />
+  );
+}
+
 /** One shared menu composes host actions and tab naming with close actions. */
-function TabMenu({
+export function TabMenu({
   label,
   actions,
   onClose,
@@ -366,7 +404,9 @@ function TabMenu({
         const action = afterClose.current;
         afterClose.current = undefined;
         if (!action) return;
-        trigger.current?.querySelector<HTMLElement>('[role="tab"]')?.focus();
+        trigger.current
+          ?.querySelector<HTMLElement>('[role="tab"], button')
+          ?.focus();
         action();
       }}
     >
@@ -398,8 +438,9 @@ function TabMenu({
         finalFocus={() =>
           closingAll.current
             ? false
-            : (trigger.current?.querySelector<HTMLElement>('[role="tab"]') ??
-              false)
+            : (trigger.current?.querySelector<HTMLElement>(
+                '[role="tab"], button',
+              ) ?? false)
         }
       >
         {actions?.map((action) => (

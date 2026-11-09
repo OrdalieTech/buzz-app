@@ -1,4 +1,5 @@
 import { workflowLabel } from "../../features/relay/workflow-attribution";
+import { useIsPresent } from "motion/react";
 import { LightningIcon } from "../../shared/design-system/icons";
 import { useChannelIdentityNames } from "../../features/identity-names/react";
 import { NavigationItem } from "../../shared/design-system/ui/NavigationItem";
@@ -22,7 +23,10 @@ import {
 import { selectProfiles } from "../../features/relay/profile-selection";
 import type { Profile } from "../../features/relay/contracts";
 import type { RelaySession } from "../../features/relay/session";
-import type { ThreadActivityItem } from "../../features/relay/unread";
+import type {
+  MentionActivityItem,
+  ThreadActivityItem,
+} from "../../features/relay/unread";
 import { Avatar } from "../../shared/Avatar";
 import { Avatar as WorkflowAvatar } from "../../shared/design-system/ui/Avatar";
 import { publicKeyLabels } from "../../shared/identity/public-key";
@@ -31,6 +35,7 @@ import activityStyles from "../../features/agents/ActivityRows.module.css";
 import { AgentActivityRow } from "../../features/agents/AgentActivityRow";
 import { workingAgentDetails } from "./working-agents";
 import { avatarMedia } from "../../shared/avatar-source";
+import { incompletePreview } from "../inbox/InboxRow";
 
 const elapsed = (createdAt: number, now = Date.now()) => {
   const seconds = Math.max(0, Math.floor(now / 1000) - createdAt);
@@ -50,14 +55,22 @@ const noSubscribe = () => () => {};
 
 function ActivityRow({
   item,
+  noun,
+  previewId,
   session,
   agents,
   onOpen,
+  read,
 }: {
-  item: ThreadActivityItem;
+  item: ThreadActivityItem | MentionActivityItem;
+  noun: "thread" | "mention";
+  /** A message whose body Activity must not show until its edits and
+   * deletions are checked. */
+  previewId?: string;
   session: RelaySession;
   agents: readonly string[];
-  onOpen(item: ThreadActivityItem): void;
+  onOpen(): void;
+  read(): Promise<unknown>;
 }) {
   const selection = useMemo(
     () =>
@@ -77,6 +90,12 @@ function ActivityRow({
     profile?.name ?? displayId.slice(0, 10),
   );
   const name = item.workflowOwnerId ? workflowLabel(resolved) : resolved;
+  const feed = useSyncExternalStore(
+    session.inboxFeed.subscribe,
+    session.inboxFeed.snapshot,
+    session.inboxFeed.snapshot,
+  );
+  const preview = incompletePreview(feed, [previewId]) ?? item.preview;
   const isAgent =
     agents.includes(item.authorId) ||
     !!profile?.isAgent ||
@@ -90,10 +109,7 @@ function ActivityRow({
     setPending(true);
     setError(false);
     try {
-      await session.unread.markThrough(
-        { kind: "thread", channelId: item.channelId, rootId: item.rootId },
-        item.latestMessageId,
-      );
+      await read();
     } catch {
       setError(true);
     } finally {
@@ -106,8 +122,8 @@ function ActivityRow({
     >
       <NavigationItem
         type="button"
-        aria-label={`Open unread thread from ${name}: ${item.preview}`}
-        onClick={() => onOpen(item)}
+        aria-label={`Open unread ${noun} from ${name}: ${preview}`}
+        onClick={onOpen}
         icon={
           item.workflowOwnerId ? (
             <WorkflowAvatar
@@ -133,7 +149,7 @@ function ActivityRow({
                 {elapsed(item.createdAt)}
               </span>
             </span>
-            <span className={styles.activityItemPreview}>{item.preview}</span>
+            <span className={styles.activityItemPreview}>{preview}</span>
           </span>
         }
       />
@@ -141,7 +157,7 @@ function ActivityRow({
         <IconButton
           size="toolbar"
           icon={<EnvelopeOpenIcon />}
-          aria-label={`Mark thread from ${name} as read`}
+          aria-label={`Mark ${noun} from ${name} as read`}
           title="Mark as read"
           loading={pending}
           onClick={() => void markRead()}
@@ -149,7 +165,7 @@ function ActivityRow({
       </span>
       {error && (
         <p className={styles.activityReadError} role="alert">
-          Could not mark this thread as read. Try again.
+          Could not mark this {noun} as read. Try again.
         </p>
       )}
     </div>
@@ -166,6 +182,7 @@ export function ChannelActivityPopover({
   onOpenWorkingAgent,
   onOpenAgentActivity,
   onOpenThread,
+  onOpenMention,
 }: {
   session: RelaySession;
   channelId: string;
@@ -178,9 +195,15 @@ export function ChannelActivityPopover({
     agent: string,
     messageId: string | undefined,
   ) => void;
-  onOpenAgentActivity?: (channelId: string, agent: string) => void;
+  onOpenAgentActivity?: (
+    channelId: string,
+    agent: string,
+    messageId: string | undefined,
+  ) => void;
   onOpenThread(item: ThreadActivityItem): void;
+  onOpenMention(item: MentionActivityItem): void;
 }) {
+  const present = useIsPresent();
   const subscribe = useCallback(
     (listener: () => void) =>
       session.unread.subscribeActivity(channelId, listener),
@@ -192,18 +215,21 @@ export function ChannelActivityPopover({
   );
   const snapshot = useSyncExternalStore(subscribe, get, get);
   const items = snapshot.items ?? [];
+  const mentions = snapshot.mentions ?? [];
   const activeAgents = agents ?? [];
   const agentIds = activeAgents.join(",");
   const [open, setOpen] = useState(false);
+  // Re-entry during the row's exit must not resurrect its old popup.
+  if (!present && open) setOpen(false);
   const triggerPointerType = useRef<string | null>(null);
   const actions =
     useRef<
       NonNullable<ComponentProps<typeof PopoverRoot>["actionsRef"]>["current"]
     >(null);
   const pressedOpen = useRef(false);
-  // An opened thread takes focus itself. Base UI returns focus to the trigger
-  // in a microtask after closing, which can land after, and steal it from, the
-  // thread.
+  // An opened thread or mention takes focus itself. Base UI returns focus to
+  // the trigger in a microtask after closing, which can land after, and steal
+  // it from, what opened.
   const handoff = useRef(false);
   // Hover opens a transient preview. Selecting its row may still take focus.
   const [preview, setPreview] = useState(false);
@@ -238,11 +264,12 @@ export function ChannelActivityPopover({
     label?: string;
   } | null)[];
   const keyLabels = publicKeyLabels(activeAgents);
-  const hasActivity = items.length > 0 || activeAgents.length > 0;
+  const unread = items.length + mentions.length;
+  const hasActivity = unread > 0 || activeAgents.length > 0;
   useEffect(() => {
     if (!hasActivity && open) actions.current?.close();
   }, [hasActivity, open]);
-  const stale = items.length > 0 && snapshot.freshness === "stale";
+  const stale = unread > 0 && snapshot.freshness === "stale";
   // Row actions close through Base UI so its hover/press state resets; the
   // sidebar trigger stays mounted after the navigation they start.
   const close = () => {
@@ -252,7 +279,7 @@ export function ChannelActivityPopover({
   return (
     <PopoverRoot
       modal={false}
-      open={open}
+      open={open && present}
       actionsRef={actions}
       onOpenChange={(next, details) => {
         if (next && !hasActivity) return details.cancel();
@@ -283,12 +310,12 @@ export function ChannelActivityPopover({
           handoff.current = false;
           setNow(Date.now());
         }
-        if (next && items.length)
+        if (next && unread)
           void session.profiles
             .ensure(
               [
                 ...new Set(
-                  items.map(
+                  [...mentions, ...items].map(
                     ({ authorId, workflowOwnerId }) =>
                       workflowOwnerId ?? authorId,
                   ),
@@ -351,13 +378,45 @@ export function ChannelActivityPopover({
                         onOpenAgentActivity
                           ? () => {
                               close();
-                              onOpenAgentActivity(channelId, agent);
+                              onOpenAgentActivity(channelId, agent, messageId);
                             }
                           : undefined
                       }
                     />
                   );
                 })}
+              </section>
+            )}
+            {mentions.length > 0 && (
+              <section aria-label="Mentions">
+                <h2 className={activityStyles.activitySectionLabel}>
+                  Mentions
+                </h2>
+                {mentions.map((mention) => (
+                  <ActivityRow
+                    key={mention.messageId}
+                    item={mention}
+                    noun="mention"
+                    previewId={mention.messageId}
+                    session={session}
+                    agents={activeAgents}
+                    onOpen={() => {
+                      handoff.current = true;
+                      close();
+                      onOpenMention(mention);
+                    }}
+                    read={() =>
+                      session.unread.markThrough(
+                        {
+                          kind: "message",
+                          channelId: mention.channelId,
+                          messageId: mention.messageId,
+                        },
+                        mention.messageId,
+                      )
+                    }
+                  />
+                ))}
               </section>
             )}
             {items.length > 0 && (
@@ -369,13 +428,24 @@ export function ChannelActivityPopover({
                   <ActivityRow
                     key={item.rootId}
                     item={item}
+                    noun="thread"
                     session={session}
                     agents={activeAgents}
-                    onOpen={(selected) => {
+                    onOpen={() => {
                       handoff.current = true;
                       close();
-                      onOpenThread(selected);
+                      onOpenThread(item);
                     }}
+                    read={() =>
+                      session.unread.markThrough(
+                        {
+                          kind: "thread",
+                          channelId: item.channelId,
+                          rootId: item.rootId,
+                        },
+                        item.latestMessageId,
+                      )
+                    }
                   />
                 ))}
               </section>

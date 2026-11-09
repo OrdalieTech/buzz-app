@@ -26,10 +26,42 @@ export const IDLE_MS = 15 * 60_000;
  * for every plugin, so plugins not on this client keep room. */
 export const POOL_LIMIT = 48;
 
+/** The most session ids a conversation keeps: each reopening starts one. */
+export const SAVED_SESSIONS = 10;
+
 /** What is saved for one conversation: when its session last took in a
- * message or ended a turn. */
-export type SavedConversation = Readonly<{ at: number }>;
+ * message or ended a turn, and the ids of its sessions, newest first. */
+export type SavedConversation = Readonly<{
+  at: number;
+  sessions?: readonly string[];
+}>;
+/** The longest session id kept; longer ones are taken as damaged. */
+const SESSION_ID_LIMIT = 256;
+
+/** Whether a saved time is one a Date can hold: finite alone lets 1e20
+ * through, which throws when shown. */
+export const validTime = (at: unknown): at is number =>
+  typeof at === "number" && !Number.isNaN(new Date(at).getTime());
+
+/** A saved conversation as read back from storage, or undefined when it is
+ * damaged: a time a Date can hold, and its session ids de-duplicated, capped and kept
+ * only when each is a short string. One saved before ids were has none. */
+export function savedConversation(
+  value: unknown,
+): SavedConversation | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const { at, sessions } = value as { at?: unknown; sessions?: unknown };
+  if (!validTime(at)) return undefined;
+  if (sessions === undefined) return { at };
+  if (!Array.isArray(sessions)) return undefined;
+  const ids = sessions.filter(
+    (id): id is string =>
+      typeof id === "string" && id.length > 0 && id.length <= SESSION_ID_LIMIT,
+  );
+  return { at, sessions: [...new Set(ids)].slice(0, SAVED_SESSIONS) };
+}
 export type SessionStore = {
+  get(key: string): SavedConversation | undefined;
   set(key: string, saved: SavedConversation): void;
 };
 
@@ -111,6 +143,14 @@ export type SessionsOptions = Readonly<{
   fingerprint(): string;
   /** Where each conversation's last use is saved. */
   store?: SessionStore;
+  /** Told of each session opened, with the prompt and title it was opened
+   * with, and the conversation it opened for: none for a one-off turn. */
+  started?(
+    sessionId: string,
+    systemPrompt: string,
+    title?: string,
+    conversation?: string,
+  ): void;
   /** Called when a conversation's session opens, is sent a message, or
    * closes. */
   onChange?(): void;
@@ -133,6 +173,10 @@ export class AgentSessions {
   /** One-off turns running or starting, by label. */
   private readonly once = new Map<string, Live | undefined>();
   private onceCount = 0;
+  /** Sessions opening, which `shutdown` waits for. */
+  private readonly opens = new Set<Promise<Live>>();
+  /** Sessions closed or closing, until a close of each is acknowledged. */
+  private readonly closing = new Set<Live>();
   /** Conversations whose session is opening, and the turn it opened for. */
   private readonly opening = new Map<
     string,
@@ -163,6 +207,20 @@ export class AgentSessions {
   }
   active(key: string) {
     return this.opening.has(key) || !!this.live.get(key)?.session.working;
+  }
+  /** Whether the work conversation or one-off turn `key`'s session runs now
+   * still runs, unstopped and in that session, when asked later. */
+  current(key: string): () => boolean {
+    const serving = () => (this.live.get(key) ?? this.once.get(key))?.session;
+    const session = serving();
+    const current = session?.current();
+    return () => !!current?.() && serving() === session;
+  }
+  /** The harness session serving a conversation or one-off turn, and the
+   * process it lives in. */
+  serving(key: string) {
+    const live = this.live.get(key) ?? this.once.get(key);
+    return live && { sessionId: live.session.id, process: live.process };
   }
   /** Conversations with a session, whether each is working, and when each
    * last took in a message or ended a turn. */
@@ -273,10 +331,7 @@ export class AgentSessions {
         (live) => this.disposed || this.adopt(key, live),
         naming,
       );
-      if (this.disposed) {
-        void this.close(live);
-        throw new Error(`${this.options.label} was stopped`);
-      }
+      if (this.disposed) throw new Error(`${this.options.label} was stopped`);
       if (signal?.aborted) return {};
       if (current && !current())
         return {
@@ -439,6 +494,18 @@ export class AgentSessions {
       if (!live.session.busy && this.stale(live)) this.drop(key, live);
   }
 
+  /** Like `dispose()`, then resolves once every session it opened, or was
+   * opening, is closed or its process has exited; rejects if one cannot be. */
+  async shutdown() {
+    this.dispose();
+    await Promise.allSettled(this.opens);
+    const closed = await Promise.allSettled(
+      [...this.closing].map((live) => this.strict(live)),
+    );
+    this.options.onChange?.();
+    const failed = closed.find((result) => result.status === "rejected");
+    if (failed) throw failed.reason;
+  }
   /** Closes its sessions, ending their turns; the process keeps serving other
    * agents. */
   dispose() {
@@ -467,7 +534,19 @@ export class AgentSessions {
 
   /** Opens a session for `key` in the agent's workspace, which `use` records
    * as its user's. */
-  private async open(
+  private open(
+    key: string,
+    title: string | undefined,
+    use: (live: Live) => unknown,
+    named?: (title: string) => void,
+  ) {
+    const opening = this.start(key, title, use, named);
+    this.opens.add(opening);
+    const done = () => this.opens.delete(opening);
+    opening.then(done, done);
+    return opening;
+  }
+  private async start(
     key: string,
     title: string | undefined,
     use: (live: Live) => unknown,
@@ -494,8 +573,10 @@ export class AgentSessions {
     // Busy until it is adopted as a conversation's.
     const slot: Slot = { idle: () => false, evict: async () => undefined };
     const room = pool.take(slot);
+    let opened: AcpSession | undefined;
     const start = () =>
       process.open({
+        onSession: (session) => (opened = session),
         cwd,
         systemPrompt: launch.systemPrompt,
         ...(title ? { title } : {}),
@@ -517,6 +598,15 @@ export class AgentSessions {
       });
     } catch (error) {
       pool.release(slot);
+      // Opened but not set up: its close is retired like any other.
+      if (opened)
+        void this.close({
+          session: opened,
+          process,
+          fingerprint,
+          slot,
+          at: Date.now(),
+        });
       throw error;
     }
     const released = () => pool.release(slot);
@@ -528,6 +618,14 @@ export class AgentSessions {
       void this.close(live);
       return this.open(key, title, use, named);
     }
+    this.options.started?.(
+      session.id,
+      launch.systemPrompt,
+      title,
+      this.once.has(key) ? undefined : key,
+    );
+    // Removed meanwhile: the callers are gone, and `shutdown` waits for this.
+    if (this.disposed) void this.close(live);
     use(live);
     return live;
   }
@@ -588,7 +686,18 @@ export class AgentSessions {
    * has been shown, and restarts its idle countdown. */
   private touch(key: string, live: Live, seen?: number) {
     live.at = Date.now();
-    this.options.store?.set(key, { at: live.at });
+    const { store } = this.options;
+    if (store) {
+      const { id } = live.session;
+      const sessions = savedConversation(store.get(key))?.sessions ?? [];
+      store.set(key, {
+        at: live.at,
+        sessions: [id, ...sessions.filter((kept) => kept !== id)].slice(
+          0,
+          SAVED_SESSIONS,
+        ),
+      });
+    }
     this.countdown(key, live);
     if (seen !== undefined)
       this.shown.set(key, Math.max(seen, this.shown.get(key) ?? 0));
@@ -612,8 +721,16 @@ export class AgentSessions {
     }
     void this.close(live);
   }
+  /** Closes the session, failing only for a caller that needs the harness to
+   * have acknowledged it. */
+  private strict(live: Live) {
+    this.closing.add(live);
+    return live.process
+      .close(live.session, true)
+      .then(() => void this.closing.delete(live));
+  }
   private close(live: Live) {
-    return live.process.close(live.session);
+    return this.strict(live).catch(() => undefined);
   }
 }
 

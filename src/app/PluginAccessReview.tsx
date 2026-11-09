@@ -55,6 +55,15 @@ function hostDeclarations(
   types: readonly RegisteredAgentType[],
 ) {
   return [
+    ...(manifest.host?.agentExecution ?? []).map((harness) => ({
+      key: `agentExecution:${harness}`,
+      signature: `Agent execution: ${harness}`,
+      title: "Agent execution:",
+      label: `Run ${types.find((type) => type.key === harness)?.title ?? harness} on another host`,
+      hint: "Can run native agent code and read files on that host. Buzz keeps the agent's identity.",
+      icon: PlugIcon,
+      details: <code className={styles.sourcePath}>{harness}</code>,
+    })),
     ...(manifest.host?.agentHooks ?? []).map((harness) => ({
       key: `agentHooks:${harness}`,
       signature: `Agent hooks: ${harness}`,
@@ -109,7 +118,7 @@ function hostDeclarations(
     ),
     ...(manifest.host?.processes ?? []).map((process) => ({
       key: `process:${process.id}`,
-      signature: `Process ${process.id}: ${JSON.stringify([process.program, ...(process.args ?? [])])}${process.bundled ? " (bundled with Buzz)" : ""} and any further arguments · stdin, full user access`,
+      signature: `Process ${process.id}: ${JSON.stringify([process.program, ...(process.args ?? [])])}${process.bundled ? " (bundled with Buzz)" : ""} · artifact: ${JSON.stringify(process.artifact ?? null)} and any further arguments · stdin, full user access`,
       title: `Process ${process.id}:`,
       label: `Start ${process.program}`,
       hint: "Can start a background process with additional arguments, using your account’s full access.",
@@ -118,6 +127,22 @@ function hostDeclarations(
         <>
           <ProgramDetails program={process.program} args={process.args ?? []} />
           {process.bundled && <p className="mb-0 mt-2">Bundled with Buzz.</p>}
+          {process.artifact && (
+            <div className="mt-2 break-all">
+              <p className="m-0">
+                Executable artifact: <code>{process.artifact.path}</code>
+              </p>
+              <p className="m-0">
+                SHA-256: <code>{process.artifact.sha256}</code>
+              </p>
+              {process.artifact.siblings?.map((sibling) => (
+                <p className="m-0" key={sibling.name}>
+                  Sibling <code>{sibling.name}</code>:{" "}
+                  <code>{sibling.sha256}</code>
+                </p>
+              ))}
+            </div>
+          )}
           <p className="mb-0 mt-2">
             Allows further arguments and standard input, with your account’s
             full access.
@@ -186,6 +211,18 @@ function hostDeclarations(
         ]
       : []),
   ];
+}
+
+export function pluginAccessIncreases(
+  manifest: PluginManifest,
+  previous: PluginManifest,
+) {
+  const granted = new Set(
+    hostDeclarations(previous, []).map((item) => item.signature),
+  );
+  return hostDeclarations(manifest, []).some(
+    (item) => !granted.has(item.signature),
+  );
 }
 
 export function PluginAccessReview({
