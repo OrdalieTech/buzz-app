@@ -51,15 +51,16 @@ async function send(page: Page, text: string) {
 /** First run up to the key choice for the staging community. */
 async function choose(page: Page, lane: string) {
   const next = page.getByRole("button", { name: lane });
+  await page.getByRole("button", { name: "Other options" }).click();
   await expect(async () => {
     // A slow first probe can land on the choice after this attempt timed out.
     if (!(await next.isVisible())) {
-      const other = page.getByRole("button", { name: "Other options" });
-      if (await other.isVisible()) await other.click();
       await page
         .getByLabel("Community address or invite link")
-        .fill(`buzz.localhost:${port}`);
-      await page.getByRole("button", { name: "Continue" }).click();
+        .fill(`buzz.localhost:${port}`, { timeout: 2000 });
+      await page
+        .getByRole("button", { name: "Continue" })
+        .click({ timeout: 2000 });
     }
     await expect(next).toBeVisible({ timeout: 2000 });
   }).toPass();
@@ -128,7 +129,7 @@ test("chats through the browser host", async ({ browser }) => {
 
   // Read state: unread survives a reload until read; once read, the relay
   // holds Bob's self-encrypted record and a reload keeps it read.
-  await bob.getByRole("button", { name: "Inbox" }).click();
+  await bob.getByRole("tab", { name: "Activity" }).click();
   await send(alice, `are you there ${run}`);
   const unread = row.locator("[data-channel-unread]");
   await expect(unread).toBeVisible();

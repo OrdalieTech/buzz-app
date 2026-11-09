@@ -214,13 +214,24 @@ for (const width of [1280, 390])
         });
     }
 
-    // Sign in through the key import path, as people do.
+    // Sign in through the key import path, as people do. A fresh install
+    // starts with Reminders off; the crawl visits its surfaces too.
     await page.goto("/");
+    await page.evaluate(() =>
+      localStorage.setItem(
+        "buzzodz.plugins.v1",
+        JSON.stringify({ version: 3, enabled: { "buzz.reminders": true } }),
+      ),
+    );
+    await page.reload();
+    await page.getByRole("button", { name: "Other options" }).click();
     await expect(async () => {
-      const other = page.getByRole("button", { name: "Other options" });
-      if (await other.isVisible()) await other.click();
-      await page.getByLabel("Community address or invite link").fill(host);
-      await page.getByRole("button", { name: "Continue" }).click();
+      await page
+        .getByLabel("Community address or invite link")
+        .fill(host, { timeout: 2000 });
+      await page
+        .getByRole("button", { name: "Continue" })
+        .click({ timeout: 2000 });
       await expect(
         page.getByRole("button", { name: "I already have a key" }),
       ).toBeVisible({ timeout: 2000 });
@@ -311,7 +322,7 @@ for (const width of [1280, 390])
       });
     await visit("inbox", async () => {
       await drawer();
-      await sidebar.getByRole("button", { name: "Inbox" }).first().click();
+      await sidebar.getByRole("tab", { name: "Activity" }).first().click();
     });
     await visit("search", async () => {
       await page.getByRole("button", { name: "Search Buzz" }).click();

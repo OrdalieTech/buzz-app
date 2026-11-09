@@ -61,13 +61,14 @@ test("pairs a remote agent and reads what it publishes", async ({
 }) => {
   const owner = await (await browser.newContext()).newPage();
   await owner.goto("/");
+  await owner.getByRole("button", { name: "Other options" }).click();
   await expect(async () => {
-    const other = owner.getByRole("button", { name: "Other options" });
-    if (await other.isVisible()) await other.click();
     await owner
       .getByLabel("Community address or invite link")
-      .fill(`buzz.localhost:${port}`);
-    await owner.getByRole("button", { name: "Continue" }).click();
+      .fill(`buzz.localhost:${port}`, { timeout: 2000 });
+    await owner
+      .getByRole("button", { name: "Continue" })
+      .click({ timeout: 2000 });
     await expect(
       owner.getByRole("button", { name: "I already have a key" }),
     ).toBeVisible({ timeout: 2000 });

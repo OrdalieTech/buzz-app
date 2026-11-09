@@ -76,13 +76,14 @@ test("uploads images, HEIC, video and voice notes", async ({
 }) => {
   test.setTimeout(300_000);
   await page.goto("/");
+  await page.getByRole("button", { name: "Other options" }).click();
   await expect(async () => {
-    const other = page.getByRole("button", { name: "Other options" });
-    if (await other.isVisible()) await other.click();
     await page
       .getByLabel("Community address or invite link")
-      .fill(`buzz.localhost:${port}`);
-    await page.getByRole("button", { name: "Continue" }).click();
+      .fill(`buzz.localhost:${port}`, { timeout: 2000 });
+    await page
+      .getByRole("button", { name: "Continue" })
+      .click({ timeout: 2000 });
     await expect(
       page.getByRole("button", { name: "I already have a key" }),
     ).toBeVisible({ timeout: 2000 });

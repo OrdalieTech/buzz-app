@@ -36,7 +36,7 @@
   .shell-body {
     padding: 0;
   }
-  #main-content > [data-buzz-surface] {
+  .shell-body [data-buzz-surface][data-joined] {
     border: 0;
     border-radius: 0;
     box-shadow: none;
@@ -44,6 +44,41 @@
   /* The system back gesture is there; forward is not a phone idiom. */
   .shell-history [aria-label="Go forward"] {
     display: none;
+  }
+
+  /* Upstream's app dock, a rail on the left, becomes a bottom tab bar: every
+     page stays one tap away and conversations keep the full width. The
+     on-screen keyboard hides it. */
+  .shell-workspace {
+    flex-direction: column;
+  }
+  .shell-side-dock {
+    order: 1;
+    flex-direction: row;
+    padding: var(--space-1) var(--space-3);
+    border-top: 1px solid var(--border-standard);
+  }
+  :root[data-keyboard-open] .shell-side-dock {
+    display: none;
+  }
+  .shell-dock-pages {
+    overflow: visible;
+  }
+  .shell-side-dock .buzz-tabs[data-variant="dock"] {
+    display: flex;
+  }
+  .shell-side-dock .buzz-tabs[data-variant="dock"] .buzz-tabs-list {
+    flex: 1;
+    flex-direction: row;
+    justify-content: space-evenly;
+  }
+  .shell-side-dock .buzz-tabs[data-variant="dock"] .buzz-tabs-tab {
+    width: 2.75rem;
+    height: 2.75rem;
+  }
+  .shell-community-switcher {
+    flex-direction: row;
+    padding-top: 0;
   }
 
   /* The drawer slides in over a scrim that closes it on tap (mobile.ts). */
