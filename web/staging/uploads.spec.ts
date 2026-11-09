@@ -77,7 +77,11 @@ test("uploads images, HEIC, video and voice notes", async ({
   test.setTimeout(300_000);
   await page.goto("/");
   await expect(async () => {
-    await page.getByLabel("Community URL").fill(`buzz.localhost:${port}`);
+    const other = page.getByRole("button", { name: "Other options" });
+    if (await other.isVisible()) await other.click();
+    await page
+      .getByLabel("Community address or invite link")
+      .fill(`buzz.localhost:${port}`);
     await page.getByRole("button", { name: "Continue" }).click();
     await expect(
       page.getByRole("button", { name: "I already have a key" }),

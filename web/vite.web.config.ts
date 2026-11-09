@@ -87,6 +87,9 @@ export default defineConfig(async (env) => {
     throw new Error(
       'Set VITE_BUZZ_COMMUNITIES to the community hosts this build may join, e.g. "chat.example.com,other.example.com".',
     );
+  // Builderlab account sign-in needs the desktop app; empty opts out of the
+  // built-in server (federatedBuilderlabUrl in vite.config.ts).
+  process.env.BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG = "";
   const config = (await upstream(env)) as UserConfig;
   // The huddle window is native-only.
   const { huddle: _, ...input } = (config.build?.rollupOptions?.input ??

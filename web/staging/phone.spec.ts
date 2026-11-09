@@ -124,19 +124,16 @@ for (const [device, engine] of [
       Reflect.get(window, "__TAURI_INTERNALS__").invoke("identity_create"),
     );
     await page.reload();
-    const dialog = page.getByRole("dialog");
+    const next = page.getByRole("button", { name: "Continue" });
     await expect(async () => {
       const field = page.getByLabel("Invite link or community URL");
       await field.fill(`wss://buzz.localhost:${port}`);
       await field.press("Enter");
-      await expect(dialog).toBeVisible({ timeout: 2000 });
+      await expect(next).toBeVisible({ timeout: 2000 });
     }).toPass();
-    await dialog.getByRole("button", { name: "Continue" }).click();
-    await dialog.getByRole("button", { name: "Continue" }).click();
-    await dialog.getByLabel("Display name").fill(`Phone ${name}`);
-    await dialog
-      .getByRole("button", { name: "Publish profile & open" })
-      .click();
+    await next.tap();
+    await page.getByLabel("Display name").fill(`Phone ${name}`);
+    await page.getByRole("button", { name: "Publish profile & open" }).tap();
     const toggle = page.locator("[data-shell-sidebar-toggle]");
     const drawer = page.locator('#shell-navigation[data-expanded="true"]');
     await toggle.tap();
@@ -181,21 +178,21 @@ for (const [device, engine] of [
       hasText: channel,
     });
     expect((await row.boundingBox())?.height).toBeGreaterThanOrEqual(44);
-    await page.getByRole("button", { name: "Inbox" }).tap();
+    await page.getByRole("button", { name: "Activity" }).tap();
     await toggle.tap();
     await page.getByRole("button", { name: channel }).tap();
     await expect(composer).toBeVisible();
     await expect(composer).not.toBeFocused();
 
-    // A colleague mentions this phone while it reads Inbox: the closed
+    // A colleague mentions this phone while it reads Activity: the closed
     // drawer's toggle carries the channel's dot, and the mention opens from
-    // Inbox as a conversation that Back leaves for the list again.
+    // Activity as a conversation that Back leaves for the list again.
     const viewer = await page.evaluate(() =>
       Reflect.get(window, "__TAURI_INTERNALS__").invoke("identity_restore"),
     );
     const channelId = (await row.getAttribute("data-channel-id")) as string;
     await toggle.tap();
-    await page.getByRole("button", { name: "Inbox" }).tap();
+    await page.getByRole("button", { name: "Activity" }).tap();
     const mentioned = `Can you check the deploy log, Phone ${name}?`;
     const other = await colleague();
     await other.publish(9021, [["h", channelId]]);

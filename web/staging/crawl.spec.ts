@@ -217,7 +217,9 @@ for (const width of [1280, 390])
     // Sign in through the key import path, as people do.
     await page.goto("/");
     await expect(async () => {
-      await page.getByLabel("Community URL").fill(host);
+      const other = page.getByRole("button", { name: "Other options" });
+      if (await other.isVisible()) await other.click();
+      await page.getByLabel("Community address or invite link").fill(host);
       await page.getByRole("button", { name: "Continue" }).click();
       await expect(
         page.getByRole("button", { name: "I already have a key" }),

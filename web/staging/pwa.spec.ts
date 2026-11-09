@@ -54,7 +54,11 @@ async function choose(page: Page, lane: string) {
   await expect(async () => {
     // A slow first probe can land on the choice after this attempt timed out.
     if (!(await next.isVisible())) {
-      await page.getByLabel("Community URL").fill(`buzz.localhost:${port}`);
+      const other = page.getByRole("button", { name: "Other options" });
+      if (await other.isVisible()) await other.click();
+      await page
+        .getByLabel("Community address or invite link")
+        .fill(`buzz.localhost:${port}`);
       await page.getByRole("button", { name: "Continue" }).click();
     }
     await expect(next).toBeVisible({ timeout: 2000 });
@@ -81,25 +85,24 @@ test("chats through the browser host", async ({ browser }) => {
   const viewer = await invoke(bob, "identity_create");
   expect(viewer).toMatch(/^[0-9a-f]{64}$/);
   await bob.reload();
-  const dialog = bob.getByRole("dialog");
   const join = async (url: string) => {
     const field = bob.getByLabel("Invite link or community URL");
+    const next = bob.getByRole("button", { name: "Continue" });
     await expect(async () => {
       await field.fill(url);
       await field.press("Enter");
-      await expect(dialog).toBeVisible({ timeout: 2000 });
+      await expect(next).toBeVisible({ timeout: 2000 });
     }).toPass();
-    await dialog.getByRole("button", { name: "Continue" }).click();
+    await next.click();
   };
   await join("wss://other.example.com");
   await expect(
     bob.getByText("This community isn't available in this app."),
   ).toBeVisible();
-  await dialog.getByRole("button", { name: "Back" }).click();
+  await bob.getByRole("button", { name: "Back" }).click();
   await join(`wss://buzz.localhost:${port}`);
-  await dialog.getByRole("button", { name: "Continue" }).click();
-  await dialog.getByLabel("Display name").fill(bobName);
-  await dialog.getByRole("button", { name: "Publish profile & open" }).click();
+  await bob.getByLabel("Display name").fill(bobName);
+  await bob.getByRole("button", { name: "Publish profile & open" }).click();
   await shell(bob);
 
   // A channel and a message.
@@ -214,6 +217,7 @@ test("continues with the previous PWA's identity and communities", async ({
     { secret: [...secret], pubkey: getPublicKey(secret), port },
   );
   await page.reload();
+  await page.getByRole("button", { name: "Other options" }).click();
   const offer = page.getByRole("alertdialog", {
     name: "Continue with your Buzz identity?",
   });
@@ -252,7 +256,9 @@ test("continues with the previous PWA's identity and communities", async ({
   await invoke(page, "sign_out", { wipe: false, removeAgents: false }).catch(
     () => {},
   );
-  await expect(page.getByLabel("Community URL")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Other options" }),
+  ).toBeVisible();
   expect(await invoke(page, "identity_restore")).toBeNull();
   expect(await invoke(page, "identity_legacy_available")).toBe(false);
 });
@@ -261,10 +267,12 @@ test("creates a key, backs it up and restores it from the backup", async ({
   browser,
 }) => {
   const page = await open(browser);
-  // No email sign-in in this build: the key choice is explicit.
-  await expect(page.getByLabel("Community URL")).toBeVisible();
+  // No account sign-in in this build: the key choice is explicit.
   await expect(
-    page.getByRole("button", { name: "Sign in with email" }),
+    page.getByRole("button", { name: "Other options" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: /^(Sign in|Create account)$/ }),
   ).toBeHidden();
   await choose(page, "Create my key");
   const npub = page.getByText(/^npub1/);

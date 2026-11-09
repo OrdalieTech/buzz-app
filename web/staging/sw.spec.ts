@@ -47,17 +47,16 @@ async function signUp(browser: Browser, name: string) {
   const secret = generateSecretKey();
   await invoke(page, "identity_import", { nsec: nip19.nsecEncode(secret) });
   await page.reload();
-  const dialog = page.getByRole("dialog");
   const field = page.getByLabel("Invite link or community URL");
+  const next = page.getByRole("button", { name: "Continue" });
   await expect(async () => {
     await field.fill(`wss://buzz.localhost:${port}`);
     await field.press("Enter");
-    await expect(dialog).toBeVisible({ timeout: 2000 });
+    await expect(next).toBeVisible({ timeout: 2000 });
   }).toPass();
-  await dialog.getByRole("button", { name: "Continue" }).click();
-  await dialog.getByRole("button", { name: "Continue" }).click();
-  await dialog.getByLabel("Display name").fill(name);
-  await dialog.getByRole("button", { name: "Publish profile & open" }).click();
+  await next.click();
+  await page.getByLabel("Display name").fill(name);
+  await page.getByRole("button", { name: "Publish profile & open" }).click();
   await expect(
     page.getByRole("button", { name: "Create channel" }),
   ).toBeVisible();

@@ -26,66 +26,55 @@ import { key } from "./commands.ts";
 // saves it create-only.
 
 type Lane = "create" | "restore" | "pair";
-let lane: Lane = "restore";
 const call = <T,>(command: string, args: object = {}) =>
   key(args as Record<string, unknown>, command) as Promise<T>;
 const text = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
-export function ConnectChoice({
-  host,
-  onImport,
-  onBack,
-}: {
+/** Unreachable: the web build has no account sign-in to choose against. */
+export const ConnectChoice = (_: {
   host: string;
   onConnect: () => void;
   onImport: () => void;
   onBack: () => void;
-}) {
-  const open = (next: Lane) => () => {
-    lane = next;
-    onImport();
-  };
-  return (
-    <>
-      <div>
-        <h1
-          id="welcome-title"
-          tabIndex={-1}
-          className="text-heading text-standard"
-        >
-          Connect to your community
-        </h1>
-        <p className="mt-2 break-all font-mono text-mono-lg text-standard">
-          {host}
-        </p>
-        <p className="mt-2 text-body text-subtle">
-          Buzz relies on a private key, kept on this device, for your identity.
-        </p>
-      </div>
-      <div className="flex flex-col gap-3">
-        <Button variant="prominent" size="lg" onClick={open("create")}>
-          Create my key
-        </Button>
-        <Button size="sm" data-return-focus="import" onClick={open("restore")}>
-          I already have a key
-        </Button>
-        <Button size="sm" onClick={open("pair")}>
-          Pair with Buzz desktop
-        </Button>
-      </div>
-      <div className="flex gap-3">
-        <Button onClick={onBack}>Back</Button>
-      </div>
-    </>
-  );
-}
+}) => null;
 
 type Props = { onBack: () => void; onImport: (nsec: string) => Promise<void> };
 
+/** Welcome opens this once the community is found: a key is the way in. */
 export function KeyImport(props: Props & { expectedPubkey?: string }) {
+  const [lane, setLane] = useState<Lane>();
+  if (!lane)
+    return (
+      <Screen
+        title="Connect to your community"
+        body="Buzz relies on a private key, kept on this device, for your identity."
+        actions={
+          <>
+            <Button
+              size="lg"
+              variant="prominent"
+              onClick={() => setLane("create")}
+            >
+              Create my key
+            </Button>
+            <Button size="lg" onClick={() => setLane("restore")}>
+              I already have a key
+            </Button>
+            <Button size="lg" onClick={() => setLane("pair")}>
+              Pair with Buzz desktop
+            </Button>
+            <Button size="lg" variant="ghost" onClick={props.onBack}>
+              Back
+            </Button>
+          </>
+        }
+      >
+        {null}
+      </Screen>
+    );
   const Page = { create: CreateKey, restore: RestoreKey, pair: PairKey }[lane];
-  return <Page {...props} />;
+  return <Page {...props} onBack={() => setLane(undefined)} />;
 }
 
 /** Runs one action at a time, keeping its refusal for the page. */
