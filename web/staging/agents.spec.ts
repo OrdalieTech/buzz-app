@@ -105,12 +105,18 @@ test("pairs a remote agent and reads what it publishes", async ({
   await dialog.getByLabel("Name").fill(name);
   await dialog.getByLabel("Agent public key").fill(nip19.npubEncode(agent));
   await expect(dialog.getByText(nip19.npubEncode(agent))).toBeVisible();
-  await dialog.getByRole("button", { name: "Create agent" }).click();
+  // Upstream introduces the agent before creating it.
+  const create = async () => {
+    await dialog.getByRole("button", { name: "Create agent" }).click();
+    await dialog.getByRole("button", { name: /^Let.s go$/ }).click();
+  };
+  await create();
   await expect(
     dialog.getByText("Confirm that this agent is yours."),
   ).toBeVisible();
+  await dialog.getByRole("button", { name: "Back", exact: true }).click();
   await dialog.getByRole("checkbox").check();
-  await dialog.getByRole("button", { name: "Create agent" }).click();
+  await create();
   const line = await owner
     .locator("code", { hasText: "BUZZ_AUTH_TAG=" })
     .textContent();
@@ -165,7 +171,7 @@ test("pairs a remote agent and reads what it publishes", async ({
   await owner.getByRole("tab", { name: "Memory" }).click();
   await owner.getByRole("button", { name: "mem/leads" }).click();
   await expect(owner.getByText(`Call Ada ${run}`)).toBeVisible();
-  await owner.getByRole("tab", { name: "Activity" }).click();
+  await owner.getByRole("main").getByRole("tab", { name: "Activity" }).click();
   const frame = (kind: string, payload: object) => ({
     kind,
     timestamp: new Date().toISOString(),
@@ -203,7 +209,8 @@ test("pairs a remote agent and reads what it publishes", async ({
         toOwner,
       ),
     );
-    await expect(owner.getByText(`Thinking about ${run}`)).toBeVisible({
+    // Upstream shows it as a preview and in full.
+    await expect(owner.getByText(`Thinking about ${run}`).first()).toBeVisible({
       timeout: 3000,
     });
   }).toPass();

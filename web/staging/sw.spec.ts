@@ -379,6 +379,8 @@ test("signs relay media and routes notifications to their message", async ({
       (await (await request.get(`${community}/webpush/deliveries`)).json())
         .length;
     const before = await deliveries();
+    // A later second than the previous line, so this one sorts newest.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
     const id = await post(alice.page, channel, text);
     await expect.poll(deliveries).toBe(before + 1);
     await dispatch(bob.page, "push");
@@ -394,9 +396,11 @@ test("signs relay media and routes notifications to their message", async ({
     });
   };
   await wake(`wake up ${run}`);
-  // Read in the app, the alert is taken back once read state reaches the
-  // relay (published 5 s after reading).
-  await row.click();
+  // Read in the app (Messages reopens the conversation; reading counts with
+  // focus in it), the alert is taken back once read state reaches the relay
+  // (published 5 s after reading).
+  await bob.page.getByRole("tab", { name: "Messages" }).click();
+  await bob.page.getByRole("textbox", { name: /^Message/ }).click();
   await expect
     .poll(
       async () => {

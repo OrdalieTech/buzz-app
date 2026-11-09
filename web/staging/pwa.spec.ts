@@ -128,8 +128,14 @@ test("chats through the browser host", async ({ browser }) => {
   await expect(row).toBeVisible();
 
   // Read state: unread survives a reload until read; once read, the relay
-  // holds Bob's self-encrypted record and a reload keeps it read.
-  await bob.getByRole("tab", { name: "Activity" }).click();
+  // holds Bob's self-encrypted record and a reload keeps it read. Bob waits
+  // in a channel of his own, where Messages reopens after the reload.
+  await bob.getByRole("button", { name: "Create channel" }).click();
+  await bob.getByLabel("Name").fill(`bob-${run}`);
+  await bob
+    .getByRole("dialog")
+    .getByRole("button", { name: "Create channel" })
+    .click();
   await send(alice, `are you there ${run}`);
   const unread = row.locator("[data-channel-unread]");
   await expect(unread).toBeVisible();

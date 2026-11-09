@@ -25,6 +25,10 @@ const degraded = new Set([
   "plugin:event|listen",
   // Repository reads run a local git; the repository page shows unavailable.
   "relay_project_git",
+  // Key backup to a Block account is desktop-only; Identity offers none.
+  "nsec_backup_watch",
+  // The welcome intro asks the native window to show; the page already is.
+  "plugin:window|show",
 ]);
 const FAILURE =
   /isn['’]t available in the browser|could not be loaded|Retry (templates|workspaces)/;
@@ -181,14 +185,17 @@ for (const width of [1280, 390])
         await close.click({ timeout: 2000 }).catch(() => {});
     }
     const sidebar = page.getByRole("complementary", { name: "Sidebar" });
-    /** On a phone the sidebar is a drawer: open it, or close it by its scrim. */
+    /** The sidebar is Messages': go there first. On a phone it is a drawer:
+     * open it, or close it by its scrim. */
+    const toggle = page.locator("[data-shell-sidebar-toggle]");
     async function drawer(open = true) {
+      if (open && !(await sidebar.isVisible()) && !(await toggle.isVisible()))
+        await page.getByRole("tab", { name: "Messages" }).click();
       if (width > 650) return;
       const shown = await page
         .locator('#shell-navigation[data-expanded="true"]')
         .isVisible();
-      if (open && !shown)
-        await page.locator("[data-shell-sidebar-toggle]").click();
+      if (open && !shown) await toggle.click();
       if (!open && shown) await page.mouse.click(width - 16, 422);
     }
     /** Every tab in `scope`, in turn. */
@@ -320,9 +327,8 @@ for (const width of [1280, 390])
           if (await first.isVisible()) await first.click();
         }
       });
-    await visit("inbox", async () => {
-      await drawer();
-      await sidebar.getByRole("tab", { name: "Activity" }).first().click();
+    await visit("activity", async () => {
+      await page.getByRole("tab", { name: "Activity" }).click();
     });
     await visit("search", async () => {
       await page.getByRole("button", { name: "Search Buzz" }).click();
