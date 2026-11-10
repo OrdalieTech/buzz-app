@@ -1,3 +1,5 @@
+import { copyFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, loadEnv, type Plugin, type UserConfig } from "vite";
 import upstream from "../vite.config.ts";
@@ -40,8 +42,21 @@ const onboarding: Plugin = {
       : null,
 };
 
+// A distributor's app icon (VITE_BUZZ_APP_ICON: a square PNG, artwork inside
+// the maskable safe zone) replaces upstream's at the paths that use it.
+const icon = process.env.VITE_BUZZ_APP_ICON;
+let outDir = "";
+
 const browserHost: Plugin = {
   name: "buzz-browser-host",
+  configResolved(config) {
+    outDir = resolve(config.root, config.build.outDir);
+  },
+  closeBundle() {
+    if (icon)
+      for (const name of ["app-icon.png", "apple-touch-icon.png"])
+        copyFileSync(icon, resolve(outDir, name));
+  },
   // Before Vite's own resolver, so the app's plugin list gains web/orb.tsx.
   enforce: "pre",
   resolveId(source, importer) {
