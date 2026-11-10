@@ -4,7 +4,7 @@ name: buzz-web-staging-${STAGING_PORT:-9443}
 
 services:
   relay:
-    image: ghcr.io/block/buzz:sha-f6f6d9a
+    image: ghcr.io/block/buzz:sha-44b3c48
     environment:
       DATABASE_URL: postgres://buzz:buzz@postgres:5432/buzz
       REDIS_URL: redis://redis:6379
@@ -28,7 +28,7 @@ services:
 
   # NIP-AB device pairing sidecar, at /pair.
   pairing:
-    image: ghcr.io/block/buzz:sha-f6f6d9a
+    image: ghcr.io/block/buzz:sha-44b3c48
     entrypoint: buzz-pair-relay
     environment:
       BUZZ_PAIR_RELAY_BIND_ADDR: 0.0.0.0:5000
