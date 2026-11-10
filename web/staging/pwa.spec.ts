@@ -136,6 +136,9 @@ test("chats through the browser host", async ({ browser }) => {
     .getByRole("dialog")
     .getByRole("button", { name: "Create channel" })
     .click();
+  await expect(
+    bob.getByRole("textbox", { name: `Message #bob-${run}` }),
+  ).toBeVisible();
   await send(alice, `are you there ${run}`);
   const unread = row.locator("[data-channel-unread]");
   await expect(unread).toBeVisible();
