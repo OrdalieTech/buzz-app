@@ -3,6 +3,7 @@
 // long-press actions, swipe to reply, haptics and reload into a new build.
 // Layout lives in mobile.css. Lessons from the previous PWA: never
 // pushState/history.back from here, press feedback is opacity only.
+import { sendKeyPreference } from "../src/features/messages/send-key-preference.ts";
 import "./mobile.css";
 
 const phone = matchMedia("(max-width: 650px)");
@@ -13,6 +14,9 @@ const DRAWER = '#shell-navigation[data-expanded="true"]';
 const TEXT_INPUT =
   'textarea, [contenteditable="true"], input:not([type]), input[type="text"], input[type="search"], input[type="email"], input[type="url"], input[type="tel"], input[type="password"], input[type="number"]';
 const root = document.documentElement;
+// Phones have no ⌘/Ctrl: Return adds a line and the send button sends
+// (upstream's "⌘/Ctrl+Enter sends" device choice).
+if (touch.matches && !sendKeyPreference.read()) sendKeyPreference.set(true);
 // Every touch event this file handles carries at least one touch.
 const first = (touches: TouchList) => touches[0] as Touch;
 

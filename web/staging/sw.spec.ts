@@ -269,7 +269,9 @@ test("signs relay media and routes notifications to their message", async ({
   expect((await request.get(image.url)).status()).toBe(401);
 
   await row.click();
-  const img = bob.page.locator(`img[src*="${image.hash}"]`);
+  const img = bob.page.locator(
+    `img[src*="${image.hash}"]:not([data-thumbnail])`,
+  );
   await expect(img).toBeVisible();
   await expect
     .poll(() => img.evaluate((img: HTMLImageElement) => img.naturalWidth))

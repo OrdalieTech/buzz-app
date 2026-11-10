@@ -18,6 +18,26 @@ for (const [key, value, parse] of [
       localStorage.setItem(key, value);
   } catch {}
 
+// Message editors ask the keyboard to correct, capitalize and suggest, which
+// upstream turns off for desktop rich text (EditableInput's attributes). The
+// editor ignores attribute changes on its root, so these stay.
+const keyboard = {
+  autocorrect: "on",
+  autocapitalize: "sentences",
+  writingsuggestions: "true",
+};
+new MutationObserver((records) => {
+  for (const { target } of records)
+    if ((target as Element).matches('[contenteditable][role="textbox"]'))
+      for (const [name, value] of Object.entries(keyboard))
+        if ((target as Element).getAttribute(name) !== value)
+          (target as Element).setAttribute(name, value);
+}).observe(document, {
+  subtree: true,
+  attributes: true,
+  attributeFilter: ["contenteditable", ...Object.keys(keyboard)],
+});
+
 // Answers @tauri-apps/api's IPC in the page, as tests/fixtures/mocked-native-ipc.tsx
 // does, without setting isTauri(). mockIPC also provides the callback
 // registry that Channel needs.

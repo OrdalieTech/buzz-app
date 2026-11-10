@@ -144,15 +144,26 @@ for (const [device, engine] of [
       .getByRole("button", { name: "Create channel" })
       .click();
     const composer = page.getByRole("textbox", { name: /^Message/ });
+    // The keyboard corrects and capitalizes, and Return adds a line: the
+    // send button sends.
+    await expect(composer).toHaveAttribute("autocorrect", "on");
+    await expect(composer).toHaveAttribute("autocapitalize", "sentences");
+    const send = page.getByRole("button", { name: "Send message" });
     for (const text of [
       "Morning! Is the deploy still on for today?",
-      "Yes, after lunch. I'll post the checklist here first.",
+      "Yes, after lunch. I'll post the checklist here first.\nChecklist first.",
       "Great, thanks",
     ]) {
+      const lines = text.split("\n");
       await composer.tap();
-      await page.keyboard.type(text);
-      await page.keyboard.press("Enter");
-      await expect(page.getByText(text)).toBeVisible();
+      for (const [index, line] of lines.entries()) {
+        if (index) await page.keyboard.press("Enter");
+        await page.keyboard.type(line);
+      }
+      await send.tap();
+      await expect(
+        page.locator("[data-message-id]", { hasText: lines[0] as string }),
+      ).toContainText(lines.at(-1) as string);
     }
     await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
     // Actions stay hidden until a long press.
