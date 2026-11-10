@@ -1,5 +1,22 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { ACCENT_KEY, parseAccent } from "../src/shared/theme/accent.ts";
+import {
+  DENSITY_KEY,
+  parseMessageDensity,
+} from "../src/shared/theme/service.ts";
 import { commands } from "./commands.ts";
+
+// A distributor's appearance defaults (VITE_BUZZ_DEFAULT_ACCENT, e.g.
+// "cobalt", and VITE_BUZZ_DEFAULT_DENSITY, "compact"), saved for whoever has
+// not chosen yet on this device; Appearance settings still change them.
+for (const [key, value, parse] of [
+  [ACCENT_KEY, import.meta.env.VITE_BUZZ_DEFAULT_ACCENT, parseAccent],
+  [DENSITY_KEY, import.meta.env.VITE_BUZZ_DEFAULT_DENSITY, parseMessageDensity],
+] as const)
+  try {
+    if (value && parse(value) === value && localStorage.getItem(key) === null)
+      localStorage.setItem(key, value);
+  } catch {}
 
 // Answers @tauri-apps/api's IPC in the page, as tests/fixtures/mocked-native-ipc.tsx
 // does, without setting isTauri(). mockIPC also provides the callback
