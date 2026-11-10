@@ -232,16 +232,18 @@ for (const width of [1280, 390])
     );
     await page.reload();
     await page.getByRole("button", { name: "Other options" }).click();
+    const key = page.getByRole("button", { name: "I already have a key" });
     await expect(async () => {
-      await page
-        .getByLabel("Community address or invite link")
-        .fill(host, { timeout: 2000 });
-      await page
-        .getByRole("button", { name: "Continue" })
-        .click({ timeout: 2000 });
-      await expect(
-        page.getByRole("button", { name: "I already have a key" }),
-      ).toBeVisible({ timeout: 2000 });
+      // A slow lookup can land on the key choice after an attempt timed out.
+      if (!(await key.isVisible())) {
+        await page
+          .getByLabel("Community address or invite link")
+          .fill(host, { timeout: 2000 });
+        await page
+          .getByRole("button", { name: "Continue" })
+          .click({ timeout: 2000 });
+      }
+      await expect(key).toBeVisible({ timeout: 2000 });
     }).toPass();
     await page.getByRole("button", { name: "I already have a key" }).click();
     await page
@@ -328,7 +330,11 @@ for (const width of [1280, 390])
         }
       });
     await visit("activity", async () => {
-      await page.getByRole("tab", { name: "Activity" }).click();
+      await drawer();
+      await page
+        .getByRole("navigation", { name: "Pages" })
+        .getByRole("button", { name: /^Activity/ })
+        .click();
     });
     await visit("search", async () => {
       await page.getByRole("button", { name: "Search Buzz" }).click();

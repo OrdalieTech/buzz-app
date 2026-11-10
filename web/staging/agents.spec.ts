@@ -62,16 +62,18 @@ test("pairs a remote agent and reads what it publishes", async ({
   const owner = await (await browser.newContext()).newPage();
   await owner.goto("/");
   await owner.getByRole("button", { name: "Other options" }).click();
+  const key = owner.getByRole("button", { name: "I already have a key" });
   await expect(async () => {
-    await owner
-      .getByLabel("Community address or invite link")
-      .fill(`buzz.localhost:${port}`, { timeout: 2000 });
-    await owner
-      .getByRole("button", { name: "Continue" })
-      .click({ timeout: 2000 });
-    await expect(
-      owner.getByRole("button", { name: "I already have a key" }),
-    ).toBeVisible({ timeout: 2000 });
+    // A slow lookup can land on the key choice after an attempt timed out.
+    if (!(await key.isVisible())) {
+      await owner
+        .getByLabel("Community address or invite link")
+        .fill(`buzz.localhost:${port}`, { timeout: 2000 });
+      await owner
+        .getByRole("button", { name: "Continue" })
+        .click({ timeout: 2000 });
+    }
+    await expect(key).toBeVisible({ timeout: 2000 });
   }).toPass();
   await owner.getByRole("button", { name: "I already have a key" }).click();
   await owner

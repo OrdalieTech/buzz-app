@@ -306,7 +306,10 @@ test("signs relay media and routes notifications to their message", async ({
   await bob.page.keyboard.press("Escape");
 
   // A running-tab alert goes through the worker, and its tap opens the message.
-  await bob.page.getByRole("tab", { name: "Activity" }).click();
+  await bob.page
+    .getByRole("navigation", { name: "Pages" })
+    .getByRole("button", { name: /^Activity/ })
+    .click();
   const text = `are you there ${run}`;
   await post(alice.page, channel, text);
   await expect
@@ -325,7 +328,10 @@ test("signs relay media and routes notifications to their message", async ({
   // Push: with a browser subscription (stubbed: headless Chromium has no push
   // service), the worker leases mentions and the DM through the gateway
   // (webpush.mjs here), and the relay delivers a wake for a new message.
-  await bob.page.getByRole("tab", { name: "Activity" }).click();
+  await bob.page
+    .getByRole("navigation", { name: "Pages" })
+    .getByRole("button", { name: /^Activity/ })
+    .click();
   const stub = (endpoint: string) => {
     const subscription = {
       endpoint,
@@ -417,7 +423,10 @@ test("signs relay media and routes notifications to their message", async ({
     )
     .toBe(false);
 
-  await bob.page.getByRole("tab", { name: "Activity" }).click();
+  await bob.page
+    .getByRole("navigation", { name: "Pages" })
+    .getByRole("button", { name: /^Activity/ })
+    .click();
   await wake(`wake up again ${run}`);
   await dispatch(bob.page, "notificationclick", channel);
   await expect(bob.page).toHaveURL(new RegExp(`#buzz=.*${channel}`));

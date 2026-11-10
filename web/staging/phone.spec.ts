@@ -178,26 +178,24 @@ for (const [device, engine] of [
       hasText: channel,
     });
     expect((await row.boundingBox())?.height).toBeGreaterThanOrEqual(44);
-    // Pages are in the bottom bar, under the open drawer's scrim; a channel
-    // opens from the drawer without the keyboard.
-    await page.mouse.click(width - 16, height / 2);
-    await expect(drawer).toBeHidden();
-    const activity = page.getByRole("tab", { name: "Activity" });
-    const messages = page.getByRole("tab", { name: "Messages" });
+    // Activity heads the drawer; a channel opens from it without the keyboard.
+    const activity = page
+      .getByRole("navigation", { name: "Pages" })
+      .getByRole("button", { name: /^Activity/ });
     await activity.tap();
-    await messages.tap();
     await toggle.tap();
     await row.tap();
     await expect(composer).toBeVisible();
     await expect(composer).not.toBeFocused();
 
-    // A colleague mentions this phone while it reads Activity: the mention
-    // opens from Activity as a conversation that Back leaves for the list
-    // again, and reading it clears the closed drawer's dot.
+    // A colleague mentions this phone while it reads Activity: the closed
+    // drawer's toggle carries the channel's dot, and the mention opens from
+    // Activity as a conversation that Back leaves for the list again.
     const viewer = await page.evaluate(() =>
       Reflect.get(window, "__TAURI_INTERNALS__").invoke("identity_restore"),
     );
     const channelId = (await row.getAttribute("data-channel-id")) as string;
+    await toggle.tap();
     await activity.tap();
     const mentioned = `Can you check the deploy log, Phone ${name}?`;
     const other = await colleague();
@@ -213,6 +211,11 @@ for (const [device, engine] of [
     other.close();
     const item = page.getByRole("button", { name: /^Open .* in #phone-/ });
     await expect(item).toBeVisible();
+    await expect
+      .poll(() =>
+        toggle.evaluate((el) => getComputedStyle(el, "::after").content),
+      )
+      .not.toBe("none");
     await shot(page, `${name}-6-inbox`);
     await item.tap();
     await expect(page.getByText(mentioned).last()).toBeVisible();
@@ -221,7 +224,6 @@ for (const [device, engine] of [
     await page.goBack();
     await expect(item).toBeVisible();
     await shot(page, `${name}-8-inbox-back`);
-    await messages.tap();
     await toggle.tap();
     await row.tap();
     await expect(composer).toBeVisible();
