@@ -57,7 +57,7 @@ export const BACKUP_FAILURES = {
     "Check your connection and try again.",
   ),
   // A retry re-sends the same encrypted bytes, which kgoose treats as stored.
-  unconfirmed: retry("Builderlab didn’t confirm your backup."),
+  unconfirmed: retry("Builderlab couldn’t confirm your backup."),
   storage: retry("Buzz couldn’t save backup progress on this device."),
   unknown: { message: "Your key wasn’t backed up.", retryable: false },
 } as const satisfies Record<

@@ -10,7 +10,11 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
-import { PluginUpdates, PluginUpdatesMenu } from "./PluginUpdates";
+import {
+  PluginUpdateFailure,
+  PluginUpdates,
+  PluginUpdatesMenu,
+} from "./PluginUpdates";
 import { PluginMenu } from "./PluginMenu";
 import { ToastProvider } from "../shared/design-system/ui/Toast";
 import {
@@ -112,6 +116,13 @@ function fixture() {
           relay={relay}
           installRequests={createPluginInstallRequests()}
         >
+          <button type="button">View Notes details</button>
+          <PluginUpdateFailure
+            pluginId="example.notes"
+            returnFocus={() =>
+              screen.getByRole("button", { name: "View Notes details" })
+            }
+          />
           <MenuRoot>
             <MenuTrigger>Profile</MenuTrigger>
             <MenuPopup>
@@ -595,4 +606,309 @@ it("requires review when a fresh update removes a process artifact constraint", 
   );
   fireEvent.click(confirm);
   await waitFor(() => expect(f.installImport).toHaveBeenCalledOnce());
+});
+
+const OFFLINE =
+  "Git could not read this repository: fatal: unable to access 'https://example.com/plugins.git/': Could not resolve host: example.com";
+const noticeTitle = (name: string) => `Couldn’t check ${name} for updates`;
+
+it("keeps a background check’s failure on its plugin’s row, with Git’s text behind Details", async () => {
+  const f = fixture();
+  f.imports.checkGit.mockRejectedValue(OFFLINE);
+  f.mount();
+  const status = await screen.findByText("Couldn’t check for updates.");
+  await waitFor(() => expect(f.imports.checkGit).toHaveBeenCalledOnce());
+  // Nothing interrupts: no notice, and the Plugins menu has no entry for it.
+  expect(screen.queryByText(noticeTitle("Notes"))).toBeNull();
+  expect(screen.queryByText(/Cannot check/)).toBeNull();
+  const row = status.parentElement?.parentElement;
+  if (!row) throw new Error("Expected the row status");
+  const details = row.querySelector("details");
+  expect(details).not.toHaveAttribute("open");
+  fireEvent.click(within(row).getByText("Details"));
+  expect(details).toHaveAttribute("open");
+  expect(details).toHaveTextContent(OFFLINE);
+  fireEvent.click(screen.getByRole("button", { name: "Profile" }));
+  expect(
+    await screen.findByRole("menuitem", { name: "Plugins" }),
+  ).not.toHaveAttribute("aria-haspopup");
+});
+
+function holdCheck(f: ReturnType<typeof fixture>) {
+  let settle!: {
+    finish(preview: ImportPreview): void;
+    fail(error: string): void;
+  };
+  f.imports.checkGit.mockImplementationOnce(
+    () =>
+      new Promise((resolve, reject) => {
+        settle = { finish: resolve, fail: reject };
+      }),
+  );
+  return () => settle;
+}
+
+it("clears the row while Check again runs, and returns a failure to the row without a notice", async () => {
+  const f = fixture();
+  f.imports.checkGit.mockRejectedValueOnce(OFFLINE);
+  const held = holdCheck(f);
+  f.mount();
+  const again = await screen.findByRole("button", { name: "Check again" });
+  again.focus();
+  fireEvent.click(again);
+  // The failure leaves at once; the row reads as it does during any check.
+  expect(screen.queryByText("Couldn’t check for updates.")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Check again" })).toBeNull();
+  expect(
+    screen.getByRole("button", { name: "View Notes details" }),
+  ).toHaveFocus();
+  await waitFor(() => expect(f.imports.checkGit).toHaveBeenCalledTimes(2));
+  expect(document.querySelector('[aria-busy="true"]')).not.toBeNull();
+  await act(async () => held().fail(OFFLINE));
+  const status = await screen.findByRole("alert");
+  expect(status).toHaveTextContent("Couldn’t check for updates.");
+  expect(screen.getByRole("button", { name: "Check again" })).toBeVisible();
+  expect(screen.getByText("Details").closest("details")).toHaveTextContent(
+    OFFLINE,
+  );
+  expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+  expect(screen.queryByText(noticeTitle("Notes"))).toBeNull();
+  expect(screen.queryByText(/Check your connection/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  expect(f.installImport).not.toHaveBeenCalled();
+});
+
+it("keeps the row clear and focus on the plugin when Check again succeeds", async () => {
+  const f = fixture();
+  f.candidate.revision = f.plugin.revision;
+  f.imports.checkGit.mockRejectedValueOnce(OFFLINE);
+  const held = holdCheck(f);
+  f.mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Check again" }));
+  await waitFor(() => expect(f.imports.checkGit).toHaveBeenCalledTimes(2));
+  await act(async () => held().finish(f.discovered));
+  await waitFor(() =>
+    expect(document.querySelector('[aria-busy="true"]')).toBeNull(),
+  );
+  expect(screen.queryByText("Couldn’t check for updates.")).toBeNull();
+  expect(
+    screen.getByRole("button", { name: "View Notes details" }),
+  ).toHaveFocus();
+  expect(screen.queryByText(noticeTitle("Notes"))).toBeNull();
+});
+
+it("doesn’t announce the hourly check’s failure after Check again succeeded", async () => {
+  vi.useFakeTimers();
+  const visibility = vi
+    .spyOn(document, "visibilityState", "get")
+    .mockReturnValue("visible");
+  const f = fixture();
+  f.candidate.revision = f.plugin.revision;
+  f.imports.checkGit.mockRejectedValueOnce(OFFLINE);
+  const held = holdCheck(f);
+  const view = f.mount();
+  try {
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(f.imports.checkGit).toHaveBeenCalledTimes(2);
+    await act(async () => held().finish(f.discovered));
+    expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+    expect(screen.queryByText("Couldn’t check for updates.")).toBeNull();
+    f.imports.checkGit.mockRejectedValueOnce(OFFLINE);
+    await act(() => vi.advanceTimersByTimeAsync(3_600_000));
+    expect(f.imports.checkGit).toHaveBeenCalledTimes(3);
+    expect(screen.getByText("Couldn’t check for updates.")).toBeVisible();
+    expect(screen.queryByRole("alert")).toBeNull();
+  } finally {
+    view.unmount();
+    visibility.mockRestore();
+  }
+});
+
+it.each([
+  [
+    "Git could not read this repository: remote: Repository not found.\nfatal: repository 'https://example.com/plugins.git/' not found",
+    "Git couldn’t find this plugin’s repository. It may have moved, been removed, or need access you don’t have.",
+  ],
+  [
+    "Git could not read this repository: fatal: could not read Username for 'https://example.com': terminal prompts disabled",
+    "Git needs a sign-in for this repository that Buzz couldn’t provide.",
+  ],
+])(
+  "adds a hint for a Git cause Buzz recognizes and keeps Check again, since access can return (%#)",
+  async (error, cause) => {
+    const f = fixture();
+    f.candidate.revision = f.plugin.revision;
+    f.imports.checkGit.mockRejectedValueOnce(OFFLINE);
+    f.imports.checkGit.mockRejectedValueOnce(error);
+    f.mount();
+    fireEvent.click(await screen.findByRole("button", { name: "Check again" }));
+    expect(
+      await screen.findByText(`Couldn’t check for updates. ${cause}`),
+    ).toBeVisible();
+    expect(screen.getAllByText(cause, { exact: false })).toHaveLength(1);
+    expect(screen.queryByText(noticeTitle("Notes"))).toBeNull();
+    fireEvent.click(screen.getByText("Details"));
+    expect(screen.getByText("Details").closest("details")).toHaveTextContent(
+      error.replace(/\s+/g, " "),
+    );
+    // Access restored, Check again clears the hint.
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(f.imports.checkGit).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect(screen.queryByText(/Couldn’t check for updates/)).toBeNull(),
+    );
+  },
+);
+
+it("keeps Check again and the generic sentence when an authorized HTTPS check is refused, as for an expired token", async () => {
+  const f = fixture();
+  const refused =
+    "Git could not read this repository: remote: Invalid username or token.\nfatal: Authentication failed for 'https://example.com/plugins.git/'";
+  f.imports.checkGit.mockRejectedValueOnce(OFFLINE);
+  f.imports.checkGit.mockRejectedValue(refused);
+  f.mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Check again" }));
+  await waitFor(() => expect(f.imports.checkGit).toHaveBeenCalledTimes(2));
+  expect(
+    await screen.findByRole("button", { name: "Check again" }),
+  ).toBeVisible();
+  expect(screen.getByText("Couldn’t check for updates.")).toBeVisible();
+  expect(screen.getByText("Details").closest("details")).toHaveTextContent(
+    "Authentication failed",
+  );
+  expect(screen.queryByText(noticeTitle("Notes"))).toBeNull();
+  expect(screen.queryByText(/Git needs a sign-in/)).toBeNull();
+});
+
+it("doesn’t check in the background while offline, and checks when the connection returns", async () => {
+  const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+  try {
+    const f = fixture();
+    f.mount();
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(f.imports.checkGit).not.toHaveBeenCalled();
+    expect(screen.queryByText("Couldn’t check for updates.")).toBeNull();
+    online.mockReturnValue(true);
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    expect(f.imports.checkGit).toHaveBeenCalledOnce();
+    expect(
+      await screen.findByRole("button", { name: "Update and reload" }),
+    ).toBeVisible();
+  } finally {
+    online.mockRestore();
+  }
+});
+
+it("checks once when the connection returns to a launch that was offline and Git still fails", async () => {
+  const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+  try {
+    const f = fixture();
+    f.imports.checkGit.mockRejectedValue(OFFLINE);
+    f.mount();
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(f.imports.checkGit).not.toHaveBeenCalled();
+    online.mockReturnValue(true);
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    expect(
+      await screen.findByText("Couldn’t check for updates."),
+    ).toBeVisible();
+    // The connection's return started this check, so its failure doesn't
+    // force another; the row waits for the next trigger.
+    expect(f.imports.checkGit).toHaveBeenCalledOnce();
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    await waitFor(() => expect(f.imports.checkGit).toHaveBeenCalledTimes(2));
+  } finally {
+    online.mockRestore();
+  }
+});
+
+it("checks again when the connection returns after it dropped during a check", async () => {
+  const f = fixture();
+  f.candidate.revision = f.plugin.revision;
+  f.imports.checkGit.mockRejectedValueOnce(OFFLINE);
+  f.mount();
+  expect(await screen.findByText("Couldn’t check for updates.")).toBeVisible();
+  // Within the hour, other triggers stay throttled.
+  await act(async () => {
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(f.imports.checkGit).toHaveBeenCalledOnce();
+  await act(async () => {
+    window.dispatchEvent(new Event("online"));
+  });
+  await waitFor(() => expect(f.imports.checkGit).toHaveBeenCalledTimes(2));
+  await waitFor(() =>
+    expect(screen.queryByText("Couldn’t check for updates.")).toBeNull(),
+  );
+  expect(screen.queryByText(noticeTitle("Notes"))).toBeNull();
+  // With nothing failed, the connection's return is throttled too.
+  await act(async () => {
+    window.dispatchEvent(new Event("online"));
+  });
+  expect(f.imports.checkGit).toHaveBeenCalledTimes(2);
+});
+
+it("checks again when the connection returns before the check it dropped has failed", async () => {
+  const f = fixture();
+  f.candidate.revision = f.plugin.revision;
+  const held = holdCheck(f);
+  f.mount();
+  await waitFor(() => expect(f.imports.checkGit).toHaveBeenCalledOnce());
+  // Nothing has failed yet, so the connection's return has nothing to force.
+  await act(async () => {
+    window.dispatchEvent(new Event("online"));
+  });
+  expect(f.imports.checkGit).toHaveBeenCalledOnce();
+  await act(async () => held().fail(OFFLINE));
+  await waitFor(() => expect(f.imports.checkGit).toHaveBeenCalledTimes(2));
+  await waitFor(() =>
+    expect(screen.queryByText("Couldn’t check for updates.")).toBeNull(),
+  );
+  // The intent was spent on that check.
+  await act(async () => {
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(f.imports.checkGit).toHaveBeenCalledTimes(2);
+});
+
+it("keeps the connection's return for a hidden window, and checks again once it is shown", async () => {
+  const visibility = vi
+    .spyOn(document, "visibilityState", "get")
+    .mockReturnValue("visible");
+  try {
+    const f = fixture();
+    f.candidate.revision = f.plugin.revision;
+    f.imports.checkGit.mockRejectedValueOnce(OFFLINE);
+    f.mount();
+    expect(
+      await screen.findByText("Couldn’t check for updates."),
+    ).toBeVisible();
+    visibility.mockReturnValue("hidden");
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    expect(f.imports.checkGit).toHaveBeenCalledOnce();
+    visibility.mockReturnValue("visible");
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await waitFor(() => expect(f.imports.checkGit).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByText("Couldn’t check for updates.")).toBeNull(),
+    );
+  } finally {
+    visibility.mockRestore();
+  }
 });

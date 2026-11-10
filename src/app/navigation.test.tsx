@@ -16,6 +16,12 @@ import type { RelayEvent } from "../features/relay/events";
 import type { Context } from "@deepseek-ai/cordis";
 import { App } from "./App";
 import { createServices, type AppServices } from "./services";
+import { shellSnapshot } from "./navigation";
+import { createNavigationController } from "../features/navigation/controller";
+import {
+  createMemoryHistory,
+  homeTarget,
+} from "../features/navigation/history";
 
 /** Any variant of the App-owned "page couldn't open" card. */
 const pageFailure =
@@ -865,4 +871,27 @@ it("Back closes Settings onto the view beneath and Forward reopens it; other sho
   expect(current.navigation.snapshot().entry.target).toEqual(beneath);
   fireEvent.keyDown(document.body, { ctrlKey: true, key: "]" });
   expect(await screen.findByRole("dialog", { name: "Settings" })).toBeVisible();
+});
+
+it("keeps the shell's snapshot when a visit opens, and follows any other change", () => {
+  const host = createNavigationController(createMemoryHistory(homeTarget));
+  const navigation = host.navigation;
+  const view = shellSnapshot(navigation);
+  void navigation.open({ version: 1, kind: "settings", section: "appearance" });
+  const departed = navigation.snapshot().entry.id;
+  void navigation.open({
+    version: 1,
+    kind: "page",
+    pluginId: "test",
+    pageId: "board",
+  });
+  const opening = view();
+  host.complete(opening.attempt, { status: "opened" });
+  expect(navigation.snapshot().status).toBe("opened");
+  expect(view()).toBe(opening);
+  // History that changes under the opened visit still reaches the shell.
+  navigation.dismiss([departed], homeTarget);
+  expect(view()).not.toBe(opening);
+  expect(view()).toBe(navigation.snapshot());
+  host.dispose();
 });

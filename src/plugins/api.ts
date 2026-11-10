@@ -72,6 +72,10 @@ export type PluginManifest = Readonly<{
     files?: boolean;
     /** Pathless temporary saves in host-selected private storage; no read access. */
     managedFiles?: boolean;
+    /** `host.requestBytes` may also read raster images from any public HTTPS
+     * address, one hop at a time with no cookies, outside `networkOrigins`.
+     * Redirects and pages come back without a body. */
+    publicImages?: boolean;
   }>;
 }>;
 // Module evaluation must be pure. apply owns resources through ctx.effect.

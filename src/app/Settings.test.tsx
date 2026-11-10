@@ -14,7 +14,7 @@ import userEvent from "@testing-library/user-event";
 import { useSyncExternalStore } from "react";
 import { ToastProvider } from "../shared/design-system/ui/Toast";
 import { Context } from "@deepseek-ai/cordis";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import { createCommunityMembership } from "../bundled/moderation/membership";
 import {
   SettingsCardsService,
@@ -22,6 +22,7 @@ import {
   type SettingsCards,
 } from "../features/settings/service";
 import type { ClientSnapshot } from "../features/communities/service";
+import { federatedFixture } from "../features/federated-identity/testing";
 import type { DecisionsService } from "../features/decisions/service";
 import type { RelayData } from "../features/relay/service";
 import type { Contribution } from "../plugins/contributions";
@@ -1327,6 +1328,94 @@ it("opens Manage plugins from the Decisions API hint", async () => {
   // The link is hidden with its section, so focus moves into the one it opened.
   rerender(view("plugins"));
   expect(screen.getByRole("region", { name: "Manage plugins" })).toHaveFocus();
+});
+
+it("opens Builderlab from Identity sync only while its card is registered", async () => {
+  vi.stubEnv("VITE_BUZZ_BUILDERLAB_URL", "https://builderlab.example");
+  onTestFinished(() => {
+    vi.unstubAllEnvs();
+  });
+  const user = userEvent.setup();
+  const builderlab = {
+    ...card("login", "Builderlab", "Plugins"),
+    key: "block.builderlab/login",
+    pluginId: "block.builderlab",
+  };
+  const { cards, set } = registry([builderlab]);
+  const status = {
+    seq: 1,
+    pass: 1,
+    builderlab: true,
+    status: "waiting",
+    reason: "not_linked",
+    management: {
+      pubkey: communityState.viewer,
+      policy: "self-managed",
+      initialBackupConfirmed: false,
+    },
+  };
+  const identity = {
+    exportKey: vi.fn(),
+    backup: {
+      subscribe: () => () => {},
+      snapshot: () => status,
+      ready: async () => status,
+    },
+  } as unknown as Parameters<typeof Settings>[0]["identity"];
+  const onSection = vi.fn();
+  const view = (section: string) => (
+    <ToastProvider>
+      <main id="main-content" tabIndex={-1}>
+        <Settings
+          {...host}
+          cards={cards}
+          identity={identity}
+          navigation={
+            {
+              target: { version: 1, kind: "settings", section },
+              complete: () => true,
+            } as never
+          }
+          onSection={onSection}
+        />
+      </main>
+    </ToastProvider>
+  );
+  const identitySection = () =>
+    screen.getByRole("region", { name: "Identity" });
+  const link = () =>
+    within(identitySection()).queryByRole("button", { name: "Builderlab" });
+  const sentence = () =>
+    within(identitySection()).queryByText(
+      (_, el) =>
+        el?.tagName === "P" &&
+        el.textContent ===
+          "This key isn’t linked to your Builderlab account yet, so it can’t be backed up",
+    );
+  const { rerender } = render(view("identity"));
+  await user.click(screen.getByRole("button", { name: "More options" }));
+  await within(identitySection()).findByRole("button", { name: "Builderlab" });
+  const shown = sentence();
+  expect(shown).not.toBeNull();
+  // Turning the plugin off while Identity is open unlinks the name in place.
+  act(() => set([]));
+  expect(link()).toBeNull();
+  expect(sentence()).toBe(shown);
+  act(() => set([builderlab]));
+  await user.click(link() as HTMLElement);
+  expect(onSection).toHaveBeenCalledExactlyOnceWith("block.builderlab/login");
+  // The link goes with Identity, so focus moves into the section it opened.
+  rerender(view("block.builderlab/login"));
+  expect(screen.getByText("Builderlab body")).toBeVisible();
+  expect(document.getElementById("main-content")).toHaveFocus();
+
+  // With the plugin off, the sentence still names Builderlab, unlinked.
+  act(() => set([]));
+  rerender(view("identity"));
+  await user.click(screen.getByRole("button", { name: "More options" }));
+  await waitFor(() => expect(sentence()).not.toBeNull());
+  expect(link()).toBeNull();
+  expect(sentence()).not.toBeNull();
 });
 
 function pluginSectionsFixture(
@@ -2702,17 +2791,54 @@ it("keeps identity independent of community profile and clears revealed keys on 
     screen.queryByRole("button", { name: "Reveal private key" }),
   ).toBeNull();
   await user.click(screen.getByRole("button", { name: "Identity" }));
-  await user.click(screen.getByRole("button", { name: "Reveal private key" }));
+  await user.click(screen.getByRole("button", { name: "More options" }));
+  await user.click(screen.getByRole("button", { name: "Private key actions" }));
+  await user.click(
+    await screen.findByRole("menuitem", { name: "Reveal private key" }),
+  );
   expect(screen.getByLabelText("Private key (nsec)")).toHaveValue(
     "nsec-public-test-fixture",
   );
   await user.click(screen.getByRole("button", { name: "Appearance" }));
   expect(screen.queryByLabelText("Private key (nsec)")).toBeNull();
   await user.click(screen.getByRole("button", { name: "Identity" }));
-  expect(screen.getByLabelText("Private key (nsec)")).toHaveValue(
-    "••••••••••••••••",
-  );
+  await user.click(screen.getByRole("button", { name: "More options" }));
+  expect(
+    screen.getByRole("button", { name: "Private key actions" }),
+  ).toHaveTextContent("••••••••••••••••");
   expect(exportKey).toHaveBeenCalledTimes(1);
+});
+
+it("retires contributed identity rows and their stale actions with the owning revision", async () => {
+  const navigate = vi.fn();
+  let stillActive = () => false;
+  const entry = {
+    ...card("account", "Account", "Plugins"),
+    identityRow: ({ active }: { active(): boolean }) => {
+      stillActive = active;
+      return (
+        <button type="button" onClick={() => active() && navigate()}>
+          Open account settings
+        </button>
+      );
+    },
+  };
+  const { cards, set } = registry([entry]);
+  const h = federatedFixture();
+  render(
+    <ToastProvider>
+      <Settings {...host} cards={cards} federatedIdentity={h.service} />
+    </ToastProvider>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Identity" }));
+  const link = await screen.findByRole("button", {
+    name: "Open account settings",
+  });
+  fireEvent.click(link);
+  expect(navigate).toHaveBeenCalledOnce();
+  act(() => set([]));
+  expect(screen.queryByText("Open account settings")).toBeNull();
+  expect(stillActive()).toBe(false);
 });
 
 it("offers Retry beside a failed installed revision without changing saved state", () => {

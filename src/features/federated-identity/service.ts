@@ -78,6 +78,11 @@ export interface FederatedIdentity {
   forCommunity?(relay: string): FederatedIdentity;
   /** The session of the sign-in server with this id, for Settings. */
   forServer?(id: string): FederatedIdentity;
+  /** Whether a community (`wss://` or `https://` origin) requires NIP-FI,
+   * from the `/info` discovery native shares with admission. One that does
+   * not is reached with the key alone, whatever any session does. Rejects
+   * when discovery fails. */
+  communityRequiresSignIn?(relay: string): Promise<boolean>;
 }
 declare module "@deepseek-ai/cordis" {
   interface Context {
@@ -205,6 +210,7 @@ export class FederatedIdentityService
     await invoke("federated_identity_cancel_sign_in");
     await this.operation("federated_identity_snapshot");
   }
+  communityRequiresSignIn = communityRequiresSignIn;
   forCommunity = (relay: string): FederatedIdentity => {
     let session = this.shared.communities.get(relay);
     if (!session) {
@@ -306,6 +312,16 @@ export async function signInServers(): Promise<readonly SessionSnapshot[]> {
   return invoke<SessionSnapshot[]>("federated_identity_servers");
 }
 
+async function communityRequiresSignIn(relay: string) {
+  if (!nativeIdentityEnabled())
+    throw new Error("Federated identity requires Buzz desktop");
+  try {
+    return await invoke<boolean>("federated_identity_requires", { relay });
+  } catch (error) {
+    throw typeof error === "string" ? new Error(error) : error;
+  }
+}
+
 /** Which server a session command is for: a community's, or one by id. */
 type Target = Readonly<{ relay: string } | { server: string }>;
 
@@ -354,6 +370,7 @@ class CommunitySession implements FederatedIdentity {
       );
     void this.operation("federated_identity_snapshot").catch(() => {});
   }
+  communityRequiresSignIn = communityRequiresSignIn;
   snapshot = () => this.state;
   subscribe = (listener: () => void) => {
     this.start();

@@ -76,37 +76,31 @@ same local bound and lifetime.
 Keys stay in native custody. Hosted-provider provisioning and standalone tool
 servers do not support these operations.
 
-## Owner tools
+## Message edits
 
-In communities the build flag `BUZZ_OWNER_MCP_COMMUNITIES` enables, an agent's
-runs in this app on a bundled harness list `owner_channel_list`, `owner_channel_get`,
-`owner_member_list`, `owner_read`, `owner_canvas_get` and `owner_canvas_history`.
-They read the owner's channels, one channel's details and
-the owner's rights in it, its roster, its messages, whole threads and searches,
-and its Canvas and earlier revisions, through the
-owner's own signed-in session, including private and archived channels, DMs and
-Solo chats the agent is not in. Message reads and Canvas history page with a
-`next` cursor, as `read` and the app's history do. A search covers only the
-owner's channels and says `partial` while their list is incomplete. Other
-channels' matches still fill its page, so `limited` with few results means
-narrowing it by channel or time. A message shows its newest edit by its author
-or, as in the app, by the author's verified owner. One read fetches a page's edits;
-when they fill it, the answer says `edits_limited` and some messages may show earlier text. They write
-nothing: no membership, subscription, read state, post, agent start or Canvas
-change. Content comes from the relay's own answer, not the owner's open views,
-so it changes no unread counts. They do not save the owner's attachments: a
-saved file would be readable before the call's final checks. The app
-decides the agent, owner and community;
-answers name them in `executedAs`. Each call needs the agent's owner signed in
-to that community now and fails, returning nothing, when the account, community
-or connection changes during it or the turn ends or is stopped, including while
-protection reviews its result. Installed harness plugins, plugins' tools, plugin
-MCP connections and external apps never get this access, and a plugin cannot add
-a tool whose name starts with `owner_`. A [Mesh agent](../src/bundled/mesh-compute/MESH_AGENT.md)
-has these tools too; as its setup warns of all tool output, members serving its
-model can read what they return. Protection reviews these calls and their
-results as it does other Buzz tools. See
-[configuration](configuration.md#owner-mcp-community-flag).
+The shared MCP `edit` tool retains the latest live attachment set, including an
+empty set left by a previous edit. Both app-hosted and standalone agents resolve
+that state as the agent through the version-1 `effective_edit` primary lookup on
+`/query`; they verify the signed original/replacement and their target/channel.
+The exact filter uses kinds `[9,40002,40008,45001,45003]`.
+Deploy the relay support from
+[buzz#9226](https://github.com/block/buzz/pull/9226) before releasing this client.
+An old relay's array response, inaccessible target, invalid response or failed
+lookup aborts without publishing. All MCP agent edits stop working on a community
+whose relay lacks this lookup; upgrade each community before releasing the client.
+There is no original-attachment fallback. Observe MCP edit errors and the relay's
+`buzz_media_publication_access_total` denials during rollout. Rolling the client
+back restores the original-attachment resurrection bug.
+
+The tool waits until the second after the observed head before requesting a
+signature, reusing the bounded wait for notes/canvas. If that second is over five
+seconds ahead, it asks the caller to retry when the clock catches up.
+The MCP publisher stamps the current time, so its five-second wait bounds tool
+latency. The CLI supplies an explicit timestamp and tolerates a 60-second lead.
+Concurrent writers still use relay ordering; this is not compare-and-swap. The relay must
+authorize every carried file for the signing agent; an owner's access does not
+grant the agent private-media access, and denial never causes an automatic retry
+with files stripped.
 
 ## External app authorization
 
@@ -380,7 +374,8 @@ attention is off. A new shared tool needs no harness change.
 Plugins add tools with `ctx.agents.addTool`, listed after the Buzz tools under
 the same `buzz` server. Names are shared by every plugin, so a plugin's tools
 should start with its name (`notes_get`); `addTool` refuses one that a Buzz tool
-or another plugin has. The standalone server in
+or another plugin has, and any starting with `owner_`, the prefix of retired
+owner-access tools, so a call to one never reaches plugin code. The standalone server in
 `src/buzz-mcp/main.ts` stays without them. A harness reads `agents.tools()`
 and passes it to `respond` or `callSessionTool`. A session keeps the list it
 started with, so `addedKey` goes in what decides when one is replaced: the
@@ -1230,8 +1225,10 @@ is deliberately omitted; public typing alone does not establish ownership.
 
 Typing expires eight seconds after its signed timestamp (future clock skew is
 capped at receipt), swept by the existing one-second activity timer. Messages
-clear only the matching agent/channel/thread scope and suppress delayed typing
-for two seconds. Disconnect, channel-route failure, disable, access/cache clear
+clear the matching agent/channel/thread scope and suppress delayed typing
+for two seconds; a thread reply does the same for that agent's channel-level
+scope, since an agent's pulses and replies for one turn can be filed apart.
+Other threads keep their typing. Disconnect, channel-route failure, disable, access/cache clear
 and disposal drop typing evidence. A fresh observer frame does not refresh it.
 
 The sidebar's quiet working dot has two independent sources. The plugin source
@@ -1245,7 +1242,7 @@ the library) anywhere in the channel, threads included. Typing remains a working
 self-declared profile hint, are not shown. This store keeps working with the plugin off, rejects
 future timestamps instead of capping them, schedules its own expiry eight
 seconds after the signed timestamp and stays quiet for two seconds after the
-typer's message. It is display-only evidence, not ownership; the channel popover
+typer's message, in that scope and, for a thread reply, at channel level. It is display-only evidence, not ownership; the channel popover
 still offers **View activity** for such an agent while the plugin is off.
 A timeline thread summary shows the same dots from this source while one of the
 viewer's agents types in that thread; before the first reply it offers **View thread**.
@@ -1343,6 +1340,16 @@ Remote terminal outcomes map `completed` to success, `failed`/`terminated` to
 failure, and `cancelled` to stopped without identifying who cancelled. Exact
 trigger IDs and outcomes survive raw-record trimming. Losing a lifecycle turn
 makes aggregate request completion uncertain.
+
+A `turn_started` frame's `triggeringEventIds` names the messages a turn started
+for, and a second start under the same turn ID makes the turn ambiguous. A
+`turn_steered` frame names messages the agent added to its running turn, as a
+remote agent's safe-point steer does. They join that turn's triggers, so they
+show working and end with it; their activity reads from the turn's start. A
+start or steer that arrives late, after the turn ended or after a newer frame,
+still records membership without reviving or refreshing the turn. Every list is
+admitted whole, up to 64 messages per turn, and the lifecycle's retained
+membership decides which messages a turn's activity belongs to.
 
 With Builderlab sign-in, stale activity or reconnect triggers an owner-only
 `/v3/beekeeper/get-agent-turn-status` read for retained exact tasks. Reads batch

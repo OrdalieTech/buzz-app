@@ -5,6 +5,9 @@
     gap: var(--space-3);
     margin-bottom: var(--space-5);
   }
+  .buzz-content-header[data-align="end"] {
+    align-items: end;
+  }
   .buzz-content-header-copy {
     flex: 1;
     min-width: 0;

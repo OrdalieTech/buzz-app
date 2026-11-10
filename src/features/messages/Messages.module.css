@@ -276,7 +276,7 @@ html[data-keyboard-navigation] .authorLink:focus-visible {
   overflow-wrap: anywhere;
 }
 .text {
-  white-space: normal;
+  white-space: pre-wrap;
 }
 .text[data-single-emoji] {
   --inline-emoji-size: var(--size-emoji-display);
@@ -1879,7 +1879,8 @@ html[data-keyboard-navigation] .text pre code:focus-visible {
   letter-spacing: var(--text-body-sm--letter-spacing);
   overflow-wrap: normal;
   scrollbar-width: thin;
-  white-space: nowrap;
+  /* Columns don't wrap; authored spaces stay, as in the rest of the body. */
+  white-space: pre;
 }
 /* Measured overflow chooses the scrollbar in style; see MessageMarkdown. */
 .text table[data-overflow="true"] {
@@ -1951,6 +1952,8 @@ html[data-keyboard-navigation] .text pre code:focus-visible {
 }
 .text:not(p) > .edited {
   display: block;
+  /* Its leading space separates an inline marker; here it would indent. */
+  white-space: normal;
 }
 .text:not(p) > :has(+ .edited:last-child) {
   margin-bottom: var(--space-1);
@@ -4145,28 +4148,45 @@ html[data-keyboard-navigation] .activityExpansion {
 }
 
 /* The painted bubble and its interactive area must have the same bounds. */
-.messageBubble:has(> .activityBubbleTrigger) {
+.messageBubble:has(> :is(.activityBubbleTrigger, .activityBubbleControls)) {
   padding: 0;
 }
 :where(html[data-message-density="compact"])
   .message[data-agent-response-preview]
-  .messageBubble:has(> .activityBubbleTrigger) {
+  .messageBubble:has(> :is(.activityBubbleTrigger, .activityBubbleControls)) {
   @apply text-caption;
   border-radius: var(--radius-capsule);
   background: var(--reaction-surface, var(--affordance-reaction));
   box-shadow: none;
 }
-.messageBubble > .activityBubbleTrigger {
+.messageBubble > .activityBubbleTrigger,
+.activityBubbleControls > .activityBubbleTrigger {
   width: 100%;
   padding: var(--space-2) var(--space-4);
   border-radius: inherit;
 }
 :where(html[data-message-density="compact"])
   .messageBubble
+  > .activityBubbleTrigger,
+:where(html[data-message-density="compact"])
+  .activityBubbleControls
   > .activityBubbleTrigger {
   min-height: calc(var(--space-6) + var(--space-half));
   padding: calc(var(--space-1) + var(--space-half) / 2)
     calc(var(--space-1h) + var(--space-half) / 2);
+}
+
+.activityBubbleControls {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  max-width: 100%;
+  border-radius: inherit;
+}
+.activityBubbleControls > .activityBubbleTrigger {
+  min-width: 0;
+  flex: 1;
+  align-self: stretch;
 }
 
 /* Activity interactions paint their shared bubble, never a second pill inside it. */

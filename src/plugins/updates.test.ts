@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { PluginManager } from "./manager";
 import type { ImportPreview, PluginInfo, StorageResult } from "./types";
-import { createPluginUpdates } from "./updates";
+import { createPluginUpdates, updateFailure } from "./updates";
 
 afterEach(() => vi.useRealTimers());
 
@@ -373,3 +373,58 @@ it("reuses discovery for plugins in the same repository and reference", async ()
   expect(f.authorize).toHaveBeenCalledTimes(2);
   updates.dispose();
 });
+
+const OFFLINE =
+  "Git could not read this repository: fatal: unable to access 'https://example.com/plugins.git/': Could not resolve host: example.com";
+
+// Hints, not verdicts: "not found" also answers a repository that denies
+// access, and a missing username means this check sent no credentials.
+const NOT_FOUND =
+  "Git couldn’t find this plugin’s repository. It may have moved, been removed, or need access you don’t have.";
+const NO_SIGN_IN =
+  "Git needs a sign-in for this repository that Buzz couldn’t provide.";
+it.each([
+  [
+    "https://github.com/acme/notes",
+    "Git could not read this repository: remote: Repository not found.\nfatal: repository 'https://github.com/acme/notes/' not found",
+    NOT_FOUND,
+  ],
+  [
+    "git@github.com:acme/notes.git",
+    "Git could not read this repository: ERROR: Repository not found.\nfatal: Could not read from remote repository.",
+    NOT_FOUND,
+  ],
+  [
+    "https://github.com/acme/notes",
+    "Git could not read this repository: fatal: could not read Username for 'https://github.com': terminal prompts disabled Private repositories need an SSH URL, such as git@github.com:owner/repo.git.",
+    NO_SIGN_IN,
+  ],
+  [
+    "git@github.com:acme/notes.git",
+    "Git could not read this repository: fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+    undefined,
+  ],
+  // A repository Buzz authorizes over HTTPS fails this way when its token
+  // expired or was revoked; the generic sentence fits.
+  [
+    "https://github.com/acme/notes",
+    "Git could not read this repository: remote: Invalid username or token.\nfatal: Authentication failed for 'https://github.com/acme/notes/'",
+    undefined,
+  ],
+  ["https://example.com/plugins.git", OFFLINE, undefined],
+  [
+    "https://example.com/plugins.git",
+    "The repository does not match the managed commit. Try again after the recommendation is corrected.",
+    "The repository does not match the managed commit. Try again after the recommendation is corrected.",
+  ],
+] as const)(
+  "names what Buzz knows about a failed check (%s, case %#)",
+  (repository, error, expected) => {
+    expect(
+      updateFailure({
+        error,
+        source: { repository, reference: "main", path: "." },
+      }),
+    ).toEqual(expected);
+  },
+);

@@ -384,6 +384,7 @@ function ConnectedAppContent({ services }: { services: AppServices }) {
             version: 1,
             kind: "settings",
             section: "block.builderlab/login",
+            route: { version: 1, params: "create-community" },
           })
         }
       />

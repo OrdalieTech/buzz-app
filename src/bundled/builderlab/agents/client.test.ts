@@ -149,6 +149,44 @@ it.each([{}, { agents: [] }])(
     expect(await h.client.list(h.signal)).toEqual([]);
   },
 );
+it("normalizes optional creation dates from JSON without inventing dates", async () => {
+  const h = await fixture();
+  const millis = Date.UTC(2026, 6, 15, 12);
+  const values = [
+    millis,
+    millis / 1000,
+    String(millis),
+    String(millis / 1000),
+    "2026-07-15T12:00:00Z",
+    null,
+    "",
+    "bad date",
+    undefined,
+    true,
+    1e20,
+  ];
+  vi.mocked(h.host.request).mockResolvedValueOnce(
+    response({
+      status: 1,
+      agents: values.map((created_at) => ({ ...row, created_at })),
+    }),
+  );
+  expect(
+    (await h.client.list(h.signal)).map(({ createdAt }) => createdAt),
+  ).toEqual([
+    millis,
+    millis,
+    millis,
+    millis,
+    millis,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+  ]);
+});
 it.each([
   ["AGENT_STATUS_UNATTESTED", "Unattested"],
   [1, "Unattested"],
@@ -207,22 +245,33 @@ it.each(["sign-out", "new-login", "cancel", "dispose"])(
   async (action) => {
     const h = await fixture();
     const held = deferred<HostResponse>();
-    vi.mocked(h.host.request).mockReturnValue(held.promise);
+    const started = deferred<void>();
+    vi.mocked(h.host.request).mockImplementation(() => {
+      started.resolve();
+      return held.promise;
+    });
     const controller = new AbortController();
     const pending = h.client.list(controller.signal);
-    if (action === "cancel") controller.abort();
-    else if (action === "dispose") h.session.dispose();
-    else {
-      h.session.signOut();
-      if (action === "new-login") await h.session.signIn();
+    const rejected = expect(pending).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    await started.promise;
+    try {
+      if (action === "cancel") controller.abort();
+      else if (action === "dispose") h.session.dispose();
+      else {
+        h.session.signOut();
+        if (action === "new-login") await h.session.signIn();
+      }
+    } finally {
+      held.resolve(
+        response(
+          { status: 1, agents: [row] },
+          action === "new-login" ? 401 : 200,
+        ),
+      );
     }
-    held.resolve(
-      response(
-        { status: 1, agents: [row] },
-        action === "new-login" ? 401 : 200,
-      ),
-    );
-    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await rejected;
     if (action === "new-login")
       expect(h.session.snapshot().status).toBe("signed-in");
   },

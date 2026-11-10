@@ -26,6 +26,8 @@ function record(
   reply: string,
   author = pubkey,
   channelId = "alpha",
+  /** Hosted frames name a thread only for a per-thread session. */
+  thread: string | undefined = root,
 ) {
   serial++;
   const event = (kind: string, payload: unknown, seq: number) => ({
@@ -52,7 +54,7 @@ function record(
       kind: "batch",
       payload: {
         events: [
-          event("turn_started", { threadRootEventId: root }, 0),
+          event("turn_started", thread ? { threadRootEventId: thread } : {}, 0),
           event(
             "acp_read",
             {
@@ -233,7 +235,7 @@ it("links to Manage plugins while Agent Activity is off", async () => {
   expect(openSettings).toHaveBeenCalledExactlyOnceWith("plugins");
 });
 
-it("shows every conversation's turns, wherever it was opened from", () => {
+it("shows every conversation's turns when not opened from one", () => {
   const { activity } = fakeActivity({
     records: [
       record("t1", "In the thread"),
@@ -248,6 +250,136 @@ it("shows every conversation's turns, wherever it was opened from", () => {
     screen.getByText("In beta", { selector: "summary span" }),
   ).toBeInTheDocument();
   expect(screen.queryByRole("button")).not.toBeInTheDocument();
+});
+
+const turnText = (text: string) =>
+  screen.queryByText(text, { selector: "summary span" });
+
+it("opens on the conversation it was opened from, and widens to all", async () => {
+  const user = userEvent.setup();
+  const otherRoot = "d".repeat(64);
+  const { activity } = fakeActivity({
+    records: [
+      record("t1", "In this thread"),
+      record("t2", "In another thread", pubkey, "alpha", otherRoot),
+      record("t3", "In beta", pubkey, "beta"),
+    ] as unknown as Snapshot["records"],
+  });
+  const openConversation = vi.fn();
+  render(
+    <ActivityPanel
+      agent={agent}
+      activity={activity}
+      conversation={{ channelId: "alpha", rootId: root }}
+      openConversation={openConversation}
+    />,
+  );
+  expect(turnText("In this thread")).toBeInTheDocument();
+  expect(turnText("In another thread")).not.toBeInTheDocument();
+  expect(turnText("In beta")).not.toBeInTheDocument();
+  expect(
+    screen.getByText(/^Turns from this conversation, captured/),
+  ).toBeInTheDocument();
+  // It's already open, so its turns don't link back to it.
+  expect(
+    screen.queryByRole("button", { name: `Thread ${root.slice(0, 8)}` }),
+  ).not.toBeInTheDocument();
+
+  await user.click(
+    screen.getByRole("button", { name: "Show all conversations" }),
+  );
+  expect(turnText("In this thread")).toBeInTheDocument();
+  expect(turnText("In another thread")).toBeInTheDocument();
+  expect(turnText("In beta")).toBeInTheDocument();
+  expect(
+    screen.getByText(/^Turns from all of this agent's conversations/),
+  ).toBeInTheDocument();
+
+  await user.click(
+    screen.getByRole("button", { name: "Show this conversation" }),
+  );
+  expect(turnText("In beta")).not.toBeInTheDocument();
+});
+
+it("counts a turn without a thread as its channel's conversation", () => {
+  // A DM or personal chat keeps one session for the channel, so kgoose names
+  // no thread for its turns.
+  const { activity } = fakeActivity({
+    records: [
+      record("t1", "In the DM", pubkey, "dm", undefined),
+      record("t2", "Elsewhere", pubkey, "beta", undefined),
+    ] as unknown as Snapshot["records"],
+  });
+  render(
+    <ActivityPanel
+      agent={agent}
+      activity={activity}
+      conversation={{ channelId: "dm", rootId: root }}
+    />,
+  );
+  expect(turnText("In the DM")).toBeInTheDocument();
+  expect(turnText("Elsewhere")).not.toBeInTheDocument();
+  // It is already the open conversation, so it isn't labeled unknown.
+  expect(screen.queryByText("Conversation unknown")).not.toBeInTheDocument();
+});
+
+it("links each thread's turns when opened from a channel with several", async () => {
+  const user = userEvent.setup();
+  const otherRoot = "d".repeat(64);
+  const { activity } = fakeActivity({
+    records: [
+      record("t1", "In one thread"),
+      record("t2", "In another thread", pubkey, "alpha", otherRoot),
+      record("t3", "In beta", pubkey, "beta"),
+    ] as unknown as Snapshot["records"],
+  });
+  const openConversation = vi.fn();
+  render(
+    <ActivityPanel
+      agent={agent}
+      activity={activity}
+      conversation={{ channelId: "alpha" }}
+      openConversation={openConversation}
+    />,
+  );
+  expect(turnText("In one thread")).toBeInTheDocument();
+  expect(turnText("In another thread")).toBeInTheDocument();
+  expect(turnText("In beta")).not.toBeInTheDocument();
+  await user.click(
+    screen.getByRole("button", { name: `Thread ${otherRoot.slice(0, 8)}` }),
+  );
+  expect(openConversation).toHaveBeenCalledExactlyOnceWith("alpha", otherRoot);
+});
+
+it("shows the opened conversation again for each new transcript request", async () => {
+  const user = userEvent.setup();
+  const { activity } = fakeActivity({
+    records: [
+      record("t1", "In this thread"),
+      record("t2", "In beta", pubkey, "beta"),
+    ] as unknown as Snapshot["records"],
+  });
+  const done = vi.fn();
+  const panel = (opening: number) => (
+    <ActivityPanel
+      agent={agent}
+      activity={activity}
+      conversation={{ channelId: "alpha", rootId: root }}
+      initialTranscript={{ opening, done }}
+    />
+  );
+  const { rerender } = render(panel(1));
+  expect(done).toHaveBeenCalledTimes(1);
+  await user.click(
+    screen.getByRole("button", { name: "Show all conversations" }),
+  );
+  expect(turnText("In beta")).toBeInTheDocument();
+  rerender(panel(1));
+  expect(turnText("In beta")).toBeInTheDocument();
+  rerender(panel(2));
+  expect(turnText("In beta")).not.toBeInTheDocument();
+  expect(turnText("In this thread")).toBeInTheDocument();
+  expect(done).toHaveBeenCalledTimes(2);
 });
 
 it("says when older activity was dropped", () => {

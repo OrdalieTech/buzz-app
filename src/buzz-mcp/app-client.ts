@@ -31,6 +31,8 @@ export function appClient(
     check?(): void;
     signal?: AbortSignal;
     protectionContext?(): Promise<unknown>;
+    /** Retain a file-backed native snapshot until the exact tool check settles. */
+    captureProtectionContext?(): Promise<{ value: unknown; release(): void }>;
     /** The runtime reviews each tool call itself before Buzz dispatches it. */
     nativeToolGate?: boolean;
   }>,
@@ -47,14 +49,7 @@ export function appClient(
   };
   const handoff = agent.handoff;
   const plugins = agent.plugins;
-  const { settings, ownerAccess } = agent;
-  /** An owner read, only while the turn still holds before and after it. */
-  const owned = async <T>(read: (signal?: AbortSignal) => Promise<T>) => {
-    check();
-    const result = await read(options.signal);
-    check();
-    return result;
-  };
+  const { settings } = agent;
   return {
     ...(agent.protection
       ? {
@@ -62,27 +57,42 @@ export function appClient(
             action: import("../features/agent-protection/service").ProtectionAction,
           ) => {
             check();
-            if (
-              action.kind === "tool" &&
-              agent.protection?.phases?.tool !== false
-            ) {
-              if (!options.protectionContext)
-                throw new Error(
-                  "The protected tool has no native conversation context",
-                );
-              action = {
-                ...action,
-                content: {
-                  ...(action.content as object),
-                  conversation: await options.protectionContext(),
-                },
-              };
+            let release = () => {};
+            try {
+              if (
+                action.kind === "tool" &&
+                agent.protection?.phases?.tool !== false
+              ) {
+                if (
+                  !options.protectionContext &&
+                  !options.captureProtectionContext
+                )
+                  throw new Error(
+                    "The protected tool has no native conversation context",
+                  );
+                const context = options.captureProtectionContext
+                  ? await options.captureProtectionContext()
+                  : {
+                      value: await options.protectionContext?.(),
+                      release: () => {},
+                    };
+                release = context.release;
+                action = {
+                  ...action,
+                  content: {
+                    ...(action.content as object),
+                    conversation: context.value,
+                  },
+                };
+              }
+              await agent.protection?.check(
+                action,
+                options.signal ?? new AbortController().signal,
+              );
+              check();
+            } finally {
+              release();
             }
-            await agent.protection?.check(
-              action,
-              options.signal ?? new AbortController().signal,
-            );
-            check();
           },
           ...(options.nativeToolGate ? { nativeToolGate: true as const } : {}),
         }
@@ -90,24 +100,6 @@ export function appClient(
     pubkey: agent.pubkey,
     key: agent.key,
     owner: agent.owner,
-    ...(ownerAccess && {
-      ownerAccess: {
-        channels: () => owned((signal) => ownerAccess.channels(signal)),
-        channel: (id) => owned((signal) => ownerAccess.channel(id, signal)),
-        members: (id, page) =>
-          owned((signal) => ownerAccess.members(id, page, signal)),
-        messages: (request) =>
-          owned((signal) => ownerAccess.messages(request, signal)),
-        canvas: (channel, revision) =>
-          owned((signal) => ownerAccess.canvas(channel, revision, signal)),
-        canvasHistory: (channel, cursor) =>
-          owned((signal) => ownerAccess.canvasHistory(channel, cursor, signal)),
-        held: (execution) => {
-          check();
-          ownerAccess.held(execution);
-        },
-      },
-    }),
     relayAuthor: options.relayAuthor,
     signingAuthority: options.signingAuthority,
     attention: agent.attention && {
@@ -145,6 +137,12 @@ export function appClient(
       const events = await agent.query(filters);
       check();
       return events;
+    },
+    effectiveEdit: async (id, channel) => {
+      check();
+      const event = await agent.effectiveEdit(id, channel);
+      check();
+      return event;
     },
     searchProfiles: (query, limit) => {
       check();

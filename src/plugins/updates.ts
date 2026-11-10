@@ -13,8 +13,39 @@ export type PluginUpdate = {
   source: GitUpdateSource;
   installedRevision: string;
   candidate?: ImportPreview["candidates"][number];
+  /** Why the check failed: Git's own text, or Buzz's sentence. */
   error?: string;
 };
+
+const MISMATCH =
+  "The repository does not match the managed commit. Try again after the recommendation is corrected.";
+const MISSING = "The saved repository has no plugin at its installed path.";
+
+/** The sentence a failed check shows when Buzz recognizes Git's text, or
+ * Buzz's own. A hint, not a verdict: Git says "not found" for a repository
+ * that denies access too, and a missing username only means this check sent
+ * no credentials. Checking again stays available for every failure, since
+ * access can be restored and an authorizeGit token renewed. Git's text stays
+ * behind Details. */
+export function updateFailure({
+  error = "",
+  source,
+}: Pick<PluginUpdate, "error" | "source">): string | undefined {
+  if (
+    /repository not found|repository '[^']*' not found|does not appear to be a git repository/i.test(
+      error,
+    )
+  )
+    return "Git couldn’t find this plugin’s repository. It may have moved, been removed, or need access you don’t have.";
+  // HTTPS checks can't prompt or use credential helpers. "Authentication
+  // failed" is left to the generic sentence: it follows an expired token.
+  if (
+    /^https?:/i.test(source.repository) &&
+    /could not read Username/i.test(error)
+  )
+    return "Git needs a sign-in for this repository that Buzz couldn’t provide.";
+  if (error === MISMATCH || error === MISSING) return error;
+}
 
 export function pluginUpdateSource(plugins: PluginManager, id: string) {
   const { configuration } = plugins.snapshot();
@@ -166,16 +197,11 @@ export function createPluginUpdates(
           source.commit &&
           preview.commit?.toLowerCase() !== source.commit.toLowerCase()
         )
-          throw new Error(
-            "The repository does not match the managed commit. Try again after the recommendation is corrected.",
-          );
+          throw new Error(MISMATCH);
         const candidate = preview.candidates.find(
           (item) => item.manifest.id === id && item.path === source.path,
         );
-        if (!candidate)
-          throw new Error(
-            "The saved repository has no plugin at its installed path.",
-          );
+        if (!candidate) throw new Error(MISSING);
         if (candidate.revision !== plugin.revision)
           update.candidate = candidate;
       } catch (reason) {

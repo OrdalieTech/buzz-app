@@ -40,6 +40,7 @@ export const manifest: PluginManifest = {
     commands: [{ id: "status", program: "example-cli", args: ["status"], maxOutputBytes: 65536 }],
     networkOrigins: ["https://api.example.com"],
     managedFiles: true,
+    publicImages: true,
   },
 };
 const ExampleSidebar = ({ target, children }: PageSidebarProps) => {

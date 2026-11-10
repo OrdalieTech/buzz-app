@@ -276,9 +276,22 @@ test.describe("text field focus appearance", () => {
         .getByRole("textbox");
       await input.click();
       await page.keyboard.type("A draft");
+      await expect(input).toHaveText("A draft");
+      const caret = () =>
+        input.evaluate((element) => {
+          const selection = document.getSelection();
+          return selection?.isCollapsed &&
+            element.contains(selection.anchorNode)
+            ? selection.anchorOffset
+            : -1;
+        });
+      // Observe each native selection move before sending the next key.
+      await expect.poll(caret).toBe(7);
       await expect(input).toHaveCSS("outline-style", "none");
       await page.keyboard.press("ArrowLeft");
+      await expect.poll(caret).toBe(6);
       await page.keyboard.press("ArrowRight");
+      await expect.poll(caret).toBe(7);
       await expect(page.locator("html")).toHaveAttribute(
         "data-keyboard-navigation",
         "",

@@ -320,6 +320,9 @@ export class CodexRuntime {
     { key: string; ready: Promise<Models> }
   >();
   private memoryReads = new MemoryReads();
+  /** A failed turn's notice as the thread reads it, such as where to sign
+   * Codex in again. */
+  explain: (notice: string) => string = (notice) => notice;
   constructor(
     private readonly spawn: Spawn,
     /** What each agent's turns read of its community, while it can be read. */
@@ -1928,7 +1931,7 @@ export class CodexRuntime {
         {
           ...params,
           ephemeral: true,
-          dynamicTools: dynamicTools(this.added(), !!agent.ownerAccess),
+          dynamicTools: dynamicTools(this.added()),
         },
       );
       once.threadId = started.thread.id;
@@ -2153,7 +2156,7 @@ export class CodexRuntime {
   private publish(request: Request, content: string) {
     return request.agent.publish({
       kind: 9,
-      content,
+      content: this.explain(content),
       tags: [
         ["h", request.conversation.channelId],
         ...(request.replyRoot !== undefined
@@ -2178,7 +2181,7 @@ export class CodexRuntime {
     if (
       !turn ||
       call.namespace !== "buzz" ||
-      !sessionTools(this.added(), true).some((tool) => tool.name === call.tool)
+      !sessionTools(this.added()).some((tool) => tool.name === call.tool)
     )
       throw new Error("No active Buzz tool for this thread and turn");
     const check = () => {
@@ -2581,15 +2584,14 @@ export class CodexRuntime {
       // Resume restores the thread's tools, so one started with other added
       // tools starts fresh.
       const added = this.added();
-      const owner = !!agent.ownerAccess;
-      const tools = addedKey(added) + (owner ? ":owner" : "");
+      const tools = addedKey(added);
       const resuming =
         existing?.workspace === workspace && (existing.tools ?? "") === tools;
       type Started = { thread: { id: string; cwd: string } };
       const start = () =>
         rpc.request<Started>("thread/start", {
           ...params,
-          dynamicTools: dynamicTools(added, owner),
+          dynamicTools: dynamicTools(added),
         });
       const resume = (threadId: string) =>
         rpc.request<Started>("thread/resume", {
@@ -3002,12 +3004,12 @@ function follow(
  * keeps a deferred tool from the model until its tool search finds it. Every
  * model in Codex's catalog has tool search (supports_search_tool); one
  * without it would not see deferred tools. */
-const dynamicTools = (added: readonly AddedTool[], owner: boolean) => [
+const dynamicTools = (added: readonly AddedTool[]) => [
   {
     type: "namespace",
     name: "buzz",
-    description: sessionHint(added, owner),
-    tools: sessionTools(added, owner).map(({ load, ...tool }) => ({
+    description: sessionHint(added),
+    tools: sessionTools(added).map(({ load, ...tool }) => ({
       type: "function",
       ...tool,
       ...(load === "search" ? { deferLoading: true } : {}),

@@ -88,6 +88,10 @@ pub struct HostGrants {
     /// Pathless temporary saves in host-selected private storage; no read access.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub managed_files: bool,
+    /// `requestBytes` may also read raster images from any public HTTPS
+    /// address, one hop at a time, with no cookies; never pages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub public_images: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -2246,6 +2250,21 @@ mod tests {
         );
         managed["host"]["managedFiles"] = serde_json::json!("true");
         assert!(serde_json::from_value::<Manifest>(managed).is_err());
+        assert!(!old.host.as_ref().unwrap().public_images);
+        let mut images = manifest.clone();
+        images["host"]["publicImages"] = serde_json::json!(false);
+        let parsed: Manifest = serde_json::from_value(images.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), manifest);
+        images["host"]["publicImages"] = serde_json::json!(true);
+        let parsed: Manifest = serde_json::from_value(images.clone()).unwrap();
+        assert!(parsed.host.as_ref().unwrap().public_images);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), images);
+        assert_ne!(
+            artifact_from_text(&manifest.to_string(), "export const x = 1".into()).unwrap(),
+            artifact_from_text(&images.to_string(), "export const x = 1".into()).unwrap()
+        );
+        images["host"]["publicImages"] = serde_json::json!("true");
+        assert!(serde_json::from_value::<Manifest>(images).is_err());
         for limit in [1, 4096, MAX_HOST_COMMAND_OUTPUT_BYTES] {
             let mut valid = manifest.clone();
             valid["host"]["commands"][0]["maxOutputBytes"] = serde_json::json!(limit);

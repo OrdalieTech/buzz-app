@@ -167,7 +167,26 @@ export function PluginImport({
   const [abandonable, setAbandonable] = useState(false);
   const mounted = useRef(true);
   const [bound, setBound] = useState<GitPluginInstallRequest>();
-  const requested = !!bound && !updateId;
+  // A link pinned to a commit and folder names one immutable plugin, so like a plugin's
+  // request it may update an imported plugin from the same source instead of being a duplicate.
+  const pinnedLink =
+    !bound &&
+    !!initialGit?.commit &&
+    initialGit.path !== undefined &&
+    existing?.source === "external";
+  const requested = (!!bound || pinnedLink) && !updateId;
+  // Native saves the requested ref for later updates, so the review must show a change to it.
+  const trackedReference =
+    existing?.updateSource && "reference" in existing.updateSource
+      ? existing.updateSource.reference
+      : undefined;
+  const requestedReference = requested
+    ? (bound?.source.reference ?? initialGit?.reference)
+    : undefined;
+  const changesReference =
+    trackedReference !== undefined &&
+    requestedReference !== undefined &&
+    requestedReference !== trackedReference;
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [checkedRevision, setCheckedRevision] = useState<string>();
   const [checking, setChecking] = useState(false);
@@ -381,6 +400,11 @@ export function PluginImport({
       ? "This repository is not at the commit that was requested. Nothing was installed."
       : null;
   const duplicate = updating && !updateId && (!requested || !!conflict);
+  const updateTarget = updateId
+    ? currentPlugin
+    : requested && !conflict
+      ? existing
+      : undefined;
   const upToDate =
     !conflict &&
     !pinError &&
@@ -718,6 +742,27 @@ export function PluginImport({
       pinError
     )
       return;
+    if (requested && existing) {
+      const snapshot = plugins.snapshot();
+      const live =
+        snapshot.configuration.status === "ready"
+          ? snapshot.configuration.catalog.plugins.find(
+              (item) => item.manifest.id === existing.manifest.id,
+            )
+          : undefined;
+      if (
+        live?.revision !== existing.revision ||
+        live.enabled !== existing.enabled ||
+        JSON.stringify(live.updateSource) !==
+          JSON.stringify(existing.updateSource)
+      ) {
+        showError(
+          "The installed plugin changed. Close this review and check again.",
+          installButton.current,
+        );
+        return;
+      }
+    }
     if (updateAction && updateId) {
       const source = pluginUpdateSource(plugins, updateId);
       if (
@@ -1014,10 +1059,9 @@ export function PluginImport({
           !error &&
           !showUnchanged &&
           reviewing &&
-          updateId &&
           candidate &&
-          currentPlugin?.source === "external" &&
-          !currentPlugin.enabled ? (
+          updateTarget?.source === "external" &&
+          !updateTarget.enabled ? (
             <p className="m-0 text-body-sm text-muted">
               This plugin will stay disabled.
             </p>
@@ -1373,6 +1417,13 @@ export function PluginImport({
                       publisher: {existing.publisher ?? "Unsigned"}.
                     </p>
                   )}
+                {reviewing && candidate && updateTarget && changesReference && (
+                  <p className="m-0 break-all text-body-sm">
+                    Future updates will follow{" "}
+                    {requestedReference || "the repository default"} instead of{" "}
+                    {trackedReference || "the repository default"}.
+                  </p>
+                )}
                 {reviewing && updating && (
                   <section aria-label="Update source" className="text-body-sm">
                     <div className="flex items-center gap-2 mb-2">

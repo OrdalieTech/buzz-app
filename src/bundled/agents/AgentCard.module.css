@@ -73,7 +73,7 @@
   z-index: -1;
   border-radius: inherit;
   pointer-events: none;
-  background-image: url("./card-grain.png");
+  background-image: url("../../shared/assets/card-grain.png");
   background-size: 128px 128px;
   opacity: 0.02;
 }

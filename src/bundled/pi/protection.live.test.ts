@@ -23,12 +23,20 @@ const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});retur
 const until=async test=>{const end=Date.now()+5000;while(!await test()){if(Date.now()>end)throw new Error('Missing lifecycle boundary');await new Promise(r=>setTimeout(r,5));}};
 const exists=path=>stat(path).then(()=>true,()=>false);
 function start(check,protectedAgent=agent) {
- const input=new PassThrough(),output=new PassThrough(),pending=new Map(),checks=new Map(),actions=[],nativeHooks=[];let id=0;
+ const input=new PassThrough(),output=new PassThrough(),pending=new Map(),checks=new Map(),transfers=new Map(),actions=[],nativeHooks=[];let id=0;
  createInterface({input:output}).on('line',line=>{
   const m=JSON.parse(line);
-  if(m.method==='security') {
-   const stop=new AbortController();checks.set(m.id,stop);actions.push(m.params);
-   Promise.resolve().then(()=>check(m.params,stop.signal)).then(allowed=>input.write(JSON.stringify({id:m.id,result:allowed===true})+'\n'),()=>input.write(JSON.stringify({id:m.id,result:false})+'\n')).finally(()=>checks.delete(m.id));
+  if(m.method?.startsWith('buzz/security/evidence/')) {
+   const operation=m.method.split('/').at(-1),p=m.params;
+   const reply=result=>input.write(JSON.stringify({id:m.id,result})+'\n');
+   if(operation==='begin'){const id=p.id;transfers.set(id,{kind:p.kind,session:p.session,parts:[],bytes:0,sequence:0});reply({id,chunkBytes:65536});}
+   else if(operation==='chunk'){const transfer=transfers.get(p.id),data=Buffer.from(p.data,'base64');assert.equal(p.sequence,transfer.sequence++);assert.ok(data.length<=65536);transfer.bytes+=data.length;transfer.parts.push(data);reply({accepted:true});}
+   else if(operation==='finish') {
+    const transfer=transfers.get(p.id);assert.equal(p.sequence,transfer.sequence);assert.equal(p.bytes,transfer.bytes);transfers.delete(p.id);
+    const params={agent,action:{kind:transfer.kind,session:transfer.session,content:JSON.parse(Buffer.concat(transfer.parts))}};
+    const stop=new AbortController();checks.set(m.id,stop);actions.push(params);
+    Promise.resolve().then(()=>check(params,stop.signal)).then(allowed=>reply({allowed:allowed===true}),()=>reply({allowed:false})).finally(()=>checks.delete(m.id));
+   } else if(operation==='cancel'){transfers.delete(p.id);reply({allowed:false});}
   } else if(m.method==='hook'){nativeHooks.push(m.params);input.write(JSON.stringify({id:m.id,result:undefined})+'\n');}
   else if(m.method==='security_cancel')checks.get(m.params.id)?.abort();
   else if(m.method==='tool')input.write(JSON.stringify({id:m.id,result:{content:[{type:'text',text:'sent'}]}})+'\n');

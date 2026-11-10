@@ -8,7 +8,11 @@ import {
   type ReadStateStorage,
 } from "./read-state-storage";
 import { eventDto, type RelayEvent } from "./events";
-import type { ThreadActivitySnapshot, UnreadCapability } from "./unread";
+import type {
+  ThreadActivitySnapshot,
+  UnreadCapability,
+  UnreadSnapshot,
+} from "./unread";
 import type { SavedHead } from "./persistence";
 import type { ReadStateSigning } from "./read-state-host";
 import { retainReadState } from "./read-state-retention";
@@ -53,6 +57,7 @@ function setup(
   let failNextSave = false;
   let failure: Error | undefined;
   const storage: ReadStateStorage = {
+    capture: async () => journal && readJournal(journal, viewer.pubkey),
     async update(change) {
       if (failure) {
         const error = failure;
@@ -465,6 +470,243 @@ it("promotes mentions, broadcasts and participating-thread replies without promo
   expect(
     h.session.unread.attention("room", missingRootBroadcast.id),
   ).toMatchObject({ status: "unknown", unread: true });
+});
+
+it("the channel snapshot names the oldest unread message its timeline shows", async () => {
+  const h = setup();
+  h.grant("room");
+  const root = message(h.viewer, "room", "own root", 10);
+  const quiet = message(h.alice, "room", "agent coordination", 11, [
+    ["audience", "agents"],
+  ]);
+  // Unread in the viewer's thread, but only the thread shows it.
+  const reply = message(h.alice, "room", "thread reply", 12, [
+    ["e", root.id, "", "reply"],
+  ]);
+  const own = message(h.viewer, "room", "own later", 13);
+  h.emit([root, quiet, reply, own]);
+  expect(h.snapshot()).toMatchObject({ observedCount: 1 });
+  expect(h.snapshot().oldestUnreadId).toBeUndefined();
+
+  const broadcast = message(h.alice, "room", "broadcast reply", 14, [
+    ["e", root.id, "", "reply"],
+    ["broadcast", "1"],
+  ]);
+  const first = message(h.alice, "room", "first top-level", 15);
+  const second = message(h.alice, "room", "second top-level", 16);
+  h.emit([second, first, broadcast]);
+  expect(h.snapshot()).toMatchObject({
+    observedCount: 4,
+    oldestUnreadId: broadcast.id,
+  });
+
+  await h.session.unread.markThrough(h.target, broadcast.id);
+  expect(h.snapshot()).toMatchObject({
+    observedCount: 2,
+    oldestUnreadId: first.id,
+  });
+  await h.session.unread.markThrough(h.target, second.id);
+  expect(h.snapshot()).toMatchObject({ observedCount: 0 });
+  expect(h.snapshot().oldestUnreadId).toBeUndefined();
+});
+
+it("the channel snapshot says sampled once a repair finishes, keeps it through later repairs and regains it after a cache clear; sampling until then", async () => {
+  const h = setup();
+  const rows = Array.from({ length: 30 }, (_, i) =>
+    message(h.alice, "room", `history ${i}`, i + 11),
+  );
+  const cursor = rows[10];
+  assert(cursor);
+  const elsewhere = message(h.alice, "other", "elsewhere", 50);
+  let hold: Promise<void> | undefined;
+  let repairs = 0;
+  h.query.mockImplementation(async (filters) => {
+    const filter = filters[0];
+    if (!filter?.kinds?.includes(9)) return [];
+    if (filter.limit === 500) {
+      repairs++;
+      await hold;
+      return rows;
+    }
+    if (filter["#h"]?.includes("other"))
+      return [
+        elsewhere,
+        bounds(h.relay, "other", "head", {
+          has_more: false,
+          next_cursor: null,
+        }),
+      ];
+    return [
+      ...rows.slice(10),
+      bounds(h.relay, "room", "head", {
+        has_more: true,
+        next_cursor: { created_at: cursor.created_at, id: cursor.id },
+      }),
+    ];
+  });
+  const repairing = () => {
+    let release = () => {};
+    hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return release;
+  };
+  h.grant("room");
+  h.session.channels.ensure("room");
+  await vi.waitFor(() =>
+    expect(h.session.channels.window("room").rows).toHaveLength(20),
+  );
+  // The window's own rows are observed evidence, but not a sample of history.
+  expect(h.snapshot()).toMatchObject({
+    coverage: "observed",
+    freshness: "observed",
+    observedCount: 20,
+    oldestUnreadId: cursor.id,
+    // Nothing asked for a repair yet; `ensure` would start one.
+    sampling: true,
+  });
+  expect(h.snapshot().sampled).toBeUndefined();
+
+  let release = repairing();
+  let repair = h.session.unread.ensure();
+  await flush();
+  expect(h.snapshot().sampled).toBeUndefined();
+  expect(h.snapshot().sampling).toBe(true);
+  release();
+  await repair;
+  expect(h.snapshot()).toMatchObject({
+    observedCount: 30,
+    oldestUnreadId: rows[0]?.id,
+    sampled: true,
+  });
+  expect(h.snapshot().sampling).toBeUndefined();
+
+  // A later repair only adds evidence: the sample stands while it runs, and
+  // subscribers see no change.
+  const sampledSnapshot = h.snapshot();
+  const changed = vi.fn();
+  const stop = h.session.unread.subscribe(h.target, changed);
+  release = repairing();
+  let started = repairs;
+  repair = h.session.unread.refresh();
+  await vi.waitFor(() => expect(repairs).toBe(started + 1));
+  expect(h.snapshot().sampled).toBe(true);
+  release();
+  await repair;
+  expect(h.snapshot()).toBe(sampledSnapshot);
+  expect(changed).not.toHaveBeenCalled();
+  stop();
+
+  // A cleared cache forgets the sample and starts a repair at once. Until it
+  // returns, the reloaded window alone is not a sample.
+  release = repairing();
+  started = repairs;
+  await h.clearCache();
+  h.session.channels.ensure("room");
+  await vi.waitFor(() =>
+    expect(h.snapshot()).toMatchObject({
+      observedCount: 20,
+      oldestUnreadId: cursor.id,
+    }),
+  );
+  expect(repairs).toBe(started + 1);
+  expect(h.snapshot().sampled).toBeUndefined();
+  expect(h.snapshot().sampling).toBe(true);
+  release();
+  await vi.waitFor(() =>
+    expect(h.snapshot()).toMatchObject({
+      observedCount: 30,
+      oldestUnreadId: rows[0]?.id,
+      sampled: true,
+    }),
+  );
+
+  // A channel entering unread scope has only its window until a repair reads it.
+  const other = { kind: "channel" as const, channelId: "other" };
+  release = repairing();
+  started = repairs;
+  h.grant("other");
+  h.session.channels.ensure("other");
+  await vi.waitFor(() =>
+    expect(h.session.unread.snapshot(other)).toMatchObject({
+      coverage: "observed",
+      observedCount: 1,
+      oldestUnreadId: elsewhere.id,
+    }),
+  );
+  expect(repairs).toBe(started + 1);
+  expect(h.session.unread.snapshot(other).sampled).toBeUndefined();
+  release();
+  await vi.waitFor(() =>
+    expect(h.session.unread.snapshot(other).sampled).toBe(true),
+  );
+
+  // Access gained while a repair is out: subscribers see the reset at once,
+  // and the sample returns only when the repair restarted after it finishes.
+  // None of them sees a snapshot that no repair can sample, the restart's gap
+  // included.
+  const seen: UnreadSnapshot[] = [];
+  const stopRoom = h.session.unread.subscribe(h.target, () =>
+    seen.push(h.snapshot()),
+  );
+  release = repairing();
+  started = repairs;
+  void h.session.unread.refresh();
+  await vi.waitFor(() => expect(repairs).toBe(started + 1));
+  expect(h.snapshot().sampled).toBe(true);
+  h.grant("third");
+  expect(h.snapshot().sampled).toBeUndefined();
+  expect(h.snapshot().sampling).toBe(true);
+  release();
+  release = repairing();
+  await vi.waitFor(() => expect(repairs).toBe(started + 2));
+  expect(h.snapshot().sampled).toBeUndefined();
+  release();
+  await vi.waitFor(() => expect(h.snapshot().sampled).toBe(true));
+  expect(seen.length).toBeGreaterThan(1);
+  expect(seen.filter((seen) => !seen.sampled && !seen.sampling)).toEqual([]);
+  stopRoom();
+});
+
+it("attention says a row is prefix-read only when a channel-wide read reaches it", async () => {
+  const h = setup();
+  h.grant("room");
+  // Catch-up needs the channel's type: a DM's is its channel read.
+  h.emit([metadata(h.relay, "room", "room", 11, [["t", "stream"]])]);
+  const first = message(h.alice, "room", "first", 11);
+  const second = message(h.alice, "room", "second", 12);
+  const mention = message(h.alice, "room", "mention", 13, [
+    ["p", h.viewer.pubkey],
+  ]);
+  const third = message(h.alice, "room", "third", 14);
+  h.emit([first, second, mention, third]);
+  const attention = (event: RelayEvent) =>
+    h.session.unread.attention("room", event.id);
+
+  // A row's own receipt reads it alone, not the ordinary row above it.
+  await h.session.unread.markMessageRead("room", second.id);
+  expect(attention(second)).toMatchObject({ unread: false });
+  expect(attention(second).prefixRead).toBeUndefined();
+  expect(attention(first)).toMatchObject({ unread: true });
+
+  // Catch-up's mark reads ordinary rows through a timestamp; the mention it
+  // reads by its own receipt.
+  await h.session.unread.markTimelineRead("room", [
+    first.id,
+    second.id,
+    mention.id,
+  ]);
+  expect(attention(first)).toMatchObject({ unread: false, prefixRead: true });
+  expect(attention(second)).toMatchObject({ unread: false, prefixRead: true });
+  expect(attention(mention)).toMatchObject({ unread: false });
+  expect(attention(mention).prefixRead).toBeUndefined();
+  expect(attention(third)).toMatchObject({ unread: true });
+  expect(attention(third).prefixRead).toBeUndefined();
+
+  // The channel's own frontier reads every message through it.
+  await h.session.unread.markThrough(h.target, mention.id);
+  expect(attention(mention)).toMatchObject({ unread: false, prefixRead: true });
+  expect(attention(third).prefixRead).toBeUndefined();
 });
 
 it("counts replies only in the viewer's conversations and threads; others stay quiet until joined or mentioned", async () => {
@@ -2426,6 +2668,141 @@ it("bottom catch-up ends a manual channel unread but keeps marked messages", asy
   again.dispose();
 });
 
+it("keeps peer message-unread intent effective across an in-flight automatic read", async () => {
+  const h = setup();
+  h.grant("room");
+  h.emit([metadata(h.relay, "room", "room", 11, [["t", "stream"]])]);
+  const row = message(h.alice, "room", "hello", 11, [["p", h.viewer.pubkey]]);
+  h.emit([row]);
+  await flush();
+  const unread = h.session.unread;
+  const target = {
+    kind: "message" as const,
+    channelId: "room",
+    messageId: row.id,
+  };
+  const reading = unread.reading("room");
+  const readSave = h.holdSaveStarted();
+  const automaticRead = reading.observe([row.id]);
+  let peerSave: ReturnType<typeof h.holdSaveStarted> | undefined;
+  try {
+    await readSave.started;
+    peerSave = h.holdSaveStarted();
+    const createdAt = Math.floor(Date.now() / 1000);
+    const marker = await signReadState(
+      {
+        slot: "a".repeat(32),
+        createdAt,
+        blob: {
+          v: 1,
+          client_id: "peer",
+          contexts: {
+            [`ov_s:msg:${row.id}`]: 1,
+            [`ov_c:msg:${row.id}`]: 0,
+            [`ov_b:msg:${row.id}`]: 0,
+          },
+        },
+      },
+      h.viewer.secret,
+      createdAt,
+    );
+    h.emit([marker]);
+    readSave.release();
+    await automaticRead;
+    await peerSave.started;
+  } finally {
+    readSave.release();
+    peerSave?.release();
+  }
+  await expect.poll(() => unread.snapshot(target).manual).toBe("remote");
+  expect(h.journal()?.state.overrides[`msg:${row.id}`]).toEqual({
+    set: 1,
+    clear: 0,
+    baseline: 11,
+  });
+  expect(unread.attention("room", row.id).unread).toBe(true);
+  reading.dispose();
+
+  // Explicit message/timeline reads preserve remote overrides at the same
+  // frontier; only a newer frontier ends them (the existing NIP-RS contract).
+  await unread.markMessageRead("room", row.id);
+  expect(unread.snapshot(target).manual).toBe("remote");
+  await unread.markTimelineRead("room", [row.id]);
+  expect(unread.snapshot(target).manual).toBe("remote");
+
+  clock(20);
+  await unread.markChannelRead("room");
+  await expect.poll(() => unread.snapshot(target).manual).toBe("none");
+  expect(unread.attention("room", row.id).unread).toBe(false);
+  expect(h.journal()?.state.frontiers.room).toBe(20);
+});
+
+it.each(["channel", "thread"] as const)(
+  "observing a reply respects its verified inherited %s frontier before preserving peer intent",
+  async (scope) => {
+    const h = setup();
+    h.grant("room");
+    const root = message(h.viewer, "room", "root", 11);
+    const tags = scope === "thread" ? [["e", root.id, "", "reply"]] : [];
+    const earlier = message(h.alice, "room", "earlier", 12, tags);
+    const row = message(h.alice, "room", "mention", 13, [
+      ...tags,
+      ["p", h.viewer.pubkey],
+    ]);
+    h.emit([root, earlier, row]);
+    const unread = h.session.unread;
+    await unread.markThrough(
+      scope === "thread"
+        ? { kind: "thread", channelId: "room", rootId: root.id }
+        : h.target,
+      earlier.id,
+    );
+    const target = {
+      kind: "message" as const,
+      channelId: "room",
+      messageId: row.id,
+    };
+    const reading = unread.reading("room");
+    const held = h.holdSaveStarted();
+    const automaticRead = reading.observe([row.id]);
+    try {
+      await held.started;
+      const createdAt = Math.floor(Date.now() / 1000);
+      h.emit([
+        await signReadState(
+          {
+            slot: "a".repeat(32),
+            createdAt,
+            blob: {
+              v: 1,
+              client_id: "peer",
+              contexts: {
+                [`ov_s:msg:${row.id}`]: 1,
+                [`ov_c:msg:${row.id}`]: 0,
+                [`ov_b:msg:${row.id}`]: 5,
+              },
+            },
+          },
+          h.viewer.secret,
+          createdAt,
+        ),
+      ]);
+      held.release();
+      await automaticRead;
+    } finally {
+      held.release();
+      reading.dispose();
+    }
+    // The merged marker is the completion barrier, not a negative snapshot before ingestion.
+    await expect
+      .poll(() => h.journal()?.state.overrides[`msg:${row.id}`]?.set)
+      .toBe(1);
+    expect(h.journal()?.state.overrides[`msg:${row.id}`]?.baseline).toBe(5);
+    expect(unread.snapshot(target).manual).toBe("none");
+    expect(unread.attention("room", row.id).unread).toBe(false);
+  },
+);
+
 it("thread bottom catch-up clears only its thread and preserves local and remote manual intent", async () => {
   const h = setup();
   h.grant("room");
@@ -4216,6 +4593,7 @@ function sharedWindows(preloaded: (journal: ReadJournal) => ReadJournal) {
     let hold: Promise<void> | undefined;
     let started = () => {};
     const storage: ReadStateStorage = {
+      capture: async () => readJournal(journal, viewer.pubkey),
       async update(change) {
         if (hold) {
           const wait = hold;

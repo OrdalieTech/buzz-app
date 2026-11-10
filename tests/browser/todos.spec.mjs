@@ -10,6 +10,7 @@ import { frames } from "./timeline.mjs";
 import { npubEncode } from "nostr-tools/nip19";
 import { verifyEvent } from "nostr-tools";
 import { test, expect } from "./fixture.mjs";
+import { animationsSettled } from "./animations.mjs";
 
 // These layout/navigation journeys exercise the opt-in Bestie surface.
 test.beforeEach(async ({ page }) => {
@@ -200,25 +201,18 @@ test("opt-in Todos saves ordinary Canvas and disabling leaves it editable", asyn
   await expect(assignee).toHaveAttribute("aria-description", /Fixture Reader/);
   const expectCompactRow = async () => {
     // Reopening and resizing animate both the dock and its parent grid.
-    await dock.evaluate(async (element) => {
-      await Promise.all(
-        [
-          ...element.getAnimations(),
-          ...element.parentElement.getAnimations(),
-        ].map((animation) => animation.finished),
-      );
-    });
+    await Promise.all([
+      animationsSettled(dock),
+      animationsSettled(dock.locator("..")),
+    ]);
     const row = assignee.locator("xpath=ancestor::li");
     const label = row.getByRole("checkbox").locator("..");
     // Opening the dock moves every row. Observe the completed animation, then
     // sample all geometry in one browser task so coordinates share a frame.
-    await dock.evaluate(async (element) => {
-      await Promise.all(
-        [element, element.parentElement]
-          .flatMap((node) => node?.getAnimations() ?? [])
-          .map((animation) => animation.finished),
-      );
-    });
+    await Promise.all([
+      animationsSettled(dock),
+      animationsSettled(dock.locator("..")),
+    ]);
     const status = row.getByRole("button", { name: "Status for Ship it" });
     const { rowBounds, labelBounds, triggerBounds, statusBounds, fits } =
       await row.evaluate(

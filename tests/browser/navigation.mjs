@@ -11,6 +11,13 @@ export async function pageChoices(page, query = "") {
   );
 }
 
+// Activity is a row at the top of the Messages sidebar.
+export function activityRow(page) {
+  return page
+    .getByRole("navigation", { name: "Pages", exact: true })
+    .getByRole("button", { name: "Activity", exact: true });
+}
+
 export async function openPage(page, name, { connected = true } = {}) {
   // The community switcher appears after local startup has replaced the launch view.
   await expect(

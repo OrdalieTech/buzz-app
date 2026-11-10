@@ -289,13 +289,13 @@ it("animates Connecting only while a connection is actually under way", async ()
       expect(screen.queryByRole("alert")).toBeNull();
     }
     // Once the visit has settled no deadline ends the wait: between retries,
-    // say it can't connect and keeps trying instead of animating forever.
+    // say it can't connect and keeps trying instead of animating forever. The
+    // page follows the visit settling without another render from its host.
     act(() => {
       controller.complete(controller.navigation.snapshot().attempt, {
         status: "opened",
       });
     });
-    view.rerender(page({ status: "error", retrying: true }));
     act(() => vi.advanceTimersByTime(1_000));
     expect(screen.getByRole("alert").textContent).toContain(
       "We’ll keep trying.",

@@ -422,6 +422,8 @@ it("saves a thinking level goose lists for the model, and marks one it does not"
     thinking: {
       "": { current: "medium", levels: ["off", "low", "medium", "high"] },
       "plain-model": { current: "off", levels: ["off"] },
+      // goose reports "off" when no level is set, yet sends none then.
+      "unset-model": { current: "off", levels: ["off", "low", "high"] },
     },
   });
   const { SettingsTab } = createTabs({
@@ -468,6 +470,21 @@ it("saves a thinking level goose lists for the model, and marks one it does not"
       screen.getByRole("combobox", { name: "Thinking" }),
     ).toHaveTextContent("High (unavailable)"),
   );
+
+  // An unset level reads as goose's default, not as thinking turned off.
+  rerender(
+    <SettingsTab
+      key="unset"
+      agent={agent({ ...DEFAULT_CONFIG, model: "unset-model" })}
+      save={save}
+    />,
+  );
+  const unset = screen.getByRole("combobox", { name: "Thinking" });
+  await waitFor(() => expect(unset).toHaveTextContent(/^Default$/));
+  await user.click(unset);
+  expect(
+    (await screen.findAllByRole("option")).map((option) => option.textContent),
+  ).toEqual(["Default", "Off", "Low", "High"]);
 });
 
 it("offers Create agent a Thinking row with goose's levels for the chosen model", async () => {
@@ -510,7 +527,7 @@ it("offers Create agent a Thinking row with goose's levels for the chosen model"
   await waitFor(() =>
     expect(
       screen.getByRole("combobox", { name: "Thinking" }),
-    ).toHaveTextContent("Off · Default"),
+    ).toHaveTextContent(/^Default$/),
   );
 });
 

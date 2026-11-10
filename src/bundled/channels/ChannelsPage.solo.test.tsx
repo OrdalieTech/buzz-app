@@ -390,6 +390,7 @@ function fixture({
     open,
     retry() {},
     snapshot: () => navigationSnapshot,
+    subscribe: () => () => {},
   } as unknown as Navigation;
   const archive: ArchiveShortcut = {};
   const read: ReadShortcut = {};

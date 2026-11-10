@@ -380,6 +380,7 @@ export async function bestieFixture(
       publish: vi.fn(),
       publishProfile: vi.fn(),
       query: vi.fn(),
+      effectiveEdit: vi.fn(),
       searchProfiles: vi.fn(),
       upload: vi.fn(),
       media: vi.fn(),

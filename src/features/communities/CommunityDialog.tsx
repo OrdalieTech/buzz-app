@@ -10,7 +10,8 @@ import { Button } from "../../shared/design-system/ui/Button";
 import { communityRequest, inspectProfile, type CommunityInfo } from "./api";
 import type { Communities, PersonalProfile } from "./service";
 import { canSaveProfile, ProfileFields, profilesEqual } from "./ProfileFields";
-import { communityDestination, relayOrigin } from "./destination";
+import { communityDestination } from "./destination";
+import { parsePastedInvite, pastedInviteError } from "./invite-link";
 import { nativeIdentityEnabled } from "../identity/service";
 import { isTransientFailure, readErrorKind } from "../relay/errors";
 import { createJoinJournal, type PendingJoin } from "./join-journal";
@@ -176,16 +177,20 @@ export function CommunityDialog({
     focusProfile.current = true;
     setStep("profile");
   }
-  /** The access step's admission, with the account's consent when it covers `url`. */
+  /**
+   * The access step's admission, with the account's consent when it covers
+   * `url`. `inviteCode` is given when it is newer than the rendered `code`.
+   */
   async function admit(
     community: string,
     url: string,
     joinPolicy: JoinPolicy | null | undefined,
+    inviteCode = code,
   ) {
     const admission = await admitCommunity({
       community,
       journal,
-      code,
+      code: inviteCode,
       policy: joinPolicy,
       consent: accountConsents(federatedIdentity, url)
         ? ACCOUNT_CONSENT
@@ -198,7 +203,19 @@ export function CommunityDialog({
     if (uploading || unavailable) return;
     if (step === "destination") {
       await work(async (signal) => {
-        const next = communityDestination(relayOrigin(url));
+        const entered = parsePastedInvite(url);
+        if (!entered)
+          throw new Error(
+            pastedInviteError(url, "Enter a community address or invite link."),
+          );
+        const next = communityDestination(entered.community);
+        // A pasted invite link carries its code the way an opened invite does.
+        // This submission uses it directly; the state serves later retries.
+        const inviteCode = entered.code || code;
+        if (entered.code) {
+          setCode(entered.code);
+          setNeedsInvite(true);
+        }
         setDestination(next);
         // Transport text names neither the host nor a next step, and differs by engine.
         const explained = (reason: unknown) =>
@@ -236,14 +253,14 @@ export function CommunityDialog({
           if (found && (found.exists || pending)) showProfile(found, pending);
           else if (
             !accountConsents(federatedIdentity, next.url) ||
-            (!found && !code.trim())
+            (!found && !inviteCode.trim())
           )
             setStep("access");
           else {
             // The account's consent leaves the access step nothing to ask
             // (no code is needed, or one is given), so Continue goes on to its
             // admission. A refusal is shown there, where a code can be entered.
-            await admit(next.id, next.url, value.policy).catch(
+            await admit(next.id, next.url, value.policy, inviteCode).catch(
               (reason: unknown) => {
                 if (current()) {
                   setStep("access");

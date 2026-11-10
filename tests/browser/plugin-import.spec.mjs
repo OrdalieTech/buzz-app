@@ -13,6 +13,7 @@ import {
 } from "./navigation.mjs";
 import { readFile } from "node:fs/promises";
 import { test, expect } from "./fixture.mjs";
+import { animationsSettled } from "./animations.mjs";
 
 test.use({ historyCounts: { alpha: 0, beta: 0 } });
 const button = (page, name) => page.getByRole("button", { name, exact: true });
@@ -50,6 +51,8 @@ async function nativeImports(
         error: null,
       }),
     );
+    // A journey can start with external plugins already installed.
+    plugins.push(...(window.installedPlugins ?? []));
     const ready = () => ({
       status: "ready",
       externalPluginsPaused: false,
@@ -155,6 +158,9 @@ async function nativeImports(
             : candidate.revision;
         }
         if (command === "plugin_import_git" && args?.checkOnly) {
+          // A journey can hold an update check to observe it in progress.
+          await window.heldGitCheck;
+          if (window.gitCheckError) throw window.gitCheckError;
           const result = structuredClone(preview);
           if (window.importCategory)
             for (const candidate of result.candidates)
@@ -615,11 +621,7 @@ test("folder/Git preview selects the exact subfolder and preserves enabled state
   await button(page, "Add").click();
   const sourceDialog = page.getByRole("dialog");
   await expect(sourceDialog).toHaveCSS("opacity", "1");
-  await sourceDialog.evaluate(async (node) => {
-    await Promise.all(
-      node.getAnimations().map((animation) => animation.finished),
-    );
-  });
+  await animationsSettled(sourceDialog);
   await sourceDialog.screenshot({
     path: info.outputPath("plugin-source.png"),
   });
@@ -778,13 +780,7 @@ test("folder/Git preview selects the exact subfolder and preserves enabled state
           return { x, y, width, height };
         }),
       );
-  await details.evaluate(async (node) => {
-    await Promise.all(
-      node
-        .getAnimations({ subtree: true })
-        .map((animation) => animation.finished),
-    );
-  });
+  await animationsSettled(details, { subtree: true });
   const settledActions = await actionPositions();
   await page.evaluate(() => {
     window.importCategory = "productivity";
@@ -1926,4 +1922,119 @@ test("an artifact link reviews and installs the pinned URL", async ({
       args: { token: "preview-1", path: "." },
     },
   ]);
+});
+
+// Native IPC throws Git's own text, as plugin_import_git does when offline.
+test("a failed update check stays on its Settings row, and Check again clears it while it checks", async ({
+  page,
+  app,
+}) => {
+  const offline =
+    "Git could not read this repository: fatal: unable to access 'https://github.com/acme/standup-notes/': Could not resolve host: github.com";
+  await page.addInitScript((offline) => {
+    window.gitCheckError = offline;
+    window.installedPlugins = [
+      {
+        manifest: {
+          id: "acme.standup-notes",
+          name: "Standup Notes",
+          apiVersion: 1,
+          updates: { defaultEnabled: true },
+        },
+        source: "external",
+        enabled: true,
+        revision: "one",
+        previous: null,
+        reloadable: true,
+        error: null,
+        updateSource: {
+          repository: "https://github.com/acme/standup-notes",
+          reference: "main",
+          path: ".",
+        },
+      },
+    ];
+  }, offline);
+  await nativeImports(page, [
+    {
+      path: ".",
+      revision: "one",
+      manifest: {
+        id: "acme.standup-notes",
+        name: "Standup Notes",
+        apiVersion: 1,
+        updates: { defaultEnabled: true },
+      },
+    },
+  ]);
+  const checks = () =>
+    page.evaluate(
+      () =>
+        window.importCalls.filter(
+          (call) =>
+            call.command === "plugin_import_git" && call.args?.checkOnly,
+        ).length,
+    );
+  const notice = page.getByText("Couldn’t check Standup Notes for updates");
+  await page.goto(app.origin);
+  await expect.poll(checks).toBe(1);
+  await openSettings(page);
+  await selectSettingsSection(page, "Manage plugins");
+  const status = settingsDialog(page).getByText("Couldn’t check for updates.", {
+    exact: true,
+  });
+  await expect(status).toBeVisible();
+  // The check that failed in the background raised nothing over the app.
+  await expect(notice).toHaveCount(0);
+  await expect(page.getByText(/Cannot check/)).toHaveCount(0);
+  const details = settingsDialog(page).locator("details", {
+    hasText: "Could not resolve host",
+  });
+  await expect(details).not.toHaveAttribute("open");
+  await details.getByText("Details", { exact: true }).click();
+  await expect(details).toHaveAttribute("open");
+  await expect(details).toContainText(offline);
+
+  // Hold the check so its in-progress row can be observed.
+  await page.evaluate(() => {
+    window.heldGitCheck = new Promise((resolve) => {
+      window.releaseGitCheck = resolve;
+    });
+  });
+  const again = button(page, "Check again");
+  const checking = settingsDialog(page).locator(
+    '[data-buzz-ui][aria-busy="true"]',
+  );
+  await again.click();
+  await expect(status).toHaveCount(0);
+  await expect(again).toHaveCount(0);
+  await expect(checking).toHaveCount(1);
+  await expect(
+    settingsDialog(page).getByRole("button", {
+      name: "View Standup Notes details",
+    }),
+  ).toBeFocused();
+  await expect.poll(checks).toBe(2);
+  // Still offline, the check fails again and its status returns to the row.
+  await page.evaluate(() => window.releaseGitCheck());
+  await expect(status).toBeVisible();
+  await expect(status).toHaveAttribute("role", "alert");
+  await expect(again).toBeVisible();
+  await expect(details).toContainText(offline);
+  await expect(notice).toHaveCount(0);
+  await expect(page.getByText(/Check your connection/)).toHaveCount(0);
+
+  // Back online, Check again finds nothing wrong and the status goes.
+  await page.evaluate(() => {
+    window.heldGitCheck = undefined;
+    window.gitCheckError = undefined;
+  });
+  await again.click();
+  await expect.poll(checks).toBe(3);
+  // The check has finished once its row is no longer busy.
+  await expect(checking).toHaveCount(0);
+  await expect(status).toHaveCount(0);
+  await expect(again).toHaveCount(0);
+  await expect(notice).toHaveCount(0);
+  await expect(page.getByText("Update Standup Notes")).toHaveCount(0);
 });

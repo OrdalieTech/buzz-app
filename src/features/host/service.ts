@@ -108,6 +108,8 @@ export type HostProcessOptions = Readonly<{
 }>;
 export type HostProcess = Readonly<{
   write(data: string): Promise<void>;
+  /** Queue one complete streamed message without interleaving other writes. */
+  writeStream?(data: AsyncIterable<string>): Promise<void>;
   /** Writes any final `data`, then closes stdin. */
   end(data?: string): Promise<void>;
   /** Asks it to stop, then kills it and its descendants. */
@@ -380,26 +382,44 @@ export class HostService extends Service implements Host {
     // The host takes at most 1 MiB a write, so a longer one goes in pieces,
     // queued so no other write lands between them.
     let queue: Promise<unknown> = Promise.resolve();
-    const write = (data: string, close: boolean) => {
-      const written = queue.then(async () => {
-        let at = 0;
-        do {
-          let end = Math.min(data.length, at + WRITE_UNITS);
-          // A piece must not split a surrogate pair.
-          if (end < data.length && /[\uD800-\uDBFF]/.test(data[end - 1] ?? ""))
-            end--;
-          await invoke<void>("plugin_host_process_write", {
-            id: owner.id,
-            handle,
-            data: data.slice(at, end),
-            close: close && end === data.length,
-          });
-          at = end;
-        } while (at < data.length);
+    let writeFailure: unknown;
+    const writePiece = async (data: string, close: boolean) => {
+      let at = 0;
+      do {
+        let end = Math.min(data.length, at + WRITE_UNITS);
+        if (end < data.length && /[\uD800-\uDBFF]/.test(data[end - 1] ?? ""))
+          end--;
+        await invoke<void>("plugin_host_process_write", {
+          id: owner.id,
+          handle,
+          data: data.slice(at, end),
+          close: close && end === data.length,
+        });
+        at = end;
+      } while (at < data.length);
+    };
+    const enqueue = (operation: () => Promise<void>) => {
+      const written = queue.then(() => {
+        if (writeFailure) throw writeFailure;
+        return operation();
       });
       queue = written.catch(() => undefined);
       return written;
     };
+    const write = (data: string, close: boolean) =>
+      enqueue(() => writePiece(data, close));
+    const writeStream = (data: AsyncIterable<string>) =>
+      enqueue(async () => {
+        try {
+          for await (const part of data) await writePiece(part, false);
+        } catch (error) {
+          // Partial protocol frames cannot be followed by another message.
+          writeFailure =
+            error instanceof Error ? error : new Error(String(error));
+          await kill();
+          throw writeFailure;
+        }
+      });
     const kill = () =>
       invoke<void>("plugin_host_process_kill", { id: owner.id, handle }).catch(
         // Already gone.
@@ -417,6 +437,7 @@ export class HostService extends Service implements Host {
     void exited.then(() => release());
     return Object.freeze({
       write: (data: string) => write(data, false),
+      writeStream,
       end: (data = "") => write(data, true),
       kill,
       ...(options.agentCredential && {

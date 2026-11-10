@@ -578,6 +578,43 @@ const targetOf = (args) => {
     : value;
 };
 
+/** Serialize native Pi values without making a second whole JSON string. */
+async function* evidenceJSON(value) {
+  if (typeof value === "string") {
+    yield '"';
+    for (let at = 0; at < value.length; ) {
+      let end = Math.min(value.length, at + 16384);
+      if (end < value.length && /[\uD800-\uDBFF]/.test(value[end - 1])) end--;
+      yield JSON.stringify(value.slice(at, end)).slice(1, -1);
+      at = end;
+    }
+    yield '"';
+  } else if (Array.isArray(value)) {
+    yield "[";
+    for (let i = 0; i < value.length; i++) {
+      if (i) yield ",";
+      yield* evidenceJSON(value[i] ?? null);
+    }
+    yield "]";
+  } else if (value && typeof value === "object") {
+    yield "{";
+    let first = true;
+    for (const [key, item] of Object.entries(value)) {
+      if (item === undefined) continue;
+      if (!first) yield ",";
+      first = false;
+      yield* evidenceJSON(key);
+      yield ":";
+      yield* evidenceJSON(item);
+    }
+    yield "}";
+  } else {
+    const text = JSON.stringify(value);
+    if (text === undefined) throw new Error("Invalid evidence");
+    yield text;
+  }
+}
+
 /** Serves the plugin on `input` and `output` until `input` closes. */
 export function serve({
   data,
@@ -703,9 +740,60 @@ export function serve({
             session: action.session,
             content: null,
           };
-        const result = await call("security", { agent, action }, signal);
-        if (result !== true)
-          throw new Error("Pi action denied by its protection policy");
+        const rpc = (op, params) =>
+          call(`buzz/security/evidence/${op}`, params, signal);
+        const id = crypto.randomUUID();
+        try {
+          const opened = await rpc("begin", {
+            id,
+            kind: action.kind,
+            session: action.session,
+          });
+          if (opened?.skipped === true) return;
+          if (
+            opened?.id !== id ||
+            !Number.isSafeInteger(opened.chunkBytes) ||
+            opened.chunkBytes <= 0
+          )
+            throw new Error("Invalid security transfer");
+          const chunk = Math.min(opened.chunkBytes, 65536);
+          let sequence = 0,
+            bytes = 0,
+            buffer = Buffer.alloc(0);
+          const send = async (data) => {
+            if (
+              (
+                await rpc("chunk", {
+                  id,
+                  sequence,
+                  data: data.toString("base64"),
+                })
+              )?.accepted !== true
+            )
+              throw new Error("Security evidence was not accepted");
+            sequence++;
+            bytes += data.length;
+          };
+          for await (const text of evidenceJSON(action.content)) {
+            const data = Buffer.from(text);
+            for (let at = 0; at < data.length; ) {
+              const take = Math.min(chunk - buffer.length, data.length - at);
+              buffer = Buffer.concat([buffer, data.subarray(at, at + take)]);
+              at += take;
+              if (buffer.length === chunk) {
+                await send(buffer);
+                buffer = Buffer.alloc(0);
+              }
+            }
+          }
+          if (buffer.length) await send(buffer);
+          if ((await rpc("finish", { id, sequence, bytes }))?.allowed !== true)
+            throw new Error("Pi action denied by its protection policy");
+        } catch (error) {
+          // The cancellation message is independent of the cancelled run signal.
+          void call("buzz/security/evidence/cancel", { id }).catch(() => {});
+          throw error;
+        }
       };
       const install = (extension) => {
         if (
@@ -1183,8 +1271,7 @@ export function serve({
         reviews.size >= 16 ||
         !turn.prompt ||
         typeof turn.prompt.system !== "string" ||
-        typeof turn.prompt.input !== "string" ||
-        Buffer.byteLength(JSON.stringify(turn.prompt)) > 768 * 1024
+        typeof turn.prompt.input !== "string"
       )
         throw new Error("Invalid security review request");
       const controller = new AbortController();

@@ -384,6 +384,78 @@ export function federatedBuilderlabAccount(
   );
 }
 
+/**
+ * The account's linked key when it is also backed up, else null. Settings'
+ * backed-up key and the mobile card's "sign in on the phone" both answer
+ * whether a key is restorable with this rule; a backup of another key never
+ * counts, as making it the account's would unlink the linked one.
+ */
+export async function backedUpLinkedKey(
+  account: Pick<FirstRunAccount, "linkedKey" | "backupStatus">,
+): Promise<string | null> {
+  const [linked, backups] = await Promise.all([
+    account.linkedKey(),
+    account.backupStatus(),
+  ]);
+  return linked && backups !== "unavailable" && backups.includes(linked)
+    ? linked
+    : null;
+}
+
+/**
+ * What the mobile card may ask of the Builderlab account: only whether a
+ * phone signed in with Builderlab restores this device's key. The account
+ * read stays app-owned, so the pairing plugin never holds the Builderlab
+ * plugin's session.
+ */
+export type BuilderlabPhone = Readonly<{
+  /** True when `viewer` is the account's linked, backed-up key
+   * (`backedUpLinkedKey`). Signed out, a failed or unavailable read, or no
+   * identity answers false; it never rejects. */
+  restoresOnPhone(viewer: string): Promise<boolean>;
+  /** Watches this device's key backup, so a finished backup can ask again. */
+  subscribe(listener: () => void): () => void;
+  /** Whether this device's latest key backup finished. */
+  backupComplete(): boolean;
+}>;
+
+declare module "@deepseek-ai/cordis" {
+  interface Context {
+    builderlabPhone: BuilderlabPhone;
+  }
+}
+
+/** `BuilderlabPhone` read through first run's Builderlab session
+ * (`federatedBuilderlabAccount`), fenced to the session current at each ask. */
+export function builderlabPhone(
+  federated: Pick<FederatedIdentity, "snapshot" | "request"> | undefined,
+  identity: BackupIdentity | undefined,
+): BuilderlabPhone {
+  return {
+    async restoresOnPhone(viewer) {
+      const session = federated?.snapshot();
+      if (
+        !federated ||
+        !identity ||
+        session?.status !== "signed-in" ||
+        !session.authority
+      )
+        return false;
+      const account = federatedBuilderlabAccount(
+        { revision: session.revision },
+        federated,
+        identity,
+      );
+      return backedUpLinkedKey(account).then(
+        (key) => key !== null && key.toLowerCase() === viewer.toLowerCase(),
+        () => false,
+      );
+    },
+    subscribe: (listener) => identity?.backup.subscribe(listener) ?? (() => {}),
+    backupComplete: () => identity?.backup.snapshot()?.status === "complete",
+  };
+}
+
 /** One JSON POST under the Builderlab API root; `path` starts with `/`. */
 type Post = (
   path: string,

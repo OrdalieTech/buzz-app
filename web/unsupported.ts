@@ -80,6 +80,7 @@ export const unsupported = [
   "federated_identity_cancel_sign_in",
   "federated_identity_register",
   "federated_identity_request",
+  "federated_identity_requires",
   "federated_identity_sign_in",
   "federated_identity_sign_out",
   "federated_identity_snapshot",

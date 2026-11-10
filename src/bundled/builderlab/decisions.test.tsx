@@ -1,4 +1,8 @@
 // @vitest-environment jsdom
+import { act, cleanup, render, screen } from "@testing-library/react";
+import { DecisionsSettings } from "../../app/DecisionsSettings";
+import { federatedFixture } from "../../features/federated-identity/testing";
+import { createNativeSession } from "./session";
 import { createTestSession } from "./test-helpers";
 import "@testing-library/jest-dom/vitest";
 import { Context } from "@deepseek-ai/cordis";
@@ -35,6 +39,7 @@ const tauri = vi.hoisted(() => ({
 }));
 vi.mock("@tauri-apps/api/core", () => tauri);
 afterEach(() => {
+  cleanup();
   vi.unstubAllEnvs();
   tauri.isTauri.mockReturnValue(false);
 });
@@ -86,6 +91,7 @@ it("never ends an FI session for a decisions 401", async () => {
     subscribe: () => () => {},
     credential: () => fi,
     signOut,
+    freshCredential: async () => fi,
   } as unknown as BuilderlabSession;
   const provider = builderlabProvider(session, true, async () => ({
     outcome: "failed",
@@ -161,7 +167,7 @@ it("sends nothing to Builderlab unless the account may use decisions", async () 
   expect(decide).not.toHaveBeenCalled();
 });
 
-it("offers Builderlab only while the signed-in account may use decisions", async () => {
+it("offers Builderlab while signed in, ready only while the account may use decisions", async () => {
   const root = new Context();
   root.provide("pluginStatus", {
     isActive: () => true,
@@ -187,12 +193,14 @@ it("offers Builderlab only while the signed-in account may use decisions", async
   const keys = () => decisions.providers().map((provider) => provider.key);
   expect(keys()).toEqual([]);
   await session.signIn();
-  expect(keys()).toEqual([]);
+  expect(keys()).toEqual(["block.builderlab/builderlab"]);
+  expect(decisions.status()).toBe("needs-setup");
   session.signOut();
   allowed = true;
   await session.signIn();
   expect(keys()).toEqual(["block.builderlab/builderlab"]);
   expect(decisions.backend()).toBe("block.builderlab/builderlab");
+  expect(decisions.status()).toBe("ready");
   session.signOut();
   expect(keys()).toEqual([]);
   await session.signIn();
@@ -207,3 +215,154 @@ it("offers Builderlab only while the signed-in account may use decisions", async
   expect(keys()).toEqual([]);
   expect(decide).not.toHaveBeenCalled();
 });
+
+it.each(["settings", "request", "settings-with-choice"] as const)(
+  "picks up newly granted Decisions access through %s without signing in again",
+  async (entry) => {
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    let allowed = false;
+    const identity = federatedFixture();
+    identity.request.mockImplementation(async () => ({
+      status: 200,
+      headers: {},
+      body: JSON.stringify({
+        subject: "user",
+        email: "a@example.com",
+        capabilities: { can_use_builderlab_decisions: allowed },
+      }),
+    }));
+    const session = createNativeSession(identity.service);
+    const root = new Context();
+    root.provide("pluginStatus", {
+      isActive: () => true,
+      subscribe: () => () => {},
+    });
+    const decisions = new DecisionsService(root, {
+      getItem: () => null,
+      setItem: () => {},
+    } as unknown as Storage);
+    const answered = {
+      outcome: "answered" as const,
+      model: "test",
+      answers: { a: { type: "yes_no" as const, probability: 0.7 } },
+    };
+    const fallback = vi.fn(async () => answered);
+    const native = vi.fn<BuilderlabDecide>(async () => answered);
+    const chosen = vi.fn(async () => answered);
+    const fallbackPlugin = root
+      .extend({ pluginOwner: { id: "buzz.typesafe", revision: "one" } })
+      .plugin((ctx) =>
+        ctx.decisions.registerProvider({
+          id: "typesafe",
+          label: "TypeSafe",
+          description: "Fallback",
+          status: () => "ready",
+          subscribe: () => () => {},
+          decide: fallback,
+        }),
+      );
+    const builderlab = root
+      .extend({ pluginOwner: { id: "block.builderlab", revision: "one" } })
+      .plugin((ctx) => offerBuilderlabDecisions(ctx, session, true, native));
+    try {
+      await Promise.all([fallbackPlugin.await(), builderlab.await()]);
+      if (entry === "settings-with-choice") {
+        const custom = root
+          .extend({ pluginOwner: { id: "example.provider", revision: "one" } })
+          .plugin((ctx) =>
+            ctx.decisions.registerProvider({
+              id: "custom",
+              label: "Custom",
+              description: "Chosen",
+              status: () => "ready",
+              subscribe: () => () => {},
+              decide: chosen,
+            }),
+          );
+        await custom.await();
+        await flush();
+        decisions.setBackend("example.provider/custom");
+      }
+      await session.signIn();
+      await expect.poll(() => session.snapshot().status).toBe("signed-in");
+      await flush();
+      // Signed in without access: listed, but defaults fall through to TypeSafe.
+      expect(
+        decisions
+          .providers()
+          .some((p) => p.key === "block.builderlab/builderlab"),
+      ).toBe(true);
+      const beforeBackend =
+        entry === "settings-with-choice"
+          ? "example.provider/custom"
+          : "buzz.typesafe/typesafe";
+      await expect(decisions.decide(request)).resolves.toMatchObject({
+        backend: beforeBackend,
+      });
+      const owner = session.credential();
+      expect(identity.request).toHaveBeenCalledOnce();
+      const settings = entry.startsWith("settings")
+        ? render(
+            <DecisionsSettings decisions={decisions} active={() => false} />,
+          )
+        : undefined;
+      expect(identity.request).toHaveBeenCalledOnce();
+      allowed = true;
+      now += 60_000;
+      if (entry.startsWith("settings")) {
+        settings?.rerender(
+          <DecisionsSettings decisions={decisions} active={() => true} />,
+        );
+        expect(
+          await screen.findByRole("radio", { name: /Builderlab/ }),
+        ).toBeVisible();
+        if (entry === "settings-with-choice") {
+          // Another provider is chosen, so nothing reads Builderlab's
+          // permissions until the user picks it.
+          expect(identity.request).toHaveBeenCalledOnce();
+          await act(async () =>
+            screen.getByRole("radio", { name: /Builderlab/ }).click(),
+          );
+        }
+        await expect
+          .poll(() => decisions.backend())
+          .toBe("block.builderlab/builderlab");
+      } else {
+        // TypeSafe can answer now, so the request that notices stale
+        // permissions does not wait for them; the re-read it starts makes
+        // Builderlab the default for the next one.
+        await expect(decisions.decide(request)).resolves.toMatchObject({
+          backend: "buzz.typesafe/typesafe",
+        });
+        await expect
+          .poll(() => decisions.backend())
+          .toBe("block.builderlab/builderlab");
+      }
+      expect(
+        decisions
+          .providers()
+          .some((p) => p.key === "block.builderlab/builderlab"),
+      ).toBe(true);
+      expect(decisions.backend()).toBe("block.builderlab/builderlab");
+      expect(fallback).toHaveBeenCalledTimes(
+        { settings: 1, request: 2, "settings-with-choice": 0 }[entry],
+      );
+      if (entry === "settings-with-choice")
+        expect(native).not.toHaveBeenCalled();
+      expect(identity.request).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        await decisions.decide(request);
+      });
+      expect(identity.request).toHaveBeenCalledTimes(2);
+      expect(session.credential()).toBe(owner);
+      expect(identity.service.signIn).toHaveBeenCalledOnce();
+      expect(identity.service.signOut).not.toHaveBeenCalled();
+    } finally {
+      cleanup();
+      await root.fiber.dispose();
+      session.dispose();
+      clock.mockRestore();
+    }
+  },
+);

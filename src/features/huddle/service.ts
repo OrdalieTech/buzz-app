@@ -480,6 +480,10 @@ export function createHuddles(
     snapshot: () => snapshot,
     voiceListening: voiceSeat("listening"),
     voiceThinking: voiceSeat("thinking"),
+    remoteVoiceError(error: string) {
+      if (snapshot.phase !== "idle" && snapshot.phase !== "error") return;
+      update({ ...idle, phase: "error", error });
+    },
     voiceError(call: string, error?: string) {
       if (snapshot.id !== call) return;
       const { error: _previous, ...rest } = snapshot;

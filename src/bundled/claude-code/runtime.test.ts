@@ -85,15 +85,43 @@ function setup(
   }> = {},
 ) {
   const fake = fakeSpawn();
+  const transcriptReaders: { options: unknown }[] = [];
   const spawn: typeof fake.spawn = async (id, spawnOptions) => {
     await options.starting;
-    if (options.nativeHistory && id === "read-protected")
-      spawnOptions?.onStdout?.(
-        Buffer.from(
-          options.nativeHistory.map((row) => JSON.stringify(row)).join("\n") +
-            (options.nativeTail ?? ""),
-        ).toString("base64"),
+    if (options.nativeHistory && id === "transcript-protected") {
+      transcriptReaders.push({ options: spawnOptions });
+      const bytes = Buffer.from(
+        options.nativeHistory.map((row) => JSON.stringify(row)).join("\n") +
+          (options.nativeTail ?? ""),
       );
+      let exit!: (code: number | null) => void;
+      const exited = new Promise<number | null>((resolve) => {
+        exit = resolve;
+      });
+      spawnOptions?.onStdout?.(JSON.stringify({ bytes: bytes.length }) + "\n");
+      return {
+        exited,
+        kill: async () => {
+          exit(0);
+        },
+        end: async () => {
+          exit(0);
+        },
+        write: async (text) => {
+          const { id, offset } = JSON.parse(text);
+          const data = bytes.subarray(offset, offset + 65536);
+          const next = offset + data.length;
+          spawnOptions?.onStdout?.(
+            JSON.stringify({
+              id,
+              data: data.toString("base64"),
+              offset: next,
+              done: next === bytes.length,
+            }) + "\n",
+          );
+        },
+      };
+    }
     if (options.title && (id === "workspace" || id === "read")) {
       spawnOptions?.onStdout?.(
         id === "workspace"
@@ -296,6 +324,7 @@ function setup(
     fake.processes.filter((process) => CLAUDES.has(process.id));
   return {
     runtime,
+    transcriptReaders,
     added,
     deliver,
     published,
@@ -486,13 +515,11 @@ it("shares projected native history with incoming and combined action reviews", 
     expect(
       Buffer.byteLength(JSON.stringify(check.mock.lastCall?.[0])),
     ).toBeLessThan(256 * 1024);
-    const readers = f.fake.processes.filter(
-      (process) => process.id === "read-protected",
-    );
+    const readers = f.transcriptReaders;
     expect(readers.length).toBeGreaterThan(0);
     for (const reader of readers)
       expect(reader.options).toMatchObject({
-        args: ["/native/transcript"],
+        args: [expect.any(String), "/native/transcript"],
         protection: protection.processProtection,
       });
     expect(f.fake.processes.some((process) => process.id === "read")).toBe(

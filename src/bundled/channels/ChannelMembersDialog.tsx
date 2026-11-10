@@ -1061,9 +1061,16 @@ export function ChannelMembersDialog({
   // to repeat for every member of a large roster on each render.
   const memberLabels = new Map([...members].map((key) => [key, label(key)]));
   const memberLabel = (key: string) => memberLabels.get(key) ?? label(key);
-  const currentMembers = [...members].sort(
-    (a, b) =>
-      memberLabel(a).localeCompare(memberLabel(b)) || a.localeCompare(b),
+  // Sort again only when a member or label changes, not on every render (each
+  // filter keystroke), which would re-sort a large roster. The serialized
+  // pairs are the memo key, since they change whenever either does.
+  const labelList = JSON.stringify([...memberLabels]);
+  const currentMembers = useMemo(
+    () =>
+      (JSON.parse(labelList) as [string, string][])
+        .sort(([a, x], [b, y]) => x.localeCompare(y) || a.localeCompare(b))
+        .map(([key]) => key),
+    [labelList],
   );
   const currentGroups = ["People", "Agents"].map((name) => {
     const keys = currentMembers.filter((key) => {

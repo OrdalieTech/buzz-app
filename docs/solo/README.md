@@ -299,6 +299,11 @@ or Escape returns to the intact form, and **Discard changes** closes it. A faile
 local draft or a name/lifetime save awaiting **Check save status** closes without
 asking: reopening restores it. A typed, unadded folder path is not part of the draft.
 
+Close and Escape in **New workspace** ask the same way once a name, folder, worktree or
+instructions are entered, and while a partly created workspace is kept for retry, but not
+after its saved defaults conflict. Its **Cancel** (**Close** after a partial create) discards
+without asking.
+
 Conflicts require explicit Reload while retaining the selected lifetime; an
 unconfirmed save survives modal remount and relabels the single primary action
 **Check save status**, without republishing or implicitly saving other draft

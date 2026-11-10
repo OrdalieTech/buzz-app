@@ -4017,6 +4017,7 @@ const sessionAgents = (
     efforts: readonly { id: string; label: string }[];
   }[] = [{ id: "fast", label: "Fast", efforts: [] }],
   pubkeys: readonly string[] = [first.pubkey],
+  includeSessionControls = true,
 ) => {
   const snapshot = {
     status: "ready",
@@ -4040,12 +4041,16 @@ const sessionAgents = (
     {
       key: "test/agent",
       models: () => ({ current: "fast", models }),
-      sessionControls: {
-        scope: () => scope,
-        state: () => state,
-        run: async () => {},
-        subscribe,
-      },
+      ...(includeSessionControls
+        ? {
+            sessionControls: {
+              scope: () => scope,
+              state: () => state,
+              run: async () => {},
+              subscribe,
+            },
+          }
+        : {}),
     },
   ];
   const session = vi.fn<Agents["session"]>(async () => {});
@@ -5881,10 +5886,15 @@ it("retries an unreadable initial Solo preference without silently sending defau
   });
 });
 
-it("uses the supported Solo model and effort when saved choices are unavailable", async () => {
+it("discloses supported fallbacks for unavailable saved Solo choices", async () => {
   const { mountChat, modelButton, send } = soloModelPreferenceHarness();
+  const removedModelPick = {
+    model: "removed",
+    effort: "high",
+    type: "test/agent",
+  };
   writeView("scope", "solo:model-picks:channel", {
-    [first.pubkey]: { model: "removed", effort: "high", type: "test/agent" },
+    [first.pubkey]: removedModelPick,
   });
   const unsupported = mountChat();
   await unsupported.user.type(unsupported.input(), "a");
@@ -5892,8 +5902,20 @@ it("uses the supported Solo model and effort when saved choices are unavailable"
     screen.getByRole("button", { name: "First Honey" }),
   );
   const trigger = await screen.findByRole("button", { name: /Model.*effort/ });
-  expect(trigger).not.toHaveAttribute("data-selected");
+  expect(trigger).toHaveAttribute("data-selected", "");
+  expect(trigger).toHaveAccessibleDescription(
+    /Saved model is unavailable\. Using Fast with the provider's default effort\./,
+  );
+  expect(readView("scope", "solo:model-picks:channel", null)).toEqual({
+    [first.pubkey]: removedModelPick,
+  });
   await unsupported.user.click(trigger);
+  const modelStatus = within(screen.getByRole("dialog")).getByRole("status", {
+    name: "Saved model and effort availability",
+  });
+  expect(modelStatus).toHaveTextContent(
+    /Saved model is unavailable\. Using Fast with the provider's default effort\./,
+  );
   expect(modelButton()).toHaveTextContent("Fast");
   expect(
     await screen.findByLabelText("Effort for Honey in this chat"),
@@ -5906,17 +5928,46 @@ it("uses the supported Solo model and effort when saved choices are unavailable"
     [first.pubkey],
     [],
   );
+  expect(readView("scope", "solo:model-picks:channel", null)).toEqual({
+    [first.pubkey]: removedModelPick,
+  });
 
   unsupported.unmount();
+  const removedEffortPick = {
+    model: "deep",
+    effort: "ultra",
+    type: "test/agent",
+  };
   writeView("scope", "solo:model-picks:channel", {
-    [first.pubkey]: { model: "deep", effort: "ultra", type: "test/agent" },
+    [first.pubkey]: removedEffortPick,
   });
   const unsupportedEffort = mountChat();
   await unsupportedEffort.user.type(unsupportedEffort.input(), "b");
   await unsupportedEffort.user.click(
     screen.getByRole("button", { name: "First Honey" }),
   );
-  await screen.findByRole("button", { name: /Model.*effort/ });
+  const effortTrigger = await screen.findByRole("button", {
+    name: /Model.*effort/,
+  });
+  await waitFor(() =>
+    expect(effortTrigger).toHaveAccessibleDescription(
+      /Saved effort is unavailable for Deep\. Using Deep with the provider's default effort\./,
+    ),
+  );
+  await unsupportedEffort.user.click(effortTrigger);
+  const effortStatus = within(screen.getByRole("dialog")).getByRole("status", {
+    name: "Saved model and effort availability",
+  });
+  expect(effortStatus).toHaveTextContent(
+    /Saved effort is unavailable for Deep\. Using Deep with the provider's default effort\./,
+  );
+  expect(
+    await screen.findByLabelText("Effort for Honey in this chat"),
+  ).toHaveAttribute("aria-valuetext", "Default");
+  expect(readView("scope", "solo:model-picks:channel", null)).toEqual({
+    [first.pubkey]: removedEffortPick,
+  });
+  await unsupportedEffort.user.keyboard("{Escape}");
   await send(unsupportedEffort);
   await waitFor(() =>
     expect(unsupportedEffort.messages.send).toHaveBeenCalledOnce(),
@@ -5928,8 +5979,277 @@ it("uses the supported Solo model and effort when saved choices are unavailable"
   expect(unsupportedEffort.messages.send.mock.calls[0]?.at(-1)).toEqual({
     [first.pubkey]: { model: "deep" },
   });
+  expect(readView("scope", "solo:model-picks:channel", null)).toEqual({
+    [first.pubkey]: removedEffortPick,
+  });
   unsupportedEffort.unmount();
 });
+
+it.each([
+  {
+    description: "a removed saved model",
+    savedPick: { model: "removed", effort: "high", type: "test/agent" },
+    expected:
+      /Saved model is unavailable\. Send omits model and effort overrides; the agent or provider decides which model runs\./,
+  },
+  {
+    description: "an unavailable effort-only pick",
+    savedPick: { effort: "high", type: "test/agent" },
+    expected:
+      /Saved effort is unavailable\. Send omits model and effort overrides; the agent or provider decides which model runs\./,
+  },
+])(
+  "does not promise the first listed model when no current model is available for $description",
+  async ({ savedPick, expected }) => {
+    const models = [{ id: "fast", label: "Fast", efforts: [] }];
+    const readyAgents = sessionAgents("channel", models);
+    const type = readyAgents.types()[0];
+    if (!type) throw new Error("The fixture agent type should exist.");
+    const noCurrentTypes = [
+      { ...type, models: () => ({ current: "", models }) },
+    ];
+    const agents = {
+      ...readyAgents,
+      types: () => noCurrentTypes,
+    } as Agents;
+    const { mountChat, send } = soloModelPreferenceHarness(agents);
+    writeView("scope", "solo:model-picks:channel", {
+      [first.pubkey]: savedPick,
+    });
+    const composer = mountChat();
+    await composer.user.type(composer.input(), "a");
+    await composer.user.click(
+      screen.getByRole("button", { name: "First Honey" }),
+    );
+
+    const trigger = await screen.findByRole("button", {
+      name: /Model.*effort/,
+    });
+    expect(trigger).toHaveAccessibleDescription(expected);
+    await composer.user.click(trigger);
+    expect(
+      within(screen.getByRole("dialog")).getByRole("status", {
+        name: "Saved model and effort availability",
+      }),
+    ).toHaveTextContent(expected);
+    await send(composer);
+
+    await waitFor(() => expect(composer.messages.send).toHaveBeenCalledOnce());
+    expect(composer.messages.send.mock.calls[0]?.slice(0, 4)).toEqual([
+      "channel",
+      expect.stringContaining("a"),
+      [first.pubkey],
+      [],
+    ]);
+    expect(composer.messages.send.mock.calls[0]).toHaveLength(4);
+    expect(readView("scope", "solo:model-picks:channel", null)).toEqual({
+      [first.pubkey]: savedPick,
+    });
+    composer.unmount();
+  },
+);
+
+it("waits for a saved Solo pick's catalog before disclosing its fallback", async () => {
+  let resolveModels!: (models: Models) => void;
+  const pendingModels = new Promise<Models>((resolve) => {
+    resolveModels = resolve;
+  });
+  const readyAgents = sessionAgents("channel");
+  const type = readyAgents.types()[0];
+  if (!type) throw new Error("The fixture agent type should exist.");
+  const delayedTypes = [{ ...type, models: () => pendingModels }];
+  const agents = {
+    ...readyAgents,
+    types: () => delayedTypes,
+  } as Agents;
+  const { mountChat, write } = soloModelPreferenceHarness(agents);
+  const savedPick = {
+    model: "removed",
+    effort: "high",
+    type: "test/agent",
+  };
+  writeView("scope", "solo:model-picks:channel", {
+    [first.pubkey]: savedPick,
+  });
+  const h = mountChat();
+  try {
+    await write(h, "Wait for the catalog");
+    const trigger = await screen.findByRole("button", {
+      name: "Model, effort, and session controls for this chat",
+    });
+    expect(trigger).not.toHaveAttribute("data-selected");
+    expect(trigger).not.toHaveAccessibleDescription(
+      /Saved model is unavailable/,
+    );
+    await h.user.click(trigger);
+    const dialog = within(screen.getByRole("dialog"));
+    const availability = dialog.getByRole("status", {
+      name: "Saved model and effort availability",
+    });
+    expect(availability).toHaveTextContent(/^\s*$/);
+    expect(
+      screen.getByText("Loading model and effort…").closest("[role=status]"),
+    ).toHaveAttribute("aria-busy", "true");
+    expect(
+      screen.queryByText(/Saved model is unavailable/),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveModels({
+        current: "fast",
+        models: [{ id: "fast", label: "Fast", efforts: [] }],
+      });
+      await pendingModels;
+    });
+    const status = await dialog.findByRole("status", {
+      name: "Saved model and effort availability",
+    });
+    expect(status).toBe(availability);
+    expect(status).toHaveTextContent(
+      /Saved model is unavailable\. Using Fast\./,
+    );
+    expect(status).toBeVisible();
+    expect(trigger).toHaveAttribute("data-selected", "");
+    expect(trigger).toHaveAccessibleDescription(
+      /Saved model is unavailable\. Using Fast\./,
+    );
+    expect(readView("scope", "solo:model-picks:channel", null)).toEqual({
+      [first.pubkey]: savedPick,
+    });
+  } finally {
+    h.unmount();
+    resolveModels({
+      current: "fast",
+      models: [{ id: "fast", label: "Fast", efforts: [] }],
+    });
+    await pendingModels;
+  }
+});
+
+it("shows an unavailable Solo pick when the catalog has no selectable controls", async () => {
+  const { mountChat } = soloModelPreferenceHarness(
+    sessionAgents(
+      "channel",
+      [{ id: "fast", label: "Fast", efforts: [] }],
+      [first.pubkey],
+      false,
+    ),
+  );
+  const removedPick = {
+    model: "removed",
+    effort: "high",
+    type: "test/agent",
+  };
+  writeView("scope", "solo:model-picks:channel", {
+    [first.pubkey]: removedPick,
+  });
+
+  const composer = mountChat();
+  await composer.user.type(composer.input(), "a");
+  await composer.user.click(
+    screen.getByRole("button", { name: "First Honey" }),
+  );
+
+  const trigger = await screen.findByRole("button", { name: /Model.*effort/ });
+  expect(trigger).toHaveAccessibleDescription(
+    /Saved model is unavailable\. Using Fast\./,
+  );
+  await composer.user.click(trigger);
+  const dialog = within(screen.getByRole("dialog"));
+  const status = dialog.getByRole("status", {
+    name: "Saved model and effort availability",
+  });
+  expect(status).toHaveTextContent(/Saved model is unavailable\. Using Fast\./);
+  const cardNotice = dialog
+    .getAllByText(/Saved model is unavailable\. Using Fast\./)
+    .find((node) => node.closest("[data-agent-model-card]"));
+  expect(cardNotice).toBeDefined();
+  if (!cardNotice)
+    throw new Error("The fallback notice should be in its card.");
+  expect(cardNotice).toBeVisible();
+  expect(cardNotice.closest("[data-agent-model-card]")).toHaveClass(
+    "floating-surface",
+  );
+  expect(screen.getByText(/Fast · No thinking options/)).toBeVisible();
+  expect(readView("scope", "solo:model-picks:channel", null)).toEqual({
+    [first.pubkey]: removedPick,
+  });
+  await composer.user.click(
+    within(screen.getByRole("dialog")).getByRole("button", {
+      name: "Reset model and effort",
+    }),
+  );
+  expect(readView("scope", "solo:model-picks:channel", null)).toEqual({});
+  expect(composer.input()).toHaveFocus();
+  composer.unmount();
+});
+
+it.each([true, false])(
+  "does not claim a supported fallback when the loaded catalog has no models (session controls: %s)",
+  async (includeSessionControls) => {
+    const { mountChat, send } = soloModelPreferenceHarness(
+      sessionAgents("channel", [], [first.pubkey], includeSessionControls),
+    );
+    const savedPick = {
+      model: "removed",
+      effort: "high",
+      type: "test/agent",
+    };
+    writeView("scope", "solo:model-picks:channel", {
+      [first.pubkey]: savedPick,
+    });
+    const composer = mountChat();
+    const publish = vi.fn<Outbox["send"]>(() => "sent");
+    composer.messages.send.mockImplementation(
+      createMessages(
+        { supports: () => true, send: publish } as unknown as Outbox,
+        first.pubkey,
+        () => undefined,
+        () => [],
+        () => {},
+      ).send,
+    );
+    await composer.user.type(composer.input(), "Use the agent default");
+    await composer.user.click(
+      screen.getByRole("button", { name: "First Honey" }),
+    );
+
+    const trigger = await screen.findByRole("button", {
+      name: /Model.*effort/,
+    });
+    expect(trigger).toHaveAccessibleDescription(
+      /Saved model is unavailable\. No supported model is listed in the loaded catalog\. Send omits model and effort overrides and uses the agent's defaults\./,
+    );
+    await composer.user.click(trigger);
+    const availability = within(screen.getByRole("dialog")).getByRole(
+      "status",
+      {
+        name: "Saved model and effort availability",
+      },
+    );
+    expect(availability).toHaveTextContent(
+      /No supported model is listed in the loaded catalog\. Send omits model and effort overrides and uses the agent's defaults\./,
+    );
+    expect(screen.getByText("Model unavailable")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+    expect(readView("scope", "solo:model-picks:channel", null)).toEqual({
+      [first.pubkey]: savedPick,
+    });
+
+    await send(composer);
+    await waitFor(() => expect(composer.messages.send).toHaveBeenCalledOnce());
+    expect(publish).toHaveBeenCalledOnce();
+    expect(
+      publish.mock.calls[0]?.[0].tags.filter(
+        ([name]) => name === "model" || name === "effort",
+      ),
+    ).toEqual([]);
+    expect(readView("scope", "solo:model-picks:channel", null)).toEqual({
+      [first.pubkey]: savedPick,
+    });
+    composer.unmount();
+  },
+);
 
 it.each(
   ["inventory", "type"].flatMap((missing) =>
@@ -6106,10 +6426,20 @@ it("keeps saved Solo choices after catalog failure and retries before sending", 
   });
   const h = mountChat();
   await write(h, "Keep my choices");
-  await openPicker(h);
-  await screen.findByText(
-    /Model unavailable|Model and effort could not be loaded/,
+  const trigger = await screen.findByRole("button", {
+    name: "Model, effort, and session controls for this chat",
+  });
+  expect(trigger).not.toHaveAttribute("data-selected");
+  expect(trigger).not.toHaveAccessibleDescription(
+    /Saved model is unavailable|Saved effort is unavailable/,
   );
+  await openPicker(h);
+  await screen.findByText("Model and effort could not be loaded.");
+  expect(
+    screen.queryByText(
+      /Saved model is unavailable|Saved effort is unavailable/,
+    ),
+  ).not.toBeInTheDocument();
   await send(h);
   expect(h.messages.send).not.toHaveBeenCalled();
   expect(await screen.findByRole("alert")).toHaveTextContent(

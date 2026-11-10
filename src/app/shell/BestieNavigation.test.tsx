@@ -364,6 +364,7 @@ it("honors the promoted DM's mute and unread state through reads and Bestie repl
       readStateFloor: () => 0,
       readPublisherLock: async (_signal, work) => work(),
       readStateStorage: {
+        capture: async () => structuredClone(journal),
         async update(change) {
           journal = change(journal);
           return journal;

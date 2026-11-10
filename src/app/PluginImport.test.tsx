@@ -2376,6 +2376,15 @@ function requestedPreview(commit: string | null, paths = ["."]) {
     })),
   };
 }
+function readySnapshot(plugins: Catalog["plugins"]) {
+  return {
+    error: null,
+    configuration: {
+      status: "ready",
+      catalog: { profile: "test", location: "test", plugins },
+    },
+  };
+}
 function requestedHarness(
   preview: ImportPreview,
   source: Partial<{ path: string; commit: string }> = { commit: pinned },
@@ -2397,7 +2406,7 @@ function requestedHarness(
     imports: { git, discard },
     installImport,
     change,
-    snapshot: () => ({ error: null }),
+    snapshot: () => readySnapshot(plugins),
   } as unknown as PluginManager;
   const request = {
     id: 7,
@@ -3040,15 +3049,19 @@ it("carries a pinned commit through the signed community branch", async () => {
 function linkedHarness(
   preview: ImportPreview,
   source: Partial<{ path: string; commit: string }>,
+  plugins: Catalog["plugins"] = [],
 ) {
   const git = vi.fn(async () => preview);
   const discard = vi.fn(async () => {});
   const installImport = vi.fn(async () => true);
+  const change = vi.fn(async () => true);
+  // The live catalog; a test replaces it to model a change behind an open review.
+  const live = { plugins };
   const manager = {
     imports: { git, discard },
     installImport,
-    change: vi.fn(async () => true),
-    snapshot: () => ({ error: null }),
+    change,
+    snapshot: () => readySnapshot(live.plugins),
   } as unknown as PluginManager;
   const element = (
     <PluginImport
@@ -3058,11 +3071,12 @@ function linkedHarness(
         ...source,
       }}
       plugins={manager}
-      catalog={{ profile: "test", location: "test", plugins: [] }}
+      catalog={{ profile: "test", location: "test", plugins }}
       busy={false}
+      onOpenInstalled={vi.fn()}
     />
   );
-  return { git, discard, installImport, element };
+  return { git, discard, installImport, change, live, element };
 }
 
 it("pins a linked source to its commit and installs the linked folder", async () => {
@@ -3159,4 +3173,270 @@ it("leaves an unconstrained link editable and unpinned", async () => {
   expect(screen.getByLabelText("Git or GitHub repository")).not.toHaveAttribute(
     "readonly",
   );
+});
+
+function installedFromLink(overrides: Partial<PluginInfo> = {}): PluginInfo {
+  return {
+    manifest: requestedManifest,
+    source: "external",
+    enabled: true,
+    revision: "older",
+    previous: null,
+    reloadable: false,
+    updateSource: {
+      repository: "https://example.com/plugins.git",
+      reference: "v1",
+      path: "plugins/b",
+    },
+    error: null,
+    ...overrides,
+  };
+}
+const pinnedLink = { commit: pinned, path: "plugins/b" };
+
+it("reviews a pinned link to the installed plugin's source as an update instead of a duplicate", async () => {
+  const { installImport, change, element } = linkedHarness(
+    requestedPreview(pinned, ["a", "plugins/b"]),
+    pinnedLink,
+    [installedFromLink()],
+  );
+  render(element);
+  const dialog = await screen.findByRole("dialog", {
+    name: "Update Requested",
+  });
+  expect(dialog).not.toHaveTextContent(/already installed/i);
+  expect(dialog).toHaveTextContent(
+    "Commit 0123456789ab (matches the requested commit)",
+  );
+  expect(dialog).not.toHaveTextContent("This plugin will stay disabled.");
+  expect(dialog).not.toHaveTextContent("Future updates will follow");
+  expect(screen.queryByRole("switch", { name: "Enable plugin" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Open in Buzz" })).toBeNull();
+  expect(installImport).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Update" }));
+  await waitFor(() =>
+    expect(installImport).toHaveBeenCalledExactlyOnceWith(
+      "requested-token",
+      "plugins/b",
+    ),
+  );
+  expect(change).not.toHaveBeenCalled();
+});
+
+it("keeps a disabled plugin disabled when a pinned link updates it", async () => {
+  const { installImport, change, element } = linkedHarness(
+    requestedPreview(pinned, ["plugins/b"]),
+    pinnedLink,
+    [installedFromLink({ enabled: false })],
+  );
+  render(element);
+  const dialog = await screen.findByRole("dialog", {
+    name: "Update Requested",
+  });
+  expect(dialog).toHaveTextContent("This plugin will stay disabled.");
+  fireEvent.click(screen.getByRole("button", { name: "Update" }));
+  await waitFor(() => expect(installImport).toHaveBeenCalledOnce());
+  expect(change).not.toHaveBeenCalled();
+});
+
+it("keeps rejecting an installed plugin as a duplicate when the link is not pinned to both commit and folder", async () => {
+  for (const source of [{}, { path: "plugins/b" }, { commit: pinned }]) {
+    const { installImport, element } = linkedHarness(
+      requestedPreview(source.commit ? pinned : null, ["plugins/b"]),
+      source,
+      [installedFromLink()],
+    );
+    const view = render(element);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Already installed",
+    });
+    expect(dialog).toHaveTextContent(
+      "This plugin is already installed. Open its details to manage it.",
+    );
+    expect(screen.getByRole("button", { name: "Open in Buzz" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+    expect(installImport).not.toHaveBeenCalled();
+    view.unmount();
+  }
+});
+
+it("refuses a pinned link update from another repository or folder than the installed source", async () => {
+  for (const updateSource of [
+    {
+      repository: "https://example.com/other.git",
+      reference: "v1",
+      path: "plugins/b",
+    },
+    {
+      repository: "https://example.com/plugins.git",
+      reference: "v1",
+      path: "plugins/c",
+    },
+    { root: "/example", path: "." },
+    null,
+  ]) {
+    const { installImport, element } = linkedHarness(
+      requestedPreview(pinned, ["plugins/b"]),
+      pinnedLink,
+      [installedFromLink({ updateSource })],
+    );
+    const view = render(element);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Already installed",
+    });
+    expect(dialog).toHaveTextContent(
+      /Requested is already installed from .+; remove it first to install it from https:\/\/example\.com\/plugins\.git · plugins\/b\./,
+    );
+    expect(screen.getByRole("button", { name: "Open in Buzz" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Install plugin" })).toBeNull();
+    expect(installImport).not.toHaveBeenCalled();
+    view.unmount();
+  }
+});
+
+it("states the tracked ref change when a pinned link updates from another ref", async () => {
+  for (const { reference, shown } of [
+    { reference: "stable", shown: "stable" },
+    { reference: "", shown: "the repository default" },
+  ]) {
+    const { installImport, element } = linkedHarness(
+      requestedPreview(pinned, ["plugins/b"]),
+      pinnedLink,
+      [
+        installedFromLink({
+          updateSource: {
+            repository: "https://example.com/plugins.git",
+            reference,
+            path: "plugins/b",
+          },
+        }),
+      ],
+    );
+    const view = render(element);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Update Requested",
+    });
+    expect(dialog).toHaveTextContent(
+      `Future updates will follow v1 instead of ${shown}.`,
+    );
+    expect(installImport).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    await waitFor(() =>
+      expect(installImport).toHaveBeenCalledExactlyOnceWith(
+        "requested-token",
+        "plugins/b",
+      ),
+    );
+    view.unmount();
+  }
+});
+
+it("keeps rejecting a pinned link to a bundled plugin as a duplicate", async () => {
+  const { installImport, element } = linkedHarness(
+    requestedPreview(pinned, ["plugins/b"]),
+    pinnedLink,
+    [installedFromLink({ source: "bundled", updateSource: null })],
+  );
+  render(element);
+  const dialog = await screen.findByRole("dialog", {
+    name: "Already installed",
+  });
+  expect(dialog).toHaveTextContent(
+    "This plugin is already installed. Open its details to manage it.",
+  );
+  expect(screen.getByRole("button", { name: "Open in Buzz" })).toBeEnabled();
+  expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+  expect(installImport).not.toHaveBeenCalled();
+});
+
+it("installs a pinned link as a new plugin when only another plugin ID is installed from that source", async () => {
+  const { installImport, change, element } = linkedHarness(
+    requestedPreview(pinned, ["plugins/b"]),
+    pinnedLink,
+    [
+      installedFromLink({
+        manifest: { ...requestedManifest, id: "example.other", name: "Other" },
+      }),
+    ],
+  );
+  render(element);
+  await screen.findByRole("dialog", { name: /^Review .+ access$/ });
+  expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Install plugin" }));
+  await waitFor(() => expect(installImport).toHaveBeenCalledOnce());
+  expect(change).toHaveBeenCalledWith("enable", "example.requested");
+});
+
+it("does not offer a pinned link update when the fetched commit differs from the pin", async () => {
+  const { installImport, element } = linkedHarness(
+    requestedPreview("f".repeat(40), ["plugins/b"]),
+    pinnedLink,
+    [installedFromLink()],
+  );
+  render(element);
+  const dialog = await screen.findByRole("dialog", {
+    name: "Update Requested",
+  });
+  expect(dialog).toHaveTextContent("not at the commit that was requested");
+  expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+  expect(installImport).not.toHaveBeenCalled();
+});
+
+it("discards a pinned link update review on cancel without installing", async () => {
+  const { discard, installImport, element } = linkedHarness(
+    requestedPreview(pinned, ["plugins/b"]),
+    pinnedLink,
+    [installedFromLink()],
+  );
+  render(element);
+  await screen.findByRole("dialog", { name: "Update Requested" });
+  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(discard).toHaveBeenCalledWith("requested-token");
+  expect(installImport).not.toHaveBeenCalled();
+});
+
+it("refuses a pinned link update when the installed plugin changed after the review opened", async () => {
+  for (const changed of [
+    installedFromLink({ revision: "newer" }),
+    installedFromLink({ enabled: false }),
+    installedFromLink({
+      updateSource: { root: "/example", path: "." },
+    }),
+  ]) {
+    const { installImport, live, element } = linkedHarness(
+      requestedPreview(pinned, ["plugins/b"]),
+      pinnedLink,
+      [installedFromLink()],
+    );
+    const view = render(element);
+    await screen.findByRole("dialog", { name: "Update Requested" });
+    live.plugins = [changed];
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The installed plugin changed. Close this review and check again.",
+    );
+    expect(installImport).not.toHaveBeenCalled();
+    view.unmount();
+  }
+});
+
+it("refuses a plugin's requested update when the installed plugin changed after the review opened", async () => {
+  const installed = [installedFromLink()];
+  const { installImport, settled, element } = requestedHarness(
+    requestedPreview(pinned, ["plugins/b"]),
+    pinnedLink,
+    installed,
+  );
+  render(element);
+  fireEvent.click(await screen.findByRole("button", { name: "Find plugins" }));
+  await screen.findByRole("dialog", { name: "Update Requested" });
+  installed[0] = installedFromLink({ revision: "newer" });
+  fireEvent.click(screen.getByRole("button", { name: "Update" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "The installed plugin changed. Close this review and check again.",
+  );
+  expect(installImport).not.toHaveBeenCalled();
+  expect(settled).not.toHaveBeenCalled();
 });

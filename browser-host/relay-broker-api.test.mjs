@@ -4158,6 +4158,7 @@ test("Builderlab HTTP accepts full agent instructions and isolates the fixed nat
   });
   const instructions = "\\".repeat(20_000);
   let received;
+  let accountReads = 0;
   const nativeCalls = [];
   const h = await harness(() => Response.json([]), {}, fixtureRelayUrl, {
     open: async (url) => openLogin(new URL(url)),
@@ -4168,12 +4169,14 @@ test("Builderlab HTTP accepts full agent instructions and isolates the fixed nat
           session_credential: "fixture-only",
           expires_at: "2030",
         });
-      if (path.endsWith("/v1/auth/me"))
+      if (path.endsWith("/v1/auth/me")) {
+        accountReads += 1;
         return Response.json({
           subject: "fixture-account",
           expires_at: "2030",
           capabilities: { can_use_remote_agents: true },
         });
+      }
       if (path.endsWith("/nostr-identities/challenge"))
         return Response.json({
           error: { code: "missing_mapping", setup_needed: true },
@@ -4222,6 +4225,29 @@ test("Builderlab HTTP accepts full agent instructions and isolates the fixed nat
     const { revision } = JSON.parse(
       event.slice("data: ".length).split("\n\n")[0],
     );
+    const capabilityCheck = await fetch(
+      `${h.base}/api/builderlab/capabilities?revision=${encodeURIComponent(revision)}`,
+    );
+    expect(capabilityCheck.status).toBe(200);
+    expect(await capabilityCheck.json()).toEqual({
+      revision,
+      capabilities: {
+        can_use_remote_agents: true,
+        can_use_builderlab_decisions: false,
+        can_delete_buzz_communities: false,
+      },
+    });
+    const reads = accountReads;
+    for (const query of ["", "?revision=previous"]) {
+      const refused = await fetch(
+        `${h.base}/api/builderlab/capabilities${query}`,
+      );
+      expect(refused.status).toBe(502);
+      expect(await refused.json()).toEqual({
+        error: "Builderlab session changed",
+      });
+    }
+    expect(accountReads).toBe(reads);
     const body = JSON.stringify({
       agent_pubkey: "a".repeat(64),
       agent_instructions: instructions,

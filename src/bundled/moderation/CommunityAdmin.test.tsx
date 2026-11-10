@@ -190,6 +190,8 @@ it("mints a bounded invite and surfaces relay refusals", async () => {
   expect(calls.filter((c) => c.route === "invite")).toEqual([
     { route: "invite", body: { ttl_secs: 3 * 24 * 60 * 60, max_uses: null } },
   ]);
+  // QR codes come from the native renderer; the browser host has none.
+  expect(screen.queryByRole("img")).toBeNull();
   // Admins cannot grant admin, so direct addition has no role choice.
   await user.type(
     screen.getByRole("textbox", { name: "Public identity" }),

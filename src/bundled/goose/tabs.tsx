@@ -643,9 +643,11 @@ export function createTabs({
     const levels = efforts.value?.levels ?? [];
     const named = (level: string) =>
       level.charAt(0).toUpperCase() + level.slice(1);
-    const fallback = efforts.value?.current
-      ? named(efforts.value.current)
-      : "Automatic";
+    // goose reports "off" both for a level set to off and for none set. With
+    // none set it often sends no level, leaving the model on its own default,
+    // so "off" cannot name what turns run on; any other level can.
+    const current = efforts.value?.current;
+    const fallback = current && current !== "off" ? named(current) : undefined;
     const select = (
       <Select
         label="Thinking"
@@ -654,8 +656,8 @@ export function createTabs({
         value={value}
         {...(!value
           ? {
-              valueLabel: fallback,
-              ...(compact && { valueSuffix: " · Default" }),
+              valueLabel: fallback ?? "Default",
+              ...(compact && fallback ? { valueSuffix: " · Default" } : {}),
             }
           : {})}
         disabled={disabled}
@@ -666,7 +668,7 @@ export function createTabs({
             options: [
               {
                 value: "",
-                label: `${fallback} · Default`,
+                label: fallback ? `${fallback} · Default` : "Default",
               },
               // A saved level the model does not offer, or not yet read.
               ...(value && !levels.includes(value)

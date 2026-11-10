@@ -66,6 +66,11 @@ export function createTestSession(
       if (!credential) throw new Error("Sign in to Builderlab first.");
       return credential;
     },
+    async freshCredential(signal: AbortSignal): Promise<Credential> {
+      signal.throwIfAborted();
+      if (!credential) throw new Error("Sign in to Builderlab first.");
+      return credential;
+    },
     async request(_owner: Credential, input: BuilderlabRequest) {
       if (!host) throw new Error("Builderlab requests are unavailable.");
       return host.request({

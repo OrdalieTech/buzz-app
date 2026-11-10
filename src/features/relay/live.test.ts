@@ -12,6 +12,7 @@ import {
   LIVE_RECOVERY_INTERVAL,
   liveChannels,
   liveReconnectDelay,
+  LIVE_RESUME_LAG,
   liveResumeSince,
   SETUP_TIMEOUT_MS,
   liveSlowRetryDelay,
@@ -6317,6 +6318,120 @@ it("ends a renewal's quiet state when an interest change replaces a carried batc
       ["a", "b"],
     );
   } finally {
+    h.owner.dispose();
+  }
+});
+
+it("gives a profile sync that reached EOSE its resume point, and resends its cursor", async () => {
+  vi.useFakeTimers();
+  const h = setup([]);
+  try {
+    await establish(h.first);
+    assert.exists(h.owner.syncVerifiedProfiles);
+    assert.exists(h.owner.syncArtifacts);
+    const live = vi.fn();
+    const pending = vi.fn();
+    const artifacts = vi.fn();
+    h.owner.syncVerifiedProfiles(
+      verifiedProfileFilter("a".repeat(64), ["b".repeat(64)]),
+      { event() {}, eose() {}, closed: live },
+    );
+    h.owner.syncVerifiedProfiles(
+      verifiedProfileFilter("a".repeat(64), ["c".repeat(64)]),
+      { event() {}, eose() {}, closed: pending },
+    );
+    h.owner.syncArtifacts(
+      { artifact: "current", "#h": ["11111111-1111-4111-8111-111111111111"] },
+      { event() {}, eose() {}, closed: artifacts },
+    );
+    await Promise.resolve();
+    const sent = h.first
+      .requests()
+      .filter((request) => request[1].startsWith("sync-"));
+    expect(sent).toHaveLength(3);
+    await h.first.receive(["EOSE", sent[0]?.[1]]);
+    await h.first.receive(["EOSE", sent[2]?.[1]]);
+    const heard = Math.floor(Date.now() / 1000);
+    renew(h.first);
+    expect(live).toHaveBeenCalledOnce();
+    const [reason, resume] = live.mock.calls[0] ?? [];
+    expect(reason).toBe("disconnected: live connection lost");
+    // The routes' overlap, from when the socket last proved it heard the relay.
+    expect(resume?.since).toBeLessThanOrEqual(heard - LIVE_RESUME_LAG);
+    expect(resume?.since).toBeGreaterThanOrEqual(heard - LIVE_RESUME_LAG - 60);
+    // No EOSE on that socket: no evidence that it was ever live.
+    expect(pending).toHaveBeenCalledExactlyOnceWith(
+      "disconnected: live connection lost",
+    );
+    // NIP-AR sync has no resume (NIP-AR Sync rule 7).
+    expect(artifacts).toHaveBeenCalledExactlyOnceWith(
+      "disconnected: live connection lost",
+    );
+    // The owner's resumed filter goes out as given.
+    const second = h.sockets[1];
+    assert.exists(second);
+    h.owner.syncVerifiedProfiles(
+      verifiedProfileFilter("a".repeat(64), ["b".repeat(64)], 1234),
+      { event() {}, eose() {}, closed() {} },
+    );
+    await second.auth();
+    await vi.advanceTimersByTimeAsync(750);
+    const resumed = second
+      .requests()
+      .find((request) => request[1].startsWith("sync-"));
+    assert.exists(resumed);
+    expect(resumed[2]).toEqual({
+      kinds: [30382],
+      authors: ["a".repeat(64)],
+      "#d": ["b".repeat(64)],
+      limit: 1,
+      since: 1234,
+    });
+  } finally {
+    h.owner.dispose();
+  }
+});
+
+it("gives no resume point to a profile sync whose EOSE is still being verified", async () => {
+  vi.useFakeTimers();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let holding = false;
+  const check = vi.fn<SignatureVerifier>(async (claims) => {
+    if (holding) await held;
+    return nativeSignatureChecks({ claims });
+  });
+  const h = setup([], undefined, undefined, undefined, check);
+  try {
+    await establish(h.first);
+    assert.exists(h.owner.syncVerifiedProfiles);
+    const closed = vi.fn();
+    h.owner.syncVerifiedProfiles(
+      verifiedProfileFilter(h.key.pubkey, ["b".repeat(64)]),
+      { event() {}, eose() {}, closed },
+    );
+    await Promise.resolve();
+    const sync = h.first
+      .requests()
+      .find((request) => request[1].startsWith("sync-"));
+    assert.exists(sync);
+    // A frame waiting for its native check holds the EOSE behind it.
+    holding = true;
+    const frames = [
+      h.first.receive(["EVENT", sync[1], message(h.key, "a", "held", 1)]),
+      h.first.receive(["EOSE", sync[1]]),
+    ];
+    await vi.waitFor(() => expect(check).toHaveBeenCalled());
+    renew(h.first);
+    expect(closed).toHaveBeenCalledExactlyOnceWith(
+      "disconnected: live connection lost",
+    );
+    release();
+    await Promise.all(frames);
+  } finally {
+    release();
     h.owner.dispose();
   }
 });

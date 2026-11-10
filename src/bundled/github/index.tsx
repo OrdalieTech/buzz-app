@@ -57,6 +57,7 @@ import {
 import { watchPulls } from "./watcher";
 import { presentPull } from "./attention";
 import { SubmitReview } from "./SubmitReview";
+import { createPanelMemory, type PanelMemory } from "./panel-memory";
 import { PullFiles } from "./PullFiles";
 import { GitHubSettings } from "./GitHubSettings";
 import { openGitHubLinksInBuzz } from "./link-preference";
@@ -72,6 +73,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
   // session's sidebar, every link in messages, the panel and agents, so one
   // shown in several places costs one read.
   const states = createPullStates(gh);
+  const memory = createPanelMemory();
   const pulls = new WeakMap<RelaySession, SoloPulls>();
   const pullsFor = (session: RelaySession) => {
     let found = pulls.get(session);
@@ -98,6 +100,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
           gh={gh}
           diff={diff}
           states={states}
+          memory={memory}
           {...(channelId && {
             resolveActions: (
               url: string,
@@ -320,9 +323,11 @@ const icons = {
 
 export function GitHubPanel({
   target,
+  context,
   gh,
   diff,
   states: shared,
+  memory: sharedMemory,
   chatLink,
   resolveActions,
 }: PanelProps & {
@@ -338,6 +343,8 @@ export function GitHubPanel({
   diff?: GitHubDiff | undefined;
   /** The plugin's pull request store; a panel alone keeps its own. */
   states?: PullStates | undefined;
+  /** The plugin's panel memory; a panel alone keeps its own. */
+  memory?: PanelMemory | undefined;
   /** Links a pull request to the chat the panel was opened from. */
   chatLink?: ((url: string) => ReactNode) | undefined;
 }) {
@@ -348,6 +355,8 @@ export function GitHubPanel({
     [shared, gh],
   );
   const states = shared ?? own;
+  const [ownMemory] = useState(createPanelMemory);
+  const memory = sharedMemory ?? ownMemory;
   return reference && states ? (
     <ObjectPanel
       key={`${reference.url}:${attempt}`}
@@ -355,6 +364,8 @@ export function GitHubPanel({
       gh={gh}
       diff={diff}
       states={states}
+      memory={memory}
+      channelId={context?.channelId}
       chatLink={chatLink}
       resolveActions={resolveActions}
       retry={() => retry(attempt + 1)}
@@ -369,6 +380,8 @@ function ObjectPanel({
   gh,
   diff,
   states,
+  memory,
+  channelId,
   chatLink,
   resolveActions,
   retry,
@@ -377,6 +390,9 @@ function ObjectPanel({
   gh: GitHubCli | undefined;
   diff: GitHubDiff | undefined;
   states: PullStates;
+  memory: PanelMemory;
+  /** Where it was opened: each channel keeps its own view of a pull request. */
+  channelId: string | undefined;
   chatLink: ((url: string) => ReactNode) | undefined;
   resolveActions:
     | ((
@@ -389,10 +405,12 @@ function ObjectPanel({
 }) {
   const isPull = reference.kind === "pull";
   const pull = usePullPanel(states, reference.url, isPull);
-  const [view, setView] = useState<"summary" | "changes">("summary");
+  const [view, setView] = useState(
+    () => memory.get(reference.url, channelId).view ?? "summary",
+  );
   // Files changed stays mounted once shown, so going back to it doesn't read
   // the diff again.
-  const [changesShown, setChangesShown] = useState(false);
+  const [changesShown, setChangesShown] = useState(view === "changes");
   const other = useGitHubObject(reference, gh, !isPull);
   const loaded = isPull ? pull.loaded : other.loaded;
   const load = isPull ? pull.load : other.load;
@@ -490,7 +508,13 @@ function ObjectPanel({
           loaded.checklist &&
           !loaded.checklist.authored && (
             <span className={styles.identityAction}>
-              <SubmitReview pull={loaded.checklist} gh={gh} refresh={load} />
+              <SubmitReview
+                pull={loaded.checklist}
+                gh={gh}
+                url={reference.url}
+                refresh={load}
+                memory={memory}
+              />
             </span>
           )}
       </div>
@@ -519,6 +543,7 @@ function ObjectPanel({
               },
             ]}
             onValueChange={(next) => {
+              memory.setView(reference.url, next, channelId);
               setView(next);
               if (next === "changes") setChangesShown(true);
             }}

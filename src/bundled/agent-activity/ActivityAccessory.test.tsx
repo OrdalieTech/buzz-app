@@ -371,7 +371,7 @@ it("keeps namesakes as separate exact identities", () => {
   }
 });
 
-it("previews only live scoped actions and retains profile navigation", () => {
+it("previews only live scoped actions for multiple agents and retains profile navigation", () => {
   const f = fixture();
   const view = render(<ActivityAccessory {...f.props} />);
   try {
@@ -388,13 +388,16 @@ it("previews only live scoped actions and retains profile navigation", () => {
     f.send(A, "old", 2, "acp_read", thought("Old thought"));
     f.send(A, "old", 3, "turn_completed");
     f.send(A, "new", 1, "turn_started", { triggeringEventIds: [root] });
+    f.send(B, "companion", 1, "turn_started", { triggeringEventIds: [root] });
     fireEvent.click(
       screen.getByRole("button", {
         name: /(?:View agent activity|Show activity history|Collapse activity history)/,
       }),
     );
     expect(
-      screen.getByText("Waiting for activity details"),
+      within(
+        screen.getByRole("button", { name: "View activity for Blossom" }),
+      ).getByText("Waiting for activity details"),
     ).toBeInTheDocument();
     expect(screen.queryByText("Old thought")).not.toBeInTheDocument();
     f.send(A, "new", 2, "acp_read", thought("Current thought"));
@@ -411,6 +414,7 @@ it("previews only live scoped actions and retains profile navigation", () => {
     expect(f.props.open).toHaveBeenCalledExactlyOnceWith(activity);
     // It asks that Activity for this message's transcript, once.
     expect(claimProfileTranscript(activity)).toBeDefined();
+    f.send(B, "companion", 2, "turn_completed");
     act(() => vi.advanceTimersByTime(31000));
     expect(
       screen.queryByLabelText("Agent activity on this message"),
@@ -438,6 +442,7 @@ it("removes the whole popup when access is revoked", () => {
   const view = render(<ActivityAccessory {...f.props} />);
   try {
     f.send(A, "a", 1, "turn_started", { triggeringEventIds: [root] });
+    f.send(B, "b", 1, "turn_started", { triggeringEventIds: [root] });
     fireEvent.click(
       screen.getByRole("button", {
         name: /(?:View agent activity|Show activity history|Collapse activity history)/,
@@ -465,6 +470,7 @@ it("makes the compact avatar and tool preview one action, retaining the popup wh
   const view = render(<ActivityAccessory {...f.props} />);
   try {
     f.send(A, "a", 1, "turn_started", { triggeringEventIds: [root] });
+    f.send(B, "b", 1, "turn_started", { triggeringEventIds: [root] });
     f.send(A, "a", 2, "acp_read", {
       method: "session/update",
       params: {
@@ -485,8 +491,8 @@ it("makes the compact avatar and tool preview one action, retaining the popup wh
     const popup = within(
       screen.getByRole("dialog", { name: "Agent activity" }),
     );
-    // The agent's row is the popup's one action; no separate Activity heading.
-    expect(popup.getAllByRole("button")).toHaveLength(1);
+    // Each agent has one navigation action; no separate Activity heading.
+    expect(popup.getAllByRole("button")).toHaveLength(2);
     for (const text of [
       "Agent activity",
       "Latest reported activity for this message.",
@@ -675,7 +681,7 @@ it("dismisses only that agent's error on this message, without changing other wo
     expect(f.props.open).not.toHaveBeenCalled();
     expect(onFocusedRemoval).not.toHaveBeenCalled();
     expect(
-      screen.getByRole("button", { name: "View activity for Bubbles" }),
+      screen.getByRole("button", { name: /View agent activity: Bubbles/ }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "View activity for Blossom" }),
@@ -1350,7 +1356,9 @@ it("retries a failed local request from its row, before Dismiss, which begins it
       }),
     ).toBeInTheDocument();
     look();
-    expect(screen.getByText("Received · waiting to start")).toBeInTheDocument();
+    expect(f.props.open).toHaveBeenCalledExactlyOnceWith(
+      `buzz:profile?agent=${A}&tab=activity`,
+    );
     expect(
       screen.queryByRole("button", { name: "Retry Blossom" }),
     ).not.toBeInTheDocument();
@@ -1466,6 +1474,88 @@ it("stops a hosted agent in the thread its message replies to", () => {
   }
 });
 
+it("opens a single agent directly and stops it without opening activity", async () => {
+  const f = fixture();
+  const agents = hosted();
+  const view = render(<ActivityAccessory {...f.props} agents={agents} />);
+  try {
+    f.send(A, "t", 1, "turn_started", { triggeringEventIds: [root] });
+    const bubble = screen.getByRole("button", { name: /View agent activity:/ });
+    expect(bubble).not.toHaveAttribute("aria-haspopup");
+    expect(bubble).not.toHaveAttribute("aria-expanded");
+    fireEvent.click(screen.getByRole("button", { name: "Stop Blossom" }));
+    expect(f.props.open).not.toHaveBeenCalled();
+    expect(agents.interrupt).toHaveBeenCalledExactlyOnceWith(A, {
+      channelId: "c",
+      threadRootId: root,
+    });
+    await settle();
+    expect(bubble).toHaveTextContent("Stopping…");
+    expect(bubble).toHaveAccessibleName(/Blossom, Stopping/);
+    fireEvent.click(bubble);
+    expect(f.props.open).toHaveBeenCalledExactlyOnceWith(
+      `buzz:profile?agent=${A}&tab=activity`,
+    );
+    expect(
+      claimProfileTranscript(`buzz:profile?agent=${A}&tab=activity`),
+    ).toBeDefined();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  } finally {
+    view.unmount();
+    f.dispose();
+  }
+});
+
+it("keeps the focused bubble and pending stop when agents join and leave", async () => {
+  const f = fixture();
+  const agents = hosted();
+  const view = render(<ActivityAccessory {...f.props} agents={agents} />);
+  try {
+    f.send(A, "t", 1, "turn_started", { triggeringEventIds: [root] });
+    fireEvent.click(screen.getByRole("button", { name: "Stop Blossom" }));
+    await settle();
+    const bubble = screen.getByRole("button", { name: /View agent activity:/ });
+    act(() => screen.getByRole("button", { name: "Stop Blossom" }).focus());
+    f.send(B, "u", 1, "turn_started", { triggeringEventIds: [root] });
+    expect(bubble).toHaveFocus();
+    openBubble();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    stopPending();
+    act(() => screen.getByRole("button", { name: "Stop Blossom" }).focus());
+    f.send(B, "u", 2, "turn_completed");
+    expect(bubble).toHaveFocus();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    stopPending();
+    expect(bubble).toHaveTextContent("Stopping…");
+    expect(bubble).toHaveAccessibleName(/Blossom, Stopping/);
+  } finally {
+    view.unmount();
+    f.dispose();
+  }
+});
+
+it("does not take focus from elsewhere when agents join and leave", () => {
+  const f = fixture();
+  const view = render(
+    <>
+      <button type="button">Elsewhere</button>
+      <ActivityAccessory {...f.props} agents={hosted()} />
+    </>,
+  );
+  try {
+    f.send(A, "t", 1, "turn_started", { triggeringEventIds: [root] });
+    const elsewhere = screen.getByRole("button", { name: "Elsewhere" });
+    act(() => elsewhere.focus());
+    f.send(B, "u", 1, "turn_started", { triggeringEventIds: [root] });
+    expect(elsewhere).toHaveFocus();
+    f.send(B, "u", 2, "turn_completed");
+    expect(elsewhere).toHaveFocus();
+  } finally {
+    view.unmount();
+    f.dispose();
+  }
+});
+
 it("offers each agent its own Stop in the activity popup", async () => {
   const f = fixture();
   const agents = hosted(true);
@@ -1512,8 +1602,8 @@ it("returns a hosted agent to its activity when its provider had nothing running
     await settle();
     expect(look().queryByText("Stopping…")).not.toBeInTheDocument();
     expect(
-      look().getByText("Waiting for activity details"),
-    ).toBeInTheDocument();
+      screen.getByRole("button", { name: /View agent activity: Blossom/ }),
+    ).toHaveAttribute("data-activity-summary");
     stopReady();
     expect(notify).toHaveBeenCalledExactlyOnceWith(
       "Blossom had nothing running to stop",

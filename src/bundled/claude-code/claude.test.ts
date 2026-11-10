@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import { appClient } from "../../buzz-mcp/app-client";
-import type { OwnerAccess } from "../../buzz-mcp/client";
 import { callSessionTool } from "../../buzz-mcp/session-tools";
 import type { AgentHandle } from "../../features/agents/service";
 import { ClaudeProcess, stepLabel } from "./claude";
@@ -399,72 +398,44 @@ it("settles a stopped turn that Claude ends as aborted tools as stopped, not fai
   expect(claude.busy).toBe(false);
 });
 
-/** A Claude whose Buzz tools run through the real app client: `owner_channel_list`
- * holds its first read until `release`, and any other tool reads a memory.
+/** A Claude whose Buzz tools run through the real app client: its first
+ * `mem_get` of `later` holds until `release`, and other reads answer at once.
  * With `holdStops`, Claude answers a Stop only when the test does. */
-async function ownerTurns(env?: Record<string, string>) {
+async function heldTurns(env?: Record<string, string>) {
   const { spawn, processes } = fakeSpawn();
   const stops: string[] = [];
   let holdStops = false;
-  const listing = {
-    execution: { agent: "agent", owner: "owner", community: "relay" },
-    channels: [
-      {
-        id: "c",
-        name: "Owner secrets",
-        type: "stream" as const,
-        visibility: "private" as const,
-        archived: false,
-      },
-    ],
-    partial: false,
-  };
   let release: (() => void) | undefined;
   let entered!: () => void;
   const reading = new Promise<void>((resolve) => {
     entered = resolve;
   });
-  const channels = vi.fn<OwnerAccess["channels"]>(async () => {
-    if (channels.mock.calls.length === 1) {
+  let later = 0;
+  const memories = vi.fn(async (slug?: string) => {
+    if (slug === "mem/later" && ++later === 1) {
       entered();
       await new Promise<void>((resolve) => {
         release = resolve;
       });
     }
-    return listing;
+    return {
+      entries: [{ slug: slug ?? "core", body: `${slug} notes`, createdAt: 1 }],
+      partial: false,
+    };
   });
-  const ownerAccess = {
-    channels,
-    channel: vi.fn(),
-    members: vi.fn(),
-    held: vi.fn<OwnerAccess["held"]>(),
-  };
   const signals: AbortSignal[] = [];
   const tools = vi.fn(
     async (_conversation: unknown, message: unknown, signal: AbortSignal) => {
       signals.push(signal);
       const { id, params } = message as {
         id: number;
-        params: { name: string };
+        params: { name: string; arguments: Record<string, unknown> };
       };
       const client = appClient(
-        {
-          pubkey: "agent",
-          key: "agent",
-          ownerAccess,
-        } as unknown as AgentHandle,
-        {
-          read: vi.fn(),
-          memories: async () => ({
-            entries: [{ slug: "core", body: "core notes", createdAt: 1 }],
-            partial: false,
-          }),
-          signal,
-        },
+        { pubkey: "agent", key: "agent" } as unknown as AgentHandle,
+        { read: vi.fn(), memories, signal },
       );
-      const name = params.name;
-      const args = name === "mem_get" ? { slug: "core" } : {};
-      return callSessionTool(client, {}, name, args).then(
+      return callSessionTool(client, {}, params.name, params.arguments).then(
         (text) => ({ jsonrpc: "2.0", id, result: { content: [{ text }] } }),
         (error: Error) => ({
           jsonrpc: "2.0",
@@ -498,7 +469,7 @@ async function ownerTurns(env?: Record<string, string>) {
     await vi.waitFor(() => expect(fake.received.some(of)).toBe(true));
     return JSON.stringify(fake.received.find(of));
   };
-  const ask = (requestId: string, name = "owner_channel_list") =>
+  const ask = (requestId: string, slug = "later") =>
     fake.emit({
       type: "control_request",
       request_id: requestId,
@@ -509,7 +480,7 @@ async function ownerTurns(env?: Record<string, string>) {
           jsonrpc: "2.0",
           id: requestId,
           method: "tools/call",
-          params: { name },
+          params: { name: "mem_get", arguments: { slug } },
         },
       },
     });
@@ -526,7 +497,7 @@ async function ownerTurns(env?: Record<string, string>) {
       holdStops = true;
     },
     answerStop,
-    ownerAccess,
+    memories,
     signals,
     reading,
     ask,
@@ -535,11 +506,11 @@ async function ownerTurns(env?: Record<string, string>) {
   };
 }
 
-it("withholds an owner read an unprotected Stop overtook, which later work cannot revive", async () => {
-  const t = await ownerTurns();
+it("withholds a read an unprotected Stop overtook, which later work cannot revive", async () => {
+  const t = await heldTurns();
   try {
     t.fake.hold = true;
-    const stopped = t.claude.send("list my channels");
+    const stopped = t.claude.send("check my notes");
     await flush();
     t.ask("r1");
     await t.reading;
@@ -547,8 +518,7 @@ it("withholds an owner read an unprotected Stop overtook, which later work canno
     t.release();
     const refused = await t.answer("r1");
     expect(refused).toContain('"isError":true');
-    expect(refused).not.toContain("Owner secrets");
-    expect(t.ownerAccess.held).not.toHaveBeenCalled();
+    expect(refused).not.toContain("later notes");
     abortTools(t.fake);
     await expect(stopped).resolves.toEqual({ ok: true, stopped: true });
 
@@ -556,7 +526,7 @@ it("withholds an owner read an unprotected Stop overtook, which later work canno
     void t.claude.send("again");
     await flush();
     t.ask("r2");
-    expect(await t.answer("r2")).toContain("Owner secrets");
+    expect(await t.answer("r2")).toContain("later notes");
     expect(t.signals[0]?.aborted).toBe(true);
     expect(t.signals[1]?.aborted).toBe(false);
   } finally {
@@ -566,10 +536,10 @@ it("withholds an owner read an unprotected Stop overtook, which later work canno
 });
 
 it("answers a turn of its own after a Stop, while a call held across the Stop stays refused", async () => {
-  const t = await ownerTurns();
+  const t = await heldTurns();
   try {
     t.fake.hold = true;
-    const stopped = t.claude.send("list my channels");
+    const stopped = t.claude.send("check my notes");
     await flush();
     t.ask("r1");
     await t.reading;
@@ -579,18 +549,17 @@ it("answers a turn of its own after a Stop, while a call held across the Stop st
 
     // A finished background task starts a turn with no message from Buzz.
     sessionState(t.fake, "running");
-    t.ask("r2", "mem_get");
+    t.ask("r2", "core");
     t.ask("r3");
     const memory = await t.answer("r2");
     expect(memory).not.toContain('"isError":true');
     expect(memory).toContain("core notes");
-    expect(await t.answer("r3")).toContain("Owner secrets");
+    expect(await t.answer("r3")).toContain("later notes");
 
     t.release();
     const refused = await t.answer("r1");
     expect(refused).toContain('"isError":true');
-    expect(refused).not.toContain("Owner secrets");
-    expect(t.ownerAccess.held).toHaveBeenCalledTimes(1);
+    expect(refused).not.toContain("later notes");
     sessionState(t.fake, "idle");
   } finally {
     t.release();
@@ -603,21 +572,21 @@ it.each([
 ])(
   "keeps a message sent while a Stop lands in the stopped turn, when Claude %s",
   async (_, env) => {
-    const t = await ownerTurns(env);
+    const t = await heldTurns(env);
     const idle = !env;
     t.fake.hold = true;
-    const stopped = t.claude.send("list my channels");
+    const stopped = t.claude.send("check my notes");
     await flush();
     if (idle) sessionState(t.fake, "running");
     await t.claude.interrupt();
-    const folded = t.claude.send("and my DMs");
+    const folded = t.claude.send("and the later ones");
     await flush();
     // A call the stopped turn makes late is still stopped.
-    t.ask("r1", "mem_get");
+    t.ask("r1", "core");
     t.ask("r2");
     expect(await t.answer("r1")).toContain('"isError":true');
     expect(await t.answer("r2")).toContain('"isError":true');
-    expect(t.ownerAccess.channels).not.toHaveBeenCalled();
+    expect(t.memories).not.toHaveBeenCalled();
     let settled = false;
     void stopped.then(() => {
       settled = true;
@@ -630,25 +599,25 @@ it.each([
     await expect(stopped).resolves.toEqual({ ok: true, stopped: true });
     await expect(folded).resolves.toEqual({ ok: true, stopped: true });
 
-    // The next message is new work, with ordinary and owner calls.
+    // The next message is new work, whose calls answer.
     const next = t.claude.send("next");
     await flush();
-    t.ask("r3", "mem_get");
+    t.ask("r3", "core");
     t.ask("r4");
     expect(await t.answer("r3")).toContain("core notes");
     await t.reading;
     t.release();
-    expect(await t.answer("r4")).toContain("Owner secrets");
+    expect(await t.answer("r4")).toContain("later notes");
     t.fake.finish();
     await expect(next).resolves.toEqual({ ok: true });
   },
 );
 
 it("stops a turn that starts while an earlier Stop awaits Claude's answer", async () => {
-  const t = await ownerTurns();
+  const t = await heldTurns();
   t.holdStops();
   t.fake.hold = true;
-  const sent = t.claude.send("list my channels");
+  const sent = t.claude.send("check my notes");
   await flush();
   const first = t.claude.interrupt();
   abortTools(t.fake);
@@ -658,7 +627,7 @@ it("stops a turn that starts while an earlier Stop awaits Claude's answer", asyn
   sessionState(t.fake, "running");
   const second = t.claude.interrupt();
   expect(t.stops).toHaveLength(2);
-  t.ask("r1", "mem_get");
+  t.ask("r1", "core");
   expect(await t.answer("r1")).toContain('"isError":true');
   t.answerStop(t.stops[0]);
   t.answerStop(t.stops[1]);
@@ -668,10 +637,10 @@ it("stops a turn that starts while an earlier Stop awaits Claude's answer", asyn
 });
 
 it("asks Claude once for Stops made together, which share its refusal", async () => {
-  const t = await ownerTurns();
+  const t = await heldTurns();
   t.fake.hold = true;
   t.fake.interruptError = "not now";
-  const sent = t.claude.send("list my channels");
+  const sent = t.claude.send("check my notes");
   await flush();
   const first = t.claude.interrupt();
   const second = t.claude.interrupt();
@@ -679,23 +648,23 @@ it("asks Claude once for Stops made together, which share its refusal", async ()
   await expect(second).rejects.toThrow("Claude did not stop: not now");
   expect(interrupts(t.fake)).toHaveLength(1);
   // Claude refused, so the turn and its calls go on.
-  t.ask("r1", "mem_get");
+  t.ask("r1", "core");
   expect(await t.answer("r1")).toContain("core notes");
   t.fake.finish();
   await expect(sent).resolves.toEqual({ ok: true });
 });
 
 it("keeps work stopped when Claude refuses a repeated Stop", async () => {
-  const t = await ownerTurns();
+  const t = await heldTurns();
   t.fake.hold = true;
-  const sent = t.claude.send("list my channels");
+  const sent = t.claude.send("check my notes");
   await flush();
   await t.claude.interrupt();
   t.fake.interruptError = "already stopping";
   await expect(t.claude.interrupt()).rejects.toThrow(
     "Claude did not stop: already stopping",
   );
-  t.ask("r1", "mem_get");
+  t.ask("r1", "core");
   expect(await t.answer("r1")).toContain('"isError":true');
   abortTools(t.fake);
   await expect(sent).resolves.toEqual({ ok: true, stopped: true });

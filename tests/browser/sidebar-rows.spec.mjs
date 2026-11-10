@@ -8,6 +8,7 @@ import {
   settleShellToggle,
 } from "./navigation.mjs";
 import { setPluginEnabled } from "./plugin-settings.mjs";
+import { animationsSettled } from "./animations.mjs";
 
 appTest.use({
   pluginFixtures: true,
@@ -51,15 +52,10 @@ appTest(
     await expect(
       page.getByRole("menuitemradio", { name: "Reverse name" }),
     ).toBeVisible();
-    await page
-      .getByRole("menu", { name: "Sort Channels", exact: true })
-      .evaluate(async (element) => {
-        await Promise.all(
-          element
-            .getAnimations({ subtree: true })
-            .map((animation) => animation.finished),
-        );
-      });
+    await animationsSettled(
+      page.getByRole("menu", { name: "Sort Channels", exact: true }),
+      { subtree: true },
+    );
     await page.screenshot({
       path: testInfo.outputPath("sidebar-rows-sort-menu.png"),
     });

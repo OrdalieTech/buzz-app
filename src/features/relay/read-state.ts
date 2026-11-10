@@ -25,6 +25,7 @@ import {
   uint32,
   type ReadState,
   type ParsedReadBlob,
+  type Override,
 } from "./read-state-model";
 import {
   newReadJournal,
@@ -163,6 +164,34 @@ export function createReadState({
   let attemptedRevision = -1;
   let failedRevision: number | undefined;
   let work: Promise<unknown> = Promise.resolve();
+  type AutomaticReadAttempt = {
+    status: "pending" | "saved" | "failed";
+    order: number;
+    seenSet: number;
+    before?: number;
+    after?: number;
+  };
+  const pendingAutomaticReads = new Map<string, Set<AutomaticReadAttempt>>();
+  type PeerObservation = {
+    event: RelayEvent;
+    order: number;
+    reads: Map<string, Set<AutomaticReadAttempt>>;
+  };
+  // Remember first arrival through retries, never recapturing later reads on
+  // replay. Decode compacts settled overlaps; a committed ingest retires them.
+  const peerObservations = new Map<string, PeerObservation>();
+  type PeerGeneration = {
+    version: Pick<RelayEvent, "id" | "created_at">;
+    order: number;
+    override: Override;
+    reads: Set<AutomaticReadAttempt>;
+    promoted: number;
+  };
+  const peerGenerations = new Map<
+    string,
+    Map<string, Map<number, PeerGeneration>>
+  >();
+  let arrivalOrder = 0;
   let epoch = 0;
   let requested = false;
   /** The completeness the last drop interrupted, while nothing since has
@@ -297,6 +326,20 @@ export function createReadState({
   const ready = queue(async () => {
     try {
       await save((current) => current, false);
+      // Recovered arrivals precede every read handle created by this owner.
+      for (const item of journal?.peerOverlaps ?? []) {
+        const keys = peerGenerations.get(item.coordinate) ?? new Map();
+        const generations = keys.get(item.key) ?? new Map();
+        generations.set(item.set, {
+          version: item.version,
+          order: 0,
+          override: { set: item.set, clear: 0, baseline: item.baseline },
+          reads: new Set(),
+          promoted: item.baseline,
+        });
+        keys.set(item.key, generations);
+        peerGenerations.set(item.coordinate, keys);
+      }
       if (!closed)
         health({
           status:
@@ -384,39 +427,284 @@ export function createReadState({
     generation = epoch,
   ) {
     const decoded = await decode(events, signal);
+    const coordinates = new Set(
+      decoded.map(({ event }) => readCoordinate(event)),
+    );
+    const superseded = new Map<string, string>();
+    // Decode original arrivals too: a newer envelope can carry the same set
+    // generation, but must not replace its first overlap with later reads.
+    for (const observation of peerObservations.values()) {
+      const coordinate = readCoordinate(observation.event);
+      if (!coordinate || !coordinates.has(coordinate)) continue;
+      let parsed = decoded.find(
+        ({ event }) => event.id === observation.event.id,
+      )?.parsed;
+      if (!parsed) {
+        try {
+          parsed = (await decode([observation.event], signal))[0]?.parsed;
+        } catch (error) {
+          signal.throwIfAborted();
+          if (closed || generation !== epoch) throw error;
+          const replacement = decoded.find(
+            ({ event }) => readCoordinate(event) === coordinate,
+          )?.event;
+          if (
+            !replacement ||
+            replacement.id === observation.event.id ||
+            newer(observation.event, replacement).id !== replacement.id
+          )
+            throw error;
+          // An obsolete unreadable envelope cannot poison its valid successor.
+          // Keep it retryable until that successor's storage transaction commits.
+          superseded.set(observation.event.id, coordinate);
+          continue;
+        }
+      }
+      if (!parsed) throw new Error("Read-state decode identity missing");
+      if (parsed.clientId !== journal?.clientId) {
+        const keys = peerGenerations.get(coordinate) ?? new Map();
+        for (const [key, override] of Object.entries(parsed.state.overrides)) {
+          const generations = keys.get(key) ?? new Map();
+          const previous = generations.get(override.set);
+          const version = newer(previous?.version, {
+            id: observation.event.id,
+            created_at: observation.event.created_at,
+          });
+          if (!previous || observation.order < previous.order)
+            generations.set(override.set, {
+              version,
+              order: observation.order,
+              override,
+              reads: observation.reads.get(key) ?? new Set(),
+              promoted: override.baseline,
+            });
+          else previous.version = version;
+          keys.set(key, generations);
+        }
+        if (keys.size) peerGenerations.set(coordinate, keys);
+      }
+      // The correlation now lives in exact generations, not encrypted revisions.
+      peerObservations.delete(observation.event.id);
+    }
+    const overlaps = [...peerGenerations].flatMap(([coordinate, keys]) =>
+      coordinates.has(coordinate)
+        ? [...keys].flatMap(([key, generations]) =>
+            [...generations.values()].map((value) => ({
+              coordinate,
+              key,
+              value,
+            })),
+          )
+        : [],
+    );
+    const rememberEarlier = () => {
+      const reads = new Map(
+        [...pendingAutomaticReads].map(([key, values]) => [
+          key,
+          new Set(values),
+        ]),
+      );
+      for (const observation of peerObservations.values())
+        for (const [key, values] of observation.reads) {
+          const pending = reads.get(key) ?? new Set();
+          for (const read of values) pending.add(read);
+          reads.set(key, pending);
+        }
+      for (const { key, value } of overlaps) {
+        const pending = reads.get(key) ?? new Set();
+        for (const read of value.reads) pending.add(read);
+        reads.set(key, pending);
+      }
+      for (const { key, value } of overlaps)
+        for (const read of reads.get(key) ?? [])
+          if (read.order > value.order)
+            read.seenSet = Math.max(read.seenSet, value.override.set);
+    };
+    rememberEarlier();
+    for (const { coordinate, value } of overlaps) {
+      // Snapshot successors advance recovery fences too, without changing the
+      // generation's first-arrival correlation with automatic reads.
+      const observed = decoded.find(
+        ({ event }) => readCoordinate(event) === coordinate,
+      )?.event;
+      if (observed)
+        value.version = newer(value.version, {
+          id: observed.id,
+          created_at: observed.created_at,
+        });
+      const override = value.override;
+      for (const read of value.reads) {
+        if (read.status === "pending") continue;
+        value.reads.delete(read);
+        const { before, after } = read;
+        if (
+          override.set > override.clear &&
+          read.status === "saved" &&
+          before !== undefined &&
+          after !== undefined &&
+          after > before &&
+          override.set > read.seenSet &&
+          override.baseline >= before
+        )
+          value.promoted = Math.max(value.promoted, after);
+      }
+    }
     if (closed || generation !== epoch)
       throw new DOMException("Read-state observation cancelled", "AbortError");
+    // A later queued revision must not checkpoint ahead of this batch's merge.
+    const recovery = overlaps.filter(
+      ({ coordinate, key, value }) =>
+        key.startsWith("msg:") &&
+        !value.reads.size &&
+        decoded.some(
+          ({ event }) =>
+            readCoordinate(event) === coordinate &&
+            newer(value.version, event).id === event.id,
+        ),
+    );
+    const overlapId = (coordinate: string, key: string, set: number) =>
+      JSON.stringify([coordinate, key, set]);
+    if (recovery.length) {
+      // A separate committed checkpoint survives a failed/cancelled merge. Until
+      // this write succeeds, the accepted overlap is only in-memory evidence.
+      await save((current) => {
+        signal.throwIfAborted();
+        if (closed || generation !== epoch)
+          throw new DOMException(
+            "Read-state observation cancelled",
+            "AbortError",
+          );
+        const pending = new Map(
+          (current.peerOverlaps ?? []).map((item) => [
+            overlapId(item.coordinate, item.key, item.set),
+            item,
+          ]),
+        );
+        for (const { coordinate, key, value } of recovery) {
+          const id = overlapId(coordinate, key, value.override.set);
+          const previous = pending.get(id);
+          pending.set(id, {
+            coordinate,
+            key,
+            set: value.override.set,
+            baseline: Math.max(previous?.baseline ?? 0, value.promoted),
+            version: newer(previous?.version, value.version),
+          });
+        }
+        return { ...current, peerOverlaps: [...pending.values()] };
+      });
+    }
+    signal.throwIfAborted();
+    let committed: typeof decoded = [];
     // Merge locally before admitting slot versions. Failed storage must remain retryable.
     await save((current) => {
+      signal.throwIfAborted();
       if (closed || generation !== epoch)
         throw new DOMException(
           "Read-state observation cancelled",
           "AbortError",
         );
+      // A sibling's newer checkpoint supersedes this revision without making
+      // observation fail. Only committed envelopes may retire its recovery fence.
+      committed = decoded.filter(
+        ({ event }) =>
+          !current.peerOverlaps?.some(
+            (item) =>
+              item.coordinate === readCoordinate(event) &&
+              newer(event, item.version).id !== event.id,
+          ),
+      );
       // Our own slots can hold values this journal lacks (a restored or
       // cloned profile): recover them, or the next blob would drop them.
       const owned = [current.slot, ...(current.spill ?? [])].map(
         (slot) => `read-state:${slot}`,
       );
       let own = current.own;
-      for (const { event, parsed } of decoded)
+      for (const { event, parsed } of committed)
         if (
           parsed.clientId === current.clientId &&
           owned.includes(readCoordinate(event) ?? "")
         )
           own = advanceOwn(own, parsed.state.frontiers);
+      const recovered = new Map(
+        (current.peerOverlaps ?? []).map((item) => [
+          overlapId(item.coordinate, item.key, item.set),
+          item,
+        ]),
+      );
+      const incoming = committed.map(({ event, parsed }) => {
+        if (parsed.clientId === current.clientId) return parsed.state;
+        const overrides = { ...parsed.state.overrides };
+        let changed = false;
+        // A peer unread accepted during an automatic read wins locally without
+        // changing the signed event or overtaking a newer local frontier.
+        for (const [key, override] of Object.entries(overrides)) {
+          const existing = current.state.overrides[key];
+          if (
+            override.set <= Math.max(override.clear, existing?.clear ?? 0) ||
+            override.set < (existing?.set ?? 0)
+          )
+            continue;
+          const preserved = peerGenerations
+            .get(readCoordinate(event) ?? "")
+            ?.get(key)
+            ?.get(override.set);
+          const afterRead = Math.max(
+            override.baseline,
+            preserved?.promoted ?? 0,
+            recovered.get(
+              overlapId(readCoordinate(event) ?? "", key, override.set),
+            )?.baseline ?? 0,
+          );
+          if (afterRead > override.baseline) {
+            overrides[key] = { ...override, baseline: afterRead };
+            changed = true;
+          }
+        }
+        return changed
+          ? { ...parsed.state, overrides: Object.freeze(overrides) }
+          : parsed.state;
+      });
       return {
         ...current,
         ...retainMarks(
           current,
-          [current.state, ...decoded.map(({ parsed }) => parsed.state)],
+          [current.state, ...incoming],
           current.recent ?? {},
         ),
         ...(own && { own }),
+        peerOverlaps: (current.peerOverlaps ?? []).filter((item) => {
+          const observed = committed.find(
+            ({ event }) => readCoordinate(event) === item.coordinate,
+          )?.event;
+          return !observed || newer(item.version, observed).id !== observed.id;
+        }),
       };
     });
+    for (const [id, coordinate] of superseded)
+      if (committed.some(({ event }) => readCoordinate(event) === coordinate))
+        peerObservations.delete(id);
+    // Reads can start while storage is saving. Fence their later envelopes
+    // before retiring the earlier generation after its committed ingest.
+    rememberEarlier();
+    for (const { coordinate, key, value } of overlaps) {
+      const incoming = committed.find(
+        ({ event }) => readCoordinate(event) === coordinate,
+      )?.event;
+      if (
+        value.reads.size ||
+        !incoming ||
+        newer(value.version, incoming).id !== incoming.id
+      )
+        continue;
+      const keys = peerGenerations.get(coordinate);
+      const generations = keys?.get(key);
+      generations?.delete(value.override.set);
+      if (!generations?.size) keys?.delete(key);
+      if (!keys?.size) peerGenerations.delete(coordinate);
+    }
     if (closed || generation !== epoch) return;
-    for (const item of decoded) {
+    for (const item of committed) {
       const coordinate = readCoordinate(item.event);
       if (!coordinate) throw new Error("Read-state coordinate missing");
       const old = slots.get(coordinate);
@@ -528,14 +816,57 @@ export function createReadState({
     unread: boolean | undefined,
     valid: Validity,
     clearLocalKeys: readonly string[] = [key],
+    observedFrontier?: (state: ReadState) => number | undefined,
   ): Promise<ReadMutationResult> {
-    return queue(async () => {
+    const automatic =
+      key.startsWith("msg:") && timestamp !== undefined && unread === undefined;
+    // Convergence and client rotation can carry observed registers across
+    // coordinates, so read-start fences join set counters from every peer.
+    const automaticRead: AutomaticReadAttempt | undefined = automatic
+      ? {
+          status: "pending",
+          order: ++arrivalOrder,
+          seenSet: (journal?.peerOverlaps ?? []).reduce(
+            (seen, item) =>
+              item.key === key ? Math.max(seen, item.set) : seen,
+            state.overrides[key]?.set ?? 0,
+          ),
+        }
+      : undefined;
+    if (automaticRead) {
+      const reads = pendingAutomaticReads.get(key) ?? new Set();
+      reads.add(automaticRead);
+      pendingAutomaticReads.set(key, reads);
+    }
+    // Reserve before the owner queue can suspend. A late reload cannot tell
+    // an already-ingested generation from one arriving during this read.
+    const captured = automaticRead
+      ? new Promise<ReadJournal | undefined>((resolve) =>
+          resolve(storage.capture()),
+        ).then(
+          (current) => ({ current }),
+          (error: unknown) => ({ error }),
+        )
+      : undefined;
+    const result = queue<ReadMutationResult>(async () => {
       await ready;
       if (!journal)
         throw new Error("Saved read state unavailable; retry storage first");
       if (timestamp !== undefined && capability !== "frontier-sync")
         throw new Error("Read-state sync unsupported by this host");
       try {
+        if (automaticRead && captured) {
+          const start = await captured;
+          if ("error" in start) throw start.error;
+          automaticRead.seenSet = (start.current?.peerOverlaps ?? []).reduce(
+            (seen, item) =>
+              item.key === key ? Math.max(seen, item.set) : seen,
+            Math.max(
+              automaticRead.seenSet,
+              start.current?.state.overrides[key]?.set ?? 0,
+            ),
+          );
+        }
         const saved = await save((current) => {
           if (!valid(current)) throw new ObservationExpired();
           if (
@@ -548,6 +879,12 @@ export function createReadState({
             timestamp === undefined
               ? (current.recent ?? {})
               : { ...current.recent, [key]: revision };
+          const before =
+            automaticRead === undefined
+              ? undefined
+              : ((observedFrontier
+                  ? observedFrontier(localState(current))
+                  : localState(current).frontiers[key]) ?? 0);
           const kept =
             timestamp === undefined
               ? {
@@ -570,6 +907,57 @@ export function createReadState({
           if (unread === false)
             for (const clearKey of clearLocalKeys) delete localUnread[clearKey];
           if (unread === true) localUnread[key] = revision;
+          const own = advanceOwn(
+            current.own,
+            timestamp === undefined ? {} : { [key]: timestamp },
+          );
+          let peerOverlaps = current.peerOverlaps;
+          if (automaticRead && before !== undefined) {
+            automaticRead.before = before;
+            const after = localState({
+              ...current,
+              state: kept.state,
+              reserve: kept.reserve,
+              own,
+            });
+            automaticRead.after =
+              (observedFrontier
+                ? observedFrontier(after)
+                : after.frontiers[key]) ?? before;
+            // Refresh and sibling-only ingestion need no live accept() here.
+            // Settle their post-capture generations in this same read commit.
+            const override = kept.state.overrides[key];
+            if (
+              override &&
+              override.set > Math.max(override.clear, automaticRead.seenSet) &&
+              override.baseline >= before &&
+              automaticRead.after > before
+            )
+              kept.state = {
+                ...kept.state,
+                overrides: {
+                  ...kept.state.overrides,
+                  [key]: {
+                    ...override,
+                    baseline: Math.max(override.baseline, automaticRead.after),
+                  },
+                },
+              };
+            // A sibling may have checkpointed the arrival but not ingested it.
+            // Preserve that same recovery point without recapturing older sets.
+            if (automaticRead.after > before) {
+              const after = automaticRead.after;
+              peerOverlaps = peerOverlaps?.map((item) =>
+                item.key === key &&
+                item.set >
+                  Math.max(automaticRead.seenSet, override?.clear ?? 0) &&
+                item.set >= (override?.set ?? 0) &&
+                item.baseline >= before
+                  ? { ...item, baseline: Math.max(item.baseline, after) }
+                  : item,
+              );
+            }
+          }
           return {
             ...current,
             revision,
@@ -578,11 +966,9 @@ export function createReadState({
             reserve: kept.reserve,
             homes: kept.homes,
             floor: kept.floor,
-            own: advanceOwn(
-              current.own,
-              timestamp === undefined ? {} : { [key]: timestamp },
-            ),
+            own,
             localUnread,
+            ...(peerOverlaps && { peerOverlaps }),
             acceptedRevision:
               timestamp === undefined &&
               current.acceptedRevision === current.revision
@@ -590,6 +976,7 @@ export function createReadState({
                 : current.acceptedRevision,
           };
         });
+        if (automaticRead) automaticRead.status = "saved";
         health({
           status: capability === "frontier-sync" ? "pending" : "local",
           error: undefined,
@@ -604,10 +991,18 @@ export function createReadState({
               : "local-only",
         };
       } catch (error) {
+        if (automaticRead) automaticRead.status = "failed";
         if (!(error instanceof ObservationExpired))
           health({ status: "error", error: errorText(error) });
         throw error;
       }
+    });
+    if (!automatic) return result;
+    return result.finally(() => {
+      if (automaticRead?.status === "pending") automaticRead.status = "failed";
+      const reads = pendingAutomaticReads.get(key);
+      reads?.delete(automaticRead as AutomaticReadAttempt);
+      if (!reads?.size) pendingAutomaticReads.delete(key);
     });
   }
   async function flush() {
@@ -927,6 +1322,8 @@ export function createReadState({
       valid: Validity,
       explicit = false,
       clearLocalKeys?: readonly string[],
+      /** Verified observation ancestry, evaluated only inside the fenced transaction. */
+      observedFrontier?: (state: ReadState) => number | undefined,
     ) =>
       mutate(
         key,
@@ -934,6 +1331,7 @@ export function createReadState({
         explicit ? false : undefined,
         valid,
         clearLocalKeys,
+        observedFrontier,
       ),
     clearLocalUnread: (key: string, keys: readonly string[], valid: Validity) =>
       mutate(key, undefined, false, valid, keys),
@@ -1055,6 +1453,27 @@ export function createReadState({
         lifetime.signal,
         AbortSignal.timeout(10000),
       ]);
+      for (const event of events) {
+        const coordinate = readCoordinate(event);
+        const known = coordinate ? slots.get(coordinate)?.event : undefined;
+        if (
+          !coordinate ||
+          event.pubkey !== viewer ||
+          peerObservations.has(event.id) ||
+          (known && newer(known, event).id === known.id)
+        )
+          continue;
+        peerObservations.set(event.id, {
+          event,
+          order: ++arrivalOrder,
+          reads: new Map(
+            [...pendingAutomaticReads].map(([key, reads]) => [
+              key,
+              new Set(reads),
+            ]),
+          ),
+        });
+      }
       void queue(async () => {
         try {
           await ingest(events, signal, generation);
@@ -1119,6 +1538,9 @@ export function createReadState({
       if (timer) clearTimeout(timer);
       listeners.clear();
       slots.clear();
+      peerObservations.clear();
+      peerGenerations.clear();
+      pendingAutomaticReads.clear();
       broadcast?.close();
       storage.close();
     },

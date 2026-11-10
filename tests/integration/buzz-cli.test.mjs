@@ -76,7 +76,7 @@ test("desktop builds stage buzz after the other helpers", () => {
 });
 
 test("every release job checks that its packaged buzz exists and runs", () => {
-  const release = read(".github/workflows/release.yml");
+  const release = read(".github/workflows/desktop-build.yml");
   for (const check of [
     'cli="$app/Contents/Resources/bin/buzz"',
     '"$cli" --help',

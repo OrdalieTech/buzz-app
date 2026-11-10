@@ -19,6 +19,7 @@ import { npubEncode } from "nostr-tools/nip19";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, afterEach, expect, it, vi } from "vitest";
 import { useEffect } from "react";
+import { formatPublicKey } from "../../shared/identity/public-key";
 import type { LiveCallbacks } from "../../features/relay/live";
 import { createRelaySession } from "../../features/relay/session";
 import type { VerifiedProfileAuthority } from "../../features/relay/verified-profile";
@@ -3897,6 +3898,27 @@ it("keeps the visible member page and focus stable while names arrive", async ()
   } finally {
     await act(async () => release());
   }
+});
+
+it("re-sorts members by name when their names arrive", async () => {
+  // Named against their key order, so the rows must change once names load.
+  const keys = [keypair(), keypair(), keypair()].sort((a, b) =>
+    (formatPublicKey(b.pubkey) ?? "").localeCompare(
+      formatPublicKey(a.pubkey) ?? "",
+    ),
+  );
+  await setup("stream", false, false, undefined, undefined, {
+    memberProfiles: keys.map((key, i) =>
+      profile(key, { name: ["Amy", "Kim", "Zed"][i] }),
+    ),
+  });
+  await vi.waitFor(() =>
+    expect(
+      within(memberData())
+        .getAllByText(/^(Amy|Kim|Zed)$/)
+        .map((name) => name.textContent),
+    ).toEqual(["Amy", "Kim", "Zed"]),
+  );
 });
 
 const retainedMemberProfiles = Array.from({ length: 1100 }, (_, i) =>

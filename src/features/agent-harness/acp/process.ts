@@ -1,3 +1,4 @@
+import { writeJSON } from "../../agent-protection/json-stream";
 // One ACP harness process, driven over line-delimited JSON-RPC. Each
 // conversation is one ACP session in it. Each session gets its own loopback
 // HTTP MCP server for its agent's Buzz tools, which the app serves and
@@ -444,7 +445,7 @@ export class AcpProcess {
   }
 
   private write(message: Wire) {
-    return this.process.write(`${JSON.stringify(message)}\n`);
+    return writeJSON(this.process, message);
   }
   private readError(data: string) {
     this.stderr = (this.stderr + data).slice(-STDERR_LIMIT);

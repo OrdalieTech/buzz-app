@@ -1078,14 +1078,12 @@ it("replaces generic installation copy with the latest installer state", async (
   const installedType = installed({ available: false }).type;
   const Setup = providerSetup(installedType);
   render(<Setup onClose={vi.fn()} />);
-  await waitFor(() =>
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Claude is not installed.",
-    ),
+  expect(await screen.findByRole("status")).toHaveTextContent(
+    "The Claude integration isn't installed yet.",
   );
   await userEvent
     .setup()
-    .click(screen.getByRole("button", { name: "Install Claude" }));
+    .click(screen.getByRole("button", { name: "Install integration" }));
   await waitFor(() =>
     expect(screen.getByRole("status")).toHaveTextContent(
       "Setting up Claude Code...",
@@ -1104,6 +1102,61 @@ it("opens its dialog for a missing key rather than running a step", async () => 
     }),
   );
   expect(type.provider?.attentionAction).toBeUndefined();
+});
+
+it("leaves a missing copy to the provider dialog", async () => {
+  // Without an attention action, Settings' Harness defaults row opens
+  // DialogBody, so the status line and download note precede the download.
+  const { type } = installed({ available: false });
+  await waitFor(() =>
+    expect(type.provider?.snapshot()).toMatchObject({
+      readiness: "attention",
+      attentionLabel: "Install Claude integration",
+    }),
+  );
+  expect(type.provider?.attentionAction).toBeUndefined();
+});
+
+it("updates an outdated copy from the Settings row directly", async () => {
+  // Startup's own update leaves a copy below Buzz's minimum outdated when
+  // no newer release is published, so the row offers the update again.
+  const { type } = installed({ version: "2.1.168" });
+  await waitFor(() =>
+    expect(type.provider?.snapshot()).toEqual({
+      readiness: "attention",
+      attentionLabel: "Update Claude Code",
+    }),
+  );
+  const action = type.provider?.attentionAction;
+  if (!action) throw new Error("Missing attention action");
+  action();
+  // The update runs at once; while it does, the row has nothing to start.
+  expect(type.provider?.snapshot()).toHaveProperty("blocking", true);
+  expect(type.provider?.attentionAction).toBeUndefined();
+  await waitFor(() =>
+    expect(type.provider?.snapshot()).not.toHaveProperty("blocking"),
+  );
+});
+
+it("signs in from the Settings row directly when the build has a sign-in", async () => {
+  interactive.signIn = true;
+  try {
+    const { type } = installed({ keySaved: false });
+    await waitFor(() =>
+      expect(type.provider?.snapshot()).toMatchObject({
+        readiness: "attention",
+        attentionLabel: "Add Claude API key",
+      }),
+    );
+    const action = type.provider?.attentionAction;
+    if (!action) throw new Error("Missing attention action");
+    action();
+    await waitFor(() =>
+      expect(type.provider?.snapshot()).toHaveProperty("readiness", "ready"),
+    );
+  } finally {
+    interactive.signIn = false;
+  }
 });
 
 it("saves settings as one config", async () => {
@@ -2096,7 +2149,11 @@ it("separates identity fields from runtime settings without changing the stored 
 });
 
 it.each([
-  { available: false, action: "Install Claude", title: "Set up Claude" },
+  {
+    available: false,
+    action: "Install integration",
+    title: "Claude integration",
+  },
 ])(
   "keeps failed Claude $action output in its open dialog",
   async ({ available, action, title }) => {

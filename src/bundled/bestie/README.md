@@ -23,11 +23,15 @@ inventory do not keep a pinned conversation.
 The page uses the ordinary conversation owners for history, drafts, sending,
 threads and unread state. Its conversation workspace reuses Messages’ tab state
 and tab host, with a retained main timeline/composer and a resizable side pane.
+The header also uses the DM’s shared plugin launchers and actions menu, including
+Huddle when available, channel details, and eligible plugin menu items.
 Threads follow the device’s thread placement preference and support the same
 move, rename, close and pane-collapse controls. Profile and plugin links open
 in the tab workspace. Thread visits bind to their originating DM. Restoring
 one after the Bestie or canonical DM changes retires incompatible thread visits
 and shows the current Bestie's chat; it never reads an old thread in the new DM.
+⌘F on the page searches this DM, and Search Buzz offers **Search conversation
+with** the Bestie, as they do in any other conversation.
 While that exact DM is promoted, Messages omits its
 ordinary row and clears any old device-local hidden-DM intent. Replacing or
 deleting the Bestie, disabling the plugin, changing communities, or losing the

@@ -24,12 +24,17 @@ globe in Personal space or with no community saved. Its tooltip names the
 selected community, or reads **Personal space**, or **Communities** when none is
 saved. There is no destination dropdown. Accepts `wss://` or `https://` origins, for example
 `wss://relay.example.com` or `wss://other.example.com`, and other
-Buzz-compatible community relays. No community is pre-joined; a packaged build
-that sets [`BUZZ_DEFAULT_COMMUNITY_URL`](configuration.md) only preselects one.
+Buzz-compatible community relays; a bare host such as `relay.example.com` is
+read as `wss://`. The relay's invite link, `https://<host>/invite/<code>`, is
+looked up at its origin and its code fills **Invite code**. An invite code
+pasted without its link is refused inline with a request for the whole link; it
+is never looked up as a host. The no-community landing reads its field the same
+way. No community is pre-joined; a packaged build that sets
+[`BUZZ_DEFAULT_COMMUNITY_URL`](configuration.md) only preselects one.
 
 Surrounding whitespace, host case, a final DNS dot, default port 443 and a single
 root slash normalize to the same HTTPS origin. Non-default ports are preserved.
-Credentials, insecure schemes, non-root paths, query and fragment are rejected,
+Credentials, insecure schemes, other paths, query and fragment are rejected,
 not silently stripped. Continue starts discovery and authenticated profile reads;
 typing does not contact a relay. The canonical origin stays visible before policy
 acceptance or profile publication. Failed setup keeps the typed input and current
@@ -121,7 +126,9 @@ with the role read from the relay-signed roster through the selected
 community's existing session rather than a further session request. The
 Membership settings card applies the same role gate in both development and
 native builds. Owners and admins in both builds read the relay-signed member
-list, mint invite links, add members directly and change or remove members. Each
+list, mint invite links, add members directly and change or remove members.
+Native builds also show the minted invite link as a dark QR code, drawn by the
+host's `qr_code` renderer that pairing uses; a new link never shows the previous code. Each
 change is one NIP-43 command (kind 9030 add, 9031 remove, 9032 role) signed by
 the viewer: the broker signs it in development, and the native host signs only
 that exact shape and posts it to the relay's `/events`. The relay alone decides

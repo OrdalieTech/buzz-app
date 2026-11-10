@@ -188,6 +188,10 @@ export class ClaudeAuth {
   }
 }
 
+/** Whether a turn's error is Buzz's own refusal to start Claude without a
+ * key, rather than anything Claude said. */
+export const refusedByBuzz = (error: string) => error.includes(NO_KEY);
+
 /** Whether Claude's error says Anthropic refused the key; turns end with
  * "Invalid API key · Fix external API key". */
 const rejected = (error: string) =>

@@ -2,6 +2,7 @@
 // answered here or by the key Worker. Every other command is refused, and
 // unsupported.ts lists the ones the native host registers today.
 
+import { encode } from "uqr";
 import { uploadCommands } from "./uploads.ts";
 
 // biome-ignore lint/suspicious/noExplicitAny: native IPC arguments are untyped JSON.
@@ -156,5 +157,21 @@ export const commands: Record<string, Handler> = {
   // "public" makes relay/native-socket.ts open a browser WebSocket.
   relay_socket_connect: () => "public",
   relay_socket_close: () => undefined,
+  /** Native `qr_code` (src-tauri/src/qr.rs): the invite QR, same size and
+   * colours, in plain modules. */
+  qr_code({ value, variant }) {
+    if (typeof value !== "string" || !value || value.length > 4096)
+      throw "Couldn’t create the QR code.";
+    const { data, size } = encode(value, { ecc: "M", border: 0 });
+    const [bg, fg] =
+      variant === "dark" ? ["black", "white"] : ["white", "black"];
+    const box = size + 8;
+    const path = data
+      .flatMap((row, y) =>
+        row.flatMap((on, x) => (on ? `M${x} ${y}h1v1h-1z` : [])),
+      )
+      .join("");
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="-4 -4 ${box} ${box}"><rect x="-4" y="-4" width="${box}" height="${box}" fill="${bg}"/><path fill="${fg}" d="${path}"/></svg>`;
+  },
   ...uploadCommands(key),
 };

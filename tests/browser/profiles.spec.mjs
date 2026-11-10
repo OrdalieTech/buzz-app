@@ -1,5 +1,6 @@
 import { test, expect } from "./source-fixture.mjs";
 import { watchPageErrors } from "./page-errors.mjs";
+import { animationsSettled } from "./animations.mjs";
 
 // Real Members -> Profiles wiring must retain a visible distinction after the
 // browser collapses trailing whitespace, without changing the clicked key.
@@ -968,17 +969,7 @@ test("member rows hand off to Profiles without trapping or losing keyboard focus
       await page.setViewportSize({ width, height: 320 });
       await expect(surface).toBeInViewport({ ratio: 1 });
       // Measure the settled layout, not the open or resize transition.
-      await dialog.evaluate(async (element) => {
-        await Promise.all(
-          element
-            .getAnimations({ subtree: true })
-            .filter(
-              (animation) =>
-                animation.effect?.getComputedTiming().iterations !== Infinity,
-            )
-            .map((animation) => animation.finished),
-        );
-      });
+      await animationsSettled(dialog, { subtree: true });
       await expect(surface).toHaveCSS(
         "background-color",
         mode === "light" ? "rgb(255, 255, 255)" : "rgb(40, 40, 40)",
@@ -1199,17 +1190,7 @@ test("member rows hand off to Profiles without trapping or losing keyboard focus
   await search.focus();
   await search.hover();
   await expect(actionSlot).toHaveCSS("opacity", "1");
-  await dialog.evaluate(async (element) => {
-    await Promise.all(
-      element
-        .getAnimations({ subtree: true })
-        .filter(
-          (animation) =>
-            animation.effect?.getComputedTiming().iterations !== Infinity,
-        )
-        .map((animation) => animation.finished),
-    );
-  });
+  await animationsSettled(dialog, { subtree: true });
   const restingBounds = await row.boundingBox();
   await memberRow.hover();
   await expect(actionSlot).toHaveCSS("opacity", "1");

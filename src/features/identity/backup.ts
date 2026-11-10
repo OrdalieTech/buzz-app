@@ -26,8 +26,19 @@ export function handoffFederatedBackupSession(
 
 /** What the native uploader last did for this device's key. `seq` orders
  * statuses; a pass numbered at or above a handoff's ticket started after it. */
+export type IdentityManagement = Readonly<{
+  pubkey: string;
+  policy: "self-managed" | "organization-managed";
+  initialBackupConfirmed: boolean;
+}>;
+
 export type BackupStatus = Readonly<
-  { seq: number; pass: number; builderlab: boolean } & (
+  {
+    seq: number;
+    pass: number;
+    builderlab: boolean;
+    management?: IdentityManagement;
+  } & (
     | { status: "idle" | "running" | "complete" }
     | { status: "waiting"; reason: "no_consent" | "no_session" | "not_linked" }
     | {
@@ -79,6 +90,12 @@ export function createBackupStatus(send: Send = invoke) {
   return {
     snapshot: () => status,
     ready,
+    retry: () => send("nsec_backup_retry"),
+    async refresh() {
+      await ready();
+      accept(await send<BackupStatus>("nsec_backup_state"));
+      return status as BackupStatus;
+    },
     subscribe(listener: () => void) {
       listeners.add(listener);
       void ready().catch(() => {});

@@ -241,6 +241,7 @@ async function fixture(
       outboxStorage,
       readPublisherLock: async (_signal, work) => work(),
       readStateStorage: {
+        capture: async () => structuredClone(journal),
         close() {},
         async update(change) {
           journal = readJournal(change(journal), viewer.pubkey);

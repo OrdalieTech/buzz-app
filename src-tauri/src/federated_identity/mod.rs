@@ -1427,6 +1427,19 @@ pub(crate) async fn federated_identity_servers(
     }
     Ok(snapshots)
 }
+/// Whether a community requires NIP-FI, from the `/info` discovery its
+/// server shares with admission. A community that doesn't is reached with the
+/// key alone, whatever that server's session does.
+#[tauri::command]
+pub(crate) async fn federated_identity_requires(
+    host: tauri::State<'_, FederatedIdentity>,
+    relay: String,
+) -> Result<bool, String> {
+    let relay = config::canonical_relay(&relay)?;
+    host.server_for(&relay)?
+        .requires_federated_identity(&relay)
+        .await
+}
 #[tauri::command]
 pub(crate) async fn federated_identity_sign_in<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,

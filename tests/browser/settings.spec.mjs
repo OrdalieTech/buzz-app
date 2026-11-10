@@ -557,7 +557,7 @@ confirmedPresence(
       for (const name of [
         "Local settings",
         "Custom emoji",
-        "Pair mobile",
+        "Mobile app",
         "Leave or remove",
         "Identity",
         "Appearance",
@@ -629,7 +629,7 @@ confirmedPresence(
       for (const name of [
         "Local settings",
         "Custom emoji",
-        "Pair mobile",
+        "Mobile app",
         "Leave or remove",
         "Identity",
         "Appearance",
@@ -746,6 +746,7 @@ fiBuild(
     await button(page, "Your profile").click();
     await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
     await button(page, "Builderlab").click();
+    await button(page, "Open Communities").click();
     await expect(
       page.getByText("Deletion status is unknown", { exact: true }),
     ).toBeVisible();
@@ -765,6 +766,7 @@ fiBuild(
     await page.reload();
     await expect(settingsDialog(page)).toBeVisible();
     await button(page, "Builderlab").click();
+    await button(page, "Open Communities").click();
     await expect(button(page, "Check deletion status")).toBeEnabled();
     await button(page, "Check deletion status").click();
     await expect(
@@ -829,7 +831,10 @@ fiBuild(
     await button(page, "Your profile").click();
     await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
     await button(page, "Builderlab").click();
-    await button(page, "Delete").click();
+    await button(page, "Open Communities").click();
+    await page.getByRole("tab", { name: "Archived", exact: true }).click();
+    await button(page, "More actions for north").click();
+    await page.getByRole("menuitem", { name: "Delete", exact: true }).click();
     const dialog = page.getByRole("dialog", {
       name: /Permanently delete north/,
     });

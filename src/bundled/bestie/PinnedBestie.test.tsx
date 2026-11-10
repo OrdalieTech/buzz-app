@@ -3,6 +3,7 @@ import "@testing-library/jest-dom/vitest";
 import { afterEach, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { RegisteredPanel } from "../../features/panels/service";
 import type { ReactNode } from "react";
 import { composerDOMFixture } from "../../features/messages/composer-testing";
 import { createAgentChoices } from "../../features/agents/choices";
@@ -281,12 +282,18 @@ async function fixture({
   );
   disposals.push(controller.dispose);
   const navigator = controller.navigation;
+  let panels: readonly RegisteredPanel[] = [];
+  const panelListeners = new Set<() => void>();
   const host = {
     relay,
     panels: {
-      snapshot: () => empty,
-      subscribe: () => () => {},
-      resolve: () => undefined,
+      snapshot: () => panels,
+      subscribe: (listener: () => void) => {
+        panelListeners.add(listener);
+        return () => panelListeners.delete(listener);
+      },
+      resolve: (target: string) =>
+        panels.find((panel) => panel.matches(target)),
     },
     navigation: { open: vi.fn() },
   } as unknown as ConversationHostServices;
@@ -297,6 +304,10 @@ async function fixture({
     find: () => undefined,
   } as unknown as Agents;
   return {
+    setPanels(next: readonly RegisteredPanel[]) {
+      panels = next;
+      for (const listener of panelListeners) listener();
+    },
     viewer: viewer.pubkey,
     scope,
     session,
@@ -853,4 +864,109 @@ it("keeps the DM and draft mounted beside a thread and retains the reply draft w
   );
   expect(composer).toHaveTextContent("Main draft");
   expect(screen.queryByLabelText("Thread")).not.toBeInTheDocument();
+});
+
+it.each(["side", "bottom", "tab"] as const)(
+  "offers DM plugin controls and opens their %s content in Bestie",
+  async (placement) => {
+    const f = await fixture({ existing: true });
+    f.choose(pollen);
+    const user = userEvent.setup();
+    f.setPanels([
+      {
+        id: "test",
+        key: "test/control",
+        pluginId: "test",
+        revision: "1",
+        title: "Call control",
+        matches: (target) => target === "test:call",
+        channelPlacement: placement,
+        channelLauncher: ({ context, toggle, available }) => (
+          <button
+            type="button"
+            onClick={() => {
+              if (available()) toggle("test:call");
+            }}
+          >
+            Call {context.channelId}
+          </button>
+        ),
+        component: ({ close }) => (
+          <button type="button" onClick={close}>
+            Close call content
+          </button>
+        ),
+      } satisfies RegisteredPanel,
+    ]);
+    f.mount();
+    await user.click(
+      await screen.findByRole("button", { name: `Call ${pollenDM}` }),
+    );
+    expect(
+      await screen.findByRole("button", { name: "Close call content" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("textbox", { name: "Message Pollen" }),
+    ).toBeInTheDocument();
+    await act(async () => f.setPanels([]));
+    expect(
+      screen.queryByRole("button", { name: `Call ${pollenDM}` }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Close call content" }),
+    ).toBeNull();
+  },
+);
+
+it("offers the shared DM actions and channel details in Bestie", async () => {
+  const f = await fixture({ existing: true });
+  f.choose(pollen);
+  const user = userEvent.setup();
+  f.mount();
+  await user.click(
+    await screen.findByRole("button", { name: "Channel actions" }),
+  );
+  await user.click(
+    await screen.findByRole("menuitem", { name: "View channel details" }),
+  );
+  expect(
+    await screen.findByRole("tab", { name: "Channel settings" }),
+  ).toBeVisible();
+  expect(
+    screen.getByRole("textbox", { name: "Message Pollen" }),
+  ).toBeInTheDocument();
+});
+
+it("opens eligible plugin menu items in the Bestie workspace", async () => {
+  const f = await fixture({ existing: true });
+  f.choose(pollen);
+  const user = userEvent.setup();
+  f.setPanels([
+    {
+      id: "canvas",
+      key: "test/canvas",
+      pluginId: "test",
+      revision: "1",
+      title: "Canvas",
+      matches: () => false,
+      channelMenu: {
+        label: "View canvas",
+        eligible: (channel) => channel.id === pollenDM,
+      },
+      component: ({ channelContext }) => (
+        <p>Canvas for {channelContext?.channelId}</p>
+      ),
+    } satisfies RegisteredPanel,
+  ]);
+  f.mount();
+  await user.click(
+    await screen.findByRole("button", { name: "Channel actions" }),
+  );
+  await user.click(
+    await screen.findByRole("menuitem", { name: "View canvas" }),
+  );
+  expect(await screen.findByText(`Canvas for ${pollenDM}`)).toBeVisible();
+  expect(
+    screen.getByRole("textbox", { name: "Message Pollen" }),
+  ).toBeInTheDocument();
 });

@@ -7,6 +7,8 @@ import { repositoriesContext } from "../../features/communities/repositories";
 import { isTauri } from "@tauri-apps/api/core";
 import { pubkeyOf } from "../../features/agents/membership";
 import { ownerReads } from "../../features/agents/reads";
+import { withProviderWords } from "../../features/agents/failure-words";
+import { refusedByBuzz } from "./auth";
 import type { PluginModule } from "../../plugins/api";
 import { ClaudeLogoIcon } from "../../shared/design-system/icons";
 import { claudeRun, TYPE_ID } from "./run";
@@ -112,12 +114,17 @@ export const apply: PluginModule["apply"] = (ctx) => {
       section: "agents",
       provider: typeKey,
     });
-  // Failed turns' reports link to the same place.
-  runtime.explain = (error) =>
-    setup.auth.explainTurn(
+  // Failed turns' reports link to the same place, then quote Claude. Buzz's
+  // own refusal to start Claude isn't Claude's words, and the link says it.
+  runtime.explain = (error) => {
+    const explained = setup.auth.explainTurn(
       error,
       `buzz://settings?section=agents&provider=${encodeURIComponent(typeKey)}`,
     );
+    return explained === error || refusedByBuzz(error)
+      ? explained
+      : withProviderWords(explained, "Claude", error);
+  };
   const {
     Create,
     CreateAction,
@@ -205,11 +212,13 @@ export const apply: PluginModule["apply"] = (ctx) => {
       snapshot: setup.providerSnapshot,
       subscribe: setup.subscribe,
       check: () => setup.check(),
+      /** Settings' row updates or signs in with one click. A missing copy
+       * has no action: its row opens DialogBody, so the download note is
+       * seen before the download starts. */
       get attentionAction() {
         const state = setup.snapshot();
         if (state.running) return undefined;
-        return state.status?.state === "missing" ||
-          state.status?.state === "outdated"
+        return state.status?.state === "outdated"
           ? () => void setup.run("install")
           : state.status?.state === "signed-out" && setup.auth.signIn
             ? () => void setup.run("sign-in")

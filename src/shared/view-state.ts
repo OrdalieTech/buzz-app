@@ -88,7 +88,22 @@ export function replaceView(
 
 // Rich snapshots contain structure as well as text (up to 32,001 nodes).
 // Keep a receiver bound, not the old text-sized 128 KiB envelope cutoff.
-export const MAX_DRAFT_VIEW_LENGTH = 8 * 1024 * 1024;
+const MAX_DRAFT_VIEW_LENGTH = 8 * 1024 * 1024;
+
+/** A saved draft record as `listDraftViews` reads it: the parsed value,
+ * "oversized" past the receiver bound, or undefined when absent, empty or
+ * malformed. */
+export function parseDraftView(
+  raw: string | null | undefined,
+): { value: unknown } | "oversized" | undefined {
+  if (!raw) return undefined;
+  if (raw.length > MAX_DRAFT_VIEW_LENGTH) return "oversized";
+  try {
+    return { value: JSON.parse(raw) };
+  } catch {
+    return undefined;
+  }
+}
 
 /** Snapshot of a viewer's existing composer drafts, never other view coordinates. */
 export function listDraftViews(
@@ -122,20 +137,19 @@ export function listDraftViews(
         !draftCoordinates(pair[1])
       )
         continue;
-      const raw = localStorage.getItem(storageKey);
-      if (!raw) continue;
-      if (raw.length > MAX_DRAFT_VIEW_LENGTH) {
+      const draft = parseDraftView(localStorage.getItem(storageKey));
+      if (draft === "oversized") {
         unavailable++;
         continue;
       }
+      if (!draft) continue;
       try {
-        const value: unknown = JSON.parse(raw);
-        if (!meaningful(value, pair[1])) continue;
+        if (!meaningful(draft.value, pair[1])) continue;
         if (drafts.length === 500) {
           limited = true;
           break;
         }
-        drafts.push({ key: pair[1], value });
+        drafts.push({ key: pair[1], value: draft.value });
       } catch {
         /* Malformed old draft. */
       }

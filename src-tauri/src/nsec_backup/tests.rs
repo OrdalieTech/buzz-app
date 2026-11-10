@@ -1630,7 +1630,10 @@ async fn a_key_install_supersedes_a_pass_that_then_reports_nothing() {
     service.pause_upload.store(false, Ordering::SeqCst);
     service.release_upload.add_permits(2);
     finish_background(&host).await;
-    assert_eq!(statuses(&seen), ["1 running", "2 running", "2 complete"]);
+    assert_eq!(
+        statuses(&seen),
+        ["1 running", "1 idle", "2 running", "2 complete"]
+    );
 }
 
 #[tokio::test]
@@ -1979,6 +1982,7 @@ fn statuses_serialize_flat_and_report_whether_builderlab_backup_can_run() {
             seq: 7,
             pass: 3,
             builderlab: true,
+            management: None,
             progress,
         })
         .unwrap()
@@ -2058,4 +2062,121 @@ fn statuses_serialize_flat_and_report_whether_builderlab_backup_can_run() {
             "{service_url}"
         );
     }
+}
+
+#[tokio::test]
+async fn management_requires_a_scoped_confirmed_receipt_and_survives_session_loss() {
+    let service = Service::new().await;
+    let directory = tempfile::tempdir().unwrap();
+    let host = service.host(directory.path());
+    let identity = IdentityHost::fixture();
+    host.initialize_management(&identity).await.unwrap();
+    let initial = host.status().management.unwrap();
+    assert_eq!(initial.pubkey, pubkey([1; 32]));
+    assert_eq!(
+        initial.policy,
+        if managed_build() {
+            "organization-managed"
+        } else {
+            "self-managed"
+        }
+    );
+    assert!(!initial.initial_backup_confirmed);
+    assert_eq!(
+        serde_json::to_value(host.status()).unwrap()["management"],
+        serde_json::json!({"pubkey": initial.pubkey, "policy": initial.policy, "initialBackupConfirmed": false})
+    );
+    service.enable(&host).await;
+    service.state.lock().unwrap().receipt_stored = false;
+    host.state.lock().unwrap().session = Some(service.session());
+    host.trigger(identity.clone());
+    finish_background(&host).await;
+    assert!(!host.status().management.unwrap().initial_backup_confirmed);
+    service.state.lock().unwrap().receipt_stored = true;
+    host.trigger(identity.clone());
+    finish_background(&host).await;
+    assert!(host.status().management.unwrap().initial_backup_confirmed);
+    // A fresh process starts conservatively, then verifies the same scoped
+    // durable receipt without uploading another copy.
+    let restored = service.host(directory.path());
+    restored.initialize_management(&identity).await.unwrap();
+    assert!(
+        !restored
+            .status()
+            .management
+            .unwrap()
+            .initial_backup_confirmed
+    );
+    restored.state.lock().unwrap().session = Some(service.session());
+    let before = service.state.lock().unwrap().uploads.len();
+    restored.trigger(identity.clone());
+    finish_background(&restored).await;
+    assert!(
+        restored
+            .status()
+            .management
+            .unwrap()
+            .initial_backup_confirmed
+    );
+    assert_eq!(service.state.lock().unwrap().uploads.len(), before);
+    // Losing the last session keeps the confirmed backup presentation.
+    let login = NsecBackupHost {
+        config: production(),
+        ..restored.clone()
+    };
+    login.session(1, None, identity).unwrap();
+    assert!(
+        restored
+            .status()
+            .management
+            .unwrap()
+            .initial_backup_confirmed
+    );
+}
+
+#[tokio::test]
+async fn new_account_handoff_and_key_install_retire_protection_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let (fi, revision) = signed_in();
+    let host = NsecBackupHost {
+        federated: Some(fi),
+        state: Default::default(),
+        root: Some(directory.path().to_owned()),
+        config: production(),
+    };
+    let identity = IdentityHost::fixture();
+    host.initialize_management(&identity).await.unwrap();
+    host.state
+        .lock()
+        .unwrap()
+        .management
+        .as_mut()
+        .unwrap()
+        .initial_backup_confirmed = true;
+    // No consent is saved; this synthetic handoff cannot make any request.
+    host.session(1, Some(revision), identity.clone()).unwrap();
+    finish_background(&host).await;
+    assert!(!host.status().management.unwrap().initial_backup_confirmed);
+    host.session(2, None, identity.clone()).unwrap();
+    host.local_key_installed(identity.clone());
+    assert!(host.status().management.is_none());
+    host.initialize_management(&identity).await.unwrap();
+    assert!(!host.status().management.unwrap().initial_backup_confirmed);
+    host.close();
+    assert!(host.initialize_management(&identity).await.is_err());
+}
+
+#[tokio::test]
+async fn management_read_preserves_first_run_backup_availability_before_a_key_exists() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = NsecBackupHost {
+        config: production(),
+        root: Some(directory.path().to_owned()),
+        ..NsecBackupHost::default()
+    };
+    host.initialize_management(&IdentityHost::fixture_without_key(true))
+        .await
+        .unwrap();
+    assert!(host.status().builderlab);
+    assert!(host.status().management.is_none());
 }

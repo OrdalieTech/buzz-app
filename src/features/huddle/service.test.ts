@@ -784,3 +784,25 @@ it("clears thinking on leave and ignores callbacks from an old call", async () =
     await h.dispose();
   }
 });
+
+it("reports remote voice errors when idle without replacing a local call", async () => {
+  const h = harness();
+  try {
+    h.service.remoteVoiceError(
+      "Codex could not start. Rejoin from your phone.",
+    );
+    expect(h.service.snapshot()).toMatchObject({
+      phase: "error",
+      error: "Codex could not start. Rejoin from your phone.",
+    });
+    await h.service.leave();
+    expect(h.service.snapshot().phase).toBe("idle");
+    await h.service.join(destination, "room");
+    h.receive({ type: "connected", room: "room", participants: [] });
+    h.service.remoteVoiceError("Late phone error");
+    expect(h.service.snapshot().phase).toBe("connected");
+    expect(h.service.snapshot().error).toBeUndefined();
+  } finally {
+    await h.dispose();
+  }
+});
