@@ -23,10 +23,13 @@ export function bindUnreadIndicator(
   let refresh = () => {};
   let stopPreferences = () => {};
   const channels = new Map<string, () => void>();
-  const publish = (unread: boolean) => {
-    if (unread === previous) return;
-    previous = unread;
-    project(unread);
+  const publish = (unread: number) => {
+    // The browser host shows the count in its tab title (web/notifications.ts).
+    if (import.meta.env.VITE_BUZZ_BROWSER_HOST === "1")
+      dispatchEvent(new CustomEvent("buzz-unread", { detail: unread }));
+    if (unread > 0 === previous) return;
+    previous = unread > 0;
+    project(previous);
   };
   const clear = () => {
     stopRoster();
@@ -51,7 +54,7 @@ export function bindUnreadIndicator(
     clear();
     session = owned;
     identity = next;
-    publish(false);
+    publish(0);
     if (!owned) return;
     const viewer = client.viewer as string;
     const scope = gates && {
@@ -66,12 +69,12 @@ export function bindUnreadIndicator(
         preferences.status !== "ready" &&
         preferences.status !== "unsupported"
       ) {
-        publish(false);
+        publish(0);
         return;
       }
       const muted = new Set(preferences.data?.muted ?? []);
       publish(
-        [...channels.keys()].some((channelId) => {
+        [...channels.keys()].filter((channelId) => {
           if (muted.has(channelId)) return false;
           const snapshot = owned.unread.snapshot({
             kind: "channel",
@@ -80,7 +83,7 @@ export function bindUnreadIndicator(
           // The dock follows the sidebar rows, which opening a channel quiets.
           const count = snapshot.row?.observedCount ?? snapshot.observedCount;
           return snapshot.manual !== "none" || (count ?? 0) > 0;
-        }),
+        }).length,
       );
     };
     stopPreferences = owned.sidebarPreferences.subscribe(changed);
@@ -136,6 +139,6 @@ export function bindUnreadIndicator(
     stopGates();
     clear();
     session = undefined;
-    publish(false);
+    publish(0);
   };
 }

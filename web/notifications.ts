@@ -18,6 +18,18 @@ const ready = supported
   : undefined;
 const shown = new Map<string, ServiceWorkerNotification>();
 
+// Unread conversations that may notify (the dock dot's rule,
+// src/features/notifications/indicator-unread.ts), shown as mail and chat
+// apps do: "(3) Buzz" in the tab title, and the installed app's badge.
+addEventListener("buzz-unread", (event) => {
+  const unread = (event as CustomEvent<number>).detail;
+  const title = document.title.replace(/^\(\d+\) /, "");
+  document.title = unread ? `(${unread}) ${title}` : title;
+  void (
+    unread ? navigator.setAppBadge?.(unread) : navigator.clearAppBadge?.()
+  )?.catch(() => {});
+});
+
 class ServiceWorkerNotification {
   static get permission() {
     return Native.permission;

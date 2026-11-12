@@ -21,7 +21,8 @@ const communities = new Set(
     .map((host) => host.trim().toLowerCase())
     .filter(Boolean),
 );
-const BLOB = /^\/media\/[0-9a-f]{64}(?:\.(?:[a-z0-9]{1,8}|thumb\.jpg))?$/;
+const BLOB =
+  /^\/media\/[0-9a-f]{64}(?:\.(?:[a-z0-9]{1,8}|thumb\.(?:jpg|webp)))?$/;
 
 /** `/api/relay/<community>/media?url=<relay media URL>`, the shape web/host.ts
  * gives `convertFileSrc(url, "buzz-media")`: null when the target is not a
@@ -87,12 +88,20 @@ async function media(url: URL, request: Request) {
   });
   const range = request.headers.get("Range");
   if (range) headers.set("Range", range);
-  const upstream = await fetch(url, {
-    headers,
-    credentials: "omit",
-    redirect: "error",
-    signal: request.signal,
-  }).catch(() => undefined);
+  const get = (target: URL) =>
+    fetch(target, {
+      headers,
+      credentials: "omit",
+      redirect: "error",
+      signal: request.signal,
+    }).catch(() => undefined);
+  let upstream = await get(url);
+  // Native `jpeg_thumb`: relays before WebP thumbnails, and images uploaded
+  // before them, have only the `.thumb.jpg` every relay writes.
+  if (upstream?.status === 404 && url.pathname.endsWith(".thumb.webp"))
+    upstream = await get(
+      new URL(url.href.replace(/\.thumb\.webp$/, ".thumb.jpg")),
+    );
   if (upstream?.status !== 200 && upstream?.status !== 206)
     return new Response(null, { status: upstream?.status ?? 502 });
   const type = (upstream.headers.get("Content-Type") ?? "")

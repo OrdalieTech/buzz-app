@@ -54,7 +54,11 @@ const browserHost: Plugin = {
   },
   closeBundle() {
     if (icon)
-      for (const name of ["app-icon.png", "apple-touch-icon.png"])
+      for (const name of [
+        "app-icon.png",
+        "apple-touch-icon.png",
+        "favicon.png",
+      ])
         copyFileSync(icon, resolve(outDir, name));
   },
   // Before Vite's own resolver, so the app's plugin list gains web/orb.tsx.
@@ -74,7 +78,14 @@ const browserHost: Plugin = {
     // Before Vite resolves the entry script.
     order: "pre",
     handler: (html) =>
-      html
+      (icon
+        ? // The distributor's icon is the favicon too (favicon.png above).
+          html.replace(
+            '<link rel="icon" href="/favicon.ico" sizes="any" />',
+            "",
+          )
+        : html
+      )
         .replace('src="/src/main.tsx"', 'src="/web/main.ts"')
         .replace(
           'content="width=device-width, initial-scale=1.0"',

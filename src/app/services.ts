@@ -278,7 +278,10 @@ export function createServices() {
         : undefined;
     }),
   );
-  if (notifications.indicator.available)
+  if (
+    notifications.indicator.available ||
+    import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"
+  )
     ctx.effect(() =>
       bindUnreadIndicator(communities, notifications.indicator.setUnread, {
         allows: (target) => notifications.gated(target),

@@ -222,6 +222,8 @@ for (const [device, engine] of [
     other.close();
     const item = page.getByRole("button", { name: /^Open .* in #phone-/ });
     await expect(item).toBeVisible();
+    // The tab title counts the unread conversation, as chat apps do.
+    await expect(page).toHaveTitle(/^\(1\) /);
     await expect
       .poll(() =>
         toggle.evaluate((el) => getComputedStyle(el, "::after").content),
@@ -247,6 +249,7 @@ for (const [device, engine] of [
         ),
       )
       .toBe(true);
+    await expect(page).not.toHaveTitle(/^\(/, { timeout: 20_000 });
     await expect
       .poll(
         () => toggle.evaluate((el) => getComputedStyle(el, "::after").content),

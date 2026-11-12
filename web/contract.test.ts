@@ -77,6 +77,13 @@ test("keeps the upstream anchors the web build relies on", () => {
   expect(read("src/features/messages/MediaDownloadAction.tsx")).toContain(
     'import.meta.env.VITE_BUZZ_BROWSER_HOST === "1" && isProxySource(source)',
   );
+  // web/notifications.ts shows the unread count in the tab title.
+  expect(read("src/app/services.ts")).toContain(
+    'notifications.indicator.available ||\n    import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"',
+  );
+  expect(read("src/features/notifications/indicator-unread.ts")).toContain(
+    'dispatchEvent(new CustomEvent("buzz-unread", { detail: unread }))',
+  );
   // Phones open Inbox rows as conversation visits (web/mobile.css breakpoint).
   expect(read("src/bundled/inbox/InboxPage.tsx")).toContain(
     'matchMedia("(max-width: 650px)").matches)',
