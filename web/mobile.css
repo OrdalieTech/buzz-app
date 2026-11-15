@@ -55,13 +55,23 @@
   .shell-side-dock {
     order: 1;
     flex-direction: row;
-    padding: var(--space-1) var(--space-3);
-    border-top: 1px solid var(--border-standard);
+    align-items: center;
+    padding: var(--space-1) var(--space-2);
+    border-top: 1px solid var(--border-subtle, var(--border-standard));
   }
   :root[data-keyboard-open] .shell-side-dock {
     display: none;
   }
+  /* Its four destinations (two pages, the community, you) share the bar
+     evenly; the current page reads by its colour and a dot under it, not a
+     filled tile. */
+  .shell-dock-pages,
+  .shell-community-switcher {
+    flex: 1 1 0;
+    justify-content: space-evenly;
+  }
   .shell-dock-pages {
+    display: flex;
     overflow: visible;
   }
   .shell-side-dock .buzz-tabs[data-variant="dock"] {
@@ -72,13 +82,105 @@
     flex-direction: row;
     justify-content: space-evenly;
   }
+  .shell-side-dock .buzz-tabs[data-variant="dock"] {
+    flex: 1;
+  }
   .shell-side-dock .buzz-tabs[data-variant="dock"] .buzz-tabs-tab {
+    position: relative;
     width: 2.75rem;
     height: 2.75rem;
+    color: var(--text-subtle);
+  }
+  .shell-side-dock
+    .buzz-tabs[data-variant="dock"]
+    .buzz-tabs-tab[data-selected] {
+    background: none;
+    color: var(--text-standard);
+  }
+  .shell-side-dock
+    .buzz-tabs[data-variant="dock"]
+    .buzz-tabs-tab[data-selected]::after {
+    position: absolute;
+    bottom: 0.2rem;
+    left: 50%;
+    width: 0.25rem;
+    height: 0.25rem;
+    border-radius: 50%;
+    background: currentColor;
+    content: "";
+    translate: -50% 0;
   }
   .shell-community-switcher {
+    display: flex;
     flex-direction: row;
+    align-items: center;
     padding-top: 0;
+  }
+
+  /* The top bar is the drawer's button and a search field across the rest:
+     no keyboard shortcut, and no back/forward, which phones do with their
+     own gesture. */
+  .shell-header {
+    gap: var(--space-2);
+    padding-inline: var(--space-2) var(--space-3);
+  }
+  .shell-history [aria-label="Go back"],
+  .shell-search-shortcut,
+  .shell-actions:not(:has(*:not(.shell-actions-fixed))) {
+    display: none;
+  }
+  .shell-menu-search {
+    flex: 1;
+    min-width: 0;
+  }
+  .shell-menu-search > .buzz-button {
+    width: 100%;
+    height: 2.5rem;
+    justify-content: flex-start;
+    padding-inline: var(--space-3);
+    border-radius: 999px;
+    background: var(--affordance-subtle, var(--surface-inset));
+    color: var(--text-subtle);
+  }
+
+  /* The composer is one line: the message, then attach, voice and send.
+     Mentions start with @, emoji come from the keyboard and formatting from
+     Markdown, so their buttons stay off the phone. */
+  :root form[data-composer-surface] {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    column-gap: var(--space-1);
+    min-height: 0;
+    padding-block: var(--space-1);
+  }
+  /* The reply being answered keeps a line of its own above. */
+  :root
+    form[data-composer-surface]
+    > :not(:has([role="textbox"], [aria-label="Send message"])) {
+    flex: 1 0 100%;
+  }
+  :root form[data-composer-surface] > :has([role="textbox"]) {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 0;
+    padding-block: var(--space-2);
+  }
+  :root form[data-composer-surface] :has(> [role="textbox"]) {
+    min-height: 0;
+  }
+  :root form[data-composer-surface] > :has([aria-label="Send message"]) {
+    flex: none;
+    padding-block-end: var(--space-1);
+  }
+  [data-composer-surface]
+    :is(
+      [aria-label="Mention controls"],
+      [aria-label="Emoji controls"],
+      [aria-label="Toggle formatting"]
+    ) {
+    display: none;
   }
 
   /* The drawer slides in over a scrim that closes it on tap (mobile.ts). */
@@ -153,6 +255,57 @@
     border-radius: 50%;
     background: var(--affordance-prominent-mark);
     content: "";
+  }
+
+  /* Media review (images and videos) takes the whole screen in black: no
+     card, the media edge to edge under a slim header, and comments, when
+     shown, below it rather than squeezing it from the side. Pinch and double
+     tap zoom an image (ImageReviewStage), so its zoom buttons go. */
+  :has(> [role="dialog"] > [data-review-stage]) {
+    padding: 0;
+    background: #000;
+  }
+  [role="dialog"]:has(> [data-review-stage]) {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    max-width: none;
+    max-height: none;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+      env(safe-area-inset-bottom) env(safe-area-inset-left);
+    border: 0;
+    border-radius: 0;
+    background: #000;
+    color-scheme: dark;
+  }
+  [role="dialog"] > [data-review-chrome][title] {
+    --text-standard: #fff;
+    --text-metadata: rgb(255 255 255 / 0.7);
+    --text-subtle: rgb(255 255 255 / 0.7);
+    --border-standard: transparent;
+    background: #000;
+    color: #fff;
+  }
+  [role="dialog"] > [data-review-stage] {
+    padding: 0;
+    background: #000;
+  }
+  [role="dialog"]:has(> [data-review-stage]) > [aria-label="Media comments"] {
+    height: 50%;
+    border-inline-start: 0;
+    border-top: 1px solid var(--border-standard);
+    border-radius: var(--radius-card) var(--radius-card) 0 0;
+  }
+  [role="dialog"]:has(> [data-review-stage])
+    > [aria-label="Media comments"][aria-hidden="true"] {
+    display: none;
+  }
+  [data-image-controls]
+    :is(
+      [aria-label="Zoom out"],
+      [aria-label="Zoom in"],
+      [aria-label^="Image zoom"]
+    ) {
+    display: none;
   }
 
   /* Controls dim under the finger; a transform under a moving finger is how

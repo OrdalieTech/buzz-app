@@ -291,12 +291,17 @@ function ReviewShell({
   const video = useRef<HTMLVideoElement>(null);
   const [commentsChoice, setCommentsOpen] = useState<boolean>();
   const [selectedImageUrl, setSelectedImageUrl] = useState(attachment.url);
+  // A phone has no room beside the media: it opens on the media, and its
+  // comments are a tap away.
+  // innerWidth is what the (max-width: 650px) media query reads.
+  const [narrow] = useState(() => window.innerWidth <= 650);
   const commentsOpen =
-    commentsChoice ?? (loading ? hasComments : replies.length > 0 || !!error);
+    commentsChoice ??
+    (!narrow && (loading ? hasComments : replies.length > 0 || !!error));
   useEffect(() => {
-    if (rootId && !loading)
+    if (rootId && !loading && !narrow)
       setCommentsOpen((choice) => choice ?? replies.length > 0);
-  }, [rootId, loading, replies.length]);
+  }, [rootId, loading, replies.length, narrow]);
   const prepareSidebarMotion = useReviewSidebarMotion(frame, commentsOpen);
   const [commentsMotion, setCommentsMotion] = useState(false);
   const [selectedComment, setSelectedComment] = useState<string>();

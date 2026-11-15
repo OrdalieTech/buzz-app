@@ -37,6 +37,32 @@ const ZOOM_PRESETS = [0.5, 1, 1.5, 2];
 type Point = Readonly<{ x: number; y: number }>;
 // Pointer travel beyond this is a pan, not a click.
 const CLICK_SLOP = 4;
+// Touch: a swipe this far changes image (sideways) or closes (down); two taps
+// this close in time and place are a double tap.
+const SWIPE = 60;
+const DOUBLE_TAP_MS = 300;
+const DOUBLE_TAP_SLOP = 30;
+
+/** The fingers on the stage: one swipes or pans, two pinch. */
+type TouchGesture = {
+  fingers: Map<number, Point>;
+  origin: Point;
+  offset: Point;
+  zoomed: boolean;
+  pinch?: { zoom: number; distance: number };
+  moved: boolean;
+};
+const spread = (fingers: Map<number, Point>) => {
+  const [a, b] = [...fingers.values()];
+  return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
+};
+const middle = (fingers: Map<number, Point>) => {
+  const points = [...fingers.values()];
+  return {
+    x: points.reduce((sum, p) => sum + p.x, 0) / points.length,
+    y: points.reduce((sum, p) => sum + p.y, 0) / points.length,
+  };
+};
 
 type ImageReviewStageProps = {
   attachments: readonly Attachment[];
@@ -73,6 +99,12 @@ export function ImageReviewStage({
   >(undefined);
   const zoomHint = useId();
   const [dragging, setDragging] = useState(false);
+  const touch = useRef<TouchGesture | undefined>(undefined);
+  const lastTap = useRef<{ at: number; x: number; y: number } | undefined>(
+    undefined,
+  );
+  // How far a one-finger swipe carries the fitted image.
+  const [swipe, setSwipe] = useState<Point>();
   const selectedIndex = Math.max(
     0,
     attachments.findIndex((item) => item.url === selectedUrl),
@@ -106,6 +138,15 @@ export function ImageReviewStage({
     panTo,
     constrain,
   } = useImageViewport(stage, image, source);
+  const fromCenter = (point: Point) => {
+    const bounds = stage.current?.getBoundingClientRect();
+    return bounds
+      ? {
+          x: point.x - bounds.left - bounds.width / 2,
+          y: point.y - bounds.top - bounds.height / 2,
+        }
+      : point;
+  };
   const copyFeedbackVisible = copying || copyNotice !== undefined;
   const feedbackVisible = copyFeedbackVisible || downloadFeedbackVisible;
   const idle = useMediaControls(stage, source, feedbackVisible);
@@ -242,6 +283,25 @@ export function ImageReviewStage({
       data-review-zoomed={zoom !== 1 || undefined}
       className={`${styles.imageReviewStage} ${pannable ? styles.imageReviewPannable : ""} ${dragging ? styles.imageReviewDragging : ""}`}
       onPointerDown={(event) => {
+        if (event.pointerType === "touch") {
+          const point = { x: event.clientX, y: event.clientY };
+          event.currentTarget.setPointerCapture(event.pointerId);
+          const active: TouchGesture = touch.current ?? {
+            fingers: new Map(),
+            origin: point,
+            offset,
+            zoomed: zoom > 1,
+            moved: false,
+          };
+          active.fingers.set(event.pointerId, point);
+          if (active.fingers.size === 2) {
+            active.pinch = { zoom, distance: spread(active.fingers) };
+            active.moved = true;
+            setSwipe(undefined);
+          }
+          touch.current = active;
+          return;
+        }
         if (event.button !== 0) return;
         if (press.current) {
           // Multi-touch is not a click; the first contact keeps the pan.
@@ -260,6 +320,36 @@ export function ImageReviewStage({
         setDragging(pannable);
       }}
       onPointerMove={(event) => {
+        const gesture = touch.current;
+        if (event.pointerType === "touch") {
+          if (!gesture?.fingers.has(event.pointerId)) return;
+          gesture.fingers.set(event.pointerId, {
+            x: event.clientX,
+            y: event.clientY,
+          });
+          if (gesture.pinch) {
+            if (gesture.fingers.size < 2) return;
+            setBoundedZoom(
+              (gesture.pinch.zoom * spread(gesture.fingers)) /
+                gesture.pinch.distance,
+              fromCenter(middle(gesture.fingers)),
+            );
+            return;
+          }
+          const dx = event.clientX - gesture.origin.x;
+          const dy = event.clientY - gesture.origin.y;
+          if (Math.hypot(dx, dy) > CLICK_SLOP) gesture.moved = true;
+          if (!gesture.moved) return;
+          if (gesture.zoomed)
+            panTo({ x: gesture.offset.x + dx, y: gesture.offset.y + dy });
+          else
+            setSwipe(
+              Math.abs(dx) > Math.abs(dy)
+                ? { x: dx, y: 0 }
+                : { x: 0, y: Math.max(0, dy) },
+            );
+          return;
+        }
         const active = press.current;
         if (!active || active.pointer !== event.pointerId) return;
         const dx = event.clientX - active.origin.x;
@@ -269,6 +359,47 @@ export function ImageReviewStage({
           panTo({ x: active.offset.x + dx, y: active.offset.y + dy });
       }}
       onPointerUp={(event) => {
+        const gesture = touch.current;
+        if (event.pointerType === "touch") {
+          if (!gesture?.fingers.delete(event.pointerId)) return;
+          event.currentTarget.releasePointerCapture(event.pointerId);
+          if (gesture.fingers.size > 0) return;
+          touch.current = undefined;
+          setSwipe(undefined);
+          if (gesture.pinch) {
+            // Pinched below fit springs back to fit.
+            if (zoom < 1) setBoundedZoom(1);
+            return;
+          }
+          const dx = event.clientX - gesture.origin.x;
+          const dy = event.clientY - gesture.origin.y;
+          if (!gesture.moved) {
+            const previous = lastTap.current;
+            const now = performance.now();
+            if (
+              previous &&
+              now - previous.at < DOUBLE_TAP_MS &&
+              Math.hypot(
+                event.clientX - previous.x,
+                event.clientY - previous.y,
+              ) < DOUBLE_TAP_SLOP
+            ) {
+              lastTap.current = undefined;
+              toggleZoomAt(event.clientX, event.clientY);
+            } else
+              lastTap.current = { at: now, x: event.clientX, y: event.clientY };
+            return;
+          }
+          if (gesture.zoomed) return;
+          if (Math.abs(dx) > SWIPE && Math.abs(dx) > Math.abs(dy))
+            choose(selectedIndex + (dx < 0 ? 1 : -1));
+          else if (dy > SWIPE * 1.5 && dy > Math.abs(dx))
+            // A swipe down closes the viewer, as Escape does.
+            document.dispatchEvent(
+              new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+            );
+          return;
+        }
         const active = press.current;
         if (active?.pointer !== event.pointerId) return;
         press.current = undefined;
@@ -277,11 +408,17 @@ export function ImageReviewStage({
         if (active.click) toggleZoomAt(event.clientX, event.clientY);
       }}
       onLostPointerCapture={(event) => {
+        if (event.pointerType === "touch") return;
         if (press.current?.pointer !== event.pointerId) return;
         press.current = undefined;
         setDragging(false);
       }}
       onPointerCancel={(event) => {
+        if (event.pointerType === "touch") {
+          touch.current = undefined;
+          setSwipe(undefined);
+          return;
+        }
         if (press.current?.pointer !== event.pointerId) return;
         press.current = undefined;
         setDragging(false);
@@ -292,8 +429,9 @@ export function ImageReviewStage({
         {
           url: selected.url,
           source,
-          transform:
-            zoom === 1
+          transform: swipe
+            ? `translate(${swipe.x}px, ${swipe.y}px) scale(${1 - Math.min(swipe.y, 400) / 2000})`
+            : zoom === 1
               ? "none"
               : `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
         },
