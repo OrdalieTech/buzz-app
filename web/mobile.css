@@ -68,7 +68,7 @@
   .shell-dock-pages,
   .shell-community-switcher {
     flex: 1 1 0;
-    justify-content: space-evenly;
+    justify-content: space-around;
   }
   .shell-dock-pages {
     display: flex;
@@ -80,7 +80,7 @@
   .shell-side-dock .buzz-tabs[data-variant="dock"] .buzz-tabs-list {
     flex: 1;
     flex-direction: row;
-    justify-content: space-evenly;
+    justify-content: space-around;
   }
   .shell-side-dock .buzz-tabs[data-variant="dock"] {
     flex: 1;
@@ -143,44 +143,60 @@
     color: var(--text-subtle);
   }
 
-  /* The composer is one line: the message, then attach, voice and send.
-     Mentions start with @, emoji come from the keyboard and formatting from
-     Markdown, so their buttons stay off the phone. */
+  /* The composer: the message on a comfortable first line, its tools in a
+     row under it, each a 40px target around a 20px icon, and send as a round
+     button in the accent colour once there is something to send. */
   :root form[data-composer-surface] {
-    display: flex;
-    flex-direction: row;
-    flex-wrap: wrap;
-    align-items: flex-end;
-    column-gap: var(--space-1);
-    min-height: 0;
-    padding-block: var(--space-1);
-  }
-  /* The reply being answered keeps a line of its own above. */
-  :root
-    form[data-composer-surface]
-    > :not(:has([role="textbox"], [aria-label="Send message"])) {
-    flex: 1 0 100%;
+    --composer-gap: var(--space-1);
+    padding: var(--space-1) var(--space-1) var(--space-1) var(--space-2);
+    border-radius: 1.5rem;
   }
   :root form[data-composer-surface] > :has([role="textbox"]) {
-    flex: 1 1 0;
-    min-width: 0;
     min-height: 0;
-    padding-block: var(--space-2);
+    padding: var(--space-2) var(--space-2) 0;
   }
-  :root form[data-composer-surface] :has(> [role="textbox"]) {
+  :root form[data-composer-surface] :has(> [role="textbox"]),
+  :root form[data-composer-surface] [role="textbox"] {
     min-height: 0;
+  }
+  :root form[data-composer-surface] [role="textbox"] {
+    max-height: 9rem;
+    overflow-y: auto;
+    font-size: 1rem;
+    line-height: 1.4;
   }
   :root form[data-composer-surface] > :has([aria-label="Send message"]) {
-    flex: none;
-    padding-block-end: var(--space-1);
+    align-items: center;
+    min-height: 0;
+    padding-top: 0;
   }
-  [data-composer-surface]
-    :is(
-      [aria-label="Mention controls"],
-      [aria-label="Emoji controls"],
-      [aria-label="Toggle formatting"]
-    ) {
-    display: none;
+  :root
+    form[data-composer-surface]
+    > :has([aria-label="Send message"])
+    .buzz-button {
+    width: 2.5rem;
+    height: 2.5rem;
+    color: var(--text-subtle);
+  }
+  :root
+    form[data-composer-surface]
+    > :has([aria-label="Send message"])
+    .buzz-button
+    svg {
+    width: 1.25rem;
+    height: 1.25rem;
+  }
+  :root form[data-composer-surface] [aria-label="Send message"] {
+    width: 2.25rem;
+    height: 2.25rem;
+    margin-inline-end: var(--space-1);
+    border-radius: 50%;
+    background: var(--affordance-subtle, var(--surface-inset));
+    color: var(--text-subtle);
+  }
+  :root form[data-composer-surface] [aria-label="Send message"]:not(:disabled) {
+    background: var(--affordance-prominent);
+    color: var(--text-on-prominent);
   }
 
   /* The drawer slides in over a scrim that closes it on tap (mobile.ts). */
@@ -221,6 +237,18 @@
   :is(.shell-sidebar, .shell-sidebar-default) {
     min-width: 100%;
     max-width: none;
+  }
+
+  /* Rows are 44px for thumbs, so the drawer's sections need less air
+     between them than the desktop sidebar's to read as groups. */
+  #shell-navigation {
+    --space-section-gap: var(--space-3);
+  }
+  #shell-navigation :has(> .shell-pages) {
+    margin-bottom: var(--space-1);
+  }
+  #shell-navigation [class*="_sidebarGroup_"] + [class*="_sidebarGroup_"] {
+    margin-top: var(--space-3);
   }
 
   /* Thumb-sized targets (44px) for the drawer's rows and the top bar, which
