@@ -504,7 +504,16 @@ const SIDEBAR = [
   "channel-sort",
   "channel-filter",
   "main-agent",
+  "channel-workspaces",
+  "channel-workspace-sort",
+  "channel-workspace-filter",
 ];
+/** Workspace records validate as their Rust `validate_sidebar_payload` peers. */
+const SIDEBAR_AS: Record<string, string> = {
+  "channel-workspaces": "channel-sections",
+  "channel-workspace-sort": "channel-sort",
+  "channel-workspace-filter": "channel-filter",
+};
 /** Rust `decode_sidebar`: verified, self-authored sidebar coordinates only. */
 async function decodeSidebar(events: unknown) {
   const invalid = "Invalid sidebar record";
@@ -541,8 +550,8 @@ function validateSidebarPayload(coordinate: string, payload: unknown) {
     if (version === 1 && HEX.test(agent) && !Object.keys(rest).length) return;
     throw "Invalid sidebar payload";
   }
-  const at = SIDEBAR.indexOf(coordinate);
-  if (at < 0) throw "Invalid sidebar coordinate";
+  const at = SIDEBAR.indexOf(SIDEBAR_AS[coordinate] ?? coordinate);
+  if (at < 0 || at > 4) throw "Invalid sidebar coordinate";
   try {
     const slots: unknown[] = [undefined, undefined, undefined, undefined];
     slots[at] = payload;
@@ -554,6 +563,7 @@ function validateSidebarPayload(coordinate: string, payload: unknown) {
       sort,
       undefined,
       at === 4 ? payload : undefined,
+      coordinate === "channel-workspaces",
     );
   } catch {
     throw "Invalid sidebar payload";
