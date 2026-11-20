@@ -137,7 +137,7 @@ for (const [device, engine] of [
     const toggle = page.locator("[data-shell-sidebar-toggle]");
     const drawer = page.locator('#shell-navigation[data-expanded="true"]');
     await toggle.tap();
-    await page.getByRole("button", { name: "Create channel" }).tap();
+    await page.getByRole("button", { name: "Create channel" }).first().tap();
     await page.getByLabel("Name").fill(channel);
     await page
       .getByRole("dialog")

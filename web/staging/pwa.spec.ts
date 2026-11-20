@@ -35,7 +35,9 @@ const invoke = (page: Page, command: string, args?: object) =>
     [command, args] as const,
   );
 const shell = (page: Page) =>
-  expect(page.getByRole("button", { name: "Create channel" })).toBeVisible();
+  expect(
+    page.getByRole("button", { name: "Create channel" }).first(),
+  ).toBeVisible();
 async function profile(page: Page, name: string) {
   await page.getByLabel("Display name").fill(name);
   await page.getByRole("button", { name: "Continue", exact: true }).click();
@@ -107,7 +109,7 @@ test("chats through the browser host", async ({ browser }) => {
   await shell(bob);
 
   // A channel and a message.
-  await alice.getByRole("button", { name: "Create channel" }).click();
+  await alice.getByRole("button", { name: "Create channel" }).first().click();
   await alice.getByLabel("Name").fill(`general-${run}`);
   await alice
     .getByRole("dialog")
@@ -130,7 +132,7 @@ test("chats through the browser host", async ({ browser }) => {
   // Read state: unread survives a reload until read; once read, the relay
   // holds Bob's self-encrypted record and a reload keeps it read. Bob waits
   // in a channel of his own, where Messages reopens after the reload.
-  await bob.getByRole("button", { name: "Create channel" }).click();
+  await bob.getByRole("button", { name: "Create channel" }).first().click();
   await bob.getByLabel("Name").fill(`bob-${run}`);
   await bob
     .getByRole("dialog")

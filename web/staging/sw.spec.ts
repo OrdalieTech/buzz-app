@@ -58,7 +58,7 @@ async function signUp(browser: Browser, name: string) {
   await page.getByLabel("Display name").fill(name);
   await page.getByRole("button", { name: "Publish profile & open" }).click();
   await expect(
-    page.getByRole("button", { name: "Create channel" }),
+    page.getByRole("button", { name: "Create channel" }).first(),
   ).toBeVisible();
   await expect.poll(() => context.serviceWorkers().length).toBe(1);
   return { page, secret };

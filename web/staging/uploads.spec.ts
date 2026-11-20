@@ -96,7 +96,7 @@ test("uploads images, HEIC, video and voice notes", async ({
   await page.getByRole("button", { name: "Join", exact: true }).click();
   await page.getByLabel("Display name").fill(`Uploader ${run}`);
   await page.getByRole("button", { name: "Continue", exact: true }).click();
-  await page.getByRole("button", { name: "Create channel" }).click();
+  await page.getByRole("button", { name: "Create channel" }).first().click();
   await page.getByLabel("Name").fill(`media-${run}`);
   await page
     .getByRole("dialog")

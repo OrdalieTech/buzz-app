@@ -86,7 +86,7 @@ test("pairs a remote agent and reads what it publishes", async ({
   const viewer = (await invoke(owner, "identity_restore")) as string;
 
   // A channel for the agent to post in.
-  await owner.getByRole("button", { name: "Create channel" }).click();
+  await owner.getByRole("button", { name: "Create channel" }).first().click();
   await owner.getByLabel("Name").fill(`orb-${run}`);
   await owner
     .getByRole("dialog")

@@ -267,7 +267,10 @@ for (const width of [1280, 390])
       // What the empty staging lacks: a channel with a message, a workspace
       // (a channel recipe) and a reminder on that message.
       await drawer();
-      await page.getByRole("button", { name: "Create channel" }).click();
+      await page
+        .getByRole("button", { name: "Create channel" })
+        .first()
+        .click();
       await page.getByLabel("Name").fill(`crawl-${Date.now().toString(36)}`);
       await page
         .getByRole("dialog")
@@ -289,7 +292,7 @@ for (const width of [1280, 390])
       await page.getByRole("button", { name: "Set reminder" }).click();
       await expect(page.getByRole("dialog")).toBeHidden();
       await drawer();
-      await page.getByRole("button", { name: "New", exact: true }).click();
+      await page.getByRole("button", { name: "New options" }).first().click();
       await page.getByRole("menuitem", { name: "New workspace" }).click();
       await page
         .getByRole("dialog")
@@ -351,7 +354,10 @@ for (const width of [1280, 390])
       "new",
       async () => {
         await drawer();
-        await sidebar.getByRole("button", { name: "New", exact: true }).click();
+        await sidebar
+          .getByRole("button", { name: "New options" })
+          .first()
+          .click();
       },
       // New chat and New section create at once; the rest open a dialog.
       live

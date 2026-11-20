@@ -79,7 +79,7 @@ test("media viewer on a phone", async ({ playwright }) => {
   await page.getByLabel("Display name").fill("Phone media");
   await page.getByRole("button", { name: "Publish profile & open" }).tap();
   await page.locator("[data-shell-sidebar-toggle]").tap();
-  await page.getByRole("button", { name: "Create channel" }).tap();
+  await page.getByRole("button", { name: "Create channel" }).first().tap();
   await page.getByLabel("Name").fill(`media-${run}`);
   await page
     .getByRole("dialog")
