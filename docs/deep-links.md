@@ -32,6 +32,7 @@ after this list:
 - `buzz://add-community?relay=<wss-url>[&name=<name>]`
 - `buzz://plugin?id=<plugin id>[&page=<page id>][&route.<key>=<value>...]`
 - `buzz://agent/new?card=<id>`
+- `buzz://dm/new?to=<64-hex key>`, a New message draft addressed to that person
 - `buzz://settings[?section=<section>][&provider=<agent type>]`, such as `buzz://settings?section=agents&provider=buzz.claude-code%2Fclaude-code`, which opens Claude's setup in Agent setup. `provider` needs `section=agents`. Like the Settings target it becomes, it only presents Settings and has no community scope.
 
 Two more links work only at the OS boundary. Neither names a destination, and
@@ -51,9 +52,13 @@ Plugin install links open **Settings > Plugins > Manage plugins** and fetch a
 preview from the Git repository and optional branch or tag. The repository accepts
 HTTPS, `ssh://`, `git@host:path`, `github.com/owner/repo`, or `owner/repo`.
 Percent-encode each query value. `path` selects the plugin folder inside the
-repository (relative, `/`-separated; no `..`, backslashes or absolute paths). `commit`
-pins the install to that exact commit: nothing installs unless the fetched repository
-matches it. Repeating any of the four keys makes the link invalid. Review the plugin
+repository (relative, `/`-separated; no `..`, backslashes or absolute paths). Buzz
+lists only that folder of the commit, so files elsewhere in a very large repository
+do not count against the import limits, and it refuses a folder that does not exist.
+`commit` pins the install to that exact commit: Buzz fetches it directly and checks that
+it is on `ref` (the repository default branch when `ref` is omitted); nothing installs
+unless it is. A commit older than the branch tip installs as long as it is still part
+of that branch's history. Repeating any of the four keys makes the link invalid. Review the plugin
 and computer access, then select **Install plugin**. Opening the link does not install, enable, or grant access.
 A link with both `path` and `commit` for a plugin already installed from that repository and
 folder opens an **Update** review instead. The review says when the link's `ref` changes the branch

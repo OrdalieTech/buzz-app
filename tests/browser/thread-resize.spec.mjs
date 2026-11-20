@@ -2,6 +2,7 @@ import { test, expect } from "./fixture.mjs";
 import { frames, open, settle, wheel } from "./timeline.mjs";
 import { generateSecretKey, getPublicKey, finalizeEvent } from "nostr-tools";
 import { animationsSettled } from "./animations.mjs";
+import { markAllRead } from "./reading.mjs";
 
 test.use({
   productionBroker: true,
@@ -118,6 +119,7 @@ test("thread preserves bottom and reading position through activity and composer
     .find((row) => row.content.startsWith("Thread root"));
   for (let i = 0; i < 30; i++) app.reply(root.id, false, false);
   await open(page, app);
+  await markAllRead(page);
   await expect.poll(() => app.relay.hasRoute("primary", "observer")).toBe(true);
   app.serveProfile(key, { name: "Diagnostic Agent", is_agent: true });
   const rootRow = page.locator(
@@ -349,7 +351,7 @@ test.describe("exact history resize ownership", () => {
     const held = new Promise((r) => (release = r)),
       seen = new Promise((r) => (intercepted = r));
     let first = true;
-    await page.route("**/api/relay/**/query", async (route) => {
+    await page.route("**/api/relay/primary/query", async (route) => {
       if (
         !first ||
         !route
@@ -436,9 +438,11 @@ test.describe("exact history resize ownership", () => {
       );
       await seen;
       await expect(target).toBeFocused();
-      for (let i = 0; i < 15; i++) reply();
+      // Enough replies to fill the history well past its viewport, so the
+      // target at its top is not also at the latest reply.
+      for (let i = 0; i < 30; i++) reply();
       await expect(
-        history.getByText("Review live reply 14", { exact: true }),
+        history.getByText("Review live reply 29", { exact: true }),
       ).toHaveCount(1);
       await page.evaluate(() => window.releaseExactReveal());
       await settle(page, history);
@@ -496,7 +500,7 @@ test.describe("exact history resize ownership", () => {
           for (const [name, original] of Object.entries(originals))
             Node.prototype[name] = function (node, ...rest) {
               const result = original.call(this, node, ...rest);
-              if (node?.textContent?.includes("Review live reply 15")) {
+              if (node?.textContent?.includes("Review live reply 30")) {
                 Object.assign(Node.prototype, originals);
                 if (contract) {
                   const scroller = el.closest('[aria-label="Thread messages"]');
@@ -516,7 +520,7 @@ test.describe("exact history resize ownership", () => {
       }
       reply();
       await expect(
-        history.getByText("Review live reply 15", { exact: true }),
+        history.getByText("Review live reply 30", { exact: true }),
       ).toHaveCount(1);
       await settle(page, history);
       if (shift === "contraction after reading")

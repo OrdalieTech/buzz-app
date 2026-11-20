@@ -1,3 +1,4 @@
+import { animationsSettled } from "./animations.mjs";
 import { setPluginEnabled } from "./plugin-settings.mjs";
 import {
   closeSettings,
@@ -265,7 +266,21 @@ for (const action of ["Remove from this device", "Leave community"]) {
 }
 
 test.describe("community administration permissions", () => {
-  test("shows Membership to a verified owner", async ({ page, app }) => {
+  test("shows Membership to a verified owner", async ({
+    page,
+    app,
+    browserName,
+  }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "clipboard", {
+        value: {
+          writeText: async (text) => {
+            window.copiedInvite = text;
+          },
+        },
+        configurable: true,
+      });
+    });
     let rosterGate;
     let rosterStarted = () => {};
     await page.route("**/api/relay/primary/query", async (route) => {
@@ -295,24 +310,67 @@ test.describe("community administration permissions", () => {
     await expect(
       page.getByRole("heading", { name: "Membership", exact: true }),
     ).toBeVisible();
-    await page.getByRole("button", { name: "Invite members" }).click();
-    const dialog = page.getByRole("dialog", { name: "Add or invite people" });
+    const dialog = settingsDialog(page);
+    await page.getByRole("tab", { name: "Invite", exact: true }).click();
     await expect(
-      dialog.getByRole("heading", { name: "Add directly" }),
-    ).toBeVisible();
+      page.getByRole("tab", { name: "Invite", exact: true }),
+    ).toHaveAttribute("aria-selected", "true");
+    await page.goBack();
     await expect(
-      dialog.getByRole("heading", { name: "Invite with a link" }),
+      page.getByRole("tab", { name: "Members", exact: true }),
+    ).toHaveAttribute("aria-selected", "true");
+    await page.goForward();
+    await expect(
+      page.getByRole("tab", { name: "Invite", exact: true }),
+    ).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByRole("dialog")).toHaveCount(1);
+    await expect(
+      dialog.getByRole("textbox", { name: "Community invite link" }),
     ).toBeVisible();
+    const inviteLink = dialog.getByRole("textbox", {
+      name: "Community invite link",
+    });
+    await expect(inviteLink).toHaveValue(
+      "https://primary.example/invite/fixture",
+    );
+    const copy = dialog.getByRole("button", { name: /^(Copy link|Copied)$/ });
+    await copy.click();
+    await expect(copy).toHaveText("Copied");
+    await expect
+      .poll(() => page.evaluate(() => window.copiedInvite))
+      .toBe("https://primary.example/invite/fixture");
+    await expect(
+      dialog.getByText("Invite link copied.", { exact: true }),
+    ).toHaveCount(0);
+    await expect(copy).not.toBeFocused();
+    await expect(copy).toHaveCSS("outline-style", "none");
+    await expect(inviteLink.locator("..")).toHaveCSS(
+      "border-color",
+      "rgba(0, 0, 0, 0)",
+    );
+    // Keyboard copying still focuses the action and keeps its visible ring.
+    await inviteLink.focus();
+    await page.keyboard.press(
+      `${browserName === "webkit" && process.platform === "darwin" ? "Alt+" : ""}Tab`,
+    );
+    await expect(copy).toBeFocused();
+    await expect(copy).toHaveCSS("outline-style", "solid");
+    await copy.press("Enter");
+    await expect(copy).toHaveText("Copied");
+    await expect(copy).toBeFocused();
+    await expect(
+      page.getByRole("tab", { name: "Add directly", exact: true }),
+    ).toHaveCount(0);
     await expect(
       dialog.getByRole("textbox", { name: "Public identity" }),
-    ).toBeVisible();
+    ).toHaveCount(0);
+    await page.getByRole("tab", { name: "Members", exact: true }).click();
     await expect(
-      dialog.getByRole("combobox", { name: /Search people/ }),
+      dialog.getByRole("button", { name: "Refresh", exact: true }),
     ).toHaveCount(0);
 
     // Keep browser history/reload, real roster verification, and host wiring real.
     // A held response proves this route cannot fall through to Profile or failure.
-    await page.keyboard.press("Escape");
     let releaseRoster;
     rosterGate = new Promise((resolve) => {
       releaseRoster = resolve;
@@ -1009,10 +1067,19 @@ test("Settings loads and publishes the selected community profile", async ({
     }),
   ).toBeFocused();
   await expect(save()).toHaveCount(0);
-  await expect(
-    page.getByRole("dialog", { name: "Profile updated" }),
-  ).toBeVisible();
+  const updated = page.getByRole("dialog", { name: "Profile updated" });
+  await expect(updated).toBeVisible();
   await expect(reopenedName).toHaveValue("Updated community profile");
+  // The notice lands over Close Settings, and a pointer resting on it holds
+  // its expiry. Dismiss it so the click below cannot arrive as it slides in.
+  const toast = page.locator("[data-sonner-toast]").filter({ has: updated });
+  await expect(toast).toHaveAttribute("data-mounted", "true");
+  await animationsSettled(toast, { subtree: true });
+  await toast.hover();
+  await updated
+    .getByRole("button", { name: "Dismiss notification", exact: true })
+    .click();
+  await expect(updated).toHaveCount(0);
   // The account avatar is behind the modal; check it from the workspace. The
   // pointer left on Close can briefly open a tooltip for the control beneath it.
   await closeSettings(page);
@@ -1210,6 +1277,75 @@ test("plugin details preserves the catalog scroll position on open and close", a
   await expect(trigger).toBeFocused();
   await expect.poll(place).toEqual(before);
   await expect(button(page, "More actions for Usage")).toHaveCount(0);
+});
+
+// WebKit keeps the offset it clamps to when a shorter pane replaces a longer
+// one, which jsdom cannot show.
+test("each Settings section keeps its own scroll place while Settings is open", async ({
+  page,
+  app,
+}) => {
+  await page.goto(app.origin);
+  await openSettings(page);
+  await selectSettingsSection(page, "Shortcuts");
+  const port = settingsDialog(page).locator(".buzz-dialog-navigation-detail");
+  const offset = (scroller) =>
+    scroller.evaluate((element) => element.scrollTop);
+  // WebKit animates wheel scrolling: wait until two reads agree.
+  const settled = async (scroller = port) => {
+    let last;
+    await expect
+      .poll(
+        async () => {
+          const previous = last;
+          last = await offset(scroller);
+          return last === previous;
+        },
+        { intervals: [200] },
+      )
+      .toBe(true);
+    return last;
+  };
+  const near = (place, scroller = port) =>
+    expect
+      .poll(async () => Math.abs((await offset(scroller)) - place))
+      .toBeLessThanOrEqual(1);
+  // Wheel over the port's own padding, so no nested scroller takes it.
+  const box = await port.boundingBox();
+  await page.mouse.move(box.x + 8, box.y + box.height / 2);
+  for (let notch = 0; notch < 6; notch++) await page.mouse.wheel(0, 120);
+  const shortcuts = await settled();
+  expect(shortcuts).toBeGreaterThan(400);
+  await selectSettingsSection(page, "Appearance");
+  await near(0);
+  await port.evaluate((element) => {
+    element.scrollTop = 120;
+  });
+  const appearance = await settled();
+  expect(appearance).toBeGreaterThan(0);
+  await selectSettingsSection(page, "Shortcuts");
+  await near(shortcuts);
+  await page.goBack();
+  await expect(
+    page.getByRole("region", { name: "Appearance", exact: true }),
+  ).toBeVisible();
+  await near(appearance);
+  // Side by side, the plugin catalog scrolls in the detail, not the port.
+  await selectSettingsSection(page, "Manage plugins");
+  const catalog = settingsDialog(page).locator(".buzz-settings-page");
+  await catalog.evaluate((element) => {
+    element.scrollTop = 240;
+  });
+  const plugins = await settled(catalog);
+  expect(plugins).toBeGreaterThan(0);
+  await selectSettingsSection(page, "Appearance");
+  await near(appearance);
+  await selectSettingsSection(page, "Manage plugins");
+  await near(plugins, catalog);
+  await closeSettings(page);
+  await openSettings(page);
+  await selectSettingsSection(page, "Shortcuts");
+  await near(0);
 });
 
 // Real shell + shared presentation + browser storage across reload. State/error

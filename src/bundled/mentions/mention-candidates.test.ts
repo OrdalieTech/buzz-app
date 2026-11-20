@@ -71,6 +71,38 @@ it("reads only the session stores its cache compares", () => {
   ]);
 });
 
+it("marks a roster's choices outside the saved chat's member list as offered", () => {
+  const roster = [
+    { pubkey: key(3), name: "Bot" },
+    { pubkey: key(6), name: "Helper" },
+  ];
+  const marks = (chat?: { members?: string[] }) => {
+    const session = fresh();
+    const channels = chat ? [{ id: "c", channelType: "solo", ...chat }] : [];
+    Object.assign(session, {
+      channels: { list: () => ({ status: "ready", channels }) },
+    });
+    return mentionCandidates(session, "c", true, roster).map((row) => [
+      row.recipient.pubkey,
+      row.member,
+      !!row.offered,
+    ]);
+  };
+  // Both stay members for listing; only the chat's own list keeps one a
+  // member for Space.
+  expect(marks({ members: [key(1), key(3)] })).toEqual([
+    [key(3), true, false],
+    [key(6), true, true],
+  ]);
+  // An unsaved draft, or a chat whose member list has not loaded, has only
+  // the roster.
+  for (const unknown of [undefined, {}, { members: [] }])
+    expect(marks(unknown)).toEqual([
+      [key(3), true, false],
+      [key(6), true, false],
+    ]);
+});
+
 it("carries known execution into recipient choices without classifying directory-only agents", () => {
   const session = fresh();
   const identities = [
@@ -177,4 +209,50 @@ it("shows the verified name each row is not, and matches every verified name", (
   } finally {
     setNamePreference("username");
   }
+});
+
+it("marks only the viewer's saved and hosted agents as theirs", () => {
+  const owned = new Map(
+    rows([
+      { pubkey: key(8), name: "Mine", isAgent: true, ownerPubkey: key(1) },
+      { pubkey: key(9), name: "Theirs", isAgent: true, ownerPubkey: key(4) },
+    ]).map((row) => [row.recipient.pubkey, row.owned]),
+  );
+  // 3 and 6 are saved or hosted, and 7 is in another community. 8's directory
+  // row names the viewer, but that claim is unverified. 9 belongs to someone
+  // else; 4 is a person.
+  expect(owned).toEqual(
+    new Map([
+      [key(1), false],
+      [key(2), false],
+      [key(3), true],
+      [key(4), false],
+      [key(6), true],
+      [key(7), true],
+      [key(8), false],
+      [key(9), false],
+    ]),
+  );
+});
+
+it("offers the viewer's agents in a DM, where they are named but never added", () => {
+  const session = fresh();
+  Object.assign(session, {
+    channels: {
+      list: () => ({
+        status: "ready",
+        channels: [{ id: "c", name: "C", channelType: "dm", members }],
+      }),
+    },
+    // A DM adds no one, so the add-member capability does not matter.
+    outbox: { supports: () => false },
+  });
+  const offered = rows(undefined, session).map((row) => [
+    row.recipient.pubkey,
+    row.member,
+    row.owned,
+  ]);
+  // Another community's agent (7) could only join, which a DM cannot do.
+  expect(offered).toContainEqual([key(6), false, true]);
+  expect(offered.map(([pubkey]) => pubkey)).not.toContain(key(7));
 });

@@ -8,6 +8,7 @@ import { fakeSpawn, MODELS, sessionState } from "./claude-testing";
 import script from "./claude.sh?raw";
 import manifest from "./manifest.json";
 import { PROTECTED_CLAUDE_ROOT, PROTECTED_CLAUDE_VERSION } from "./security";
+import { PROCESS_LIMIT } from "./sessions";
 import { ClaudeAuth, type Step } from "./auth";
 import { checkClaude, ClaudeSetup, MIN_VERSION, withScript } from "./setup";
 
@@ -251,7 +252,13 @@ function scripted(
   const spawn = async (id: string, options: HostProcessOptions = {}) => {
     const args = options.args ?? [];
     calls.push({ id, args });
-    const result = output[`${id} ${args.join(" ")}`.trim()];
+    const command = `${id} ${args.join(" ")}`.trim();
+    // No setup of the person's own unless the script says otherwise.
+    const result =
+      output[command] ??
+      (command === "claude auth status --json"
+        ? { stdout: '{"loggedIn": false}', code: 1 }
+        : undefined);
     if (result instanceof Error) throw result;
     queueMicrotask(() => {
       if (result?.stdout) options.onStdout?.(result.stdout);
@@ -283,22 +290,22 @@ it("finds Claude missing when Buzz has no copy", async () => {
 
 it("finds a copy older than Buzz needs outdated", async () => {
   const { spawn } = scripted({
-    "claude --version": { stdout: "2.1.168 (Claude Code)\n" },
+    "claude --version": { stdout: "2.1.266 (Claude Code)\n" },
   });
   await expect(checkClaude(spawn, new ClaudeAuth(spawn))).resolves.toEqual({
     state: "outdated",
-    version: "2.1.168",
+    version: "2.1.266",
   });
 });
 
 it("reports the version and whether an API key is saved", async () => {
   const signedOut = scripted({
-    "claude --version": { stdout: "2.1.200 (Claude Code)\n" },
+    "claude --version": { stdout: "2.1.280 (Claude Code)\n" },
   });
   nativeKey.saved = false;
   await expect(
     checkClaude(signedOut.spawn, new ClaudeAuth(signedOut.spawn)),
-  ).resolves.toEqual({ state: "signed-out", version: "2.1.200" });
+  ).resolves.toEqual({ state: "signed-out", version: "2.1.280" });
   const signedOutSetup = new ClaudeSetup(signedOut.spawn);
   await signedOutSetup.check();
   expect(signedOutSetup.providerSnapshot()).toEqual({
@@ -307,11 +314,11 @@ it("reports the version and whether an API key is saved", async () => {
   });
   nativeKey.saved = true;
   const ready = scripted({
-    "claude --version": { stdout: "2.1.200 (Claude Code)\n" },
+    "claude --version": { stdout: "2.1.280 (Claude Code)\n" },
   });
   await expect(
     checkClaude(ready.spawn, new ClaudeAuth(ready.spawn)),
-  ).resolves.toEqual({ state: "ready", version: "2.1.200" });
+  ).resolves.toEqual({ state: "ready", version: "2.1.280" });
   const setup = new ClaudeSetup(ready.spawn);
   await setup.check();
   const refreshing = setup.check();
@@ -334,7 +341,7 @@ class InteractiveAuth extends ClaudeAuth {
 it("runs an interactive sign-in, shows its output, and checks again after", async () => {
   const { spawn, calls } = scripted({
     "claude auth login": { stdout: "Opening browser…\n" },
-    "claude --version": { stdout: "2.1.200\n" },
+    "claude --version": { stdout: "2.1.280\n" },
   });
   const setup = new ClaudeSetup(spawn, undefined, new InteractiveAuth(spawn));
   const run = setup.run("sign-in");
@@ -343,7 +350,7 @@ it("runs an interactive sign-in, shows its output, and checks again after", asyn
   expect(setup.snapshot()).toMatchObject({
     running: undefined,
     output: "Opening browser…\n",
-    status: { state: "ready", version: "2.1.200" },
+    status: { state: "ready", version: "2.1.280" },
   });
   expect(calls.map((call) => call.args.join(" "))).toEqual([
     "auth login",
@@ -401,7 +408,7 @@ it("explains that it needs the desktop app", async () => {
 
 it("caches failed model discovery until retry and closes a late probe on disposal", async () => {
   const checks = scripted({
-    "claude --version": { stdout: "2.1.200" },
+    "claude --version": { stdout: "2.1.280" },
   });
   let release!: (process: HostProcess) => void;
   const late = new Promise<HostProcess>((resolve) => {
@@ -414,8 +421,8 @@ it("caches failed model discovery until retry and closes a late probe on disposa
   await setup.loadModels();
   expect(setup.snapshot().modelsError).toBe("probe failed");
   await setup.loadModels();
-  // The version and the failed probe.
-  expect(spawn).toHaveBeenCalledTimes(2);
+  // The version, the setup check and the failed probe.
+  expect(spawn).toHaveBeenCalledTimes(3);
   spawn.mockImplementationOnce(() => late);
   const pending = setup.loadModels(true);
   expect(setup.snapshot().modelsChecking).toBe(true);
@@ -435,7 +442,7 @@ it("caches failed model discovery until retry and closes a late probe on disposa
 /** Health checks answer from a script; `claude` sessions answer like Claude. */
 function discoverable() {
   const checks = scripted({
-    "claude --version": { stdout: "2.1.200" },
+    "claude --version": { stdout: "2.1.280" },
   });
   const claude = fakeSpawn();
   const spawn = vi.fn<Spawn>(async (id, options) =>
@@ -472,9 +479,81 @@ it("looks for the catalog again after a discovery that listed nothing", async ()
   expect(sessions).toHaveLength(1);
 });
 
+it("looks for a stale catalog again, keeping the listed one meanwhile", async () => {
+  const { spawn, sessions } = discoverable();
+  const setup = new ClaudeSetup(spawn);
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    await setup.catalog();
+    const listed = setup.snapshot().models;
+    expect(sessions).toHaveLength(1);
+    // Within the hour, the list is current.
+    vi.setSystemTime(Date.now() + 60 * 60_000 - 1);
+    await setup.loadModels();
+    expect(sessions).toHaveLength(1);
+    // A failed refresh neither hides nor faults the listed models.
+    vi.setSystemTime(Date.now() + 1);
+    spawn.mockRejectedValueOnce(new Error("probe failed"));
+    const failing = setup.loadModels();
+    expect(setup.snapshot().modelsChecking).toBe(false);
+    await failing;
+    expect(setup.snapshot()).toMatchObject({
+      models: listed,
+      modelsChecking: false,
+      modelsError: "",
+    });
+    // It waits another hour. A surface asking then gets the listed catalog
+    // at once while the refresh runs; the same listing leaves it as it was.
+    await setup.loadModels();
+    expect(sessions).toHaveLength(1);
+    vi.setSystemTime(Date.now() + 60 * 60_000);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = false;
+    spawn.mockImplementationOnce((id, options) => {
+      started = true;
+      return held.then(() => spawn(id, options));
+    });
+    try {
+      await expect(setup.catalog()).resolves.toBe(listed);
+      expect(started).toBe(true);
+      expect(sessions).toHaveLength(1);
+    } finally {
+      release();
+    }
+    await setup.loadModels();
+    expect(sessions).toHaveLength(2);
+    expect(setup.snapshot().models).toBe(listed);
+    // A changed listing replaces it once the refresh finishes.
+    vi.setSystemTime(Date.now() + 60 * 60_000);
+    spawn.mockImplementationOnce((id, options) =>
+      spawn(id, {
+        ...options,
+        onStdout: (data) =>
+          options?.onStdout?.(
+            data.replace("claude-haiku-5-5", "claude-haiku-5-6"),
+          ),
+      }),
+    );
+    await expect(setup.catalog()).resolves.toBe(listed);
+    await setup.loadModels();
+    expect(sessions).toHaveLength(3);
+    const refreshed = await setup.catalog();
+    expect(refreshed).not.toBe(listed);
+    expect(
+      refreshed.find((model) => model.value === "haiku")?.resolvedModel,
+    ).toBe("claude-haiku-5-6");
+  } finally {
+    setup.dispose();
+    vi.useRealTimers();
+  }
+});
+
 it("bounds a stalled discovery and releases it for an explicit retry", async () => {
   const checks = scripted({
-    "claude --version": { stdout: "2.1.200" },
+    "claude --version": { stdout: "2.1.280" },
   });
   let exit!: (code: number | null) => void;
   const exited = new Promise<number | null>((resolve) => {
@@ -516,7 +595,16 @@ const CHECKSUM = "a".repeat(64);
 /** Buzz's copy on a fake disk, and downloads.claude.ai offering `latest`. */
 function releases(
   latest: string,
-  { current, broken }: { current?: string; broken?: string } = {},
+  {
+    current,
+    broken,
+    quits,
+  }: {
+    current?: string;
+    broken?: string;
+    /** Reports its version, then quits with this on stderr when driven. */
+    quits?: Readonly<{ version: string; stderr: string }>;
+  } = {},
 ) {
   const state = {
     current,
@@ -527,13 +615,25 @@ function releases(
   const claude = fakeSpawn();
   const spawn = async (id: string, options: HostProcessOptions = {}) => {
     const args = options.args ?? [];
-    if (id === "claude" && args.includes("stream-json"))
-      return claude.spawn(id, options);
     const version = options.env?.BUZZ_CLAUDE_VERSION ?? state.current;
+    if (id === "claude" && args.includes("stream-json")) {
+      if (!quits || version !== quits.version) return claude.spawn(id, options);
+      queueMicrotask(() => options.onStderr?.(quits.stderr));
+      return {
+        write: async () => undefined,
+        end: async () => undefined,
+        kill: async () => undefined,
+        exited: new Promise<number | null>((resolve) =>
+          setTimeout(() => resolve(1), 0),
+        ),
+      };
+    }
     let result: { stdout?: string; stderr?: string; code: number } = {
       code: 0,
     };
     if (id === "platform") result = { stdout: "Darwin arm64\n", code: 0 };
+    else if (args[0] === "auth")
+      result = { stdout: '{"loggedIn": false}', code: 1 };
     else if (id === "install") {
       state.fetched.push(args.join(" "));
       if (state.offline) result = { code: 1 };
@@ -596,7 +696,7 @@ it("installs the latest release once it passes its test", async () => {
 
 it("keeps the copy in use when a new release fails its test", async () => {
   const { spawn, request, state } = releases("2.1.300", {
-    current: "2.1.200",
+    current: "2.1.280",
     broken: "2.1.300",
   });
   const setup = new ClaudeSetup(spawn, request);
@@ -605,14 +705,32 @@ it("keeps the copy in use when a new release fails its test", async () => {
   expect(state.used).toEqual([]);
   expect(setup.snapshot()).toMatchObject({
     notice:
-      "Claude 2.1.300 failed its test: Killed: 9. Buzz keeps using 2.1.200.",
-    status: { state: "ready", version: "2.1.200" },
+      "Claude 2.1.300 failed its test: Killed: 9. Buzz keeps using 2.1.280.",
+    status: { state: "ready", version: "2.1.280" },
   });
   // A refused release is not downloaded again, unless the person asks.
   await setup.update(false);
   expect(state.fetched).toHaveLength(1);
   await setup.run("install");
   expect(state.fetched).toHaveLength(2);
+});
+
+it("says why a new release quit during its test", async () => {
+  const { spawn, request, state } = releases("2.1.300", {
+    current: "2.1.280",
+    quits: {
+      version: "2.1.300",
+      stderr: "Starting Claude\nError: bypassPermissions is disabled\n",
+    },
+  });
+  const setup = new ClaudeSetup(spawn, request);
+  await setup.update(false);
+  expect(state.used).toEqual([]);
+  expect(setup.snapshot()).toMatchObject({
+    notice:
+      "Claude 2.1.300 failed its test: Error: bypassPermissions is disabled. Buzz keeps using 2.1.280.",
+    status: { state: "ready", version: "2.1.280" },
+  });
 });
 
 it("does nothing when the copy is already the latest", async () => {
@@ -662,6 +780,8 @@ function pinnedRelease(state: {
   installed: boolean;
   broken?: boolean;
   failed?: boolean;
+  /** Times the host refuses the copy as it runs all it allows. */
+  full?: number;
 }) {
   const calls: string[] = [];
   const pinned: { protection?: unknown; killed: boolean }[] = [];
@@ -672,6 +792,10 @@ function pinnedRelease(state: {
     if (id === "install") state.installed = !state.broken && !state.failed;
     const protectedCopy = id === "claude-protected-arm64";
     const started = { protection: options.protection, killed: false };
+    if (protectedCopy && state.full) {
+      state.full--;
+      throw PROCESS_LIMIT;
+    }
     if (protectedCopy) pinned.push(started);
     if (protectedCopy && !state.installed)
       throw new Error("Artifact is unreadable");
@@ -718,6 +842,57 @@ it("installs the pinned protected release only when the host refuses its copy", 
     `install ${PROTECTED_CLAUDE_VERSION} darwin-arm64 ${CHECKSUM}`,
     "claude-protected-arm64 --version",
   ]);
+});
+
+it("makes room for the protected check when the host runs all it allows", async () => {
+  const { spawn, request, calls } = pinnedRelease({ installed: true, full: 1 });
+  const room = vi.fn(async () => true);
+  await new ClaudeSetup(spawn, request).protectedInstalled(
+    new AbortController().signal,
+    room,
+  );
+  expect(room).toHaveBeenCalledTimes(1);
+  expect(calls).toEqual([
+    "platform",
+    "claude-protected-arm64 --version",
+    "claude-protected-arm64 --version",
+  ]);
+});
+
+it("reclaims capacity before the protected check's platform probe", async () => {
+  const fake = pinnedRelease({ installed: true });
+  let full = true;
+  const calls: string[] = [];
+  const spawn: typeof fake.spawn = async (id, options) => {
+    calls.push(id);
+    // The native cap applies to every declared process, including uname.
+    if (full) throw PROCESS_LIMIT;
+    return fake.spawn(id, options);
+  };
+  const room = vi.fn(async () => {
+    full = false;
+    return true;
+  });
+  await expect(
+    new ClaudeSetup(spawn, fake.request).protectedInstalled(
+      new AbortController().signal,
+      room,
+    ),
+  ).resolves.toBeUndefined();
+  expect(room).toHaveBeenCalledTimes(1);
+  expect(calls).toEqual(["platform", "platform", "claude-protected-arm64"]);
+});
+
+it("fails a protected check the full host refuses, without installing", async () => {
+  const { spawn, request, calls } = pinnedRelease({ installed: true, full: 2 });
+  const room = vi.fn(async () => false);
+  await expect(
+    new ClaudeSetup(spawn, request).protectedInstalled(
+      new AbortController().signal,
+      room,
+    ),
+  ).rejects.toBe(PROCESS_LIMIT);
+  expect(calls).toEqual(["platform", "claude-protected-arm64 --version"]);
 });
 
 it("checks the pinned copy contained, never the download folder's file", async () => {
@@ -960,7 +1135,7 @@ it("stops holding a delivery when its deadline passes", async () => {
 });
 
 it("does not hold deliveries while it updates a copy in use", async () => {
-  const disk = releases("2.1.300", { current: "2.1.200" });
+  const disk = releases("2.1.300", { current: "2.1.280" });
   const { spawn, waiting, release } = held(disk, "install");
   const setup = new ClaudeSetup(spawn, disk.request);
   const update = setup.update(false);
@@ -996,4 +1171,35 @@ it("tries the first download again when a mention finds no copy", async () => {
   await setup.installed(new AbortController().signal);
   expect(disk.state.fetched).toHaveLength(2);
   expect(disk.state.used).toEqual(["2.1.300"]);
+});
+
+it("holds a delivery while it updates a copy too old for Buzz", async () => {
+  const disk = releases("2.1.300", { current: "2.1.177" });
+  const { spawn, waiting, release } = held(disk, "install");
+  const setup = new ClaudeSetup(spawn, disk.request);
+  const update = setup.update(false);
+  await waiting;
+  let delivered = false;
+  const delivery = setup.installed(new AbortController().signal).then(() => {
+    delivered = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(delivered).toBe(false);
+  release();
+  await Promise.all([update, delivery]);
+  expect(setup.snapshot().status).toMatchObject({ version: "2.1.300" });
+});
+
+it("refuses a delivery when a copy too old for Buzz could not be updated", async () => {
+  const disk = releases("2.1.300", { current: "2.1.177" });
+  disk.state.offline = true;
+  const setup = new ClaudeSetup(disk.spawn, disk.request);
+  await setup.update(false);
+  expect(setup.snapshot().status).toEqual({
+    state: "outdated",
+    version: "2.1.177",
+  });
+  await expect(setup.installed(new AbortController().signal)).rejects.toThrow(
+    "Claude 2.1.177 is older than Buzz needs (2.1.267)",
+  );
 });

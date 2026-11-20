@@ -1,17 +1,21 @@
 import { getEventHash } from "nostr-tools";
 import type { RelayReader } from "../relay/reader";
 import { retryRead } from "../relay/read-retry";
-import type { RelayWriter } from "../relay/transport";
+import type { ReadTransport } from "../relay/transport";
 import { newer, type RelayEvent } from "../relay/events";
 import { attestedOwner } from "../agents/owner-attestation";
+import { foldProfiles } from "../relay/profiles";
 import { PublishRejected } from "../relay/outbox";
 import { lifecycleChannelId } from "../relay/channel-lifecycle-protocol";
 import {
   authorizeMemberChange,
   canRemoveMember,
+  canSetMemberRole,
+  isEditableMemberRole,
   memberAdministrationTemplate,
   memberAuthority,
   memberChangeConfirmed,
+  transferRefusal,
   validateMemberAdministrationTemplate,
   type MemberAuthority,
   type MemberChange,
@@ -32,6 +36,7 @@ const empty: MemberAdministrationState = Object.freeze({
   authority: Object.freeze({
     roles: Object.freeze({}),
     canManage: false,
+    canManageSolo: false,
     canRemove: false,
     canRemoveOwnedAgent: false,
     system: false,
@@ -50,7 +55,7 @@ export function createMemberAdministration({
   acceptDiscovery,
 }: {
   reader?: RelayReader | undefined;
-  writer?: RelayWriter | undefined;
+  writer?: ReadTransport["memberAdministration"];
   viewer: string;
   relayAuthor: string;
   canAccess(id: string): boolean;
@@ -91,7 +96,13 @@ export function createMemberAdministration({
     assertAccess(id);
     return {
       events,
-      authority: memberAuthority(events, id, viewer, relayAuthor),
+      authority: memberAuthority(
+        events,
+        id,
+        viewer,
+        relayAuthor,
+        writer?.soloMemberRoleUpdates === true,
+      ),
     };
   }
   async function perform(
@@ -135,7 +146,7 @@ export function createMemberAdministration({
           const unresolved = operation?.status === "uncertain";
           const confirmed =
             unresolved &&
-            memberChangeConfirmed(result.authority, operation.change);
+            memberChangeConfirmed(result.authority, viewer, operation.change);
           acceptDiscovery(result.events);
           signal.throwIfAborted();
           if (!current()) return;
@@ -195,6 +206,31 @@ export function createMemberAdministration({
         });
         try {
           let owner: string | undefined;
+          let agent: boolean | undefined;
+          // Verify provenance once per attempt, never from display/inventory hints.
+          // Every preflight reads fresh membership; the relay owns the final ACL.
+          const profile = async () => {
+            const profiles = await reader.read(
+              [
+                {
+                  kinds: [0],
+                  authors: [change.pubkey],
+                  limit: 1,
+                  consistency: "strong",
+                },
+              ],
+              { signal, fresh: true, priority: "foreground" },
+            );
+            signal.throwIfAborted();
+            assertAccess(id);
+            if (
+              profiles.some(
+                (event) => event.kind !== 0 || event.pubkey !== change.pubkey,
+              )
+            )
+              throw new Error("Unexpected profile response");
+            return profiles.reduce<RelayEvent | undefined>(newer, undefined);
+          };
           const authorize = async () => {
             const { authority } = await read(id, signal);
             if (
@@ -203,39 +239,59 @@ export function createMemberAdministration({
               !canRemoveMember(authority, viewer, change.pubkey) &&
               canRemoveMember(authority, viewer, change.pubkey, viewer)
             ) {
-              // Verify provenance once per attempt, never from display/inventory hints.
-              // Both preflights read fresh membership; the relay owns the final ACL.
-              const profiles = await reader.read(
-                [
-                  {
-                    kinds: [0],
-                    authors: [change.pubkey],
-                    limit: 1,
-                    consistency: "strong",
-                  },
-                ],
-                { signal, fresh: true, priority: "foreground" },
-              );
-              signal.throwIfAborted();
-              assertAccess(id);
-              if (
-                profiles.some(
-                  (event) => event.kind !== 0 || event.pubkey !== change.pubkey,
-                )
-              )
-                throw new Error("Unexpected agent ownership response");
-              const profile = profiles.reduce<RelayEvent | undefined>(
-                newer,
-                undefined,
-              );
-              if (profile) owner = await attestedOwner(profile);
+              const event = await profile();
+              if (event) owner = await attestedOwner(event);
               signal.throwIfAborted();
               assertAccess(id);
             }
-            authorizeMemberChange(authority, viewer, change, owner);
+            if (change.role === "owner" && agent === undefined) {
+              // Without a profile, nothing shows the heir isn't an agent.
+              const event = await profile();
+              agent =
+                !event || !!foldProfiles([event]).get(change.pubkey)?.isAgent;
+              if (agent) throw new Error(transferRefusal);
+            }
+            const soloRoleUpdate =
+              authority.canManageSolo && isEditableMemberRole(change.role);
+            let targetOwner = owner;
+            if (
+              soloRoleUpdate &&
+              !canSetMemberRole(
+                authority,
+                viewer,
+                change.pubkey,
+                change.role,
+              ) &&
+              canSetMemberRole(
+                authority,
+                viewer,
+                change.pubkey,
+                change.role,
+                viewer,
+              )
+            ) {
+              // Promotions require fresh ownership proof on both preflights.
+              const event = await profile();
+              targetOwner = event && (await attestedOwner(event));
+              signal.throwIfAborted();
+              assertAccess(id);
+            }
+            authorizeMemberChange(
+              authority,
+              viewer,
+              change,
+              targetOwner,
+              agent,
+            );
+            return soloRoleUpdate;
           };
-          await authorize();
-          const template = memberAdministrationTemplate(id, change);
+          const soloRoleUpdate = await authorize();
+          const template = memberAdministrationTemplate(
+            id,
+            viewer,
+            change,
+            soloRoleUpdate,
+          );
           validateMemberAdministrationTemplate(template, viewer);
           const signed = await writer.sign(structuredClone(template), signal);
           signal.throwIfAborted();
@@ -248,7 +304,10 @@ export function createMemberAdministration({
             getEventHash(signed) !== signed.id
           )
             throw new Error("Signer changed the member administration command");
-          await authorize();
+          if ((await authorize()) !== soloRoleUpdate)
+            throw new Error(
+              "Chat type changed. Refresh members and roles before trying again.",
+            );
           signal.throwIfAborted();
           if (active?.() === false)
             throw new DOMException("Member change cancelled", "AbortError");
@@ -258,7 +317,7 @@ export function createMemberAdministration({
           // Acceptance is not proof; delayed side effects use explicit readback,
           // not a privileged outbox or an automatic retry loop.
           const result = await read(id, signal);
-          if (!memberChangeConfirmed(result.authority, change))
+          if (!memberChangeConfirmed(result.authority, viewer, change))
             throw new Error(uncertain);
           acceptDiscovery(result.events);
           signal.throwIfAborted();

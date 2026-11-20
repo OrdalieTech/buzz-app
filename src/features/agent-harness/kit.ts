@@ -223,17 +223,8 @@ export function harnessKit(sources: Sources): HarnessKit {
       const wake = trigger.type !== "mention" ? trigger : undefined;
       if (trigger.type === "mention") {
         // Only the owner or an attested sibling. Unlike the bundled harnesses,
-        // which kept relay workflow mentions for compatibility, no workflow
-        // authority is given, so no workflow mention is delegated; the
-        // community still applies the build's workflow restriction.
-        if (
-          !(await fromOwner(trigger.event, agent.owner, {
-            agent: agent.pubkey,
-            authority: undefined,
-            community: sources.relay(agent.key)?.snapshot().origin,
-          }))
-        )
-          return undefined;
+        // which kept relay workflow mentions for compatibility, no workflow check.
+        if (!(await fromOwner(trigger.event, agent.owner))) return undefined;
         signal.throwIfAborted();
       }
       const event =
@@ -397,7 +388,7 @@ export function harnessKit(sources: Sources): HarnessKit {
         text: [
           resumed ? `${text}\n\n${RESUMED_PROMPT}` : text,
           ...notes,
-          turnNote(agent),
+          turnNote(agent, channelId, noteRoot),
         ]
           .filter(Boolean)
           .join("\n\n"),
@@ -428,30 +419,33 @@ export function harnessKit(sources: Sources): HarnessKit {
       const pubkey = agent.pubkey;
       const reads = () => ownerReads(sources.relay(agent.key), pubkey);
       return async (message) => {
-        const ready = session(agent.key);
-        const client = appClient(agent, {
-          relayAuthor: ready?.relayAuthor,
-          signingAuthority: ready?.workflowAuthority,
-          read: (path) =>
-            options.read
-              ? options.read(path)
-              : Promise.reject(new Error(`This agent cannot read ${path}`)),
-          memories: (slug) => {
-            const found = reads();
-            if (!found)
-              return Promise.reject(new Error("Buzz is not connected"));
-            return memoryReads.read(
-              found,
-              pubkey,
-              AbortSignal.timeout(READ_TIMEOUT_MS),
-              slug,
-            );
-          },
-          remembered: () => {
-            const found = reads();
-            if (found) memoryReads.forget(found.connection, pubkey);
-          },
-        });
+        // Built when the call runs, and again after a reload it waits out.
+        const client = () => {
+          const ready = session(agent.key);
+          return appClient(agent, {
+            relayAuthor: ready?.relayAuthor,
+            signingAuthority: ready?.workflowAuthority,
+            read: (path) =>
+              options.read
+                ? options.read(path)
+                : Promise.reject(new Error(`This agent cannot read ${path}`)),
+            memories: (slug) => {
+              const found = reads();
+              if (!found)
+                return Promise.reject(new Error("Buzz is not connected"));
+              return memoryReads.read(
+                found,
+                pubkey,
+                AbortSignal.timeout(READ_TIMEOUT_MS),
+                slug,
+              );
+            },
+            remembered: () => {
+              const found = reads();
+              if (found) memoryReads.forget(found.connection, pubkey);
+            },
+          });
+        };
         const added = sources.added();
         return respond(client, context, message, added, {
           instructions: sessionHint(added),

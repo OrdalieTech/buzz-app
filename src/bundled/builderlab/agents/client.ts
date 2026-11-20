@@ -7,9 +7,13 @@ import type {
   HostResponse,
   NipOaAuthorization,
 } from "../../../features/host/service";
-import { oauthTarget } from "../oauth/browser";
 import { managementTimestamp } from "../management-date";
-import type { BuilderlabSession, Credential } from "../session";
+import {
+  sessionTarget,
+  UNAUTHORIZED,
+  type BuilderlabSession,
+  type Credential,
+} from "../session";
 import {
   clearRegistration,
   registrationIntent,
@@ -32,6 +36,24 @@ export type RemoteAgent = Readonly<{
     | "effort-unsupported"
     | "unknown";
 }>;
+
+/** One of a remote agent's conversations, as Builderlab stores it. */
+export type AgentSession = Readonly<{
+  sessionId: string;
+  channelId: string;
+  /** Absent when the whole channel shares one session. */
+  threadRootId?: string;
+  updatedAt: number;
+}>;
+/** Sessions read at most, the most the server returns in one page. */
+const SESSION_LIMIT = 50;
+const communityHost = (community: string) => {
+  try {
+    return new URL(community).host;
+  } catch {
+    throw new Error(`The agent's community is not a URL: ${community}`);
+  }
+};
 
 export type RemoteAgentModel = Readonly<{
   id: string;
@@ -129,6 +151,10 @@ const LINK_ERRORS: Record<string, string> = {
     "This Buzz identity is linked to a different Builderlab account.",
 };
 
+// Sign-in and the activation guard can overlap, also through different clients
+// of one sign-in; they share one binding attempt.
+const linking = new WeakMap<Credential, Promise<void>>();
+
 export function createAgentClient(
   session: BuilderlabSession,
   // Without native identity (the dev viewer), owner proofs come from the
@@ -155,12 +181,9 @@ export function createAgentClient(
     )
       throw new DOMException("Builderlab session changed.", "AbortError");
   }
-  function refuseExpired(response: HostResponse) {
+  function refuseUnauthorized(response: HostResponse) {
     if (response.status !== 401) return;
-    throw Object.assign(
-      new Error("Your Builderlab session expired. Sign in again."),
-      { status: 401 },
-    );
+    throw Object.assign(new Error(UNAUTHORIZED), { status: 401 });
   }
   async function request(
     path: string,
@@ -188,7 +211,7 @@ export function createAgentClient(
       throw new BuilderlabUnavailable("Could not reach Builderlab. Try again.");
     }
     check(credential, signal);
-    refuseExpired(response);
+    refuseUnauthorized(response);
     if (response.status === 403)
       throw Object.assign(
         new Error("This Builderlab account cannot manage remote agents."),
@@ -209,7 +232,12 @@ export function createAgentClient(
     }
   }
   function readRequest(
-    path: "get-model-catalog" | "list-agents" | "get-agent-turn-status",
+    path:
+      | "get-model-catalog"
+      | "list-agents"
+      | "get-agent-turn-status"
+      | "list-agent-sessions"
+      | "get-agent-session-messages",
     body: unknown,
     signal: AbortSignal,
   ) {
@@ -232,7 +260,7 @@ export function createAgentClient(
   ): Promise<Record<string, unknown>> {
     signal.throwIfAborted();
     const credential = session.credential();
-    const target = oauthTarget();
+    const target = sessionTarget(session);
     let response: HostResponse;
     try {
       response = await session.request(credential, {
@@ -251,7 +279,7 @@ export function createAgentClient(
       throw new Error("Could not reach Builderlab. Try again.");
     }
     check(credential, signal);
-    refuseExpired(response);
+    refuseUnauthorized(response);
     let result: Record<string, unknown> | undefined;
     try {
       const parsed = JSON.parse(response.body);
@@ -281,19 +309,17 @@ export function createAgentClient(
       ?.pubkey_hex;
     return typeof hex === "string" ? hex.toLowerCase() : null;
   };
-  // Sign-in and the activation guard can overlap; they share one binding attempt.
-  let linking: { credential: Credential; done: Promise<void> } | undefined;
   /** Binds this device's Buzz key to the signed-in account; attestation requires it. */
   function link(signal: AbortSignal): Promise<void> {
     if (!owner) return Promise.resolve();
     const credential = session.credential();
-    if (linking?.credential !== credential) {
-      const done = bind(owner, signal).finally(() => {
-        if (linking?.done === done) linking = undefined;
-      });
-      linking = { credential, done };
-    }
-    return linking.done;
+    const running = linking.get(credential);
+    if (running) return running;
+    const done = bind(owner, signal).finally(() => {
+      if (linking.get(credential) === done) linking.delete(credential);
+    });
+    linking.set(credential, done);
+    return done;
   }
   async function bind(
     owner: OwnerIdentity,
@@ -304,6 +330,8 @@ export function createAgentClient(
     if (typeof key !== "string" || !/^[0-9a-f]{64}$/.test(key))
       throw new Error("Set up your Buzz identity before creating an agent.");
     const credential = session.credential();
+    // The site this attempt links; a challenge for another is never signed.
+    const expected = new URL(sessionTarget(session)).origin;
     const bound = boundKey(await identityRequest("current", {}, signal));
     if (bound === key) {
       backupLinkedIdentity();
@@ -313,11 +341,13 @@ export function createAgentClient(
     if (bound) throw new Error(LINK_ERRORS.identity_already_bound);
     const challenge = await identityRequest(
       "challenge",
-      { origin: new URL(oauthTarget()).origin },
+      { origin: expected },
       signal,
     );
     const { challenge_id, nonce, verification_code, origin, expires_at } =
       challenge;
+    if (origin !== expected)
+      throw new Error("Builderlab returned a challenge for another site.");
     let event: object;
     try {
       event = await owner.signBinding({
@@ -401,6 +431,75 @@ export function createAgentClient(
         statuses.set(taskId, outcome);
       }
       return statuses;
+    },
+    /** One page of the agent's conversation sessions, most recently active
+     * first, from `cursor` when given; `cursor` names the next page while
+     * older ones remain. With `place`, only the session of that
+     * conversation: its thread's, else its channel's. */
+    async sessions(
+      agentId: string,
+      signal: AbortSignal,
+      place?: Readonly<{
+        community: string;
+        channelId: string;
+        threadRootId?: string | undefined;
+      }>,
+      cursor?: string,
+    ) {
+      const result = await readRequest(
+        "list-agent-sessions",
+        {
+          agent_id: agentId,
+          limit: SESSION_LIMIT,
+          ...(cursor && { cursor }),
+          ...(place && {
+            // Beekeeper keys conversations by the community's host.
+            community: communityHost(place.community),
+            channel_id: place.channelId,
+            ...(place.threadRootId && {
+              thread_root_event_id: place.threadRootId,
+            }),
+          }),
+        },
+        signal,
+      );
+      const rows = result.sessions ?? [];
+      if (!Array.isArray(rows))
+        throw new Error("Builderlab returned an invalid session list.");
+      const sessions = rows.map((row): AgentSession => {
+        const updatedAt = managementTimestamp(row?.updated_at);
+        if (
+          typeof row?.session_id !== "string" ||
+          !row.session_id ||
+          typeof row.channel_id !== "string" ||
+          !row.channel_id
+        )
+          throw new Error("Builderlab returned an invalid session list.");
+        return {
+          sessionId: row.session_id,
+          channelId: row.channel_id,
+          ...(typeof row.thread_root_event_id === "string" &&
+          row.thread_root_event_id
+            ? { threadRootId: row.thread_root_event_id }
+            : {}),
+          updatedAt: updatedAt ?? 0,
+        };
+      });
+      return {
+        sessions,
+        cursor:
+          typeof result.next_cursor === "string" && result.next_cursor
+            ? result.next_cursor
+            : undefined,
+      };
+    },
+    /** A listed session's stored messages and turns, as Builderlab sent them. */
+    sessionMessages(sessionId: string, signal: AbortSignal) {
+      return readRequest(
+        "get-agent-session-messages",
+        { session_id: sessionId },
+        signal,
+      );
     },
     link,
     activate,
@@ -598,8 +697,10 @@ export function createAgentClient(
       if (!AGENT_NAME.test(agentName)) throw new Error(INVALID_NAME);
       const credential = await remoteCredential(signal);
       const { account } = credential;
+      // The server this account is on, read with it.
+      check(credential, signal);
       const intent = registrationIntent(
-        oauthTarget(),
+        sessionTarget(session),
         account.subject,
         agentName,
         picture,

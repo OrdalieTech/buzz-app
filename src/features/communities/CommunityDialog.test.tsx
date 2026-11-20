@@ -111,7 +111,11 @@ it("publishes a description-only edit to an existing community profile", async (
   expect(api.publishProfile).toHaveBeenCalledWith(
     "https://relay.example",
     { name: "Fixture", picture: "", about: "After" },
-    { name: "Fixture", about: "Before" },
+    {
+      name: "Fixture",
+      about: "Before",
+      tz: new Intl.DateTimeFormat().resolvedOptions().timeZone,
+    },
   );
   await waitFor(() => expect(communities.joined).toHaveBeenCalledOnce());
 });
@@ -357,7 +361,11 @@ it("explains an inherited invalid avatar when editing at join and recovers on re
       picture: "https://images.example/new.png",
       about: "",
     },
-    { name: "Fixture", picture },
+    {
+      name: "Fixture",
+      picture,
+      tz: new Intl.DateTimeFormat().resolvedOptions().timeZone,
+    },
   );
   await waitFor(() => expect(communities.joined).toHaveBeenCalledOnce());
 });
@@ -877,6 +885,203 @@ it("opens a checked connection address separately without replacing or removing 
   }
 });
 
+it("shows a sign-in refusal at the access step once, with its sign-in", async () => {
+  const user = userEvent.setup();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const route = String(url).split("/").at(-1);
+      if (route === "register") return Response.json({ id: "x" });
+      if (route === "info")
+        return Response.json({ name: "Fixture", membershipRequired: true });
+      if (route === "claim")
+        return Response.json(
+          { error: "Federated sign-in is required" },
+          { status: 401 },
+        );
+      throw new Error(`Unexpected request: ${url}`);
+    }),
+  );
+  const communities = {
+    snapshot: () => ({
+      status: "ready",
+      relayAvailable: true,
+      profile: { name: "Local", picture: "" },
+    }),
+  } as unknown as Communities;
+  const h = federatedFixture();
+  render(
+    <CommunityDialog
+      communities={communities}
+      federatedIdentity={h.service}
+      mode="join"
+      close={() => {}}
+      invite={{ community: "https://relay.example", code: "v2.abc" }}
+    />,
+  );
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  expect(await screen.findByLabelText("Invite code")).toHaveValue("v2.abc");
+  // Continue at the access step claims the invite, which is refused.
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  expect(
+    await screen.findByText(
+      "This community requires builderlab.example sign-in.",
+    ),
+  ).toBeVisible();
+  expect(screen.getByLabelText("Invite code")).toHaveValue("v2.abc");
+  expect(
+    screen.getByRole("button", { name: "Sign in with builderlab.example" }),
+  ).toBeVisible();
+  expect(screen.queryByText("Federated sign-in is required")).toBeNull();
+});
+
+it("keeps an explained access refusal hidden after Not now dismisses its switch", async () => {
+  const user = userEvent.setup();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const route = String(url).split("/").at(-1);
+      if (route === "register") return Response.json({ id: "x" });
+      if (route === "info")
+        return Response.json({ name: "Fixture", membershipRequired: true });
+      if (route === "claim")
+        return Response.json(
+          { error: "authorization-denied" },
+          { status: 403 },
+        );
+      throw new Error(`Unexpected request: ${url}`);
+    }),
+  );
+  const communities = {
+    snapshot: () => ({
+      status: "ready",
+      relayAvailable: true,
+      profile: { name: "Local", picture: "" },
+    }),
+  } as unknown as Communities;
+  const h = federatedFixture();
+  await h.service.signIn();
+  render(
+    <CommunityDialog
+      communities={communities}
+      federatedIdentity={h.service}
+      mode="join"
+      close={() => {}}
+      invite={{ community: "https://relay.example", code: "v2.abc" }}
+    />,
+  );
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  // The signed-in account consents, so Continue claims the invite at once.
+  await user.click(await screen.findByRole("button", { name: "Not now" }));
+  expect(screen.queryByRole("button", { name: "Switch account" })).toBeNull();
+  // Dismissing the explanation dismisses the refusal: its raw text stays hidden.
+  expect(screen.queryByText(/authorization-denied/)).toBeNull();
+});
+
+// NIP-FA: an issuer refusal is not retried automatically; Continue after one
+// is the user's retry, so it asks the issuer again.
+it("asks the community's issuer again before each Continue's request", async () => {
+  const user = userEvent.setup();
+  let refuse = true;
+  const order: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const route = String(url).split("/").at(-1);
+      if (route === "info") order.push("info");
+      if (route === "register") return Response.json({ id: "x" });
+      if (route === "info" && refuse)
+        return Response.json(
+          { error: "authorization-denied" },
+          { status: 403 },
+        );
+      if (route === "info")
+        return Response.json({ name: "Fixture", membershipRequired: true });
+      throw new Error(`Unexpected request: ${url}`);
+    }),
+  );
+  const communities = {
+    snapshot: () => ({
+      status: "ready",
+      relayAvailable: true,
+      profile: { name: "Local", picture: "" },
+    }),
+  } as unknown as Communities;
+  const h = federatedFixture();
+  vi.mocked(h.service.askAgain).mockImplementation(async (relay) => {
+    order.push(`ask again ${relay}`);
+  });
+  render(
+    <CommunityDialog
+      communities={communities}
+      federatedIdentity={h.service}
+      mode="join"
+      close={() => {}}
+    />,
+  );
+  await user.type(
+    screen.getByLabelText("Community URL"),
+    "wss://relay.example",
+  );
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  expect(
+    await screen.findByText(
+      "Your account does not have access to this community. Contact its administrator.",
+    ),
+  ).toBeVisible();
+  refuse = false;
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  expect(await screen.findByLabelText("Invite code")).toBeInTheDocument();
+  expect(order).toEqual([
+    "ask again https://relay.example",
+    "info",
+    "ask again https://relay.example",
+    "info",
+  ]);
+});
+
+// Continue asks the issuer again, so an issuer refusal needn't wait for a restart.
+it("tells the person to try again after an issuer refusal, not to restart", async () => {
+  const user = userEvent.setup();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const route = String(url).split("/").at(-1);
+      if (route === "register") return Response.json({ id: "x" });
+      if (route === "info")
+        return Response.json({ error: "grant-refused" }, { status: 403 });
+      throw new Error(`Unexpected request: ${url}`);
+    }),
+  );
+  const communities = {
+    snapshot: () => ({
+      status: "ready",
+      relayAvailable: true,
+      profile: { name: "Local", picture: "" },
+    }),
+  } as unknown as Communities;
+  const h = federatedFixture();
+  render(
+    <CommunityDialog
+      communities={communities}
+      federatedIdentity={h.service}
+      mode="join"
+      close={() => {}}
+    />,
+  );
+  await user.type(
+    screen.getByLabelText("Community URL"),
+    "wss://relay.example",
+  );
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  expect(
+    await screen.findByText(
+      "Buzz couldn’t confirm your organization sign-in for this community. Try again. If it keeps happening, contact your administrator.",
+    ),
+  ).toBeVisible();
+  expect(screen.queryByText(/Restart Buzz/)).toBeNull();
+});
+
 it("offers federated sign-in when joining refuses for it, then lets Continue run the current step", async () => {
   const user = userEvent.setup();
   let refuse = true;
@@ -921,6 +1126,8 @@ it("offers federated sign-in when joining refuses for it, then lets Continue run
       "This community requires builderlab.example sign-in.",
     ),
   ).toBeVisible();
+  // The explanation replaces the field's raw error.
+  expect(screen.queryByText("Federated sign-in is required")).toBeNull();
   const signIn = await screen.findByRole("button", {
     name: "Sign in with builderlab.example",
   });
@@ -1279,3 +1486,162 @@ it.each([
     expect(await screen.findByLabelText("Invite code")).toBeVisible();
   },
 );
+
+it("reports a signed-in account's admission as a write, so Close and Back wait for the claim", async () => {
+  api.inspectProfile.mockResolvedValue({
+    exists: false,
+    existing: {},
+    profile: { name: "", picture: "" },
+  });
+  const user = userEvent.setup();
+  let answer = () => {};
+  const claimed = new Promise<void>((resolve) => {
+    answer = resolve;
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const route = String(url).split("/").at(-1);
+      if (route === "register") return Response.json({ id: "x" });
+      if (route === "info")
+        return Response.json({
+          name: "Fixture",
+          membershipRequired: true,
+          policy: {
+            version: "v1",
+            terms_markdown: "Terms",
+            age_attestation_required: true,
+          },
+        });
+      if (route === "accept-policy")
+        return Response.json({ receipt: "receipt-1" });
+      if (route === "claim") {
+        await claimed;
+        return Response.json({ status: "joined" });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }),
+  );
+  const writing = vi.fn();
+  render(
+    <CommunityDialog
+      communities={lookupCommunities}
+      federatedIdentity={await signedInAccount()}
+      mode="join"
+      close={() => {}}
+      onWritingChange={writing}
+      invite={{ community: "https://relay.example", code: "v2.abc" }}
+    />,
+  );
+  // From the destination step: the lookup is a read, the claim after it a write.
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  await waitFor(() => expect(writing).toHaveBeenLastCalledWith(true));
+  expect(screen.getByRole("button", { name: "Close" })).toBeDisabled();
+  act(() => answer());
+  expect(await screen.findByLabelText("Display name")).toBeVisible();
+  await waitFor(() => expect(writing).toHaveBeenLastCalledWith(false));
+  expect(screen.getByRole("button", { name: "Close" })).toBeEnabled();
+});
+
+it("keeps a submitted address submitted after the host withdraws its one-use connect", async () => {
+  const lookups = silentHost();
+  const view = render(
+    <CommunityDialog
+      communities={lookupCommunities}
+      mode="join"
+      close={() => {}}
+      submittedDestination
+      invite={{ community: "https://quiet.example", code: "" }}
+    />,
+  );
+  await waitFor(() => expect(lookups).toHaveLength(1));
+  expect(screen.getByRole("status")).toHaveTextContent(
+    "Finding your community…",
+  );
+  // The host consumes the instruction once the dialog has started it.
+  view.rerender(
+    <CommunityDialog
+      communities={lookupCommunities}
+      mode="join"
+      close={() => {}}
+      submittedDestination={false}
+      invite={{ community: "https://quiet.example", code: "" }}
+    />,
+  );
+  expect(screen.getByRole("status")).toHaveTextContent(
+    "Finding your community…",
+  );
+  expect(screen.queryByLabelText("Community URL")).toBeNull();
+  expect(lookups).toHaveLength(1);
+});
+
+it("holds Close from before the access step's issuer reset, so a dismissed join sends no policy acceptance", async () => {
+  api.inspectProfile.mockResolvedValue({
+    exists: false,
+    existing: {},
+    profile: { name: "", picture: "" },
+  });
+  const user = userEvent.setup();
+  const routes: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const route = String(url).split("/").at(-1) ?? "";
+      routes.push(route);
+      if (route === "register") return Response.json({ id: "x" });
+      if (route === "info")
+        return Response.json({
+          name: "Fixture",
+          policy: {
+            version: "v1",
+            terms_markdown: "Terms",
+            age_attestation_required: true,
+          },
+        });
+      if (route === "accept-policy")
+        return Response.json({ receipt: "receipt-1" });
+      if (route === "claim") return Response.json({ status: "joined" });
+      throw new Error(`Unexpected request: ${url}`);
+    }),
+  );
+  const h = federatedFixture();
+  let reset = () => {};
+  vi.mocked(h.service.askAgain)
+    .mockResolvedValueOnce(undefined)
+    .mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          reset = resolve;
+        }),
+    );
+  const writing = vi.fn();
+  render(
+    <CommunityDialog
+      communities={lookupCommunities}
+      federatedIdentity={h.service}
+      mode="join"
+      close={() => {}}
+      onWritingChange={writing}
+      invite={{ community: "https://relay.example", code: "v2.abc" }}
+    />,
+  );
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  await user.click(
+    await screen.findByRole("checkbox", {
+      name: "I confirm that I am at least 18 years old.",
+    }),
+  );
+  await user.click(screen.getByRole("checkbox", { name: /I agree/ }));
+  await user.click(screen.getByRole("button", { name: "Continue" }));
+  // The issuer reset is pending: nothing is sent yet, but the join cannot be left.
+  await waitFor(() => expect(h.service.askAgain).toHaveBeenCalledTimes(2));
+  expect(writing).toHaveBeenLastCalledWith(true);
+  expect(screen.getByRole("button", { name: "Close" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Back" })).toBeDisabled();
+  expect(routes).not.toContain("accept-policy");
+  act(() => reset());
+  expect(await screen.findByLabelText("Display name")).toBeVisible();
+  expect(routes).toContain("accept-policy");
+  await waitFor(() => expect(writing).toHaveBeenLastCalledWith(false));
+  expect(screen.getByRole("button", { name: "Close" })).toBeEnabled();
+});

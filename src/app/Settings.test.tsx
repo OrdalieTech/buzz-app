@@ -16,6 +16,7 @@ import { ToastProvider } from "../shared/design-system/ui/Toast";
 import { Context } from "@deepseek-ai/cordis";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import { createCommunityMembership } from "../bundled/moderation/membership";
+import performanceDiagnosticsManifest from "../bundled/performance-diagnostics/manifest.json";
 import {
   SettingsCardsService,
   type SettingsCard,
@@ -28,6 +29,14 @@ import type { RelayData } from "../features/relay/service";
 import type { Contribution } from "../plugins/contributions";
 import { createPluginInstallRequests } from "../plugins/installer";
 import { createPluginRequests } from "../plugins/requests";
+import { createPluginManager } from "../plugins/manager";
+import { PagesService } from "../features/pages/service";
+import type { PluginStorage } from "../plugins/storage";
+import type {
+  ImportPreview,
+  PluginInfo,
+  StorageResult,
+} from "../plugins/types";
 
 afterEach(cleanup);
 // Settings reads agent plugin requests from every plugin manager.
@@ -323,6 +332,15 @@ it.each([false, true])("groups plugins (Essentials=%s)", async (essentials) => {
       discovery: { category: "communication" },
     },
   });
+  ready.configuration.catalog.plugins.push({
+    manifest: performanceDiagnosticsManifest,
+    source: "bundled",
+    enabled: essentials,
+    revision: "bundled",
+    previous: null,
+    reloadable: false,
+    error: null,
+  });
   render(
     <Settings
       {...host}
@@ -480,7 +498,9 @@ it.each([false, true])("groups plugins (Essentials=%s)", async (essentials) => {
   await waitFor(() =>
     expect(within(content).getByText("Invoices")).toBeVisible(),
   );
-  fireEvent.change(search, { target: { value: "no-match" } });
+  fireEvent.change(search, {
+    target: { value: "buzz.performance-diagnostics" },
+  });
   expect(within(content).queryAllByRole("article")).toHaveLength(0);
   expect(within(content).getByText("No plugins match")).toBeVisible();
   const clearFilters = within(content).getByRole("button", {
@@ -722,6 +742,159 @@ it("opens each plugin's existing metadata and controls in a detail aside", () =>
 });
 
 // These fixtures exercise catalog updates through the same subscription as the host.
+it.each(["folder", "git"] as const)(
+  "repairs an enabled unsigned plugin through Settings without changing its revision (%s)",
+  async (source) => {
+    const signatureError = "External plugins require a signed release";
+    const unsigned: PluginInfo = {
+      manifest: { id: "example.repair", name: "Repair", apiVersion: 1 },
+      source: "external",
+      enabled: true,
+      revision: "unchanged",
+      previous: null,
+      hasSignature: false,
+      publisher: null,
+      reloadable: true,
+      updateSource:
+        source === "folder"
+          ? { root: "/plugins", path: "dist" }
+          : {
+              repository: "https://example.com/plugins.git",
+              reference: "main",
+              path: "dist",
+            },
+      error: signatureError,
+    };
+    const signed = {
+      ...unsigned,
+      hasSignature: true,
+      publisher: "a".repeat(64),
+      error: null,
+    };
+    let installed = unsigned;
+    const catalog = (): StorageResult => ({
+      status: "ready",
+      externalPluginsPaused: false,
+      catalog: { profile: "test", location: "test", plugins: [installed] },
+    });
+    const preview: ImportPreview = {
+      token: "repair-preview",
+      source: "/plugins",
+      commit: null,
+      warnings: [],
+      candidates: [
+        {
+          path: "dist",
+          manifest: signed.manifest,
+          revision: signed.revision,
+          publisher: signed.publisher,
+        },
+      ],
+    };
+    const code = `export const inject = ["pages"];
+export function apply(ctx) {
+  ctx.pages.register({ id: "repaired", title: "Repaired", component: () => null });
+}`;
+    const originalURL = URL;
+    vi.stubGlobal(
+      "URL",
+      class extends originalURL {
+        static createObjectURL() {
+          return `data:text/javascript,${encodeURIComponent(code)}`;
+        }
+        static revokeObjectURL() {}
+      },
+    );
+    const install = vi.fn(async () => {
+      installed = signed;
+      return catalog();
+    });
+    const storage: PluginStorage = {
+      getCatalog: async () => catalog(),
+      changePlugin: vi.fn(),
+      recoverSettings: vi.fn(),
+      reloadPlugin: vi.fn(),
+      readModule: vi.fn(async () => code),
+      imports: {
+        folder: vi.fn(),
+        files: vi.fn(),
+        git: vi.fn(async () => preview),
+        url: vi.fn(),
+        checkGit: vi.fn(async () => preview),
+        checkFolder: vi.fn(async () => ({
+          revision: signed.revision,
+          publisher: signed.publisher,
+        })),
+        previewFolder: vi.fn(async () => preview),
+        install,
+        discard: vi.fn(async () => {}),
+      },
+    };
+    const root = new Context();
+    const plugins = createPluginManager(root, { storage, bundled: [] });
+    const pages = new PagesService(root);
+    const { cards } = registry([]);
+    const view = render(<Settings {...host} cards={cards} plugins={plugins} />);
+    try {
+      await waitFor(() => expect(plugins.startup()).toBe("ready"));
+      fireEvent.click(screen.getByRole("button", { name: "Manage plugins" }));
+      fireEvent.click(
+        await screen.findByRole("button", { name: "View Repair details" }),
+      );
+      const details = screen.getByRole("complementary", {
+        name: "Repair details",
+      });
+      expect(within(details).getByText(signatureError)).toBeVisible();
+      if (source === "git")
+        fireEvent.click(
+          within(details).getByRole("button", { name: "Check for updates" }),
+        );
+      await waitFor(() =>
+        expect(
+          within(details).getByRole("button", { name: "Update" }),
+        ).toBeEnabled(),
+      );
+      fireEvent.click(within(details).getByRole("button", { name: "Update" }));
+      const dialog = await screen.findByRole("dialog", {
+        name: "Update Repair",
+      });
+      const confirm = await within(dialog).findByRole("button", {
+        name: "Update",
+      });
+      expect(install).not.toHaveBeenCalled();
+      expect(storage.readModule).not.toHaveBeenCalled();
+      expect(pages.snapshot()).toEqual([]);
+      fireEvent.click(confirm);
+      await waitFor(() =>
+        expect(pages.snapshot().map((page) => page.key)).toEqual([
+          "example.repair/repaired",
+        ]),
+      );
+      expect(install).toHaveBeenCalledExactlyOnceWith("repair-preview", "dist");
+      expect(plugins.snapshot().configuration).toMatchObject({
+        catalog: {
+          plugins: [
+            {
+              enabled: true,
+              revision: "unchanged",
+              hasSignature: true,
+              error: null,
+            },
+          ],
+        },
+      });
+      expect(within(details).queryByText(signatureError)).toBeNull();
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(within(details).getByText("Up to date")).toBeVisible();
+    } finally {
+      view.unmount();
+      await plugins.dispose();
+      await root.fiber.dispose();
+      vi.stubGlobal("URL", originalURL);
+    }
+  },
+);
+
 function reviewPluginFixture(
   extra: Partial<Parameters<typeof Settings>[0]> = {},
 ) {
@@ -1534,7 +1707,9 @@ type Visit = {
   entryId?: string;
   traversal?: true;
   pluginId?: string;
-  pluginImport?: { repository: string; reference: string };
+  pluginImport?:
+    | { repository: string; reference: string }
+    | { id: string; url: string; sha256: string };
 };
 
 it("links a plugin's details to the Settings sections it adds", async () => {
@@ -1830,6 +2005,57 @@ it("records the plugin Open in Buzz shows on the visit replacing its import", as
   expect(shown()).toBe("Codex");
 });
 
+it("keeps the plugin a URL link's Open plugin shows when its dismissal lands later", async () => {
+  const fromFolder = {
+    manifest: { id: "example.artifact", name: "Artifact", apiVersion: 1 },
+    source: "external",
+    enabled: true,
+    revision: "git",
+    previous: null,
+    reloadable: false,
+    error: null,
+    updateSource: { root: "/plugins/artifact", path: "." },
+  };
+  const snapshot = {
+    configuration: {
+      status: "ready",
+      externalPluginsPaused: false,
+      catalog: { profile: "test", location: "test", plugins: [fromFolder] },
+    },
+    activation: {},
+    busy: false,
+    error: null,
+    refreshError: null,
+  };
+  const url = vi.fn();
+  const { visit, land, entry, shown, stored, onPluginImportClosed } =
+    pluginHost(
+      { snapshot: () => snapshot, imports: { url, discard: vi.fn() } },
+      { entryId: "p1" },
+    );
+  visit("plugins", {
+    entryId: "p2",
+    pluginImport: {
+      id: "example.artifact",
+      url: "https://plugins.example.org/artifact.json",
+      sha256: "a".repeat(64),
+    },
+  });
+  onPluginImportClosed.mockImplementation(() =>
+    setTimeout(() => land("plugins", { entryId: "p1", traversal: true })),
+  );
+  fireEvent.click(await screen.findByRole("button", { name: "Open plugin" }));
+  await waitFor(() => expect(entry()).toBe("p1"));
+  expect(shown()).toBe("Artifact");
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Close plugin details" }),
+    ).toHaveFocus(),
+  );
+  expect(stored("p1")).toBe("example.artifact");
+  expect(url).not.toHaveBeenCalled();
+});
+
 it("keeps an earlier visit's details when an import finishes after Back", async () => {
   let finish!: (installed: boolean) => void;
   const installed = new Promise<boolean>((resolve) => {
@@ -1851,6 +2077,182 @@ it("keeps an earlier visit's details when an import finishes after Back", async 
   await waitFor(() => expect(onPluginImportClosed).toHaveBeenCalledOnce());
   visit("plugins", { entryId: "p0", traversal: true });
   expect(shown()).toBe("Codex");
+});
+
+/** Drives the ResizeObservers watching `watched` (the detail), for this test. */
+function resizeDetail(watched = ".buzz-settings-page") {
+  const Stub = globalThis.ResizeObserver;
+  const watching = new Set<() => void>();
+  vi.stubGlobal(
+    "ResizeObserver",
+    class extends Stub {
+      readonly run: () => void;
+      constructor(callback: ResizeObserverCallback) {
+        super(callback);
+        this.run = () => callback([], this);
+      }
+      observe(target: Element) {
+        if (target.matches(watched)) watching.add(this.run);
+      }
+      disconnect() {
+        watching.delete(this.run);
+      }
+    },
+  );
+  onTestFinished(() => {
+    vi.stubGlobal("ResizeObserver", Stub);
+  });
+  return () => {
+    for (const run of watching) act(run);
+  };
+}
+
+it("keeps each section's scroll place, and opens one it hasn't shown at its start", () => {
+  const resize = resizeDetail();
+  const { cards } = registry([card("alpha", "Alpha"), card("beta", "Beta")]);
+  const { view } = pluginSectionsFixture(cards);
+  // Every section shares the dialog's one scrollport. Stacked, the dialog's
+  // navigation scrolls in it too; a section's own navigation doesn't count.
+  const inPort = (section: string, stacked = false) => (
+    <div data-testid="scrollport" style={{ overflowY: "auto" }}>
+      {stacked && <nav aria-label="Settings sections" />}
+      <div>
+        <nav aria-label="Inside a section" />
+      </div>
+      {view(section)}
+    </div>
+  );
+  const { rerender } = render(inPort("example/alpha"));
+  const port = screen.getByTestId("scrollport");
+  let height = 3000;
+  Object.defineProperty(port, "clientHeight", { value: 500 });
+  Object.defineProperty(port, "scrollHeight", { get: () => height });
+  const scrollTo = (top: number) => {
+    port.scrollTop = top;
+    fireEvent.scroll(port);
+  };
+  scrollTo(720);
+  rerender(inPort("example/beta"));
+  expect(port.scrollTop).toBe(0);
+  scrollTo(300);
+  rerender(inPort("example/alpha"));
+  expect(port.scrollTop).toBe(720);
+  rerender(inPort("example/beta"));
+  expect(port.scrollTop).toBe(300);
+
+  // A section shorter when restored clamps; its place waits for the content.
+  height = 800;
+  rerender(inPort("example/alpha"));
+  scrollTo(300);
+  height = 3000;
+  resize();
+  expect(port.scrollTop).toBe(720);
+  rerender(inPort("example/beta"));
+  rerender(inPort("example/alpha"));
+  expect(port.scrollTop).toBe(720);
+
+  // Stacked, the sidebar starts each section where it is (Dialog).
+  rerender(inPort("example/beta", true));
+  expect(port.scrollTop).toBe(720);
+  scrollTo(0);
+  // Widened without a switch, the shown section's place is kept.
+  rerender(inPort("example/beta"));
+  scrollTo(200);
+  rerender(inPort("example/alpha"));
+  expect(port.scrollTop).toBe(720);
+  rerender(inPort("example/beta"));
+  expect(port.scrollTop).toBe(200);
+
+  // A scroll while stacked is the user's, so widening doesn't force a place.
+  rerender(inPort("example/alpha", true));
+  scrollTo(100);
+  rerender(inPort("example/alpha"));
+  port.scrollTop = 0;
+  resize();
+  expect(port.scrollTop).toBe(0);
+});
+
+it("keeps the plugin catalog's place in the detail it scrolls in, side by side", () => {
+  // The held detail keeps its size; the catalog grows inside it.
+  const resize = resizeDetail('[aria-labelledby="plugin-settings-title"]');
+  const { cards } = registry([card("alpha", "Alpha")]);
+  const { view } = pluginSectionsFixture(cards);
+  const inPort = (section: string, stacked = false) => (
+    <div data-testid="scrollport" style={{ overflowY: "auto" }}>
+      {stacked && <nav aria-label="Settings sections" />}
+      {view(section)}
+    </div>
+  );
+  const { rerender } = render(inPort("plugins"));
+  const port = screen.getByTestId("scrollport");
+  const detail = port.querySelector(".buzz-settings-page") as HTMLElement;
+  let height = 3000;
+  Object.defineProperty(detail, "clientHeight", { value: 500 });
+  Object.defineProperty(detail, "scrollHeight", { get: () => height });
+  const scrollTo = (element: HTMLElement, top: number) => {
+    element.scrollTop = top;
+    fireEvent.scroll(element);
+  };
+  scrollTo(detail, 640);
+  rerender(inPort("example/alpha"));
+  // Elsewhere the detail doesn't scroll, so the browser drops its offset.
+  detail.scrollTop = 0;
+  scrollTo(port, 300);
+  rerender(inPort("plugins"));
+  expect(detail.scrollTop).toBe(640);
+  // The held pane leaves the port nothing to scroll; its clamp isn't a place.
+  scrollTo(port, 0);
+  rerender(inPort("example/alpha"));
+  expect(port.scrollTop).toBe(300);
+
+  // A catalog shorter when restored clamps; its place waits for the content.
+  detail.scrollTop = 0;
+  height = 800;
+  rerender(inPort("plugins"));
+  scrollTo(detail, 300);
+  scrollTo(port, 0);
+  height = 3000;
+  resize();
+  expect(detail.scrollTop).toBe(640);
+
+  // Stacked, the catalog scrolls in the port, where the sidebar starts it.
+  rerender(inPort("example/alpha", true));
+  detail.scrollTop = 0;
+  rerender(inPort("plugins", true));
+  expect(detail.scrollTop).toBe(0);
+});
+
+it("starts a section a link opens at its top, even with a kept place", async () => {
+  const user = userEvent.setup();
+  const { cards } = registry([
+    {
+      ...card("authors", "GitHub comment authors", "Plugins"),
+      key: "buzz.github/authors",
+      pluginId: "buzz.github",
+    },
+  ]);
+  const { view, links } = pluginSectionsFixture(cards);
+  const inPort = (section: string) => (
+    <div data-testid="scrollport" style={{ overflowY: "auto" }}>
+      {view(section)}
+    </div>
+  );
+  const { rerender } = render(inPort("buzz.github/authors"));
+  const port = screen.getByTestId("scrollport");
+  port.scrollTop = 720;
+  fireEvent.scroll(port);
+  rerender(inPort("plugins"));
+  // Beside the catalog, the held pane leaves the port nothing to scroll.
+  port.scrollTop = 0;
+  fireEvent.click(screen.getByRole("button", { name: "View GitHub details" }));
+  await user.click(
+    within(links("GitHub") as HTMLElement).getByRole("button", {
+      name: "GitHub comment authors",
+    }),
+  );
+  rerender(inPort("buzz.github/authors"));
+  expect(port.scrollTop).toBe(0);
+  expect(document.getElementById("settings-content")).toHaveFocus();
 });
 
 it("links a decision provider's details to Decisions API", async () => {
@@ -2055,6 +2457,7 @@ it("keeps Community admin hidden after applying a verified ordinary-member roste
       session: {
         relayAuthor,
         read: () => roster,
+        subscribeLive: () => () => {},
         profiles: { ensure: vi.fn(async () => {}) },
       },
     }),
@@ -2321,7 +2724,7 @@ it("keeps related plugins out of the pane even when tags overlap", () => {
   };
   const plugins = {
     imports: {
-      checkFolder: vi.fn(async () => "updated"),
+      checkFolder: vi.fn(async () => ({ revision: "updated" })),
       previewFolder: vi.fn(),
       folder: vi.fn(),
       files: vi.fn(),
@@ -2841,6 +3244,77 @@ it("retires contributed identity rows and their stale actions with the owning re
   expect(stillActive()).toBe(false);
 });
 
+it.each([true, false])(
+  "opens Identity at Community sign-ins, heading focused, only when the open asks for it (%s)",
+  async (part) => {
+    const { cards } = registry([]);
+    const organization = federatedFixture();
+    organization.publish({ status: "signed-in" });
+    const scrollIntoView = vi.fn();
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    try {
+      render(
+        <ToastProvider>
+          <Settings
+            {...host}
+            cards={cards}
+            identity={
+              {
+                exportKey: vi.fn(),
+                backup: {
+                  subscribe: () => () => {},
+                  snapshot: () => undefined,
+                  ready: () => new Promise(() => {}),
+                },
+              } as unknown as Parameters<typeof Settings>[0]["identity"]
+            }
+            federatedIdentity={organization.service}
+            navigation={
+              {
+                entryId: "identity-visit",
+                target: {
+                  version: 1,
+                  kind: "settings",
+                  section: "identity",
+                  ...(part && { part: "organization-sign-in" }),
+                },
+                complete: vi.fn(),
+                savePosition: vi.fn(),
+              } as unknown as Parameters<typeof Settings>[0]["navigation"]
+            }
+          />
+        </ToastProvider>,
+      );
+      const heading = await screen.findByRole("heading", {
+        name: "Community sign-ins",
+      });
+      // The section keeps its place below the identity badge (#1424).
+      const badge = screen.getByRole("region", { name: "Your Buzz ID" });
+      expect(
+        badge.compareDocumentPosition(heading) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      if (part) {
+        expect(heading).toHaveFocus();
+        expect(scrollIntoView).toHaveBeenCalledExactlyOnceWith({
+          block: "start",
+          behavior: "instant",
+        });
+        expect(scrollIntoView.mock.contexts[0]).toBe(heading);
+      } else {
+        expect(heading).not.toHaveFocus();
+        expect(scrollIntoView).not.toHaveBeenCalled();
+      }
+      // Arriving never focuses the section's sign-out.
+      expect(
+        screen.getByRole("button", { name: "Sign out of organization" }),
+      ).not.toHaveFocus();
+    } finally {
+      Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+    }
+  },
+);
+
 it("offers Retry beside a failed installed revision without changing saved state", () => {
   const fixture = reviewPluginFixture();
   const retryPlugin = vi.fn(() => true);
@@ -2944,11 +3418,11 @@ it("retains both local drafts across section navigation but retires them with th
 });
 
 it("allows Add to install while an independent folder check is pending, including pane remount", async () => {
-  let finish!: (revision: string) => void;
+  let finish!: (release: { revision: string }) => void;
   const fixture = reviewPluginFixture();
   const checkFolder = vi.fn(
     () =>
-      new Promise<string>((resolve) => {
+      new Promise<{ revision: string }>((resolve) => {
         finish = resolve;
       }),
   );
@@ -2992,7 +3466,7 @@ it("allows Add to install while an independent folder check is pending, includin
   await within(dialog).findByRole("button", { name: "Install plugin" });
   fixture.external.revision = "cli-reloaded";
   act(fixture.publish);
-  await act(async () => finish("current"));
+  await act(async () => finish({ revision: "current" }));
   expect(discard).not.toHaveBeenCalled();
   fireEvent.click(
     within(dialog).getByRole("switch", { name: "Enable plugin" }),
@@ -3102,7 +3576,7 @@ it("recommends managed plugins in Settings and points to them from navigation", 
     "https://example.com/plugins",
     "v1",
     undefined,
-    pinned,
+    { commit: pinned, path: "dist" },
   );
 });
 
@@ -3220,7 +3694,7 @@ it("routes a managed plugin's updates through the managed review instead of the 
     "https://example.com/plugins",
     "v1",
     undefined,
-    pinned,
+    { commit: pinned, path: "dist" },
   );
   expect(checkGit).not.toHaveBeenCalled();
 });

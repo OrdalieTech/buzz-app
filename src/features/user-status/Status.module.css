@@ -24,14 +24,12 @@
   max-width: 100%;
 }
 .emoji {
+  display: inline-block;
   width: var(--user-status-emoji-size, 1.25rem);
   height: var(--user-status-emoji-size, 1.25rem);
   flex: 0 0 var(--user-status-emoji-size, 1.25rem);
   object-fit: contain;
   vertical-align: middle;
-}
-.emoji[data-pending] {
-  display: inline-block;
 }
 .emojiFallback {
   white-space: nowrap;
@@ -137,6 +135,9 @@
   width: 100%;
   min-width: 0;
   overflow: hidden;
+  /* Emoji ink can rise above the line box; keep room inside the clip and mask. */
+  padding-block: var(--space-1);
+  margin-block: calc(-1 * var(--space-1));
   text-align: start;
 }
 .tickerTrack {

@@ -27,6 +27,8 @@ use zeroize::Zeroizing;
 
 const RETRY: &str = "Could not restore your identity. Try again.";
 const CANCELED: &str = "Restore was canceled. Try again.";
+/// Builderlab didn't answer: a network or connection failure, not a refusal.
+const OFFLINE: &str = "Couldn't reach Builderlab. Check your connection and try again.";
 // The renderer matches these two to offer manual key entry instead of a retry
 // (`recoveryOff` in `src/features/identity/service.ts`).
 const UNAVAILABLE: &str = "Backup recovery is unavailable.";
@@ -177,6 +179,8 @@ enum ReadError {
     /// Buzz user capability or the account its USER role (kgoose's
     /// `unauthorized`), which no retry or new sign-in changes.
     NotOffered,
+    /// The request never got an answer (network, DNS, TLS).
+    Unreachable,
     Other,
 }
 impl From<&str> for ReadError {
@@ -193,6 +197,7 @@ impl From<ReadError> for String {
     fn from(error: ReadError) -> Self {
         match error {
             ReadError::NotOffered => REFUSED,
+            ReadError::Unreachable => OFFLINE,
             // A new sign-in may clear a rejected session.
             ReadError::SignedOut | ReadError::Other => RETRY,
         }
@@ -204,7 +209,7 @@ impl From<ReadError> for Stop {
         Self::Failed(match error {
             ReadError::SignedOut => Failure::SignedOut,
             ReadError::NotOffered => Failure::NotOffered,
-            ReadError::Other => Failure::Unreachable,
+            ReadError::Unreachable | ReadError::Other => Failure::Unreachable,
         })
     }
 }
@@ -372,12 +377,13 @@ impl NsecBackupHost {
     async fn initialize_management(&self, identity: &IdentityHost) -> Result<()> {
         let epoch = self.state.lock().map_err(|_| RETRY)?.epoch;
         let pubkey = identity.saved_viewer().await?;
+        let receipt = pubkey.as_deref().is_some_and(|pubkey| self.receipt(pubkey));
         let mut state = self.state.lock().map_err(|_| RETRY)?;
         if state.closed || state.epoch != epoch {
             return Err(CANCELED.into());
         }
         if let Some(pubkey) = pubkey {
-            self.management_for(&mut state, &pubkey);
+            self.management_for(&mut state, &pubkey, receipt);
         } else {
             state.management = None;
         }
@@ -385,7 +391,18 @@ impl NsecBackupHost {
         self.publish(&mut state, progress);
         Ok(())
     }
-    fn management_for(&self, state: &mut State, pubkey: &str) {
+    /// Whether this device holds a confirmed backup receipt for `pubkey`, under
+    /// any account. It needs no network, so a launch offline or signed out
+    /// still shows a backed-up key as backed up.
+    fn receipt(&self, pubkey: &str) -> bool {
+        match (self.config.as_ref(), self.root.as_ref()) {
+            (Some(config), Some(root)) => persistence::confirmed(root, config, pubkey),
+            _ => false,
+        }
+    }
+    /// Starts `pubkey`'s presentation from `receipt`, the device's durable
+    /// evidence; a pass for the signed-in account then confirms or clears it.
+    fn management_for(&self, state: &mut State, pubkey: &str, receipt: bool) {
         if state
             .management
             .as_ref()
@@ -400,7 +417,7 @@ impl NsecBackupHost {
             } else {
                 "self-managed"
             },
-            initial_backup_confirmed: false,
+            initial_backup_confirmed: receipt,
         });
     }
     fn snapshot(&self, state: &State) -> BackupStatus {
@@ -457,6 +474,16 @@ impl NsecBackupHost {
         {
             return Err("Invalid backup session".into());
         }
+        // Read the receipt outside the lock; it applies only if the key is
+        // still the one it was read for.
+        let shown = self
+            .state
+            .lock()
+            .map_err(|_| "Backup unavailable")?
+            .management
+            .as_ref()
+            .map(|management| management.pubkey.clone());
+        let receipt = shown.as_deref().is_some_and(|pubkey| self.receipt(pubkey));
         let mut state = self.state.lock().map_err(|_| "Backup unavailable")?;
         if state.closed || state.generation.is_some_and(|seen| generation <= seen) {
             return Ok(None);
@@ -468,11 +495,14 @@ impl NsecBackupHost {
         }
         state.retire();
         state.session = federated;
-        // A new account must prove its own scoped receipt. Signing out
-        // keeps the already-confirmed presentation.
+        // A new account starts again from the device's receipts: what an
+        // earlier account's pass cleared or confirmed no longer applies, and
+        // its own pass confirms or clears the key. Signing out keeps the
+        // presentation.
         if state.session.is_some() {
             if let Some(management) = &mut state.management {
-                management.initial_backup_confirmed = false;
+                management.initial_backup_confirmed =
+                    receipt && shown.as_deref() == Some(management.pubkey.as_str());
             }
         }
         drop(state);
@@ -584,8 +614,30 @@ impl NsecBackupHost {
                         }
                         Progress::Complete
                     }
-                    Ok(Outcome::Waiting(reason)) => Progress::Waiting { reason },
-                    Err(Stop::Failed(kind)) => Progress::Failed { kind },
+                    Ok(Outcome::Waiting(reason)) => {
+                        // The signed-in account has no key linked, so it holds
+                        // no backup of this one, whatever a receipt says. This
+                        // is in memory only: the receipt still proves a backup
+                        // exists on some account, so the next launch or
+                        // handoff shows it again until a pass answers.
+                        if reason == Waiting::NotLinked {
+                            if let Some(management) = &mut state.management {
+                                management.initial_backup_confirmed = false;
+                            }
+                        }
+                        Progress::Waiting { reason }
+                    }
+                    Err(Stop::Failed(kind)) => {
+                        // Another key is linked: this one is not backed up
+                        // with this account. Any other failure is a re-check
+                        // that did not finish, not a missing backup.
+                        if kind == Failure::OtherKeyLinked {
+                            if let Some(management) = &mut state.management {
+                                management.initial_backup_confirmed = false;
+                            }
+                        }
+                        Progress::Failed { kind }
+                    }
                     Ok(Outcome::Idle) | Err(Stop::Canceled) => Progress::Idle,
                 };
                 host.publish(&mut state, progress);
@@ -616,12 +668,13 @@ impl NsecBackupHost {
             // A denied, busy or locked store is not an absent key.
             Err(_) => return Err(Stop::Failed(Failure::Storage)),
         };
+        let receipt = self.receipt(&pubkey);
         {
             let mut state = self.state.lock().map_err(|_| RETRY)?;
             if state.closed || state.epoch != epoch {
                 return Err(Stop::Canceled);
             }
-            self.management_for(&mut state, &pubkey);
+            self.management_for(&mut state, &pubkey, receipt);
         }
         // Hold consent's shared lease until this pass ends, including persisted retries.
         let Some(_consent) = crate::nsec_backup_choice::admit(
@@ -827,14 +880,26 @@ impl NsecBackupHost {
         redirect: String,
         verifier: Zeroizing<String>,
     ) -> Result<RestoreResult> {
-        let parameters = callback.wait(&oauth_id).await.map_err(|_| RETRY)?;
+        let parameters = callback.wait(&oauth_id).await.map_err(|error| {
+            if error == crate::oauth_callback::TIMED_OUT {
+                crate::oauth_callback::TIMED_OUT
+            } else {
+                RETRY
+            }
+        })?;
         self.valid_restore(epoch)?;
-        if parameters
+        if let Some((_, error)) = parameters
             .parameters
             .iter()
-            .any(|(name, _)| name == "error")
+            .find(|(name, _)| name == "error")
         {
-            return Err(RETRY.into());
+            // RFC 6749 4.1.2.1: the user declined or closed the sign-in page.
+            return Err(if error == "access_denied" {
+                CANCELED
+            } else {
+                RETRY
+            }
+            .into());
         }
         let mut codes = parameters
             .parameters
@@ -855,6 +920,7 @@ impl NsecBackupHost {
             buzz_nsec_backup::Error::HttpStatus(404) => UNAVAILABLE.to_owned(),
             // Not a private org, or no Buzz user role: no retry changes it.
             buzz_nsec_backup::Error::HttpStatus(403) => REFUSED.to_owned(),
+            buzz_nsec_backup::Error::Transport => OFFLINE.to_owned(),
             _ => RETRY.to_owned(),
         })?;
         let (candidates, failed_count) = candidates(recovered);
@@ -1159,7 +1225,7 @@ impl Api {
             .body(bytes::Bytes::from_owner(body))
             .send()
             .await
-            .map_err(|_| RETRY)?;
+            .map_err(|_| OFFLINE)?;
         let value: Exchange =
             serde_json::from_slice(&Self::body(response).await?).map_err(|_| RETRY)?;
         Ok(value.session_credential)
@@ -1182,7 +1248,7 @@ impl Api {
             .header(&self.header, &self.credential)
             .send()
             .await
-            .map_err(|_| RETRY)?;
+            .map_err(|_| ReadError::Unreachable)?;
         match response.status() {
             reqwest::StatusCode::UNAUTHORIZED => return Err(ReadError::SignedOut),
             reqwest::StatusCode::FORBIDDEN => return Err(ReadError::NotOffered),
@@ -1266,10 +1332,7 @@ pub(crate) fn nsec_backup_confirmed(
     host: tauri::State<'_, NsecBackupHost>,
     pubkey: String,
 ) -> bool {
-    match (host.config.as_ref(), host.root.as_ref()) {
-        (Some(config), Some(root)) => persistence::confirmed(root, config, &pubkey),
-        _ => false,
-    }
+    host.receipt(&pubkey)
 }
 /// The ticket of the pass this handoff starts, if any.
 #[tauri::command]

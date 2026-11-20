@@ -225,6 +225,29 @@ it("shows no public image access when it isn't declared", () => {
     }),
   ).toBeNull();
 });
+const publicPages = (granted: boolean): PluginManifest => ({
+  ...manifest(false),
+  host: { publicPages: granted },
+});
+it("discloses public page reads and that only preview fields come back", async () => {
+  render(<PluginAccessReview manifest={publicPages(true)} />);
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: /Contact any public website for link previews/,
+    }),
+  );
+  await waitFor(() =>
+    expect(screen.getByText(/returns only its preview fields/)).toBeVisible(),
+  );
+});
+it("shows no public page access when it isn't declared", () => {
+  render(<PluginAccessReview manifest={publicPages(false)} />);
+  expect(
+    screen.queryByRole("button", {
+      name: /Contact any public website for link previews/,
+    }),
+  ).toBeNull();
+});
 it.each([
   [false, true, "Added"],
   [true, false, "Removed"],

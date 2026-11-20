@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { communityFromScope } from "../../features/relay/gifs";
 import {
   useProfileGeneration,
@@ -22,7 +28,6 @@ import {
 import { AlertDialog } from "../../shared/design-system/ui/AlertDialog";
 import { Avatar } from "../../shared/design-system/ui/Avatar";
 import { Button } from "../../shared/design-system/ui/Button";
-import { Dialog } from "../../shared/design-system/ui/Dialog";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
 import { Input } from "../../shared/design-system/ui/Input";
 import { InputGroup } from "../../shared/design-system/ui/InputGroup";
@@ -35,6 +40,8 @@ import {
   MenuRoot,
   MenuTrigger,
 } from "../../shared/design-system/ui/Menu";
+import { SettingsGroup } from "../../shared/design-system/ui/SettingsGroup";
+import { Tabs } from "../../shared/design-system/ui/Tabs";
 import { SearchField } from "../../shared/design-system/ui/SearchField";
 import {
   allowedActions,
@@ -57,6 +64,9 @@ import {
   renderQrCode,
   useQrVariant,
 } from "../../shared/QrCode";
+import styles from "./CommunityAdmin.module.css";
+import { DIRECT_MEMBER_ADD_ENABLED } from "./features";
+import { canShareInvite, shareInvite } from "./shareInvite";
 
 const DAY = 24 * 60 * 60;
 const EXPIRY = [1, 3, 7, 30].map((days) => ({
@@ -74,12 +84,20 @@ const message = (reason: unknown) =>
   reason instanceof Error ? reason.message : String(reason);
 const STALE = "The member list is out of date. Retry before making changes.";
 
+export type MembershipMethod = "members" | "invite" | "direct";
+type MembershipSelection = {
+  selectedMethod?: MembershipMethod | undefined;
+  onMethodChange?: ((method: MembershipMethod) => void) | undefined;
+};
+
 export function CommunityAdmin({
   relay,
   membership: suppliedMembership,
   communityName,
   active,
-}: {
+  selectedMethod,
+  onMethodChange,
+}: MembershipSelection & {
   relay: RelayData;
   membership?: CommunityMembership;
   communityName?: string;
@@ -102,7 +120,7 @@ export function CommunityAdmin({
       <h2 id="community-admin-title" className="mt-0 mb-2 text-label">
         Membership
       </h2>
-      <p className="text-body-sm text-muted">
+      <p className="mt-0 mb-6 text-body-sm text-muted">
         {communityName
           ? `Manage members and access to ${communityName}.`
           : "Manage members and community access."}
@@ -115,6 +133,8 @@ export function CommunityAdmin({
           viewer={connection.viewer}
           membership={membership}
           active={active}
+          selectedMethod={selectedMethod}
+          onMethodChange={onMethodChange}
         />
       ) : (
         <p role="status">Choose a connected community to manage members.</p>
@@ -131,7 +151,9 @@ function Members({
   viewer,
   membership,
   active,
-}: {
+  selectedMethod,
+  onMethodChange,
+}: MembershipSelection & {
   session: RelaySession;
   community: string;
   viewer: string;
@@ -151,7 +173,10 @@ function Members({
   const [pending, setPending] = useState<Pending | null>(null);
   const proceed = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
-  const [inviting, setInviting] = useState(false);
+  useEffect(() => {
+    if (selectedMethod && selectedMethod !== "members" && !busy)
+      setPending(null);
+  }, [selectedMethod, busy]);
   const profiles = useSyncExternalStore(
     session.profiles.subscribe,
     session.profiles.snapshot,
@@ -204,15 +229,15 @@ function Members({
       setBusy(false);
     }
   }
-  const refreshButton = (
+  const refreshButton = readError ? (
     <Button
       loading={refreshing}
       disabled={refreshing || busy}
       onClick={() => void refresh()}
     >
-      {readError ? "Retry" : "Refresh"}
+      Retry
     </Button>
-  );
+  ) : null;
   const status = (
     <>
       {notice && (
@@ -275,103 +300,115 @@ function Members({
     remove: "Remove",
   } as const;
   return (
-    <>
-      <div className="mt-4 flex justify-end gap-2">
-        {refreshButton}
-        {/* A stale roster cannot prove the viewer still manages this community. */}
-        {!stale && (
-          <Button variant="primary" onClick={() => setInviting(true)}>
-            Invite members
-          </Button>
-        )}
-      </div>
+    <MembershipContent
+      selectedMethod={selectedMethod}
+      onMethodChange={onMethodChange}
+      busy={busy || !!pending}
+      community={community}
+      members={members}
+      owner={role === "owner"}
+      stale={stale}
+      refreshing={refreshing}
+      active={active}
+      retry={() => void refresh()}
+      add={(pubkey, next) => apply({ action: "add", pubkey, role: next })}
+    >
       {status}
       {error && (
         <p role="alert" className="text-body-sm">
           {error}
         </p>
       )}
-      <h3 className="mt-6 text-label">
-        Members <span className="text-muted">{members.length}</span>
-      </h3>
-      <div className="rounded-xl border border-default p-4">
-        <SearchField
-          label="Search members"
-          placeholder="Search members"
-          value={query}
-          onValueChange={setQuery}
-        />
-        <ul className="m-0 mt-3 list-none p-0" aria-label="Members">
-          {shown.map((member) => {
-            // A stale list must not offer another destructive command.
-            const actions = stale
-              ? []
-              : allowedActions(role, member, member.pubkey === viewer);
-            const label = name(member.pubkey);
-            const picture = profiles.get(member.pubkey)?.picture;
-            return (
-              <li key={member.pubkey} className="flex items-center gap-3 py-2">
-                <Avatar
-                  src={avatarMedia(picture, session.media)}
-                  alt=""
-                  fallback={label}
-                />
-                <div className="min-w-0 flex-1">
-                  <p className="m-0 flex min-w-0 items-center gap-1.5 text-body">
-                    <span className="truncate">{label}</span>
-                    {member.role === "owner" && (
-                      <CrownIcon className="shrink-0 text-warning" />
-                    )}
-                    {member.role === "admin" && (
-                      <ShieldIcon className="shrink-0 text-accent" />
-                    )}
-                  </p>
-                  <p className="m-0 text-body-sm text-muted">
+      <div className="flex flex-col gap-4">
+        <div className={styles.searchControls}>
+          <div className="min-w-0 flex-1">
+            <SearchField
+              label="Search members"
+              placeholder="Search members"
+              value={query}
+              onValueChange={setQuery}
+            />
+          </div>
+          {refreshButton}
+        </div>
+        <div>
+          <h3 className="m-0 pb-2 text-caption text-subtle">
+            Members · {members.length}
+          </h3>
+          <ul className={styles.members} aria-label="Members">
+            {shown.map((member) => {
+              // A stale list must not offer another destructive command.
+              const actions = stale
+                ? []
+                : allowedActions(role, member, member.pubkey === viewer);
+              const label = name(member.pubkey);
+              const picture = profiles.get(member.pubkey)?.picture;
+              return (
+                <li key={member.pubkey} className={styles.member}>
+                  <Avatar
+                    src={avatarMedia(picture, session.media)}
+                    alt=""
+                    fallback={label}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="m-0 flex min-w-0 items-center gap-1.5 text-body-sm">
+                      <span className="truncate">{label}</span>
+                      {member.role === "owner" && (
+                        <CrownIcon className="shrink-0 text-warning" />
+                      )}
+                      {member.role === "admin" && (
+                        <ShieldIcon className="shrink-0 text-accent" />
+                      )}
+                    </p>
+                  </div>
+                  {actions.length > 0 && (
+                    <div className={styles.memberAction}>
+                      <MenuRoot>
+                        <MenuTrigger
+                          render={
+                            <IconButton
+                              aria-label={`Actions for ${label}`}
+                              icon={<DotsThreeIcon />}
+                              disabled={busy || refreshing}
+                            />
+                          }
+                        />
+                        <MenuPopup align="end">
+                          {actions.map((action) => (
+                            <MenuItem
+                              key={action}
+                              onClick={() => setPending({ member, action })}
+                            >
+                              <MenuIcon>
+                                {action === "promote" ? (
+                                  <ShieldIcon size={14} />
+                                ) : action === "demote" ? (
+                                  <UserIcon size={14} />
+                                ) : (
+                                  <MinusIcon size={14} />
+                                )}
+                              </MenuIcon>
+                              {verb[action]}
+                            </MenuItem>
+                          ))}
+                        </MenuPopup>
+                      </MenuRoot>
+                    </div>
+                  )}
+                  <span className="shrink-0 text-caption text-subtle">
                     {member.role[0]?.toUpperCase() + member.role.slice(1)}
                     {member.pubkey === viewer ? " · You" : ""}
-                  </p>
-                </div>
-                {actions.length > 0 && (
-                  <MenuRoot>
-                    <MenuTrigger
-                      render={
-                        <IconButton
-                          aria-label={`Actions for ${label}`}
-                          icon={<DotsThreeIcon />}
-                          disabled={busy || refreshing}
-                        />
-                      }
-                    />
-                    <MenuPopup align="end">
-                      {actions.map((action) => (
-                        <MenuItem
-                          key={action}
-                          onClick={() => setPending({ member, action })}
-                        >
-                          <MenuIcon>
-                            {action === "promote" ? (
-                              <ShieldIcon size={14} />
-                            ) : action === "demote" ? (
-                              <UserIcon size={14} />
-                            ) : (
-                              <MinusIcon size={14} />
-                            )}
-                          </MenuIcon>
-                          {verb[action]}
-                        </MenuItem>
-                      ))}
-                    </MenuPopup>
-                  </MenuRoot>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-        {!shown.length && (
-          <p role="status" className="text-body-sm text-muted">
-            No members match.
-          </p>
-        )}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+          {!shown.length && (
+            <p role="status" className="text-body-sm text-muted">
+              No members match.
+            </p>
+          )}
+        </div>
       </div>
       {pending && (
         <AlertDialog
@@ -421,19 +458,7 @@ function Members({
           }
         />
       )}
-      <InviteDialog
-        open={inviting}
-        close={() => setInviting(false)}
-        community={community}
-        members={members}
-        owner={role === "owner"}
-        stale={stale}
-        refreshing={refreshing}
-        active={active}
-        retry={() => void refresh()}
-        add={(pubkey, next) => apply({ action: "add", pubkey, role: next })}
-      />
-    </>
+    </MembershipContent>
   );
 }
 
@@ -493,9 +518,9 @@ const ROLES_OFFERED = [
   { value: "admin", label: "Admin" },
 ];
 
-function InviteDialog({
-  open,
-  close,
+function MembershipContent({
+  children,
+  busy,
   community,
   members,
   owner,
@@ -504,9 +529,11 @@ function InviteDialog({
   active,
   retry,
   add,
-}: {
-  open: boolean;
-  close(): void;
+  selectedMethod,
+  onMethodChange,
+}: MembershipSelection & {
+  children: ReactNode;
+  busy: boolean;
   community: string;
   members: readonly Member[];
   owner: boolean;
@@ -516,6 +543,13 @@ function InviteDialog({
   retry(): void;
   add(pubkey: string, role: "admin" | "member"): Promise<void>;
 }) {
+  const [localMethod, setMethod] = useState<MembershipMethod>("members");
+  const requestedMethod = selectedMethod ?? localMethod;
+  const method =
+    !DIRECT_MEMBER_ADD_ENABLED && requestedMethod === "direct"
+      ? "members"
+      : requestedMethod;
+  const open = method === "invite";
   const [ttl, setTtl] = useState(String(3 * DAY));
   const [uses, setUses] = useState("");
   const [identity, setIdentity] = useState("");
@@ -524,6 +558,7 @@ function InviteDialog({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [copied, setCopied] = useState(false);
+  const [sharing, setSharing] = useState(false);
   // The QR code drawn for one link, or no svg when it failed; it never shows
   // for another link.
   const [qr, setQr] = useState<{
@@ -544,7 +579,17 @@ function InviteDialog({
   const current = link?.settings === settings ? link : null;
   const locked = stale || refreshing;
   useEffect(() => {
-    // Opening the dialog, or changing its settings, creates the link to share.
+    if (open) return;
+    // A new visit needs a fresh link: the previous one may be exhausted.
+    ++minting.current;
+    requested.current = "";
+    setLink(null);
+    setQr(null);
+    setCopied(false);
+    setError("");
+  }, [open]);
+  useEffect(() => {
+    // Visiting a sharing tab, or changing its settings, creates the link to share.
     if (!open || locked || current || requested.current === settings) return;
     if (!active()) return;
     requested.current = settings;
@@ -620,113 +665,173 @@ function InviteDialog({
     }
   }
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        if (next) return;
-        minting.current++;
-        requested.current = "";
-        setLink(null);
-        setQr(null);
-        setTtl(String(3 * DAY));
-        setUses("");
-        setIdentity("");
-        setRole("member");
-        setError("");
-        setNotice("");
-        close();
-      }}
-      preventClose={adding}
-      title="Add or invite people"
-      description="Share a link someone can use to join, or add them by their exact identity."
-    >
-      <div className="flex flex-col gap-6">
-        <section aria-labelledby="invite-with-link">
-          <h3 id="invite-with-link" className="m-0 text-label">
-            Invite with a link
-          </h3>
-          <p className="mt-1 mb-3 text-body-sm text-muted">
-            Anyone with this link can use it to join until it expires.
-          </p>
-          <InputGroup>
-            <Input
-              aria-label="Community invite link"
-              readOnly
-              value={url ?? ""}
-              placeholder={
-                current?.failed
-                  ? "Couldn’t create invite link"
-                  : locked && !current
-                    ? "Retry the member list to create a link"
-                    : "Creating invite link…"
-              }
-            />
-            <Button
-              size="sm"
-              loading={pending}
-              disabled={current?.failed ? locked : !url}
-              onClick={() => {
-                if (current?.failed) {
-                  setLink(null);
-                  return;
-                }
-                if (!url) return;
-                writeClipboardText(url)
-                  .then(() => {
-                    setCopied(true);
-                    setNotice("Invite link copied.");
-                  })
-                  .catch(() => setError("Could not copy the invite link."));
-              }}
-            >
-              {current?.failed ? "Retry" : copied ? "Copied" : "Copy link"}
-            </Button>
-          </InputGroup>
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-x-4">
-            <div className="flex items-center gap-1">
-              <span className="text-label-sm">Expires after</span>
-              <Choice
-                label="Choose invite expiry"
-                value={ttl}
-                options={EXPIRY}
-                onChange={setTtl}
-                // Stays usable while a link is made, so the closing menu can
-                // return focus to it; the newest choice's link wins.
-                disabled={locked}
-              />
-            </div>
-            <div className="flex items-center gap-1">
-              <span className="text-label-sm">Max uses</span>
-              <Choice
-                label="Choose maximum invite uses"
-                value={uses}
-                options={USES}
-                onChange={setUses}
-                disabled={locked}
-              />
-            </div>
-          </div>
-          {showQr && (
-            <div className="mt-3 flex justify-center">
-              {drawn?.svg ? (
-                <QrCode
-                  svg={drawn.svg}
-                  alt="Scan this QR code to open the invite link"
-                />
-              ) : (
-                // Holds the code's place while the link or its code is made.
-                <div
-                  aria-hidden="true"
-                  className="size-60 max-w-full shrink-0 bg-surface-inset"
-                />
-              )}
-            </div>
-          )}
+    <div className="flex flex-col gap-6">
+      <div className={styles.tabs}>
+        <Tabs
+          value={method}
+          onValueChange={onMethodChange ?? setMethod}
+          label="Membership sections"
+          variant="panel"
+          items={[
+            {
+              value: "members",
+              label: "Members",
+              panelId: "invite-members-panel",
+              disabled: adding || busy,
+            },
+            {
+              value: "invite",
+              label: "Invite",
+              panelId: "invite-share-panel",
+              disabled: adding || busy,
+            },
+            ...(DIRECT_MEMBER_ADD_ENABLED
+              ? [
+                  {
+                    value: "direct" as const,
+                    label: "Add directly",
+                    panelId: "invite-direct-panel",
+                    disabled: adding || busy,
+                  },
+                ]
+              : []),
+          ]}
+        />
+      </div>
+      {method === "members" && (
+        <section
+          role="tabpanel"
+          id="invite-members-panel"
+          aria-labelledby="invite-members-panel-tab"
+        >
+          {children}
         </section>
-        <section aria-labelledby="add-member-directly">
-          <h3 id="add-member-directly" className="m-0 text-label">
-            Add directly
-          </h3>
+      )}
+      {open && (
+        <section
+          className={styles.invitePanel}
+          role="tabpanel"
+          id="invite-share-panel"
+          aria-labelledby="invite-share-panel-tab"
+        >
+          <div className={styles.inviteQr}>
+            {showQr && (
+              <div className="flex justify-center">
+                {drawn?.svg ? (
+                  <QrCode
+                    svg={drawn.svg}
+                    alt="Scan this QR code to open the invite link"
+                  />
+                ) : (
+                  // Holds the code's place while the link or its code is made.
+                  <div
+                    aria-hidden="true"
+                    className="size-60 max-w-full shrink-0"
+                  />
+                )}
+              </div>
+            )}
+            {showQr && drawn?.svg && canShareInvite() && (
+              <div className={styles.qrShare}>
+                <Button
+                  size="sm"
+                  variant="subtle"
+                  disabled={!url || !drawn?.svg || locked}
+                  loading={sharing}
+                  onClick={async (event) => {
+                    if (!url || sharing) return;
+                    const anchor = event.currentTarget.getBoundingClientRect();
+                    setSharing(true);
+                    setError("");
+                    try {
+                      await shareInvite(url, anchor);
+                    } catch {
+                      setError(
+                        "Could not open sharing. Try again or copy the link.",
+                      );
+                    } finally {
+                      setSharing(false);
+                    }
+                  }}
+                >
+                  Share
+                </Button>
+              </div>
+            )}
+          </div>
+          <div className="flex min-w-0 flex-col gap-4">
+            <InputGroup
+              trailing={
+                <Button
+                  size="sm"
+                  loading={pending}
+                  disabled={current?.failed ? locked : !url}
+                  // Copying with a pointer should not move focus into the field.
+                  // Keyboard activation keeps the shared visible-focus treatment.
+                  onMouseDown={(event) => {
+                    if (event.button === 0) event.preventDefault();
+                  }}
+                  onClick={() => {
+                    if (current?.failed) {
+                      setLink(null);
+                      return;
+                    }
+                    if (!url) return;
+                    writeClipboardText(url)
+                      .then(() => {
+                        setCopied(true);
+                      })
+                      .catch(() => setError("Could not copy the invite link."));
+                  }}
+                >
+                  {current?.failed ? "Retry" : copied ? "Copied" : "Copy link"}
+                </Button>
+              }
+            >
+              <Input
+                aria-label="Community invite link"
+                readOnly
+                value={url ?? ""}
+                placeholder={
+                  current?.failed
+                    ? "Couldn’t create invite link"
+                    : "Creating invite link…"
+                }
+              />
+            </InputGroup>
+            <SettingsGroup>
+              <div className="flex items-center justify-between gap-4 py-3">
+                <span className="text-body-sm">Expires after</span>
+                <Choice
+                  label="Choose invite expiry"
+                  value={ttl}
+                  options={EXPIRY}
+                  onChange={setTtl}
+                  // Stays usable while a link is made, so the closing menu can
+                  // return focus to it; the newest choice's link wins.
+                  disabled={locked}
+                />
+              </div>
+              <div className="flex items-center justify-between gap-4 py-3">
+                <span className="text-body-sm">Max uses</span>
+                <Choice
+                  label="Choose maximum invite uses"
+                  value={uses}
+                  options={USES}
+                  onChange={setUses}
+                  disabled={locked}
+                />
+              </div>
+            </SettingsGroup>
+          </div>
+        </section>
+      )}
+      {DIRECT_MEMBER_ADD_ENABLED && method === "direct" && (
+        <section
+          role="tabpanel"
+          id="invite-direct-panel"
+          aria-labelledby="invite-direct-panel-tab"
+        >
           <p className="mt-1 mb-3 text-body-sm text-muted">
             Paste the person’s npub or 64-character public key.
           </p>
@@ -774,34 +879,34 @@ function InviteDialog({
             </Button>
           </form>
         </section>
-        <div className="flex flex-col gap-2 empty:hidden">
-          {error && (
+      )}
+      <div className="flex flex-col gap-2 empty:hidden">
+        {error && (
+          <p role="alert" className="m-0 text-body-sm">
+            {error}
+          </p>
+        )}
+        {method !== "members" && stale && !adding && (
+          <div className="flex items-center justify-between gap-3">
             <p role="alert" className="m-0 text-body-sm">
-              {error}
+              {STALE}
             </p>
-          )}
-          {stale && !adding && (
-            <div className="flex items-center justify-between gap-3">
-              <p role="alert" className="m-0 text-body-sm">
-                {STALE}
-              </p>
-              <Button
-                size="sm"
-                loading={refreshing}
-                disabled={refreshing}
-                onClick={retry}
-              >
-                Retry
-              </Button>
-            </div>
-          )}
-          {notice && (
-            <p role="status" className="m-0 text-body-sm">
-              {notice}
-            </p>
-          )}
-        </div>
+            <Button
+              size="sm"
+              loading={refreshing}
+              disabled={refreshing}
+              onClick={retry}
+            >
+              Retry
+            </Button>
+          </div>
+        )}
+        {notice && (
+          <p role="status" className="m-0 text-body-sm">
+            {notice}
+          </p>
+        )}
       </div>
-    </Dialog>
+    </div>
   );
 }

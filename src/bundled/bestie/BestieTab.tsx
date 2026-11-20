@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { watchSlug } from "../../features/agents/attention";
+import { interestSlug, watchSlug } from "../../features/agents/attention";
 import type {
   Agent,
   AgentAddedTab,
   Agents,
 } from "../../features/agents/service";
+import type { Navigation } from "../../features/navigation/controller";
+import type { SettingsCards } from "../../features/settings/service";
 import { useRelayConnection } from "../../features/relay/react";
 import type { RelayData } from "../../features/relay/service";
 import type { RelaySession } from "../../features/relay/session";
@@ -23,6 +25,7 @@ import { PreferenceRow } from "../../shared/design-system/ui/PreferenceRow";
 import { SettingsGroup } from "../../shared/design-system/ui/SettingsGroup";
 import { SwitchPreferenceRow } from "../../shared/design-system/ui/SwitchPreferenceRow";
 import { bestieName, useBestieChoice } from "../agents/BestieChoice";
+import { CostRow } from "./CostRow";
 import {
   FEATURES,
   type Feature,
@@ -48,9 +51,15 @@ import { inCommunity, savedBestie } from "./saved";
 
 /** The agents a tab saves to, and finds to know which are remote. */
 type TabAgents = FeatureAgents & Pick<Agents, "find">;
+type TabCards = Pick<SettingsCards, "subscribe" | "has">;
 
 /** The Bestie tab, on the agent saved as Bestie in its community. */
-export function bestieTab(relay: RelayData, agents: TabAgents): AgentAddedTab {
+export function bestieTab(
+  relay: RelayData,
+  agents: TabAgents,
+  navigation: Pick<Navigation, "open">,
+  settingsCards: TabCards,
+): AgentAddedTab {
   const bestie = savedBestie(relay);
   return {
     id: "bestie",
@@ -62,7 +71,13 @@ export function bestieTab(relay: RelayData, agents: TabAgents): AgentAddedTab {
       inCommunity(agent, relay.snapshot()),
     subscribe: bestie.subscribe,
     component: ({ agent }) => (
-      <BestieTab relay={relay} agents={agents} agent={agent} />
+      <BestieTab
+        relay={relay}
+        agents={agents}
+        agent={agent}
+        navigation={navigation}
+        settingsCards={settingsCards}
+      />
     ),
   };
 }
@@ -74,6 +89,8 @@ export function bestieTab(relay: RelayData, agents: TabAgents): AgentAddedTab {
 export function formerBestieTab(
   relay: RelayData,
   agents: TabAgents,
+  navigation: Pick<Navigation, "open">,
+  settingsCards: TabCards,
 ): AgentAddedTab {
   const bestie = savedBestie(relay);
   return {
@@ -105,7 +122,14 @@ export function formerBestieTab(
       };
     },
     component: ({ agent }) => (
-      <BestieTab relay={relay} agents={agents} agent={agent} former />
+      <BestieTab
+        relay={relay}
+        agents={agents}
+        agent={agent}
+        navigation={navigation}
+        settingsCards={settingsCards}
+        former
+      />
     ),
   };
 }
@@ -170,11 +194,15 @@ function BestieTab({
   relay,
   agents,
   agent,
+  navigation,
+  settingsCards,
   former = false,
 }: {
   relay: RelayData;
   agents: TabAgents;
   agent: Agent;
+  navigation: Pick<Navigation, "open">;
+  settingsCards: TabCards;
   former?: boolean;
 }) {
   const { session, scope } = useRelayConnection(relay);
@@ -271,6 +299,12 @@ function BestieTab({
             )}
           />
         )}
+        <CostRow
+          agents={agents}
+          agent={agent}
+          open={navigation.open}
+          settingsCards={settingsCards}
+        />
       </SettingsGroup>
       <InlineHeader title="Settings" />
       <SettingsGroup>
@@ -334,6 +368,8 @@ function FeatureSwitch({
     );
   const instructions = instructionsOf(agent);
   const timer = feature.timer && agent.attention[watchSlug(feature.timer.id)];
+  const part =
+    feature.timer && (timer || agent.attention[interestSlug(feature.timer.id)]);
   const required = FEATURES.find(({ id }) => id === feature.requires);
   const blocked = !!required && !featureOn(agent, required);
   const checked = featureOn(agent, feature);
@@ -425,12 +461,13 @@ function FeatureSwitch({
         disabled={saving || ((blocked || formerCheckIn) && !checked)}
         onCheckedChange={(on) => void save(on)}
       />
-      {/* A timer left without its section, as when undoing a failed On
-          failed too, still runs: Remove takes it away. */}
-      {timer && !checked && (
+      {/* A timer or Interest left without the rest, as when undoing a failed
+          On failed too, or one was deleted in Attention: Remove takes it
+          away. */}
+      {part && !checked && (
         <PreferenceRow
-          title={`${feature.title}'s timer is still saved`}
-          subtitle="Its section in Instructions is missing, so it reads as off."
+          title={`${feature.title} is partly saved`}
+          subtitle="Part of it is missing, so it reads as off. Remove clears the rest."
           trailing={(label) => (
             <Button
               variant="outline"

@@ -45,15 +45,13 @@ appTest(
     await expect(
       section.locator('[data-plugin-row="decorated"] [data-channel-id="beta"]'),
     ).toBeVisible();
-    await page
-      .getByRole("button", { name: "More actions for Channels" })
-      .click();
+    await page.getByRole("button", { name: "More actions for Team" }).click();
     await page.getByRole("menuitem", { name: "Sort", exact: true }).click();
     await expect(
       page.getByRole("menuitemradio", { name: "Reverse name" }),
     ).toBeVisible();
     await animationsSettled(
-      page.getByRole("menu", { name: "Sort Channels", exact: true }),
+      page.getByRole("menu", { name: "Sort Team", exact: true }),
       { subtree: true },
     );
     await page.screenshot({
@@ -108,3 +106,80 @@ appTest(
     await expect(section.locator("[data-plugin-row]")).toHaveCount(0);
   },
 );
+
+appTest.describe("ordinary Solo rows", () => {
+  appTest.use({ soloChannels: ["beta"], ownSoloChannels: ["beta"] });
+
+  // Browser seam: the installed contribution wraps the actual shell row, with
+  // its menu hit target and keyboard focus, rather than a substitute component.
+  appTest(
+    "decorates the complete Solo entry without replacing its host interactions",
+    async ({ page, app }, info) => {
+      await page.goto(app.origin);
+      await openPage(page, "Messages");
+      const row = page.locator('[data-solo-destination-id="beta"]');
+      await expect(row).toBeVisible();
+      await openSettings(page);
+      await selectSettingsSection(page, "Manage plugins");
+      await setPluginEnabled(page, "Host row fixture", true);
+      await closeSettings(page);
+      const decorated = page
+        .locator('[data-plugin-row="decorated"]')
+        .filter({ has: row });
+      await expect(decorated).toBeVisible();
+      const actions = page.getByRole("menu", {
+        name: "Actions for Beta",
+        exact: true,
+      });
+      await row.focus();
+      await page.keyboard.press("Enter");
+      await expect(row).toHaveAttribute("aria-current", "page");
+      await row.press("Shift+F10");
+      await expect(
+        page.getByRole("menuitem", { name: "Rename", exact: true }),
+      ).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(row).toBeFocused();
+      await row.click({ button: "right" });
+      await actions
+        .getByRole("menuitem", { name: "Rename", exact: true })
+        .click();
+      await expect(
+        page.getByRole("textbox", { name: "Chat name", exact: true }),
+      ).toHaveValue("Beta");
+      await page.keyboard.press("Escape");
+      await expect(row).toBeFocused();
+      for (const [width, mode, fontSize] of [
+        [1440, "light", "16px"],
+        [390, "dark", "20px"],
+      ]) {
+        await page.setViewportSize({ width, height: 850 });
+        await page.evaluate(
+          ({ mode, fontSize }) => {
+            document.documentElement.setAttribute("data-color-mode", mode);
+            document.documentElement.style.fontSize = fontSize;
+          },
+          { mode, fontSize },
+        );
+        await settleShellToggle(page);
+        const toggle = page.locator("[data-shell-sidebar-toggle]");
+        if ((await toggle.getAttribute("aria-label"))?.startsWith("Show"))
+          await toggle.click();
+        await expect(row).toBeVisible();
+        await row.click({ button: "right" });
+        await expect(actions).toBeVisible();
+        await page.screenshot({
+          path: info.outputPath(`solo-plugin-row-${width}-${mode}.png`),
+        });
+        await page.keyboard.press("Escape");
+        await expect(row).toBeFocused();
+      }
+      await openSettings(page);
+      await selectSettingsSection(page, "Manage plugins");
+      await setPluginEnabled(page, "Host row fixture", false);
+      await closeSettings(page);
+      await expect(decorated).toHaveCount(0);
+      await expect(row).toBeAttached();
+    },
+  );
+});

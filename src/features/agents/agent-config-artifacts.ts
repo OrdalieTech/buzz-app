@@ -2,6 +2,7 @@
 // channel: identity, validation, the reads that decide state, and one save that
 // tells "accepted" apart from "current". The caller supplies a relay-only
 // snapshot reader and a narrow artifact writer.
+import { notesOf, noteTags } from "./plugin-notes";
 import { PublishRejected } from "../relay/outbox";
 import type { RelayWriter } from "../relay/transport";
 import type { EventData, ReadFilter, RelayEvent } from "../relay/events";
@@ -153,8 +154,27 @@ export const checkedHead = (event: RelayEvent, expected: Expected) => {
     : ({ kind: "head", event } as const);
 };
 
+/** The preset an agent settings snapshot names, such as "recommended", and
+ * its plugin notes' tags. */
+function settingsMarks(type: string, content: string) {
+  if (type !== "buzz.agent.settings") return { tags: [] };
+  try {
+    const body = JSON.parse(content) as { preset?: unknown };
+    const { preset } = body;
+    return {
+      preset: typeof preset === "string" && preset ? preset : undefined,
+      tags: noteTags(notesOf(body)),
+    };
+  } catch {
+    return { tags: [] };
+  }
+}
+
 /** One revision to sign. `content` is the complete snapshot; `extra` carries
- * preserved client tags (e.g. `team`). */
+ * preserved client tags (e.g. `team`). Agent settings also get a `preset` tag
+ * matching their content, so who is on Automatic can be counted from tags
+ * without reading content, and a ["note", pluginId, tag] tag for each tagged
+ * plugin note (plugin-notes.ts); carried ones are never kept. */
 export function artifactTemplate(
   input: Expected & {
     op: "create" | "update" | "restore";
@@ -166,6 +186,7 @@ export function artifactTemplate(
 ) {
   if ((input.op === "create") !== (input.prev === undefined))
     throw new Error("Only a create has no previous revision");
+  const { preset, tags } = settingsMarks(input.type, input.content);
   return {
     kind: ARTIFACT_KIND,
     created_at: Math.floor(Date.now() / 1000),
@@ -178,7 +199,15 @@ export function artifactTemplate(
       ["title", input.title],
       ["op", input.op],
       ...(input.prev ? [["prev", input.prev]] : []),
-      ...(input.extra ?? []).map((t) => [...t]),
+      ...(preset ? [["preset", preset]] : []),
+      ...tags,
+      ...(input.extra ?? [])
+        .filter(
+          ([name]) =>
+            name !== "preset" &&
+            (name !== "note" || input.type !== "buzz.agent.settings"),
+        )
+        .map((t) => [...t]),
     ],
   };
 }

@@ -56,7 +56,10 @@ test("a Solo chat alone with an agent tags it while a background read-state snap
   await page.route("**/query", async (route) => {
     const filters = route.request().postDataJSON();
     if (isSnapshot(filters)) {
-      if (gapped) {
+      // Only primary has the gap. Secondary's badge session waits for
+      // primary's first repair, so its foreground startup snapshot can land
+      // after the gap too; holding it would test the wrong read.
+      if (gapped && route.request().url().includes("/api/relay/primary/")) {
         held.resolve(route.request());
         await gate.promise;
       }
@@ -69,8 +72,8 @@ test("a Solo chat alone with an agent tags it while a background read-state snap
   const [agent] = app.soloAgents;
   // The gap leaves the chat's row carrying an unread badge in its name.
   const row = page
-    .getByRole("navigation", { name: "Solo conversations" })
-    .locator(`[data-solo-channel-id="${chat}"]`);
+    .getByRole("navigation", { name: "Subscribed channels" })
+    .locator(`[data-solo-destination-id="${chat}"]`);
   const pill = page.getByRole("button", {
     name: `Sending to ${agent.name}. Change agents`,
     exact: true,
@@ -87,13 +90,23 @@ test("a Solo chat alone with an agent tags it while a background read-state snap
     exact: true,
   });
   try {
-    const started = page.waitForResponse(
-      (response) =>
+    // Startup takes two snapshots: read state's foreground read and own
+    // follow state's background recovery. Let both finish before the gap, so
+    // the held snapshot is the one read state takes after it.
+    let startup = 0;
+    const started = Promise.withResolvers();
+    const count = (response) => {
+      if (
         query(response.request()) &&
-        isSnapshot(response.request().postDataJSON()),
-    );
+        isSnapshot(response.request().postDataJSON()) &&
+        ++startup === 2
+      )
+        started.resolve();
+    };
+    page.on("response", count);
     await page.goto(app.origin);
-    await started;
+    await started.promise;
+    page.off("response", count);
     await expect(row).toBeVisible();
     gapped = true;
     inventoryAnswered = false;

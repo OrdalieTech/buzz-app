@@ -94,6 +94,10 @@
   .buzz-button[data-size="xs"]:has(> .buzz-button-label > svg:first-child) {
     padding-inline-start: var(--space-1);
   }
+  /* A small leading dot needs less inset than a text-only capsule. */
+  .buzz-button[data-size="xs"][data-leading-dot] {
+    padding-inline-start: calc(var(--space-3) - var(--space-half));
+  }
   /* Text links align with adjacent body copy, with the shared focus treatment. */
   .buzz-button[data-size="text"] {
     @apply text-label-sm;
@@ -285,6 +289,9 @@
   }
   .buzz-button[data-variant="outline"] {
     box-shadow: inset 0 0 0 1px var(--interaction-border);
+  }
+  .buzz-button[data-outline-subtle] {
+    --interaction-border: var(--border-standard);
   }
 
   /* Only the dashes travel around the overdue outline; its geometry stays still. */
@@ -531,6 +538,28 @@
   .buzz-split-button[data-variant="outline"] > .buzz-button:last-of-type {
     margin-inline-start: -1px;
   }
+  /* Ghost splits sit among icon buttons: same corners, one shared hover
+     fill so the two halves read as one control, and a narrow caret half. */
+  .buzz-split-button[data-variant="ghost"] {
+    gap: 0;
+  }
+  .buzz-split-button[data-variant="ghost"] > :where(.buzz-button) {
+    border-radius: var(--radius-icon-button);
+  }
+  /* Low specificity so the hovered or pressed half stays a step stronger. */
+  :where(
+    .buzz-split-button[data-variant="ghost"]:is(
+      :hover,
+      :has([aria-expanded="true"])
+    )
+  ) > .buzz-button:not([data-disabled]) {
+    background: var(--interaction-fill);
+  }
+  .buzz-split-button[data-variant="ghost"]
+    > .buzz-button[aria-haspopup="menu"] {
+    width: auto;
+    padding-inline: var(--space-half);
+  }
   /* The focused half's ring stays above its neighbour. */
   .buzz-split-button > .buzz-button:focus-visible,
   :where(.buzz-dialog) .buzz-split-button > .buzz-button:focus {
@@ -546,9 +575,33 @@
   .buzz-button[data-icon-shape="round"] {
     border-radius: var(--radius-pill);
   }
+  .buzz-icon-button-emoji {
+    display: block;
+    font-family: var(--font-emoji);
+    font-size: var(--size-emoji-inline);
+    line-height: 1;
+  }
 
   .buzz-button[data-color-swatch] .buzz-button-label {
     color: var(--text-on-accent);
+  }
+  /* A transparent swatch shows a checkerboard in every state, with ink that
+     reads on it. */
+  .buzz-button[data-color-swatch="transparent"],
+  .buzz-button[data-color-swatch="transparent"]:is(
+    :hover,
+    :active,
+    [aria-expanded="true"]
+  ):not([data-disabled]) {
+    background:
+      repeating-conic-gradient(
+        var(--border-primary) 0 25%,
+        var(--surface-panel) 0 50%
+      )
+      50% / 0.75rem 0.75rem;
+  }
+  .buzz-button[data-color-swatch="transparent"] .buzz-button-label {
+    color: var(--text-primary);
   }
 
   .buzz-button[data-color-swatch] .buzz-button-label > svg {
@@ -1279,10 +1332,17 @@
     position: absolute;
     inset-block-start: 0;
     inset-inline-end: 0;
-    max-width: var(--space-8);
-    max-height: var(--space-4);
+    max-width: var(--size-control);
+    max-height: var(--size-control);
     pointer-events: none;
     overflow: hidden;
+  }
+
+  /* Count labels straddle the corner; other contributed marks keep their slot. */
+  .buzz-tabs[data-variant="dock"] .buzz-tabs-badge:has(.buzz-count-badge) {
+    inset-inline-end: calc(-1 * var(--space-1));
+    transform: translateY(-50%);
+    overflow: visible;
   }
 
   .buzz-tabs[data-variant="dock"]:where([data-orientation="vertical"])
@@ -2126,6 +2186,23 @@
     color: var(--text-metadata);
   }
 
+  .buzz-badge {
+    @apply text-caption;
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    min-height: var(--space-5);
+    padding: var(--space-half) var(--space-1h);
+    border-radius: var(--radius-pill);
+    background: var(--affordance-subtle);
+    color: var(--text-subtle);
+    white-space: nowrap;
+  }
+  .buzz-badge[data-tone="success"] {
+    background: var(--surface-categorical-green);
+    color: var(--text-categorical-green);
+  }
+
   /* Quiet count: a circle for one digit, a pill for more. */
   .buzz-count-badge {
     @apply text-caption;
@@ -2139,6 +2216,11 @@
     background: var(--affordance-subtle);
     color: var(--text-subtle);
     font-variant-numeric: tabular-nums;
+  }
+  .buzz-tabs[data-variant="dock"] .buzz-count-badge {
+    background: var(--surface-dock-count);
+    color: var(--text-dock-count);
+    box-shadow: 0 0 0 1px var(--bg-app);
   }
   .navigation-item[data-selected] .buzz-count-badge {
     background: var(--surface-row-selected-detail);

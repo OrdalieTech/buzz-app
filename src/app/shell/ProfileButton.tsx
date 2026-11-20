@@ -56,6 +56,11 @@ import type {
 } from "../../features/account-actions/service";
 import type { Communities } from "../../features/communities/service";
 import styles from "./ProfileButton.module.css";
+import * as communityApi from "../../features/communities/api";
+import {
+  deviceTimeZone,
+  shareDeviceTimeZone,
+} from "../../features/profiles/share-time-zone";
 
 const noSubscription = () => () => {};
 // The parent row retains the icon for the saved appearance preference.
@@ -109,8 +114,11 @@ export function ProfileButton({
     online: "Online",
     away: "Away",
     offline: "Offline",
-    unknown: "Status unavailable",
+    unknown: "Availability unknown",
   }[observed];
+  // The unknown label already names the control.
+  const availabilityName =
+    observed === "unknown" ? label : `Availability: ${label}`;
   const [statusChange, setStatusChange] = useState<{
     target: "online" | "away" | "offline";
     session: typeof session;
@@ -179,15 +187,37 @@ export function ProfileButton({
     // Roster setup can cancel earlier reads, and disk hydration can hold an old
     // profile. Refresh once at this authority boundary through the same session.
     const controller = new AbortController();
-    void session
-      .read([{ kinds: [0], authors: [viewer], limit: 5 }], {
-        priority: "background",
-        fresh: true,
+    const read = session.read([{ kinds: [0], authors: [viewer], limit: 5 }], {
+      priority: "background",
+      fresh: true,
+      signal: controller.signal,
+    });
+    read.catch(() => {});
+    // Local time is shared by default. This fresh read triggers it; a strong
+    // read just before publishing supplies what is published.
+    if (selected)
+      void shareDeviceTimeZone({
+        community: selected,
+        viewer,
+        communities,
+        read,
+        inspect: () => communityApi.inspectProfile(selected, session),
         signal: controller.signal,
-      })
-      .catch(() => {});
+        zone: deviceTimeZone(),
+        publish: (profile, existing) =>
+          communityApi.publishProfile(selected, profile, existing),
+      });
     return () => controller.abort();
-  }, [profiles, viewer, connection.status, session, roster, liveStatus]);
+  }, [
+    communities,
+    profiles,
+    viewer,
+    selected,
+    connection.status,
+    session,
+    roster,
+    liveStatus,
+  ]);
   const profile = selected ? communityProfile : localProfile;
   const displayName = profile?.name.trim();
   const name =
@@ -225,6 +255,12 @@ export function ProfileButton({
   const ActionDialog = actions.find(
     (action) => action === selectedAction,
   )?.component;
+  const renderAction = (action: RegisteredAccountAction) => (
+    <MenuItem key={action.key} onClick={() => setSelectedAction(action)}>
+      <MenuIcon>{action.icon ?? <PlugIcon size={17} />}</MenuIcon>
+      {action.title}
+    </MenuItem>
+  );
   const accountLabel = useId();
   const statusUnavailable = useId();
   const avatar = (
@@ -282,7 +318,7 @@ export function ProfileButton({
                   aria-label={
                     viewer
                       ? observed === "unknown"
-                        ? "Your status is unavailable"
+                        ? "Your availability is unknown"
                         : `Your status: ${label}`
                       : "Your avatar"
                   }
@@ -330,7 +366,7 @@ export function ProfileButton({
                 <MenuRoot modal={false}>
                   <span className={styles.availability} data-status={observed}>
                     <MenuTrigger
-                      aria-label={`Availability: ${label}${pending ? `, updating to ${currentChange.target}` : ""}`}
+                      aria-label={`${availabilityName}${pending ? `, updating to ${currentChange.target}` : ""}`}
                       render={
                         <Button variant="subtle" size="xs">
                           {pending && (
@@ -396,7 +432,7 @@ export function ProfileButton({
               role="alert"
               className="mx-3 my-2 max-w-56 text-body-sm text-danger"
             >
-              Could not confirm your status. Try again.
+              Could not confirm your availability. Try again.
             </p>
           )}
           {presence.error && (
@@ -509,6 +545,9 @@ export function ProfileButton({
               onSettings("plugins");
             }}
           />
+          {actions
+            .filter((action) => action.placement === "before-settings")
+            .map(renderAction)}
           <MenuItem
             aria-current={settingsSelected ? "page" : undefined}
             onClick={() => {
@@ -526,16 +565,12 @@ export function ProfileButton({
               </MenuTrailing>
             )}
           </MenuItem>
-          {actions.length > 0 && <MenuSeparator />}
-          {actions.map((action) => (
-            <MenuItem
-              key={action.key}
-              onClick={() => setSelectedAction(action)}
-            >
-              <MenuIcon>{action.icon ?? <PlugIcon size={17} />}</MenuIcon>
-              {action.title}
-            </MenuItem>
-          ))}
+          {actions.some((action) => action.placement !== "before-settings") && (
+            <MenuSeparator />
+          )}
+          {actions
+            .filter((action) => action.placement !== "before-settings")
+            .map(renderAction)}
         </MenuPopup>
       </MenuRoot>
       {ActionDialog && (

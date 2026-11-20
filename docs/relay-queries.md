@@ -45,6 +45,20 @@ if (outbox?.supports(9)) {
 }
 ```
 
+When work keyed by the new event's ID must finish before the event publishes,
+use `outbox.sendHeld(input, hold, recovery?, active?)`. Each delivery attempt in
+this window calls `hold(id)` after signing and publishes only after it resolves.
+Only that event waits, and it takes no delivery slot while it waits. In a chat
+this device is starting, local agents also get the message only after the hold.
+The hold counts toward the attempt's delivery deadline (10 seconds by default).
+A rejected hold, or one still pending at the deadline, fails the delivery
+without publishing; Retry calls the hold again. The entry is saved as `held`.
+After a reload its hold is gone, so a plain `retry(id)` throws and the app's
+Retry controls say to retry from the plugin that sent it. The plugin retries
+with `outbox.retry(id, active, hold)`, which publishes only after the new hold
+resolves. Older hosts omit the method: check `outbox.sendHeld` before calling
+it.
+
 `session.read(filters, { signal })` is a finite read merged with matching local
 operations at completion. `session.observe(filters)` additionally subscribes to
 outbox changes, exposing immutable `{ status, events, error }` snapshots. Own the
@@ -98,8 +112,8 @@ against the writer without replaying accepted commands. Agent deletion discovers
 member channels and confirms each removal with writer-backed rosters; unreadable
 rosters still fail closed. Standalone recipe saves use writer-backed exact-ID
 confirmation; recipe head and catalog reads remain replica-eligible. For
-writer-backed Canvas editor/Todos reads and replica-eligible template copies, see
-the [Canvas/outbox contract](plugin-architecture.md#optional-canvas-todos).
+writer-backed Canvas editor reads and replica-eligible template copies, see
+the [Canvas/outbox contract](plugin-architecture.md#canvas-saves).
 
 ## Managed-agent registration (kind 30177)
 
@@ -216,8 +230,10 @@ including empty pages whose raw scan cursor does not occur among delivered event
 
 Strict root admission/validation runs once before each load or refresh traversal,
 not between the pages of a retained-range repair: repairing N pages uses one root
-read plus N independently verified window reads. Each separate scrollback load
-still reads the root. Root deletion observed live and access revocation retain their
+read plus N independently verified window reads. A load given a read frontier
+pages until it reaches a reply at or before that time the same way, so the
+older paging that reaches the first unread reply reads the root once. Each separate scrollback
+load still reads the root. Root deletion observed live and access revocation retain their
 existing session paths; a later refresh/load revalidates the root. Neither the root
 lookup nor the page sequence provides an atomic snapshot.
 
@@ -241,6 +257,20 @@ independently from finite channel-head invalidation. Author deletion of a retain
 edit/reaction removes that overlay. Unknown or denied auxiliary targets remain
 invisible; active thread target evidence survives shared-cache eviction but still
 passes the existing recursive access check.
+
+Closing a ready ordinary view of a root keeps the rows it showed (root, confirmed
+replies, direction and load-more state) in a memory-only resume (32 threads / 8 MiB,
+least recently used first); closing it during a read, or after it selected an exact
+target, leaves an earlier resume in place. The next ordinary view of that root
+starts `ready` showing those rows, after the existing access check, so the panel
+positions it without the loader. Resumed rows are display only and never evidence:
+the closed view missed the stream, and the relay omits deleted rows with their
+deletions. A resumed row never shows over that row's own evidence or any retained
+deletion of it. A view opened from a resume with no retained root skips the
+session's replay of retained events, which a first open without the root ignores. The view's first refresh runs in the background with the same reads as a
+first open, then replaces them; if it fails they are dropped. Exact views neither
+use nor replace a resume. Any access change, cache clear or session disposal drops
+every resume.
 
 Threads share the 64 owned-handle ceiling. Each retains at most 2,000 events / 4 MiB;
 overflow clears display evidence and exposes an explicit recoverable limit rather
@@ -344,12 +374,12 @@ which it is true when it arrived, kept while the event waits, so watches do not
 change who a mention wakes; they still hear the rest. A channel leaves the
 agents-only set once a lookup of the viewer's own succeeds, not when it starts:
 an exact lookup marked `viewerLookup` (a name search, a label lookup, a mounted
-link, a search read, or any `session.channels.resolve` call, which only the
-viewer's own surfaces make) reports through `resolved`, and so does a mounted link
+link, a search read, or a `session.channels.resolve` call with its default viewer lookup) reports through `resolved`, and so does a mounted link
 to a channel already known, which needs no lookup: links hold their demand
 even when readable. Rechecks, such as preview
 revalidation after an access-revoked CLOSED or a member-added confirmation,
-leave it as it was.
+leave it as it was. Watch admission calls `session.channels.resolve` with
+`viewerLookup: false`, preserving agent-only provenance instead of promoting the channel into viewer mention traffic.
 Shared composers and reactions remain unavailable for nonmembers; message helpers
 and workflows do not acquire write eligibility from public metadata. The relay
 remains the final write authority, including low-level outbox intent.
@@ -395,7 +425,8 @@ If the directory fails, an in-flight provisional lookup can still supply rows
 before the error; a stalled lookup then waits for its existing transport timeout.
 Names match by
 the joined-channel rule (`matchRank`: exact, prefix, word start, substring,
-word runs, then letters in order), so `buzz community` finds `buzz-community`.
+word runs, then every typed word in any order), so `buzz community` finds
+`buzz-community`.
 The best eight are resolved through the same exact `resolve` path as message
 hits; the page itself never grants access. So
 `channels.get(id)` returns a `readOnly` summary and `channels.list()` stays
@@ -475,6 +506,10 @@ A channel-only link (`buzz://channel/<id>`) shows what the reader may see about
 that channel. `channels.describe(id)` answers from local evidence and never
 reads: `found` with the name and flags, `withheld`, or `unknown`. `joined`
 comes from the viewer in the roster, so a channel restored from cache counts.
+An unreadable `found` reference has `answered: true` only when a completed
+lookup admitted no readable channel. Missing `looking` alone does not establish
+an answer: it also occurs before demand and during an initial failure's backoff.
+The answer resets with access/cache state and is retained during rechecks.
 A public channel the viewer left is `found` from its signed open metadata; that
 names it but does not restore member reads. `channels.refer(id)` demands a
 background lookup once the list is ready, until the returned release; a
@@ -697,13 +732,28 @@ disconnect. Window focus does not read the roster. Decryption, uploads and serve
 
 The same rule covers the other reads a global route replays. After a continuous
 profiles replay, statuses and the emoji catalog are not read again; after a
-continuous membership replay, the read-state markers and the reminders list are
-not read again. Each owner returns to the state the drop interrupted once the
-replay is in, and reads again when that state was incomplete, failed, or still
-loading. A cut replay or no cursor keeps the earlier reads, even after an earlier
-report on the same connection; a route that fails before it establishes, or a
-host that reports no route, keeps them once per connection. The unread repair
-still runs on each connection.
+continuous membership replay, the read-state markers, reminders list and saved
+sidebar preferences are not read again unless reconciliation is still owed.
+Each owner returns to the state the drop interrupted once the replay is in, and
+reads again when that state was incomplete, failed, or still loading. A cut
+replay or no cursor keeps the earlier reads, even after an earlier report on the
+same connection; a route that fails before it establishes, or a host that reports
+no route, keeps them once per connection. The unread repair still runs on each
+connection.
+
+Saved sidebar preferences use no idle polling. A newer own sidebar event,
+including a local-write echo, requests one strong, fresh five-filter latest-head
+batch (limit 1 per coordinate). Same-turn hints coalesce; a newer hint or an
+overlapping local write can require a trailing batch. Duplicate or superseded
+hints request none. A non-continuous membership establishment requests one batch,
+including the first connection without a cursor: cold start typically reads
+twice (initial load plus repair), with another batch possible if replay overlaps
+a read. Continuous reconnect adds none when reconciliation is complete. Each
+published local preference write can therefore add one echo batch; unchanged
+writes that do not publish add none. Transient read failures use the existing
+session recovery backoff (1 second through a 30-second cap); other failures wait
+for Retry, a newer hint or reconnect. All reads use the existing host decoder;
+live payloads are invalidation hints, not preference authority.
 
 `session.messages.send(channelId, text)`, `.reply(channelId, resolvedRootId, text)`,
 `.edit(messageId, text)` and `.retry(id)`
@@ -841,8 +891,10 @@ a fresh hash of signed fields and the exact previously verified signature. It
 still returns newly owned frozen data and performs every HTTP read and access
 check. It is not an event/query cache or authorization proof. Live subscriptions
 retain up to 16,384 proofs across reconnects; direct `eventDto` calls are uncached.
-Desktop finite reads and live events send signature batches to the existing Rust
-libsecp256k1 verifier off the renderer thread. JavaScript still checks wire shape
+Desktop finite reads, live events, and cached channel discovery/history/profile
+restoration send signature checks to the existing Rust libsecp256k1 verifier off
+the renderer thread. Cached restoration retains JavaScript verification as a
+fallback if the host is unavailable or rejects the cached batch. JavaScript still checks wire shape
 and content hashes. Live EVENT/EOSE/CLOSED delivery stays ordered, with bounded
 pending work; overflow or host failure reconnects from before unprocessed frames.
 Browser and broker callers retain JavaScript signature verification.
@@ -1192,11 +1244,14 @@ outcomes retain their exact signed event and are never transparently re-signed.
 The relay WebSocket keeps retrying transient disconnects and authentication
 timeouts while its session is active. Its exponential delay starts at 250–500ms
 and caps at 15–30s, with jitter on each attempt. A full minute authenticated
-resets that backoff; a brief successful authentication does not. After a close with
-code 1012 (Service Restart) or 1001 (Going Away), as a rolling deploy sends to every
-client at once, the first attempt instead waits a uniform random time up to 10 s
-(more once repeated bounces have grown the backoff past that), so a fleet the relay
-closed at once does not return at once. Authentication rejection
+resets that backoff; a brief successful authentication does not. When a socket that
+had authenticated drops, whether through a deploy's 1012 (Service Restart) or 1001
+(Going Away) close or an abnormal drop, the first attempt instead waits a uniform
+random time up to 10 s (more once repeated bounces have grown the backoff past that),
+so a fleet the relay dropped at once does not return at once. A socket that never
+opened keeps the fast backoff. While that reconnect is scheduled, the background
+recovery retry leaves it alone and retries only failed reads; wake, network, focus,
+sign-in and the Retry button reconnect right away. Authentication rejection
 or signing failure keeps its error visible and reconnects on a slow timer, 60 s
 doubling to 10 minutes, because access or a locked signer can change later; a
 signer that does not match the viewer stays terminal. A route the relay CLOSED

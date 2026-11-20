@@ -23,7 +23,7 @@ import { setAttention, type AgentRecord } from "./store";
 export const ABSENT = "object-v1:absent";
 /** The most stored attention an agent can write for itself, so that one agent
  * cannot fill the device storage that every agent's settings share. */
-export const AGENT_BYTES = 256 * 1024;
+export const AGENT_BYTES = 1024 * 1024;
 /** The shortest interval an agent can give a timer. Each run is a new Claude
  * turn, so a faster timer only queues turns it cannot run. */
 export const MIN_INTERVAL_SECS = 60;
@@ -269,6 +269,8 @@ export type WriteOptions = Readonly<{
   /** A timer rearm: its deadline is set from `armed_at` even when that is
    * unchanged, keeping the occurrences used. */
   rearm?: boolean;
+  /** Internal helpers may transfer a watch atomically, scoped to its current Interest. */
+  move?: boolean;
 }>;
 
 /** The record after one checked write: replaces (or with `null` removes) the
@@ -277,7 +279,7 @@ export async function checkedWrite(
   record: AgentRecord,
   slug: string,
   value: AttentionValue | null,
-  { expected, interest, rearm }: WriteOptions,
+  { expected, interest, rearm, move }: WriteOptions,
   now: number,
 ): Promise<AgentRecord> {
   const parsed = parseSlug(slug);
@@ -337,7 +339,8 @@ export async function checkedWrite(
     value &&
     prior.type !== "interest" &&
     value.type !== "interest" &&
-    prior.interest_id !== value.interest_id
+    prior.interest_id !== value.interest_id &&
+    !move
   )
     throw new AttentionError(
       "invalid-operation",

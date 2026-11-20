@@ -19,11 +19,11 @@ import {
   type Panels,
 } from "../../features/panels/service";
 import { useTabDrag } from "../../features/panels/useTabDrag";
-import { PanelCard } from "../../features/panels/PanelCard";
+import { PanelMediaCard } from "./PanelMediaCard";
 import type { MessageLinkOrigin } from "../../features/messages/MessageRow";
 import {
   BrowserIcon,
-  MessageReplyIcon,
+  ThreadIcon,
   InfoIcon,
 } from "../../shared/design-system/icons";
 import { parseBuzzLink } from "../../features/navigation/buzz-links";
@@ -39,6 +39,7 @@ import { focusDock } from "./useCoveredByDock";
 import {
   entryPane,
   panelContentTarget,
+  profileContentPanel,
   panelTabId,
   rootOfTab,
   selectedTabId,
@@ -53,7 +54,8 @@ import tabStyles from "./ChannelTabs.module.css";
 /** The content-tab families whose visits follow explicit dismissal. */
 export const historyPanel = (entry: PanelOpening) =>
   !entry.channelContext &&
-  (entry.panel.key === "buzz.profiles/profile" ||
+  (entry.panel.addressable === true ||
+    profileContentPanel(entry) ||
     entry.panel.key === "buzz.github/object");
 
 /** Shared secondary workspace. Pages retain their main reader and route semantics. */
@@ -231,8 +233,8 @@ export function useConversationTabs({
     opening.current = opened;
   }
   const selectOpening = useCallback(
-    (next: Opening | undefined) => {
-      if (next && inMain(next)) {
+    (next: Opening | undefined, pane?: TabPane) => {
+      if (next && (pane ? pane === "main" : inMain(next))) {
         tabState.selectMain(panelTabId(next));
         return;
       }
@@ -242,7 +244,7 @@ export function useConversationTabs({
     [inMain, tabState.select, tabState.selectMain],
   );
   const open = useCallback(
-    (next: Opening | undefined, append = false) => {
+    (next: Opening | undefined, append = false, pane?: TabPane) => {
       const found = next
         ? entryList.current.find(
             (entry) =>
@@ -292,9 +294,10 @@ export function useConversationTabs({
       if (selected && historyPanel(selected))
         panelHistory.current.onVisitPanel?.(selected);
       setEntries(updated);
-      selectOpening(selected);
+      if (selected && pane) tabState.moveEntry(panelTabId(selected), pane);
+      selectOpening(selected, pane);
     },
-    [selectOpening, setEntries],
+    [selectOpening, setEntries, tabState.moveEntry],
   );
   const panelTabs = entries.filter(
     (entry) =>
@@ -651,6 +654,7 @@ export function useConversationTabs({
     messageId: string,
     rootId: string,
     intent?: "reply" | "reveal" | "focus",
+    unreadSince?: number,
   ) => {
     if (!currentVisit()) return;
     // Flat sessions keep their side-only host; channels support both panes.
@@ -660,6 +664,7 @@ export function useConversationTabs({
       rootId,
       intent,
       threadPane ?? (mainPane ? undefined : "side"),
+      unreadSince,
     );
     if (
       opening.current &&
@@ -833,7 +838,7 @@ export function useConversationTabs({
           : (target?.name ?? "Unavailable conversation"),
       icon:
         tab.kind === "thread" ? (
-          <MessageReplyIcon size="1rem" />
+          <ThreadIcon size="1rem" />
         ) : target ? (
           conversationIcon(target)
         ) : (
@@ -895,7 +900,11 @@ export function useConversationTabs({
       instance: entry,
       label: entry.panel.title,
       ...(entry.channelContext && {
-        icon: <InfoIcon size="1rem" />,
+        icon: entry.panel.tabIcon ? (
+          <entry.panel.tabIcon />
+        ) : (
+          <InfoIcon size="1rem" />
+        ),
       }),
       close: () => closeTab(entry),
       // Panel tabs cross panes at the edge between them, never reorder.
@@ -907,7 +916,17 @@ export function useConversationTabs({
       }),
       content:
         !entry.panel.deferUntilShown || visitTab.shown.has(id) ? (
-          <PanelCard
+          <PanelMediaCard
+            session={queries}
+            scope={scope}
+            channelId={entry.channelId}
+            channelName={
+              entry.channelContext?.channelName ?? current?.name ?? ""
+            }
+            extensions={extensions}
+            isActive={() =>
+              panelActive(entry) && (inMain(entry) || tabState.paneOpen)
+            }
             panel={entry.panel}
             contentKey={panelContentTarget(entry)}
             target={entry.target}

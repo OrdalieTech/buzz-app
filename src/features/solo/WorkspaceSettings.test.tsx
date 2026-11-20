@@ -2,8 +2,10 @@
 import { createChannelDetails } from "../relay/channel-details";
 import { SOLO_LABEL } from "./labels";
 import { PublishRejected } from "../relay/outbox";
-import { readView } from "../../shared/view-state";
+import { readView, writeView } from "../../shared/view-state";
 import { createChannelKit } from "../channel-templates/capability";
+import { channelTemplates } from "../channel-templates/local";
+import { readyAgentChoices } from "../agents/test-fakes";
 import {
   LIVE_CANVAS_BYTES,
   LIVE_CANVAS_LIMIT,
@@ -27,8 +29,15 @@ import {
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { RelaySession } from "../relay/session";
+import { WorkspaceNameConflict } from "../relay/sidebar-edits";
 import { WorkspaceSettings } from "./WorkspaceSettings";
 import { readWorkspace, projectTemplateId, workspaceCanvas } from "./workspace";
+import { createRelaySession } from "../relay/session";
+// Template agent checks read these; no case here applies a template's agents.
+const templateSession = (({ agentChoices, channels }) => ({
+  agentChoices,
+  channels,
+}))(createRelaySession(null).session);
 
 beforeEach(() => {
   localStorage.clear();
@@ -48,6 +57,7 @@ it("edits a chat's workspace and Canvas with its exact loaded revision", async (
   );
   const close = vi.fn();
   const session = {
+    ...templateSession,
     canvas: {
       available: true,
       read: async () => ({
@@ -103,6 +113,7 @@ it("retains a conflicted draft and never silently reloads over it", async () => 
   });
   const close = vi.fn();
   const session = {
+    ...templateSession,
     canvas: {
       available: true,
       read: async () => ({ id: "old", content: "Original" }),
@@ -143,10 +154,19 @@ it("saves section defaults as an existing relay template without writing section
   const save = vi.fn(async () => {});
   const close = vi.fn();
   const session = {
+    ...templateSession,
     scope: "https://relay.example.test:viewer",
+    sidebarPreferences: {
+      refresh: async () => {},
+      snapshot: () => ({
+        status: "ready",
+        data: { sections: [{ id: "work", name: "Work", order: 0 }] },
+      }),
+    },
     channelKit: {
       refresh: async () => {},
       snapshot: () => ({ status: "ready", entries: [] }),
+      snapshotList: () => [],
       save,
     },
   } as unknown as RelaySession;
@@ -158,14 +178,17 @@ it("saves section defaults as an existing relay template without writing section
       close={close}
     />,
   );
-  fireEvent.change(await screen.findByRole("textbox", { name: /^Folders/ }), {
-    target: { value: "~/Development/project" },
-  });
+  fireEvent.change(
+    await screen.findByPlaceholderText("~/Development/my-project"),
+    {
+      target: { value: "~/Development/project" },
+    },
+  );
   fireEvent.click(screen.getByRole("button", { name: "Add" }));
   fireEvent.change(screen.getByRole("textbox", { name: /^Instructions/ }), {
     target: { value: "Work carefully" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Save defaults" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
   await waitFor(() => expect(close).toHaveBeenCalled());
   expect(save).toHaveBeenCalledWith(
     expect.objectContaining({
@@ -211,7 +234,12 @@ it("recreates deleted section defaults using the tombstone revision", async () =
     },
   });
   const session = {
+    ...templateSession,
     scope: "https://relay.example.test:viewer",
+    sidebarPreferences: {
+      refresh: async () => {},
+      snapshot: () => ({ status: "ready", data: { sections: [] } }),
+    },
     channelKit: kit.capability,
   } as unknown as RelaySession;
   const close = vi.fn();
@@ -230,7 +258,7 @@ it("recreates deleted section defaults using the tombstone revision", async () =
       target: { value: "Old instructions" },
     },
   );
-  fireEvent.click(screen.getByRole("button", { name: "Save defaults" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
   await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
   first.unmount();
   const saved = kit.capability.snapshot().entries[0];
@@ -245,7 +273,7 @@ it("recreates deleted section defaults using the tombstone revision", async () =
   fireEvent.change(screen.getByRole("textbox", { name: /^Instructions/ }), {
     target: { value: "New instructions" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Save defaults" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
   await waitFor(() => expect(close).toHaveBeenCalledTimes(2));
   const restored = kit.capability.snapshot().entries[0];
   expect(restored?.record.deleted).toBe(false);
@@ -255,7 +283,7 @@ it("recreates deleted section defaults using the tombstone revision", async () =
 
 // The combined modal talks to the real signed details owner; Canvas remains its
 // independent revision/receipt boundary, held explicitly for orchestration tests.
-function combined() {
+function combined(initialCanvas = "Original Canvas") {
   const id = "11111111-1111-4111-8111-111111111111";
   const viewer = keypair(),
     relay = keypair();
@@ -306,7 +334,7 @@ function combined() {
     canAccess: () => true,
     acceptDiscovery: () => {},
   });
-  let head = { id: "revision-one", content: "Original Canvas" };
+  let head = { id: "revision-one", content: initialCanvas };
   const canvas = {
     available: true,
     read: vi.fn(async () => head),
@@ -318,6 +346,7 @@ function combined() {
   const close = vi.fn(),
     visit = new AbortController();
   const session = {
+    ...templateSession,
     canvas,
     channelDetails: details.capability,
   } as unknown as RelaySession;
@@ -456,7 +485,7 @@ it("remount checks uncertain lifetime without replaying confirmed Canvas; remain
   h.saved(undefined);
   fireEvent.click(check);
   await waitFor(() => expect(saveChanges()).toBeEnabled());
-  expect(screen.getByRole("status")).toHaveTextContent(
+  expect(await screen.findByRole("status")).toHaveTextContent(
     "Chat name and lifetime saved. Workspace and Canvas still have unsaved changes.",
   );
   expect(h.close).not.toHaveBeenCalled();
@@ -803,6 +832,7 @@ function chat(
 ) {
   const close = vi.fn();
   const session = {
+    ...templateSession,
     canvas: {
       available: true,
       read: async () => ({ id: "revision-one", content: "Original" }),
@@ -875,40 +905,438 @@ it("closes untouched settings at once, and Cancel discards edits without asking"
   expect(h.save).not.toHaveBeenCalled();
 });
 
-function project(entries: unknown[] = []) {
+function project(
+  entries: unknown[] = [],
+  agentChoices: unknown = templateSession.agentChoices,
+) {
   const close = vi.fn();
+  const group = { id: "work", name: "Work", defaultTemplateId: "" };
+  const rename = vi.fn(async (_id: string, edit: { name?: string }) => {
+    if (edit.name) group.name = edit.name;
+  });
+  const save = vi.fn(async (_template: unknown, ..._rest: unknown[]) => {});
   const session = {
+    ...templateSession,
+    agentChoices,
     scope: "https://relay.example.test:viewer",
     channelKit: {
       refresh: async () => {},
-      snapshot: () => ({ status: "ready", entries }),
-      save: vi.fn(),
+      snapshot: () => ({
+        status: "ready",
+        entries: [
+          {
+            eventId: "groups-revision",
+            createdAt: 1,
+            record: {
+              version: 1,
+              community: "https://relay.example.test",
+              deleted: false,
+              value: {
+                type: "groups",
+                id: "me",
+                groups: [group],
+                assignments: {},
+              },
+            },
+          },
+          ...entries,
+        ],
+      }),
+      save,
+    },
+    sidebarPreferences: {
+      sectionRenameWritable: true,
+      renameSection: rename,
+      refresh: async () => {},
+      snapshot: () => ({
+        status: "ready",
+        data: { sections: [{ id: "work", name: group.name, order: 0 }] },
+      }),
     },
   } as unknown as RelaySession;
-  render(
+  const view = () => (
     <WorkspaceSettings
       session={session}
       scope="test"
       target={{ kind: "project", id: "work", name: "Work" }}
       close={close}
-    />,
+    />
   );
-  return { close };
+  const mounted = render(view());
+  return { close, rename, save, view, mounted, group };
 }
 
-it("asks before closing Workspace settings with edited instructions", async () => {
-  const user = userEvent.setup();
+it.each([
+  { renamed: false, external: true },
+  { renamed: true, external: false },
+  { renamed: true, external: true },
+])(
+  "retries failed defaults with the live name despite a stale sidebar ($renamed saved, $external external rename)",
+  async ({ renamed, external }) => {
+    const h = project();
+    fireEvent.change(await instructions(), {
+      target: { value: "Keep these instructions" },
+    });
+    if (renamed)
+      fireEvent.change(
+        screen.getByRole("textbox", { name: "Workspace name" }),
+        {
+          target: { value: "Projects" },
+        },
+      );
+    h.save.mockRejectedValueOnce(new Error("defaults offline"));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "defaults offline",
+    );
+    h.mounted.unmount();
+    const currentName = external ? "Renamed elsewhere" : "Projects";
+    h.group.name = currentName;
+    render(h.view());
+    expect(await instructions()).toHaveValue("Keep these instructions");
+    expect(screen.getByRole("textbox", { name: "Workspace name" })).toHaveValue(
+      currentName,
+    );
+    h.save.mockRejectedValueOnce(new Error("retry offline"));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /^retry offline$/,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(h.close).toHaveBeenCalledOnce());
+    expect(h.rename.mock.calls).toEqual(
+      renamed ? [["work", { name: "Projects" }, "Work"]] : [],
+    );
+    expect(h.save).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        name: `${currentName} chats`,
+        canvas: "Keep these instructions",
+      }),
+      undefined,
+    );
+  },
+);
+
+it.each([true, false])(
+  "keeps a conflicting name draft despite a stale sidebar (recorded baseline: %s)",
+  async (baseline) => {
+    const h = project();
+    fireEvent.change(await instructions(), {
+      target: { value: "Keep the conflicting draft" },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "Workspace name" }), {
+      target: { value: "Projects" },
+    });
+    h.rename.mockRejectedValueOnce(new Error("rename offline"));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "rename offline",
+    );
+    h.mounted.unmount();
+    if (!baseline) {
+      const key = "solo:workspace-draft:project:work";
+      const draft = readView<Record<string, unknown>>("test", key, {});
+      delete draft.nameBase;
+      writeView("test", key, draft);
+    }
+    h.group.name = "Renamed elsewhere";
+    render(h.view());
+    expect(await instructions()).toHaveValue("Keep the conflicting draft");
+    expect(screen.getByRole("textbox", { name: "Workspace name" })).toHaveValue(
+      "Projects",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(/name.*review/i);
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+    expect(h.rename).toHaveBeenCalledTimes(1);
+    expect(h.save).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Review saved settings" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Discard draft and reload saved settings",
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("textbox", { name: "Workspace name" }),
+      ).toHaveValue("Renamed elsewhere"),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+  },
+);
+
+it("keeps an open form's conflicting name and instructions until explicit reload", async () => {
   const h = project();
   fireEvent.change(await instructions(), {
-    target: { value: "Work carefully" },
+    target: { value: "Keep the open-dialog instructions" },
   });
+  fireEvent.change(screen.getByRole("textbox", { name: "Workspace name" }), {
+    target: { value: "Projects" },
+  });
+  h.group.name = "Renamed elsewhere";
+  h.rename.mockRejectedValueOnce(new WorkspaceNameConflict());
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(/name.*review/i);
+  expect(screen.getByRole("textbox", { name: "Workspace name" })).toHaveValue(
+    "Projects",
+  );
+  expect(await instructions()).toHaveValue("Keep the open-dialog instructions");
+  expect(
+    readView("test", "solo:workspace-draft:project:work", null),
+  ).toMatchObject({
+    name: "Projects",
+    nameBase: "Work",
+    canvas: "Keep the open-dialog instructions",
+  });
+  expect(h.group.name).toBe("Renamed elsewhere");
+  expect(h.rename).toHaveBeenNthCalledWith(
+    1,
+    "work",
+    { name: "Projects" },
+    "Work",
+  );
+  expect(h.save).not.toHaveBeenCalled();
+  expect(h.close).not.toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Review saved settings" }),
+  );
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: "Discard draft and reload saved settings",
+    }),
+  );
+  await waitFor(() =>
+    expect(screen.getByRole("textbox", { name: "Workspace name" })).toHaveValue(
+      "Renamed elsewhere",
+    ),
+  );
+  expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+  fireEvent.change(screen.getByRole("textbox", { name: "Workspace name" }), {
+    target: { value: "Projects" },
+  });
+  fireEvent.change(await instructions(), {
+    target: { value: "Keep the open-dialog instructions" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(h.close).toHaveBeenCalledOnce());
+  expect(h.rename).toHaveBeenLastCalledWith(
+    "work",
+    { name: "Projects" },
+    "Renamed elsewhere",
+  );
+  expect(h.save).toHaveBeenCalledWith(
+    expect.objectContaining({
+      name: "Projects chats",
+      canvas: "Keep the open-dialog instructions",
+    }),
+    undefined,
+  );
+});
+
+it("validates workspace names and retains failed edits across remount and partial-save recovery", async () => {
+  const user = userEvent.setup();
+  const h = project();
+  await instructions();
+  const name = screen.getByRole("textbox", { name: "Workspace name" });
+  expect(name).toHaveValue("Work");
+  expect(name).toHaveAttribute("maxlength", "256");
+  fireEvent.change(name, { target: { value: " " } });
+  expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  fireEvent.change(name, { target: { value: " Projects " } });
+  await user.keyboard("{Escape}");
+  await user.click(
+    within(await prompt()).getByRole("button", { name: "Keep editing" }),
+  );
+  expect(h.close).not.toHaveBeenCalled();
+  fireEvent.change(await instructions(), {
+    target: { value: "Keep these instructions" },
+  });
+  h.rename.mockRejectedValueOnce(new Error("rename offline"));
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("rename offline");
+  expect(h.save).not.toHaveBeenCalled();
+  h.mounted.unmount();
+  render(h.view());
+  await instructions();
+  expect(screen.getByRole("textbox", { name: "Workspace name" })).toHaveValue(
+    " Projects ",
+  );
+  expect(await instructions()).toHaveValue("Keep these instructions");
+  h.save.mockRejectedValueOnce(new Error("defaults offline"));
+  let storage: ReturnType<typeof vi.spyOn> | undefined;
+  h.rename.mockImplementationOnce(async () => {
+    storage = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementationOnce(() => {
+        throw new Error("Device full");
+      });
+  });
+  try {
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Workspace name saved. The confirmed workspace name couldn’t be retained",
+    );
+    expect(h.save).not.toHaveBeenCalled();
+  } finally {
+    storage?.mockRestore();
+  }
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Workspace name saved. defaults offline",
+  );
+  const restoredName = screen.getByRole("textbox", { name: "Workspace name" });
+  fireEvent.change(restoredName, { target: { value: "Another name" } });
+  h.rename.mockRejectedValueOnce(new Error("new name offline"));
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() =>
+    expect(screen.getByRole("alert")).toHaveTextContent(/^new name offline$/),
+  );
+  fireEvent.change(restoredName, { target: { value: "Projects" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(h.close).toHaveBeenCalledOnce());
+  expect(h.rename).toHaveBeenCalledTimes(3);
+  expect(h.rename.mock.calls).toEqual([
+    ["work", { name: "Projects" }, "Work"],
+    ["work", { name: "Projects" }, "Work"],
+    ["work", { name: "Another name" }, "Projects"],
+  ]);
+  expect(h.save).toHaveBeenCalledTimes(2);
+  expect(h.save).toHaveBeenLastCalledWith(
+    expect.objectContaining({ name: "Projects chats" }),
+    undefined,
+  );
+});
+
+it("opens a near-limit historical chat Canvas as structured settings and protects oversized edits", async () => {
+  const user = userEvent.setup();
+  const header = [
+    '<!-- buzz-session-workspace:v1 {"folders":["/repo"],"worktree":{"location":"~/trees","baseBranch":"main"}} -->',
+    "## Workspace instructions",
+    "",
+    "- Use `/repo` for review only. Do not make changes directly in it.",
+    "- Before starting new work, fetch the latest `main` branch from origin.",
+    "- For each repository that needs changes, create a new worktree under `~/trees` from `origin/main`.",
+    "- Make all changes in that new worktree.",
+    "<!-- /buzz-session-workspace -->",
+    "",
+    "",
+  ].join("\n");
+  const body = "x".repeat(LIVE_CANVAS_BYTES - header.length);
+  const h = combined(header + body);
+  const { close } = h;
+  const save = h.canvas.save;
+  expect(
+    await screen.findByRole("button", { name: "Remove repo" }),
+  ).toBeVisible();
+  expect(
+    screen.getByRole("switch", { name: "Work in a new worktree" }),
+  ).toBeChecked();
+  expect(screen.getByRole("textbox", { name: "Base branch" })).toHaveValue(
+    "main",
+  );
+  const field = screen.getByRole("textbox", { name: /^Instructions/ });
+  expect((field as HTMLTextAreaElement).value.length).toBe(body.length);
+  await user.keyboard("{Escape}");
+  expect(close).toHaveBeenCalledOnce();
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  await waitFor(() =>
+    expect(screen.getByRole("radio", { name: /^Ongoing/ })).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    ),
+  );
+  fireEvent.click(screen.getByRole("radio", { name: /^Ongoing/ }));
+  h.publish.mockImplementationOnce(async (event) => {
+    h.apply(event);
+    throw new Error("Lost ack");
+  });
+  fireEvent.click(saveChanges());
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "may have been saved",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Check save status" }));
+  await waitFor(() => expect(close).toHaveBeenCalledTimes(2));
+  expect(save).not.toHaveBeenCalled();
+  fireEvent.change(field, { target: { value: `${body.slice(0, -1)}y` } });
+  await user.keyboard("{Escape}");
+  await user.click(
+    within(await prompt()).getByRole("button", { name: "Keep editing" }),
+  );
+  fireEvent.click(saveChanges());
+  expect(await screen.findByRole("alert")).toHaveTextContent(LIVE_CANVAS_LIMIT);
+  expect(save).not.toHaveBeenCalled();
+  fireEvent.change(field, { target: { value: body } });
+  await user.keyboard("{Escape}");
+  expect(close).toHaveBeenCalledTimes(3);
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  fireEvent.change(field, { target: { value: "Shorter instructions" } });
+  fireEvent.click(saveChanges());
+  await waitFor(() => expect(save).toHaveBeenCalledOnce());
+  expect(readWorkspace(save.mock.calls[0]?.[1] ?? "")).toEqual({
+    folders: ["/repo"],
+    worktree: { location: "~/trees", baseBranch: "main" },
+    canvas: "Shorter instructions",
+  });
+});
+
+it("closes untouched legacy worktree settings and reverted edits without a discard prompt", async () => {
+  const user = userEvent.setup();
+  const canvas = [
+    '<!-- buzz-session-workspace:v1 {"folders":["/repo"],"worktree":{"location":"~/trees","baseBranch":"main"}} -->',
+    "## Workspace instructions",
+    "",
+    "- Use `/repo` for review only. Do not make changes directly in it.",
+    "- Before starting new work, fetch the latest `main` branch from origin.",
+    "- For each repository that needs changes, create a new worktree under `~/trees` from `origin/main`.",
+    "- Make all changes in that new worktree.",
+    "<!-- /buzz-session-workspace -->",
+    "",
+    "Instructions",
+  ].join("\n");
+  const h = project([
+    {
+      eventId: "saved",
+      createdAt: 1,
+      record: {
+        version: 1,
+        community: "https://relay.example.test",
+        deleted: false,
+        value: {
+          type: "template",
+          id: await projectTemplateId("work"),
+          name: "Work chats",
+          description: "",
+          agents: [],
+          teamIds: [],
+          canvas,
+        },
+      },
+    },
+  ]);
+  const field = await instructions();
+  expect(field).toHaveValue("Instructions");
+  await user.keyboard("{Escape}");
+  expect(h.close).toHaveBeenCalledOnce();
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  fireEvent.change(field, { target: { value: "An edit" } });
   await user.click(
     within(
       screen.getByRole("dialog", { name: "Workspace settings" }),
     ).getByRole("button", { name: "Close" }),
   );
   expect(await prompt()).toBeVisible();
-  expect(h.close).not.toHaveBeenCalled();
+  expect(h.close).toHaveBeenCalledOnce();
+  await user.click(
+    within(await prompt()).getByRole("button", { name: "Keep editing" }),
+  );
+  fireEvent.change(field, { target: { value: "Instructions" } });
+  await user.keyboard("{Escape}");
+  expect(h.close).toHaveBeenCalledTimes(2);
+  expect(h.save).not.toHaveBeenCalled();
+  expect(h.rename).not.toHaveBeenCalled();
 });
 
 it("asks before closing Workspace settings with a different agent lineup", async () => {
@@ -931,9 +1359,15 @@ it("asks before closing Workspace settings with a different agent lineup", async
       },
     },
   });
+  // Channel templates are local; the workspace's saved defaults are relay records.
+  channelTemplates.save({
+    name: "Review kit",
+    teams: [],
+    agents: ["b".repeat(64)],
+    canvas: "Shared",
+  });
   const h = project([
     template(await projectTemplateId("work"), "Work chats", "a"),
-    template("review", "Review kit", "b"),
   ]);
   expect(await instructions()).toHaveValue("Shared");
   // The saved defaults' agents are where the dialog starts, not an edit.
@@ -953,6 +1387,65 @@ it("asks before closing Workspace settings with a different agent lineup", async
   );
   expect(choice).toHaveTextContent("Review kit");
   expect(h.close).toHaveBeenCalledOnce();
+});
+
+it("saves a template's available agents as the workspace defaults", async () => {
+  const user = userEvent.setup();
+  const agent = "b".repeat(64);
+  channelTemplates.save({
+    name: "Review kit",
+    teams: [],
+    agents: [agent, "c".repeat(64)],
+    canvas: "Review carefully",
+  });
+  const snapshot = readyAgentChoices([{ pubkey: agent, name: "Bo" }]);
+  const h = project([], {
+    ...templateSession.agentChoices,
+    snapshot: () => snapshot,
+    subscribe: () => () => {},
+    ensure: () => {},
+  });
+  await instructions();
+  await user.click(
+    screen.getByRole("combobox", { name: "Start from a template" }),
+  );
+  await user.click(await screen.findByRole("option", { name: "Review kit" }));
+  await user.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(h.close).toHaveBeenCalledOnce());
+  // Only the owner's agent here is saved, with the template's Canvas.
+  expect(h.save).toHaveBeenCalledOnce();
+  expect(h.save.mock.calls[0]?.[0]).toMatchObject({
+    agents: [agent],
+    canvas: "Review carefully",
+  });
+});
+
+it("reopens Workspace settings showing the template it last applied", async () => {
+  const user = userEvent.setup();
+  channelTemplates.save({
+    name: "Sunny stuff",
+    teams: [],
+    agents: [],
+    canvas: "Be sunny",
+  });
+  const first = project();
+  await instructions();
+  await user.click(
+    screen.getByRole("combobox", { name: "Start from a template" }),
+  );
+  await user.click(await screen.findByRole("option", { name: "Sunny stuff" }));
+  expect(await instructions()).toHaveValue("Be sunny");
+  await user.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(first.close).toHaveBeenCalledOnce());
+  cleanup();
+  // Reopening shows the applied template, and showing it is not an edit.
+  const second = project();
+  await instructions();
+  expect(
+    screen.getByRole("combobox", { name: "Start from a template" }),
+  ).toHaveTextContent("Sunny stuff");
+  await user.keyboard("{Escape}");
+  expect(second.close).toHaveBeenCalledOnce();
 });
 
 it.each(["name", "lifetime"] as const)(

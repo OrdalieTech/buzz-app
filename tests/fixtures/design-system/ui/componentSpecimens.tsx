@@ -1,6 +1,10 @@
 import { SidebarNavigation } from "../../../../src/shared/design-system/ui/SidebarNavigation";
 import { LoadingRegion } from "../../../../src/shared/design-system/ui/LoadingRegion";
-import { SettingsGroup } from "../../../../src/shared/design-system/ui/SettingsGroup";
+import {
+  SettingsGroup,
+  SettingsGroupExpand,
+} from "../../../../src/shared/design-system/ui/SettingsGroup";
+import { ValueChip } from "../../../../src/shared/design-system/ui/ValueChip";
 import { EmptyState } from "../../../../src/shared/design-system/ui/EmptyState";
 import { ExamplePreview } from "./ExamplePreview";
 import { Calendar } from "../../../../src/shared/design-system/ui/Calendar";
@@ -61,6 +65,7 @@ import {
   SmileyIcon,
   SquaresFourIcon,
   GlobeIcon,
+  SparklesIcon,
 } from "../../../../src/shared/design-system/icons/index";
 import type { ReactNode } from "react";
 import { useId, useState } from "react";
@@ -70,6 +75,7 @@ import {
 } from "../../../../src/shared/design-system/ui/ThemePicker";
 import { KeyboardShortcut } from "../../../../src/shared/design-system/ui/KeyboardShortcut";
 import { CountBadge } from "../../../../src/shared/design-system/ui/CountBadge";
+import { Badge } from "../../../../src/shared/design-system/ui/Badge";
 
 function ThemePickerSpecimen() {
   const [value, setValue] = useState<ThemeMode>("system");
@@ -872,7 +878,13 @@ function TabsSpecimen() {
         variant="dock"
         value={panelDestination}
         onValueChange={setPanelDestination}
-        items={iconItems}
+        items={iconItems.map((item, index) => ({
+          ...item,
+          trailing:
+            index === 0 ? (
+              <CountBadge count={12} label="12 items" />
+            ) : undefined,
+        }))}
       />
       <Tabs
         label="Icon segmented filters"
@@ -2178,6 +2190,24 @@ function RadioGroupSpecimen() {
         </Field>
       </SpecimenGroup>
       <SpecimenGroup
+        label="Compact checkmarked rows"
+        code={`<Field label="Voice">
+  <RadioGroup size="sm" defaultValue="cove">
+    <Radio value="cove" label="Cove" variant="row" />
+    <Radio value="maple" label="Maple" variant="row" />
+    <Radio value="none" label="Unavailable" variant="row" disabled />
+  </RadioGroup>
+</Field>`}
+      >
+        <Field label="Voice">
+          <RadioGroup size="sm" defaultValue="cove">
+            <Radio value="cove" label="Cove" variant="row" />
+            <Radio value="maple" label="Maple" variant="row" />
+            <Radio value="none" label="Unavailable" variant="row" disabled />
+          </RadioGroup>
+        </Field>
+      </SpecimenGroup>
+      <SpecimenGroup
         label="Native form reset"
         code={`<form aria-label="Notification preferences">
   <Field label="Notifications">
@@ -2445,6 +2475,7 @@ export const COMPONENT_SPECIMENS: Record<string, () => ReactNode> = {
           </div>
         </SettingsGroup>
       </div>
+      <ExpandSpecimen />
       <div>
         <InlineHeader title="Attached folders" />
         <SettingsGroup layout="cards">
@@ -2454,7 +2485,26 @@ export const COMPONENT_SPECIMENS: Record<string, () => ReactNode> = {
       </div>
     </div>
   ),
+  "value-chip": () => (
+    <p className="m-0 flex flex-wrap items-center gap-2 text-body-sm text-secondary">
+      Uses
+      <ValueChip icon={<SparklesIcon size={14} />} label="Example harness">
+        Model A · High
+      </ValueChip>
+      <ValueChip>
+        A much longer value that ellipsizes in a narrow column
+      </ValueChip>
+    </p>
+  ),
   "theme-picker": ThemePickerSpecimen,
+  badge: () => (
+    <div className="flex items-center gap-2">
+      <Badge size="xs">Read only</Badge>
+      <Badge size="xs" tone="success">
+        Best match
+      </Badge>
+    </div>
+  ),
   "count-badge": () => (
     <div className="flex w-64 flex-col gap-1">
       <NavigationItem
@@ -2718,3 +2768,50 @@ export const COMPONENT_SPECIMENS: Record<string, () => ReactNode> = {
   "navigation-section": NavigationSectionSpecimen,
   "navigation-item": NavigationItemSpecimen,
 };
+
+/** A choice that reveals its rows in place, as Manual does in AI settings. */
+function ExpandSpecimen() {
+  const [mode, setMode] = useState("automatic");
+  return (
+    <div>
+      <InlineHeader title="Expand in place" />
+      <SettingsGroup>
+        <PreferenceRow
+          icon={<SparklesIcon size={20} />}
+          title="Mode"
+          subtitle={
+            mode === "manual" ? "You choose each setting." : "Chosen for you."
+          }
+          trailing={
+            <Select
+              label="Mode"
+              variant="compact"
+              align="end"
+              value={mode}
+              groups={[
+                {
+                  label: "",
+                  options: [
+                    { value: "automatic", label: "Automatic" },
+                    { value: "manual", label: "Manual" },
+                  ],
+                },
+              ]}
+              onValueChange={setMode}
+            />
+          }
+        />
+        <SettingsGroupExpand open={mode === "manual"}>
+          <PreferenceRow
+            title="First"
+            trailing={<Button size="sm">Edit</Button>}
+          />
+          <PreferenceRow
+            title="Second"
+            trailing={<Button size="sm">Edit</Button>}
+          />
+        </SettingsGroupExpand>
+      </SettingsGroup>
+    </div>
+  );
+}

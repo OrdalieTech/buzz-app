@@ -259,7 +259,7 @@ it.each([
       name: "Back up your key?",
     });
     expect(dialog).toHaveAccessibleDescription(
-      "Buzz will save an encrypted copy of your identity key with your Builderlab account. That copy can restore your identity, including in other apps where you use the same key.",
+      "Buzz will save an encrypted copy of your identity key with your Builderlab account. That copy can restore your identity, including in other apps where you use the same key. If you manage your own key, keep a copy of your private key: you need it to use this account on another device or if you lose access to this one.",
     );
     expect(app.setBackupChoice).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: action }));

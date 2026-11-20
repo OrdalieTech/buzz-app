@@ -42,6 +42,9 @@ export type OutgoingEvent = Readonly<{
   acknowledged?: true;
   /** A caller-scoped admission requires renewed live eligibility for retry. */
   guarded?: boolean;
+  /** Sent with a caller hold. Once restored, only a retry that passes a new
+   * hold can publish it. */
+  held?: true;
   delivery: Delivery;
   error?: string | undefined;
   /** The relay refused the last attempt, rather than it failing on this
@@ -67,8 +70,31 @@ export interface Outbox {
   ready(): Promise<void>;
   /** Fresh shared-journal ownership without importing another window's operations. */
   recovery(key: string): Promise<OutgoingEvent | undefined>;
+  /** Verify the exact durable receipt and retain its dismissal lock through
+   * dependent publication. Signing must happen before acquiring this lock.
+   * Older Outboxes may omit this; dependent publication must fail closed. */
+  withRecovery?(
+    id: string,
+    recovery: OutboxRecovery,
+    run: () => Promise<unknown>,
+  ): Promise<void>;
+  /** Complete under exact ownership, without joining an independent dismissal. */
+  finishRecovery?(id: string, recovery: OutboxRecovery): Promise<void>;
   send(
     input: OutboxInput,
+    recovery?: OutboxRecovery,
+    active?: () => boolean,
+  ): string;
+  /** `send`, but each delivery attempt in this window calls `hold` with the
+   * event's id after signing and publishes only once it resolves. Only this
+   * event waits, and it uses no delivery slot meanwhile. The wait counts toward
+   * the attempt's deadline; a rejected or expired hold fails the delivery,
+   * which Retry may attempt again. Restored after reload, the entry has no
+   * hold, so only `retry` with a new `hold` publishes it.
+   * Older hosts may omit this method. */
+  sendHeld?(
+    input: OutboxInput,
+    hold: (id: string) => Promise<void>,
     recovery?: OutboxRecovery,
     active?: () => boolean,
   ): string;
@@ -85,8 +111,15 @@ export interface Outbox {
     verifyRetirement?: (event: EventData) => Promise<"recorded" | undefined>,
     replacement?: Replacement,
   ): Promise<void>;
-  retry(id: string, active?: () => boolean): void;
-  dismiss(id: string): Promise<void>;
+  /** `hold` replaces the event's hold in this window. A held entry restored
+   * after reload is refused without one. */
+  retry(
+    id: string,
+    active?: () => boolean,
+    hold?: (id: string) => Promise<void>,
+  ): void;
+  /** owner: the recovery its caller owns and releases with an unconfirmed send. */
+  dismiss(id: string, owner?: OutboxRecovery): Promise<void>;
   /** Durable explicit dismissal, with delivery evidence at removal. */
   observeDismiss(listener: (item: OutgoingEvent) => void): () => void;
 }
@@ -125,6 +158,8 @@ export class PublishRejected extends Error {
 export class PublishNotSent extends PublishRejected {}
 
 export { browserOutboxStorage } from "./outbox-storage";
+/** Why a held entry restored after reload cannot take a plain retry. */
+export const HELD_RETRY_REFUSED = "Retry this from the plugin that sent it.";
 const abortError = () => new DOMException("Relay session closed", "AbortError");
 const MAX_PENDING = 256;
 const MAX_CONFIRMED = 2048;
@@ -196,6 +231,8 @@ export function createOutbox(
     if (find(id)?.guarded && admissionGates.get(id)?.() !== true)
       throw new DOMException("Channel addition cancelled", "AbortError");
   };
+  // In memory, like admission gates; a restored `held` entry has none.
+  const sendHolds = new Map<string, (id: string) => Promise<void>>();
   let snapshot: readonly OutgoingEvent[] = Object.freeze([]);
   // Hydrated receipts are observations, not delivery owned by this window.
   const restoredReceipts = new Set<string>();
@@ -311,6 +348,17 @@ export function createOutbox(
   let storageError: string | undefined;
   let hydrated = false;
   let durable = Promise.resolve();
+  let ownership = Promise.resolve();
+  function locked<T>(id: string, run: () => Promise<T>): Promise<T> {
+    if (storage.lock) return storage.lock(id, run);
+    // Memory/single-window stores still serialize publication with dismissal.
+    const work = ownership.then(run, run);
+    ownership = work.then(
+      () => {},
+      () => {},
+    );
+    return work;
+  }
   const notify = () => {
     visible = Object.freeze([
       ...completed.entries().map(([, item]) => item),
@@ -446,6 +494,7 @@ export function createOutbox(
       ...(item.recovery ? { recovery: recoveryValue(item.recovery) } : {}),
       ...(item.acknowledged === true ? { acknowledged: true as const } : {}),
       ...(item.guarded ? { guarded: true } : {}),
+      ...(item.held ? { held: true as const } : {}),
       delivery:
         item.delivery === "seen" && signed
           ? "seen"
@@ -599,14 +648,27 @@ export function createOutbox(
       replace({ ...current, signed });
       await Promise.race([persist(id), aborted]);
       if (closed || signal.aborted || !find(id)) return;
+      const callerHold = sendHolds.get(id);
+      if (callerHold) {
+        // Spends this attempt's deadline, and ends before `holdPublish` can
+        // hand a starting chat's message to local agents.
+        attempt.held = true;
+        pumpDeliveries();
+        await Promise.race([callerHold(id), aborted]);
+        if (closed || signal.aborted || !find(id)) return;
+      }
       const hold = holdPublish?.(signed);
       if (hold) {
-        attempt.held = true;
+        if (!attempt.held) {
+          attempt.held = true;
+          pumpDeliveries();
+        }
         clearTimeout(attempt.timer);
-        pumpDeliveries();
         await Promise.race([hold, aborted]);
         attempt.expiresAt = Date.now() + timeoutMs;
         attempt.timer = setTimeout(() => expire(id), timeoutMs);
+      }
+      if (attempt.held) {
         while (inflight() >= 3) await Promise.race([nextSlot(), aborted]);
         delete attempt.held;
         if (closed || signal.aborted || !find(id)) return;
@@ -692,6 +754,7 @@ export function createOutbox(
         find(id)?.delivery === "seen"
       ) {
         admissionGates.delete(id);
+        sendHolds.delete(id);
       }
       total();
       clearTimeout(attempt.timer);
@@ -726,6 +789,7 @@ export function createOutbox(
     recovery?: OutboxRecovery,
     active?: () => boolean,
     replacing?: string,
+    hold?: (id: string) => Promise<void>,
   ) {
     if (active && !active())
       throw new DOMException("Channel addition cancelled", "AbortError");
@@ -838,9 +902,11 @@ export function createOutbox(
       delivery: "sending" as const,
       ...(savedRecovery ? { recovery: savedRecovery } : {}),
       ...(active ? { guarded: true } : {}),
+      ...(hold ? { held: true as const } : {}),
     });
     admit([...snapshot, operation], event.kind);
     if (active) admissionGates.set(event.id, active);
+    if (hold) sendHolds.set(event.id, hold);
     captureSend(event);
     if (!replacing)
       profiling.measure("send.local", event.id, () => {
@@ -865,6 +931,42 @@ export function createOutbox(
       );
     else schedule(event.id, intent);
     return { id: event.id, persisted: intent };
+  }
+  async function withRecovery(
+    id: string,
+    recovery: OutboxRecovery,
+    run: () => Promise<unknown>,
+    dismissAbsent = false,
+  ): Promise<void> {
+    await outbox.ready();
+    await durable.catch(() => {});
+    await locked(id, async () => {
+      const shared = (await storage.load({ readOnly: true })).find(
+        (item) => item.event.id === id,
+      );
+      if (closed) throw abortError();
+      if (
+        shared?.recovery?.key !== recovery.key ||
+        shared.recovery.value !== recovery.value
+      ) {
+        // This includes fresh local receipts: they cannot reclaim a durable
+        // dismissal through a later unrelated journal save.
+        storage.forget?.(id);
+        restoredReceipts.delete(id);
+        completed.delete(id);
+        snapshot = Object.freeze(
+          snapshot.filter((item) => item.event.id !== id),
+        );
+        notify();
+        // Only dismissal is idempotent. Missing ownership must still fence
+        // dependent publication and successful recovery completion.
+        if (!shared && dismissAbsent) return;
+        throw new Error(
+          "This operation was removed or changed in another window. Retry the message to continue.",
+        );
+      }
+      await run();
+    });
   }
   const outbox: Outbox = Object.freeze({
     snapshot: () => finalSnapshot ?? snapshot,
@@ -898,19 +1000,26 @@ export function createOutbox(
       }
       return shared;
     },
+    withRecovery,
+    async finishRecovery(id: string, recovery: OutboxRecovery) {
+      await withRecovery(id, recovery, () => persist(id, "dismiss"));
+      admissionGates.delete(id);
+      sendHolds.delete(id);
+    },
     async recover(id: string, recovery: OutboxRecovery, consume?: () => void) {
       const adopt = async () => {
         await outbox.ready();
         const saved = recoveryValue(recovery);
         if (!saved) throw new Error("Invalid outbox recovery state");
+        const shared = (await storage.load({ readOnly: true })).find(
+          (entry) => entry.event.id === id,
+        );
+        if (closed) throw abortError();
         let item = visible.find((entry) => entry.event.id === id);
         if (!item || dismissing.has(id))
           throw new Error(
             "The original operation is unavailable. Refresh before retrying.",
           );
-        const shared = (await storage.load({ readOnly: true })).find(
-          (entry) => entry.event.id === id,
-        );
         if (!shared && restoredReceipts.has(id))
           throw new Error(
             "The original operation was removed in another window. Try Send again.",
@@ -924,11 +1033,17 @@ export function createOutbox(
           consume?.();
           return;
         }
-        if (shared && restoredReceipts.has(id)) item = shared;
-        if (item.acknowledged) {
+        if (item.acknowledged || shared?.acknowledged) {
           consume?.();
           return;
         }
+        // Shared ownership still applies when this window verifies an echo
+        // after the journal read starts. That echo remains delivery evidence.
+        if (shared && restoredReceipts.has(id))
+          item =
+            item.delivery === "seen" && item.signed
+              ? { ...shared, signed: item.signed, delivery: "seen" }
+              : shared;
         if (
           (item.recovery &&
             (item.recovery.key !== saved.key ||
@@ -1039,10 +1154,22 @@ export function createOutbox(
       recovery?: OutboxRecovery,
       active?: () => boolean,
     ) => enqueue(input, recovery, active).id,
-    retry(id: string, active?: () => boolean) {
+    sendHeld: (
+      input: OutboxInput,
+      hold: (id: string) => Promise<void>,
+      recovery?: OutboxRecovery,
+      active?: () => boolean,
+    ) => enqueue(input, recovery, active, undefined, hold).id,
+    retry(
+      id: string,
+      active?: () => boolean,
+      hold?: (id: string) => Promise<void>,
+    ) {
       const item = find(id);
       if (item?.guarded && (active ?? admissionGates.get(id))?.() !== true)
         throw new DOMException("Channel addition cancelled", "AbortError");
+      if (item?.held && !hold && !sendHolds.has(id))
+        throw new Error(HELD_RETRY_REFUSED);
       // Workflow recovery is inspect/dismiss only, including restored intents.
       if (
         !closed &&
@@ -1057,6 +1184,7 @@ export function createOutbox(
         // Promote that intent before scheduling so signing and publication honor
         // the renewed caller policy, including after the next hydration.
         if (active) admissionGates.set(id, active);
+        if (hold) sendHolds.set(id, hold);
         if (item.delivery === "failed" || item.delivery === "unknown")
           captureSend(item.event);
         replace({
@@ -1075,12 +1203,17 @@ export function createOutbox(
         dismissListeners.delete(listener);
       };
     },
-    dismiss(id: string) {
+    dismiss(id: string, owner?: OutboxRecovery) {
       const pending = dismissing.get(id);
       if (pending) return pending;
       if (closed || attempts.has(id)) return Promise.resolve();
       const item = visible.find((item) => item.event.id === id);
-      if (item?.recovery && item.delivery !== "failed")
+      if (
+        item?.recovery &&
+        item.delivery !== "failed" &&
+        (item.recovery.key !== owner?.key ||
+          item.recovery.value !== owner.value)
+      )
         return Promise.reject(
           new Error(
             item.event.kind === 9000
@@ -1089,9 +1222,12 @@ export function createOutbox(
           ),
         );
       const remove = () => persist(id, "dismiss");
-      const work = (storage.lock ? storage.lock(id, remove) : remove())
+      const work = (
+        owner ? withRecovery(id, owner, remove, true) : locked(id, remove)
+      )
         .then(() => {
           admissionGates.delete(id);
+          sendHolds.delete(id);
         })
         .finally(() => dismissing.delete(id));
       dismissing.set(id, work);
@@ -1180,6 +1316,7 @@ export function createOutbox(
       finalVisible = visible;
       closed = true;
       admissionGates.clear();
+      sendHolds.clear();
       lifetime.abort();
       for (const attempt of attempts.values()) {
         attempt.controller?.abort(abortError());

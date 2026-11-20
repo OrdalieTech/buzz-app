@@ -331,6 +331,7 @@ export async function bestieFixture(
       };
     },
     retry() {},
+    tryAgain() {},
     disconnect() {},
     async clearCache() {},
   };

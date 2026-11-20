@@ -3,6 +3,7 @@ import "@testing-library/jest-dom/vitest";
 import {
   act,
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -19,8 +20,12 @@ import {
 import { BACKUP_FAILURES } from "../features/identity/backup-failure";
 import { backupOfferedFor } from "../features/identity/builderlab-account";
 import type { Identity } from "../features/identity/service";
-import type { FederatedIdentity } from "../features/federated-identity/service";
+import type {
+  FederatedIdentity,
+  SessionSnapshot,
+} from "../features/federated-identity/service";
 import { IdentitySettings } from "./IdentitySettings";
+import { FOLLOW_MS, SETTLED_MS } from "./landing";
 import { federatedFixture } from "../features/federated-identity/testing";
 
 vi.mock("@tauri-apps/api/core", async (importOriginal) => ({
@@ -243,6 +248,10 @@ function bound(service: FederatedIdentity): FederatedIdentity {
       expect(this).toBe(self);
       return service.cancelSignIn();
     },
+    signInLink() {
+      expect(this).toBe(self);
+      return service.signInLink();
+    },
     signOut() {
       expect(this).toBe(self);
       return service.signOut();
@@ -304,6 +313,198 @@ it("only shows renewal and expiry within seven days, with the default caret and 
   await waitFor(() =>
     expect(screen.getByRole("button", { name: "Renew sign-in" })).toHaveFocus(),
   );
+});
+
+it("shows a renewal in progress with a Cancel that ends only the browser step", async () => {
+  const h = federatedFixture();
+  h.publish({
+    status: "signed-in",
+    email: "a@example.com",
+    expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+  });
+  // Like native: a renewal keeps the session signed in until the browser
+  // step ends, and canceling ends it without a new session.
+  let finish: () => void = () => {};
+  vi.mocked(h.service.signIn).mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        h.publish({ renewing: true });
+        finish = () => {
+          h.publish({ renewing: false });
+          resolve(h.service.snapshot());
+        };
+      }),
+  );
+  vi.mocked(h.service.cancelSignIn).mockImplementation(async () => finish());
+  render(<IdentitySettings viewer={viewer} federatedIdentity={h.service} />, {
+    wrapper: ToastProvider,
+  });
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Renew sign-in" }));
+  expect(screen.getByRole("status")).toHaveTextContent(
+    "Finish in your browser",
+  );
+  expect(screen.queryByRole("button", { name: "Renew sign-in" })).toBeNull();
+  await user.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(h.service.cancelSignIn).toHaveBeenCalledOnce();
+  expect(
+    await screen.findByRole("button", { name: "Renew sign-in" }),
+  ).toBeVisible();
+  expect(screen.queryByText("Finish in your browser")).toBeNull();
+  expect(screen.getByText("a@example.com")).toBeVisible();
+  expect(h.service.signOut).not.toHaveBeenCalled();
+});
+
+it("keeps keyboard focus on the renewal action as Renew and Cancel swap", async () => {
+  const h = federatedFixture();
+  h.publish({
+    status: "signed-in",
+    email: "a@example.com",
+    expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+  });
+  let finish: () => void = () => {};
+  vi.mocked(h.service.signIn).mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        h.publish({ renewing: true });
+        finish = () => {
+          h.publish({ renewing: false });
+          resolve(h.service.snapshot());
+        };
+      }),
+  );
+  vi.mocked(h.service.cancelSignIn).mockImplementation(async () => finish());
+  render(<IdentitySettings viewer={viewer} federatedIdentity={h.service} />, {
+    wrapper: ToastProvider,
+  });
+  const user = userEvent.setup();
+  screen.getByRole("button", { name: "Renew sign-in" }).focus();
+  await user.keyboard("{Enter}");
+  expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+  await user.keyboard("{Enter}");
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Renew sign-in" })).toHaveFocus(),
+  );
+});
+
+// No click arms these: native ends the renewal on its own.
+it("keeps keyboard focus on the renewal action when native ends a renewal", async () => {
+  const h = federatedFixture();
+  h.publish({
+    status: "signed-in",
+    email: "a@example.com",
+    expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    renewing: true,
+  });
+  render(<IdentitySettings viewer={viewer} federatedIdentity={h.service} />, {
+    wrapper: ToastProvider,
+  });
+  screen.getByRole("button", { name: "Cancel" }).focus();
+  act(() => h.publish({ renewing: false }));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Renew sign-in" })).toHaveFocus(),
+  );
+});
+
+// Native records a renewal only once it starts the browser step: a Cancel
+// before then waits for it, then ends that step.
+it("holds a Cancel chosen before native records the renewal, then ends it", async () => {
+  const h = federatedFixture();
+  h.publish({
+    status: "signed-in",
+    email: "a@example.com",
+    expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+  });
+  let start: () => void = () => {};
+  let finish: () => void = () => {};
+  vi.mocked(h.service.signIn).mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        start = () => h.publish({ renewing: true });
+        finish = () => {
+          h.publish({ renewing: false });
+          resolve(h.service.snapshot());
+        };
+      }),
+  );
+  vi.mocked(h.service.cancelSignIn).mockImplementation(async () => finish());
+  render(<IdentitySettings viewer={viewer} federatedIdentity={h.service} />, {
+    wrapper: ToastProvider,
+  });
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Renew sign-in" }));
+  await user.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(h.service.cancelSignIn).not.toHaveBeenCalled();
+  act(() => start());
+  await waitFor(() => expect(h.service.cancelSignIn).toHaveBeenCalledOnce());
+  expect(
+    await screen.findByRole("button", { name: "Renew sign-in" }),
+  ).toBeVisible();
+  expect(h.service.signOut).not.toHaveBeenCalled();
+});
+
+it("does not take focus back after the person moves away from Cancel", async () => {
+  const h = federatedFixture();
+  h.publish({
+    status: "signed-in",
+    email: "a@example.com",
+    expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    renewing: true,
+  });
+  let finish: () => void = () => {};
+  vi.mocked(h.service.cancelSignIn).mockImplementation(
+    () =>
+      new Promise<void>((resolve) => {
+        finish = () => {
+          h.publish({ renewing: false });
+          resolve();
+        };
+      }),
+  );
+  render(
+    <>
+      <IdentitySettings viewer={viewer} federatedIdentity={h.service} />
+      <button type="button">Elsewhere</button>
+    </>,
+    { wrapper: ToastProvider },
+  );
+  const user = userEvent.setup();
+  screen.getByRole("button", { name: "Cancel" }).focus();
+  await user.keyboard("{Enter}");
+  expect(h.service.cancelSignIn).toHaveBeenCalledOnce();
+  const elsewhere = screen.getByRole("button", { name: "Elsewhere" });
+  elsewhere.focus();
+  act(() => finish());
+  expect(
+    await screen.findByRole("button", { name: "Renew sign-in" }),
+  ).toBeVisible();
+  expect(elsewhere).toHaveFocus();
+});
+
+it("shows a renewal that native reports as waiting, after the page reopens", async () => {
+  const h = federatedFixture();
+  // Settings was left mid-renewal: only native knows it still waits.
+  h.publish({
+    status: "signed-in",
+    email: "a@example.com",
+    expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    renewing: true,
+  });
+  vi.mocked(h.service.cancelSignIn).mockImplementation(async () => {
+    h.publish({ renewing: false });
+  });
+  render(<IdentitySettings viewer={viewer} federatedIdentity={h.service} />, {
+    wrapper: ToastProvider,
+  });
+  expect(screen.getByRole("status")).toHaveTextContent(
+    "Finish in your browser",
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(h.service.cancelSignIn).toHaveBeenCalledOnce();
+  expect(
+    await screen.findByRole("button", { name: "Renew sign-in" }),
+  ).toBeVisible();
+  expect(screen.getByText("a@example.com")).toBeVisible();
 });
 
 it("signs in to the organization once when signed out", async () => {
@@ -555,6 +756,12 @@ it("renders native status transitions and ignores a stale completion", async () 
     if (progress.status === "complete") {
       expect(badge.getByText(/A backup is saved/)).toBeVisible();
       expect(badge.queryByRole("button", { name: "Retry backup" })).toBeNull();
+    } else if (
+      // A sign-in on this page starts the next pass itself.
+      progress.status === "waiting" &&
+      progress.reason === "no_session"
+    ) {
+      expect(badge.queryByRole("button", { name: "Retry backup" })).toBeNull();
     } else {
       const retry = badge.getByRole("button", { name: "Retry backup" });
       if (progress.status === "running") {
@@ -568,6 +775,132 @@ it("renders native status transitions and ignores a stale completion", async () 
     }
     expect(backupRow()).toBeNull();
   }
+});
+
+const confirmedAt = (seq: number, progress: Progress) => {
+  const status = at(seq, progress);
+  return {
+    ...status,
+    management: { ...status.management, initialBackupConfirmed: true },
+  } as BackupStatus;
+};
+
+// The native receipt confirms the key at launch: a re-check that can't reach
+// or sign in to Builderlab leaves it backed up.
+it.each([
+  { status: "idle" },
+  { status: "waiting", reason: "no_session" },
+  ...(
+    ["unreachable", "signed_out", "busy", "storage", "not_offered"] as const
+  ).map((kind) => ({ status: "failed", kind }) as const),
+] as const)(
+  "shows a confirmed key as backed up through a %o re-check",
+  async (progress) => {
+    vi.stubEnv("VITE_BUZZ_BUILDERLAB_URL", "https://builderlab.example");
+    await renderBackup(confirmedAt(1, progress)).settled();
+    const badge = within(screen.getByRole("region", { name: "Your Buzz ID" }));
+    expect(badge.getByText("Backed up")).toBeVisible();
+    expect(badge.queryByRole("button", { name: "Check backup" })).toBeNull();
+    await showKeyDetails();
+    expect(badge.getByText(/A backup is saved/)).toBeVisible();
+    expect(badge.queryByRole("button", { name: "Retry backup" })).toBeNull();
+    expect(
+      badge.queryByText(/Couldn’t reach|Sign in to Builderlab/),
+    ).toBeNull();
+  },
+);
+
+it("shows a confirmed key as backed up when the account read fails", async () => {
+  const { fi, mount } = accountFixture(confirmedAt(1, { status: "idle" }));
+  fi.request.mockRejectedValue(new Error("Offline"));
+  mount();
+  await waitFor(() => expect(fi.request).toHaveBeenCalledTimes(2));
+  await act(async () => {
+    await Promise.allSettled(
+      fi.request.mock.results.map((result) => result.value),
+    );
+  });
+  const badge = within(screen.getByRole("region", { name: "Your Buzz ID" }));
+  expect(badge.getByText("Backed up")).toBeVisible();
+  await showKeyDetails();
+  expect(badge.getByText(/A backup is saved/)).toBeVisible();
+  expect(badge.queryByText("Backup status unknown")).toBeNull();
+  expect(badge.queryByRole("button", { name: "Retry backup" })).toBeNull();
+});
+
+// Backed up K, turned automatic backup off, then linked K2 elsewhere: native
+// stops at consent before it asks the account, so only Settings' own read
+// sees K2.
+it("withholds a receipt's Backed up while the account shows another backed-up key", async () => {
+  const other = "cd".repeat(32);
+  const { fi, mount } = accountFixture(
+    confirmedAt(1, { status: "waiting", reason: "no_consent" }),
+  );
+  fi.request.mockImplementation(async ({ path }) =>
+    accountResponse(path, other, [viewer, other]),
+  );
+  mount();
+  expect(await screen.findByText("Backed-up key · Linked")).toBeVisible();
+  const badge = within(screen.getByRole("region", { name: "Your Buzz ID" }));
+  expect(badge.queryByText("Backed up")).toBeNull();
+  await showKeyDetails();
+  expect(badge.queryByText(/A backup is saved/)).toBeNull();
+});
+
+// A receipt counts for any account. Backed up K with account A, turned
+// automatic backup off, then signed in to B: native stops at consent before it
+// asks B, and B's read finds no backup of K. The pill stays; the copy names
+// this account only once it confirms the backup.
+it.each([
+  { linked: "cd".repeat(32), backups: [] as string[], holder: "a" },
+  { linked: viewer, backups: [viewer], holder: "your" },
+])(
+  "says a receipt's backup is with $holder account after reading $linked",
+  async ({ linked, backups, holder }) => {
+    const { fi, mount } = accountFixture(
+      confirmedAt(1, { status: "waiting", reason: "no_consent" }),
+    );
+    fi.request.mockImplementation(async ({ path }) =>
+      accountResponse(path, linked, backups),
+    );
+    mount();
+    await waitFor(() => expect(fi.request).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.allSettled(
+        fi.request.mock.results.map((result) => result.value),
+      );
+    });
+    const badge = within(screen.getByRole("region", { name: "Your Buzz ID" }));
+    expect(badge.getByText("Backed up")).toBeVisible();
+    await showKeyDetails();
+    expect(
+      badge.getByText(`A backup is saved with ${holder} Builderlab account.`, {
+        exact: false,
+      }),
+    ).toBeVisible();
+  },
+);
+
+// Another attempt gets the same answer: the copy says what to do instead.
+it.each([
+  [
+    { status: "waiting", reason: "no_session" },
+    "Sign in to Builderlab to back up your key",
+  ],
+  ...(["not_offered", "invalid_service", "refused"] as const).map(
+    (kind) =>
+      [
+        { status: "failed", kind },
+        BACKUP_FAILURES[kind].message.replace(/\.$/, ""),
+      ] as const,
+  ),
+] as const)("offers no Retry backup for %o", async (progress, copy) => {
+  vi.stubEnv("VITE_BUZZ_BUILDERLAB_URL", "https://builderlab.example");
+  await renderBackup(at(1, progress)).settled();
+  await showKeyDetails();
+  const badge = within(screen.getByRole("region", { name: "Your Buzz ID" }));
+  expect(badge.getByText(copy)).toBeVisible();
+  expect(badge.queryByRole("button", { name: "Retry backup" })).toBeNull();
 });
 
 /** bb-acme first, then bb-public, each with its own session. */
@@ -610,6 +943,48 @@ const memberships = [
   { id: "wss://kalvin.communities.buzz.xyz", name: "kalvin" },
   { id: "wss://buzz.homelab.example", name: "homelab" },
 ];
+
+// A listed row has no error popup to take focus: Renew gets it back when a
+// renewal fails on its own.
+it("keeps keyboard focus on a listed server's Renew when its renewal fails", async () => {
+  const { block, root, servers } = twoServers();
+  block.publish({
+    status: "signed-in",
+    email: "will@acme.example",
+    expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+  });
+  let fail: () => void = () => {};
+  vi.mocked(block.service.signIn).mockImplementation(
+    () =>
+      new Promise((_, reject) => {
+        fail = () => reject(new Error("refused"));
+      }),
+  );
+  const listed = vi.fn(servers);
+  render(
+    <IdentitySettings
+      viewer={viewer}
+      federatedIdentity={root}
+      servers={listed}
+    />,
+    { wrapper: ToastProvider },
+  );
+  await waitFor(() => expect(listed).toHaveBeenCalledOnce());
+  await act(async () => {
+    await listed.mock.results[0]?.value;
+  });
+  const card = screen.getByRole("article", {
+    name: "Acme (acme.builderlab.xyz)",
+  });
+  within(card).getByRole("button", { name: "Renew sign-in" }).focus();
+  await userEvent.keyboard("{Enter}");
+  expect(within(card).getByRole("button", { name: "Cancel" })).toHaveFocus();
+  await act(async () => fail());
+  expect(await within(card).findByRole("alert")).toBeVisible();
+  expect(
+    within(card).getByRole("button", { name: "Renew sign-in" }),
+  ).toHaveFocus();
+});
 
 it("lists each signed-in server and signs out of one without touching the other", async () => {
   const { block, pub, root, servers } = twoServers();
@@ -753,6 +1128,397 @@ it("names the first server's failed restore beside a signed-in server, without c
   expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
 });
 
+it.each([false, true])(
+  "keeps Community sign-ins focused and in view as the server list loads and a session ends, until the user scrolls (scrolled: %s)",
+  async (scrolled) => {
+    const { block, root } = twoServers();
+    block.publish({ status: "signed-in", email: "will@acme.example" });
+    let list!: (servers: readonly SessionSnapshot[]) => void;
+    const servers = () =>
+      new Promise<readonly SessionSnapshot[]>((resolve) => {
+        list = resolve;
+      });
+    // Settings' scrollport. The landing stops 48px down.
+    const port = document.body.appendChild(document.createElement("div"));
+    port.style.overflowY = "auto";
+    let top = 0;
+    Object.defineProperty(port, "scrollTop", {
+      configurable: true,
+      get: () => top,
+      set: (value: number) => {
+        top = value;
+      },
+    });
+    const scrollIntoView = vi.fn(() => {
+      top = 48;
+    });
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
+    const heading = () =>
+      screen.getByRole("heading", { name: "Community sign-ins" });
+    try {
+      render(
+        <IdentitySettings
+          viewer={viewer}
+          federatedIdentity={root}
+          memberships={memberships}
+          servers={servers}
+          landing="visit"
+        />,
+        {
+          container: port.appendChild(document.createElement("div")),
+          wrapper: ToastProvider,
+        },
+      );
+      const first = heading();
+      expect(first).toHaveFocus();
+      expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+      // Instant, so the place it reads back afterwards is where it stopped.
+      expect(scrollIntoView).toHaveBeenCalledExactlyOnceWith({
+        block: "start",
+        behavior: "instant",
+      });
+      expect(scrollIntoView.mock.contexts[0]).toBe(first);
+      expect(top).toBe(48);
+      expect(
+        screen.getByRole("button", { name: "Sign out of organization" }),
+      ).toBeVisible();
+      // The user pages up from the heading, which scrolls the port.
+      if (scrolled) {
+        fireEvent.keyDown(first, { key: "PageUp" });
+        port.scrollTop = 20;
+      }
+      // The listed servers load below the heading, which stays and keeps
+      // the landing's focus.
+      await act(async () => list([block.service.snapshot()]));
+      expect(heading()).toBe(first);
+      expect(first).toHaveFocus();
+      // The server's session ending in the background changes the list
+      // below it, not the heading.
+      act(() => {
+        block.publish({ status: "signed-out", email: null });
+      });
+      expect(screen.getByText("Not signed in")).toBeVisible();
+      expect(heading()).toBe(first);
+      expect(first).toHaveFocus();
+      // Nothing moved the heading, so the landing never scrolls again; a user
+      // who scrolled keeps their place.
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+      expect(top).toBe(scrolled ? 20 : 48);
+      // Once the user moves on, focus stays where it went.
+      await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+      expect(
+        await screen.findByRole("button", {
+          name: "Sign out of acme.builderlab.xyz",
+        }),
+      ).toBeVisible();
+      expect(first).not.toHaveFocus();
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    } finally {
+      focus.mockRestore();
+      Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+      cleanup();
+      port.remove();
+    }
+  },
+);
+
+/** Settings' scrollport as a real-browser probe measured it: 649px tall, with
+ * the Community sign-ins heading 646px into 743px of content and its
+ * section the rest. Landing scrolls as near the heading's top as the content
+ * allows. Change `layout` as loading would; the landing notices it only on
+ * `resize` or `scroll`. */
+const SECTION = '[aria-labelledby="community-sign-ins-title"]';
+const signInHeading = () =>
+  screen.getByRole("heading", { name: "Community sign-ins" });
+function probedScrollport() {
+  const port = document.body.appendChild(document.createElement("div"));
+  port.style.overflowY = "auto";
+  const layout = { top: 0, height: 743 };
+  Object.defineProperties(port, {
+    scrollTop: {
+      configurable: true,
+      get: () => layout.top,
+      set: (top: number) => {
+        layout.top = top;
+      },
+    },
+    scrollHeight: { configurable: true, get: () => layout.height },
+    clientHeight: { configurable: true, get: () => 649 },
+  });
+  const box = (top: number, height: number) =>
+    ({
+      x: 0,
+      y: top,
+      top,
+      bottom: top + height,
+      left: 0,
+      right: 0,
+      width: 0,
+      height,
+      toJSON() {},
+    }) as DOMRect;
+  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(
+    function (this: Element) {
+      if (this.id === "community-sign-ins-title")
+        return box(646 - layout.top, 24);
+      if (this.getAttribute("aria-labelledby") === "community-sign-ins-title")
+        return box(646 - layout.top, layout.height - 646);
+      return box(0, 0);
+    },
+  );
+  const scrollIntoView = vi.fn(() => {
+    layout.top = Math.min(646, layout.height - 649);
+  });
+  HTMLElement.prototype.scrollIntoView = scrollIntoView;
+  /** Each live observer, with what it observes. */
+  const observers = new Map<
+    object,
+    { callback: ResizeObserverCallback; nodes: Set<Element> }
+  >();
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      constructor(callback: ResizeObserverCallback) {
+        observers.set(this, { callback, nodes: new Set() });
+      }
+      observe(node: Element) {
+        observers.get(this)?.nodes.add(node);
+      }
+      unobserve(node: Element) {
+        observers.get(this)?.nodes.delete(node);
+      }
+      disconnect() {
+        observers.delete(this);
+      }
+    },
+  );
+  return {
+    port,
+    layout,
+    scrollIntoView,
+    /** Whether the whole section shows, its bottom at or above the port's. */
+    shown: () => layout.height - layout.top <= 649,
+    /** Everything a live observer watches. */
+    observed: () => [...observers.values()].flatMap(({ nodes }) => [...nodes]),
+    /** Live observers of the section: the landing's; the badge has its own. */
+    observing: () => {
+      const section = port.querySelector(SECTION);
+      return [...observers.values()].filter(
+        ({ nodes }) => !!section && nodes.has(section),
+      ).length;
+    },
+    /** The section changed height, and with it every content-sized ancestor
+     * below the port: what observes any of them hears of it. */
+    resize: () =>
+      act(() => {
+        const section = port.querySelector(SECTION);
+        for (const [observer, { callback, nodes }] of [...observers])
+          if (
+            section &&
+            [...nodes].some(
+              (node) =>
+                node !== port && port.contains(node) && node.contains(section),
+            )
+          )
+            callback([], observer as ResizeObserver);
+      }),
+    scroll: () =>
+      act(() => {
+        port.dispatchEvent(new Event("scroll"));
+      }),
+    restore() {
+      Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+      vi.unstubAllGlobals();
+      cleanup();
+      port.remove();
+    },
+  };
+}
+
+function landedSignIn(servers: () => Promise<readonly SessionSnapshot[]>) {
+  const { block, root } = twoServers();
+  block.publish({ status: "signed-in", email: "will@acme.example" });
+  const scroll = probedScrollport();
+  const container = scroll.port.appendChild(document.createElement("div"));
+  const { unmount } = render(
+    <IdentitySettings
+      viewer={viewer}
+      federatedIdentity={root}
+      memberships={memberships}
+      servers={servers}
+      landing="visit"
+    />,
+    { container, wrapper: ToastProvider },
+  );
+  return { block, scroll, container, unmount };
+}
+
+it.each([
+  ["a clamp it notices resizing", 48, "resize"],
+  ["a clamp it notices scrolling", 48, "scroll"],
+  ["the section growing below the heading", 94, "resize"],
+] as const)(
+  "follows the layout after landing Community sign-ins, with no replacement, and lands again after %s",
+  async (_, top, notice) => {
+    const { scroll } = landedSignIn(() => new Promise(() => {}));
+    try {
+      expect(scroll.layout.top).toBe(94);
+      expect(scroll.shown()).toBe(true);
+      scroll.layout.height = 776;
+      scroll.layout.top = top;
+      expect(scroll.shown()).toBe(false);
+      await scroll[notice]();
+      expect(scroll.scrollIntoView).toHaveBeenCalledTimes(2);
+      expect(scroll.layout.top).toBe(127);
+      expect(scroll.shown()).toBe(true);
+      expect(signInHeading()).toHaveFocus();
+      // Where the landing put it, another notice leaves it.
+      await scroll.resize();
+      await scroll.scroll();
+      expect(scroll.scrollIntoView).toHaveBeenCalledTimes(2);
+    } finally {
+      scroll.restore();
+    }
+  },
+);
+
+it("lands Community sign-ins no more once the user scrolls, though a replacement takes the focus back", async () => {
+  let list!: (servers: readonly SessionSnapshot[]) => void;
+  const { block, scroll } = landedSignIn(
+    () =>
+      new Promise((resolve) => {
+        list = resolve;
+      }),
+  );
+  try {
+    expect(scroll.layout.top).toBe(94);
+    fireEvent.wheel(scroll.port, { deltaY: -46 });
+    scroll.layout.top = 48;
+    scroll.layout.height = 776;
+    await scroll.resize();
+    await scroll.scroll();
+    await act(async () => list([block.service.snapshot()]));
+    expect(signInHeading()).toHaveFocus();
+    await scroll.resize();
+    expect(scroll.scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scroll.layout.top).toBe(48);
+  } finally {
+    scroll.restore();
+  }
+});
+
+it("lands Community sign-ins in full through the probed journey: a clamp to the end, then growth", async () => {
+  const { scroll } = landedSignIn(() => new Promise(() => {}));
+  try {
+    expect(scroll.layout.top).toBe(94);
+    // The content shrinks to 697px, clamping scrollTop to its end.
+    scroll.layout.height = 697;
+    scroll.layout.top = 48;
+    await scroll.scroll();
+    expect(scroll.layout.top).toBe(48);
+    expect(scroll.shown()).toBe(true);
+    // Then it grows to 776px, the heading where the clamp left it.
+    scroll.layout.height = 776;
+    await scroll.resize();
+    expect(scroll.layout.top).toBe(127);
+    expect(scroll.shown()).toBe(true);
+    expect(signInHeading()).toHaveFocus();
+  } finally {
+    scroll.restore();
+  }
+});
+
+it("follows the layout no more once focus moves on from Community sign-ins", async () => {
+  const { scroll } = landedSignIn(() => new Promise(() => {}));
+  try {
+    expect(scroll.observing()).toBe(1);
+    const signOut = screen.getByRole("button", {
+      name: "Sign out of organization",
+    });
+    await act(async () => signOut.focus());
+    expect(scroll.observing()).toBe(0);
+    scroll.layout.height = 776;
+    scroll.layout.top = 48;
+    await scroll.resize();
+    await scroll.scroll();
+    expect(scroll.scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(signOut).toHaveFocus();
+  } finally {
+    scroll.restore();
+  }
+});
+
+it("watches only what resizes inside the scrollport, and lets go when Identity unmounts", () => {
+  const { scroll, container, unmount } = landedSignIn(
+    () => new Promise(() => {}),
+  );
+  try {
+    const observed = scroll.observed();
+    expect(observed).toContain(
+      screen.getByRole("region", { name: "Community sign-ins" }),
+    );
+    expect(observed).toContain(container);
+    expect(observed).not.toContain(scroll.port);
+    unmount();
+    expect(scroll.observing()).toBe(0);
+  } finally {
+    scroll.restore();
+  }
+});
+
+it("follows the layout until it holds still for SETTLED_MS, then lands Community sign-ins no more", async () => {
+  vi.useFakeTimers();
+  const { scroll } = landedSignIn(() => new Promise(() => {}));
+  try {
+    act(() => vi.advanceTimersByTime(SETTLED_MS - 1));
+    expect(scroll.observing()).toBe(1);
+    act(() => vi.advanceTimersByTime(1));
+    expect(scroll.observing()).toBe(0);
+    scroll.layout.height = 776;
+    await scroll.resize();
+    await scroll.scroll();
+    expect(scroll.scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scroll.layout.top).toBe(94);
+    expect(signInHeading()).toHaveFocus();
+  } finally {
+    scroll.restore();
+    vi.useRealTimers();
+  }
+});
+
+it("follows a layout that never holds still for FOLLOW_MS at most", async () => {
+  vi.useFakeTimers();
+  const { scroll } = landedSignIn(() => new Promise(() => {}));
+  // Grows or shrinks the content, clamping scrollTop to it, and notices.
+  const change = async () => {
+    scroll.layout.height = scroll.layout.height === 743 ? 776 : 743;
+    scroll.layout.top = Math.min(scroll.layout.top, scroll.layout.height - 649);
+    await scroll.resize();
+  };
+  try {
+    // Each change lands again and restarts the wait for the layout to settle.
+    let elapsed = 0;
+    let lands = 1;
+    while (elapsed + SETTLED_MS - 1 < FOLLOW_MS) {
+      act(() => vi.advanceTimersByTime(SETTLED_MS - 1));
+      elapsed += SETTLED_MS - 1;
+      await change();
+      expect(scroll.scrollIntoView).toHaveBeenCalledTimes(++lands);
+      expect(scroll.shown()).toBe(true);
+    }
+    expect(lands).toBeGreaterThan(2);
+    act(() => vi.advanceTimersByTime(FOLLOW_MS - elapsed));
+    expect(scroll.observing()).toBe(0);
+    await change();
+    expect(scroll.scrollIntoView).toHaveBeenCalledTimes(lands);
+    expect(signInHeading()).toHaveFocus();
+  } finally {
+    scroll.restore();
+    vi.useRealTimers();
+  }
+});
+
 it("keeps a per-server sign-out that native couldn't finish visible, named, with Try again", async () => {
   const { block, pub, root, servers } = twoServers();
   block.publish({ status: "signed-in", email: "will@acme.example" });
@@ -853,6 +1619,24 @@ it("offers no sign-out retry for a server whose restore failed", async () => {
   expect(screen.queryByText(/Couldn’t sign out/)).toBeNull();
   expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   expect(pub.service.signOut).not.toHaveBeenCalled();
+  // Only a check of the stored session, which a restore that works answers.
+  const row = screen.getByRole("article", {
+    name: "app.builderlab.xyz",
+  });
+  vi.mocked(pub.service.recheck).mockImplementation(async () =>
+    pub.publish({ status: "signed-in", failure: null }),
+  );
+  await userEvent.click(
+    within(row).getByRole("button", { name: "Check again" }),
+  );
+  expect(pub.service.recheck).toHaveBeenCalledOnce();
+  expect(
+    await within(row).findByRole("button", {
+      name: "Sign out of app.builderlab.xyz",
+    }),
+  ).toBeVisible();
+  expect(pub.service.signIn).not.toHaveBeenCalled();
+  expect(pub.service.signOut).not.toHaveBeenCalled();
 });
 
 it("shows the first server's failed restore as its own recovery text", async () => {
@@ -873,15 +1657,30 @@ it("shows the first server's failed restore as its own recovery text", async () 
     await listed.mock.results[0]?.value;
   });
   expect(screen.getByRole("alert")).toHaveTextContent(
-    /^Sign-in did not finish\. Try again\.$/,
+    /^Buzz couldn’t check your saved sign-in\. Check your connection, then choose Check again\.$/,
   );
-  // Neither a sign-out retry nor a sign-in while the record is unchecked.
+  // Neither a sign-out retry nor a sign-in while the record is unchecked:
+  // only a check that retries the restore and keeps the record.
   expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  const card = screen.getByRole("article", {
+    name: "Acme (acme.builderlab.xyz)",
+  });
+  expect(within(card).queryByRole("button", { name: "Sign in" })).toBeNull();
+  vi.mocked(block.service.recheck).mockImplementation(async () =>
+    block.publish({ status: "unavailable", failure: "network-unavailable" }),
+  );
+  await userEvent.click(
+    within(card).getByRole("button", { name: "Check again" }),
+  );
+  expect(block.service.recheck).toHaveBeenCalledOnce();
+  // A check that fails again keeps its recovery text and its button.
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    /^Buzz couldn’t check your saved sign-in\. Check your connection, then choose Check again\.$/,
+  );
   expect(
-    within(
-      screen.getByRole("article", { name: "Acme (acme.builderlab.xyz)" }),
-    ).queryByRole("button", { name: "Sign in" }),
-  ).toBeNull();
+    within(card).getByRole("button", { name: "Check again" }),
+  ).toBeVisible();
+  expect(block.service.signIn).not.toHaveBeenCalled();
   expect(block.service.signOut).not.toHaveBeenCalled();
 });
 
@@ -931,7 +1730,7 @@ it("rechecks the account after backup completes without adding a duplicate same-
 it.each(["success", "failure"] as const)(
   "retries an account lookup through the card with %s while blocking duplicate starts",
   async (outcome) => {
-    const { host, fi, mount } = accountFixture(at(1, { status: "complete" }));
+    const { host, fi, mount } = accountFixture(at(1, { status: "idle" }));
     const retry = vi.spyOn(host.identity.backup, "retry").mockResolvedValue(2);
     let retrying = false;
     let release!: () => void;
@@ -973,7 +1772,6 @@ it.each(["success", "failure"] as const)(
         expect(badge.queryByText("Backup status unknown")).toBeNull(),
       );
       expect(badge.queryByRole("button", { name: "Retry backup" })).toBeNull();
-      expect(badge.getByText(/A backup is saved/)).toBeVisible();
     } else {
       await waitFor(() => expect(action).toBeEnabled());
       expect(badge.getByText("Backup status unknown")).toBeVisible();

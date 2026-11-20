@@ -39,6 +39,9 @@ export class AcpSession {
   /** Takes the first name the harness generates for it; a titled session gets
    * none. */
   named: ((title: string) => void) | undefined;
+  /** Run before each new turn is sent, one at a time: brings the session's
+   * system prompt up to date. */
+  beforeTurn: (() => Promise<void>) | undefined;
   /** The harness's id for the running turn, which a steer must name. */
   private runId: string | undefined;
   /** Steers waiting for the running turn's id, which the harness sends just
@@ -46,6 +49,8 @@ export class AcpSession {
   private runWaiters: ((runId: string | undefined) => void)[] = [];
   /** A `session/prompt` is in flight. */
   private prompting = false;
+  /** Confirms the in-flight prompt once the harness starts or answers it. */
+  private confirmPrompt: (() => void) | undefined;
   private readonly steering = new Set<Waiter>();
   private steered = Promise.resolve();
   /** Turns to run, each with the model and level it was asked for, if any. */
@@ -58,6 +63,7 @@ export class AcpSession {
     refresh?: ActivityReceipt["refresh"];
     waiter?: Waiter;
     delivered?: () => void;
+    accepted?: () => void;
   }[] = [];
   /** The model the running turn runs on; empty is its provider's default. */
   private model = "";
@@ -105,6 +111,8 @@ export class AcpSession {
   private idlers: (() => void)[] = [];
   /** How often its work has been stopped or has ended. */
   private generation = 0;
+  /** Cancellation belongs to this burst of work, never the next one. */
+  private work: AbortController | undefined;
 
   constructor(
     private readonly acp: AcpProcess,
@@ -152,6 +160,7 @@ export class AcpSession {
   ): Promise<Settled> {
     if (this.closed)
       return Promise.resolve({ ok: false, error: "The session was closed" });
+    if (this.quiet()) this.work = new AbortController();
     this.pending++;
     let waiter!: Waiter;
     const settled = new Promise<Settled>((resolve) => {
@@ -174,6 +183,7 @@ export class AcpSession {
       this.queue.push({
         text,
         ...(activity.delivered ? { delivered: activity.delivered } : {}),
+        ...(activity.accepted ? { accepted: activity.accepted } : {}),
         ...(activity.current ? { current: activity.current } : {}),
         ...(activity.refresh ? { refresh: activity.refresh } : {}),
         waiter,
@@ -195,6 +205,17 @@ export class AcpSession {
       this.generation === generation && !this.stopped && !this.quiet();
   }
 
+  /** The exact work's cancellation, already aborted before any work starts. */
+  get signal(): AbortSignal {
+    return (
+      this.work?.signal ?? AbortSignal.abort(new Error("The turn has ended"))
+    );
+  }
+
+  private abortWork() {
+    this.work?.abort(new Error("The turn has ended"));
+  }
+
   /** A final message succeeded: the work counts as done at once, and the
    * turn of tool call `call` ends, unless another message is still waiting
    * for its answer. */
@@ -211,6 +232,7 @@ export class AcpSession {
   interrupt() {
     if (!this.working || this.closed) return;
     this.generation++;
+    this.abortWork();
     this.queue.length = 0;
     this.steered = Promise.resolve();
     this.stopped = {
@@ -258,7 +280,10 @@ export class AcpSession {
     const runId = steering ? steering.runId(update) : null;
     if (runId !== null) {
       this.runId = runId;
-      if (runId) this.ranAs(runId);
+      if (runId) {
+        this.confirmPrompt?.();
+        this.ranAs(runId);
+      }
     }
     if (kind === "session_info_update" || runId !== null) return;
     const step = stepLabel(update);
@@ -313,6 +338,7 @@ export class AcpSession {
       const { steering } = this.acp.hooks;
       if (runId && steering) {
         try {
+          activity.accepted?.();
           await steering.steer(this.acp, this.id, runId, text);
           if (live()) {
             activity.delivered?.();
@@ -332,6 +358,7 @@ export class AcpSession {
         this.queue.splice(next < 0 ? this.queue.length : next, 0, {
           text,
           ...(activity.delivered ? { delivered: activity.delivered } : {}),
+          ...(activity.accepted ? { accepted: activity.accepted } : {}),
           ...(activity.current ? { current: activity.current } : {}),
           ...(activity.refresh ? { refresh: activity.refresh } : {}),
           waiter,
@@ -384,6 +411,8 @@ export class AcpSession {
         this.ending = undefined;
         // Stopped work has ended, and messages sent since run as new work.
         if (this.stopped) this.endStopped();
+        if (!this.work || this.work.signal.aborted)
+          this.work = new AbortController();
         const {
           text,
           model,
@@ -393,11 +422,13 @@ export class AcpSession {
           refresh,
           waiter,
           delivered,
+          accepted,
         } = this.queue.shift() ?? {
           text: "",
         };
         let sent = false;
         try {
+          await this.beforeTurn?.();
           await this.select(model, effort);
           // A harness may ignore a level its model lacks, and keep one across
           // a model switch without its being set again.
@@ -421,7 +452,11 @@ export class AcpSession {
             if (waiter) this.discard(waiter);
             continue;
           }
-          delivered?.();
+          accepted?.();
+          this.confirmPrompt = () => {
+            this.confirmPrompt = undefined;
+            delivered?.();
+          };
           sent = true;
           if (waiter) this.sent(waiter);
           const lead = this.preamble;
@@ -431,6 +466,7 @@ export class AcpSession {
               { type: "text", text: lead ? `${lead}\n\n${prompt}` : prompt },
             ],
           })) as { stopReason?: string };
+          this.confirmPrompt?.();
           // A rejected prompt never reached the model: the next one leads.
           this.preamble = "";
           if (stopReason === "cancelled") this.cancelEnded();
@@ -449,6 +485,8 @@ export class AcpSession {
             error: errorMessage(error),
             ...(code === undefined ? {} : { code }),
           };
+        } finally {
+          this.confirmPrompt = undefined;
         }
       }
     } finally {
@@ -573,6 +611,7 @@ export class AcpSession {
       );
   }
   private settle(settled: Settled) {
+    this.abortWork();
     this.pending = 0;
     this.active.clear();
     this.displaced.clear();
@@ -601,6 +640,7 @@ export class AcpSession {
   }
   private wake() {
     if (!this.quiet()) return;
+    this.abortWork();
     this.generation++;
     for (const resolve of this.idlers.splice(0)) resolve();
   }

@@ -344,8 +344,8 @@ function fixture(
     ? {
         ...owner.session,
         messages: { ...owner.session.messages },
-        soloPreferences: {
-          ...owner.session.soloPreferences,
+        sidebarPreferences: {
+          ...owner.session.sidebarPreferences,
           snapshot: () => (filed ? filedProjects : unfiledProjects),
           refresh: async () => {},
           assign: placement,
@@ -445,7 +445,7 @@ function fixture(
   };
 }
 
-it("shows Public (existing) without offering Public and changes its admission to Guest", async () => {
+it("shows Public without offering Public and changes its admission to Guest", async () => {
   const t = fixture(true, { visibility: "public", joinRole: "member" });
   await t.ready();
   t.mount();
@@ -455,7 +455,7 @@ it("shows Public (existing) without offering Public and changes its admission to
     name: "General access",
   });
   await waitFor(() => expect(audience).toBeEnabled());
-  expect(audience).toHaveTextContent("Public (existing)");
+  expect(audience).toHaveTextContent("Public");
   await user.click(audience);
   expect(
     (await screen.findAllByRole("option")).map((option) =>
@@ -464,7 +464,7 @@ it("shows Public (existing) without offering Public and changes its admission to
   ).toEqual(["View only", "Private"]);
   await user.click(screen.getByRole("option", { name: "View only" }));
   expect(screen.getByRole("alertdialog")).toHaveAccessibleDescription(
-    "Everyone in this community will be able to read this chat’s full history and Canvas, including its workspace folders and agent instructions. People already in the chat keep their access.",
+    "Everyone in this community will be able to read this chat’s full history and Canvas, including its workspace folders and agent instructions. People already in the chat keep their access. You won’t be able to switch back to Public here.",
   );
   expect(t.published).toEqual([]);
   await user.click(screen.getByRole("button", { name: "Change access" }));
@@ -531,7 +531,7 @@ it("opens a Solo chat for view-only visitors and makes it private again without 
   expect(
     screen.queryByRole("combobox", { name: "New people can" }),
   ).not.toBeInTheDocument();
-  expect(t.session.soloPreferences.snapshot().data?.assignments).toEqual({
+  expect(t.session.sidebarPreferences.snapshot().data?.assignments).toEqual({
     [source]: "g",
   });
   expect(t.placement).not.toHaveBeenCalled();
@@ -1315,16 +1315,11 @@ it("shows loading and failed current access with refresh, never an empty roster"
     );
     await user.click(refresh);
     await within(access).findByRole("region", { name: "People" });
-    // General access has its own failed metadata read and explicit recovery.
-    const recovery = within(access).getByRole("group", {
-      name: "General access recovery",
-    });
-    expect(within(recovery).getByRole("alert")).toHaveTextContent(
-      "Roster unavailable",
-    );
-    await user.click(
-      within(recovery).getByRole("button", { name: "Reload access" }),
-    );
+    // General access renders from the channel summary, so the failed roster
+    // read leaves it no read of its own to fail or recover.
+    expect(
+      within(access).queryByRole("group", { name: "General access recovery" }),
+    ).toBeNull();
     await waitFor(() => expect(within(access).queryByRole("alert")).toBeNull());
     t.failRoster(true);
     await findDestination(user, dialog);

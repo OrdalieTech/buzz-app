@@ -93,7 +93,7 @@ export function navigationOwner(
   const messages = "buzz.channels/channels";
   const page = pages.find((page) => page.key === selected);
   return page &&
-    pagePlacement(page) === "sidebar" &&
+    (page.conversationNavigation || pagePlacement(page) === "sidebar") &&
     pages.some((page) => page.key === messages)
     ? messages
     : selected;
@@ -116,4 +116,15 @@ export function pagePresentation(page: RegisteredPage): PagePresentation {
     tone,
     ...(page.icon === undefined ? {} : { image: page.icon }),
   };
+}
+
+/** Visibility compatibility for callers of AppShell predating registered sidebar contexts. */
+export function legacySidebarAvailable(
+  pages: readonly RegisteredPage[],
+  selected: string,
+) {
+  return (
+    navigationOwner(pages, selected) === "buzz.channels/channels" ||
+    pages.some((page) => page.key === selected && !!page.sidebar)
+  );
 }

@@ -1,12 +1,17 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
+import { useSyncExternalStore } from "react";
 import { act, cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Agent, AgentChange, Agents } from "../../features/agents/service";
 import type { RelayData } from "../../features/relay/service";
+import type { RelaySession } from "../../features/relay/session";
 import { readView, writeView } from "../../shared/view-state";
-import { setDefaultAgent } from "../../features/solo/default-agent";
+import {
+  chooseDefaultAgent,
+  setDefaultAgent,
+} from "../../features/solo/default-agent";
 import { onBestieMade } from "../agents/BestieChoice";
 import { bestieTab, formerBestieTab } from "./BestieTab";
 import {
@@ -15,7 +20,7 @@ import {
   startHostedRead,
 } from "./former";
 import { validateObject } from "../../features/agents/attention";
-import { checkinHourly, memory, withFeature } from "./features";
+import { memory, notes, withFeature } from "./features";
 
 afterEach(() => {
   cleanup();
@@ -40,6 +45,8 @@ const member = (name: string, digit: string): Agent =>
   }) as unknown as Agent;
 const ada = member("Ada", "a");
 const bea = member("Bea", "b");
+const navigation = { open: vi.fn(async () => ({ status: "opened" })) } as never;
+const settingsCards = { has: () => true, subscribe: () => () => {} };
 
 /** Agents that save as a synced editor would: the agent's next config.
  * `listed` are the agents it finds, Ada and Bea, both on this device. */
@@ -119,7 +126,7 @@ function community(saved: string | null | undefined, agents = [ada, bea]) {
 it("shows on the saved Bestie only, and moves when Change picks another", async () => {
   const user = userEvent.setup();
   const { relay, mainAgent } = community(ada.pubkey);
-  const tab = bestieTab(relay, host([]).agents);
+  const tab = bestieTab(relay, host([]).agents, navigation, settingsCards);
   const changed = vi.fn();
   const stop = tab.subscribe?.(changed);
   // Nothing shows before the account's choice is read.
@@ -154,6 +161,66 @@ it("shows on the saved Bestie only, and moves when Change picks another", async 
   stop?.();
 });
 
+it("shows the Bestie's cost for the week, without a failed read stopping the tab", async () => {
+  const { relay } = community(ada.pubkey);
+  const usage = vi.fn().mockRejectedValue(new Error("unreadable"));
+  const agents = {
+    ...host().agents,
+    types: () => [{ key: "test/echo", adopt: () => ({}), usage }],
+  } as unknown as Parameters<typeof bestieTab>[1];
+  const tab = bestieTab(relay, agents, navigation, settingsCards);
+  const stop = tab.subscribe?.(() => {});
+  await vi.waitFor(() => expect(tab.when?.(ada)).toBe(true));
+  const Tab = tab.component;
+  render(<Tab agent={ada} />);
+  expect(await screen.findByText("Cost, last 7 days")).toBeVisible();
+  expect(
+    await screen.findByText("Couldn't read this agent's sessions."),
+  ).toBeVisible();
+  // The rest of the tab is where it was.
+  expect(screen.getByText("This is your Bestie")).toBeVisible();
+  expect(usage).toHaveBeenCalledTimes(1);
+  stop?.();
+});
+
+it("shows no cost on a Bestie or a Former Bestie, and reads none, while Usage is off", async () => {
+  const usage = vi.fn(async () => []);
+  const agents = {
+    ...host().agents,
+    types: () => [{ key: "test/echo", adopt: () => ({}), usage }],
+  } as unknown as Parameters<typeof bestieTab>[1];
+  const usageOff = { has: () => false, subscribe: () => () => {} };
+  const bestie = community(ada.pubkey);
+  const tab = bestieTab(bestie.relay, agents, navigation, usageOff);
+  const stop = tab.subscribe?.(() => {});
+  await vi.waitFor(() => expect(tab.when?.(ada)).toBe(true));
+  const Tab = tab.component;
+  const { unmount } = render(<Tab agent={ada} />);
+  expect(screen.getByText("This is your Bestie")).toBeVisible();
+  expect(screen.queryByText("Cost, last 7 days")).toBeNull();
+  unmount();
+  stop?.();
+
+  const remembering = {
+    ...ada,
+    config: { instructions: withFeature("Be brief.", memory, true) },
+  } as Agent;
+  const former = formerBestieTab(
+    community(bea.pubkey).relay,
+    agents,
+    navigation,
+    usageOff,
+  );
+  const stopFormer = former.subscribe?.(() => {});
+  await vi.waitFor(() => expect(former.when?.(remembering)).toBe(true));
+  const Former = former.component;
+  render(<Former agent={remembering} />);
+  expect(screen.getByText("Private channels Ada can read")).toBeVisible();
+  expect(screen.queryByText("Cost, last 7 days")).toBeNull();
+  expect(usage).not.toHaveBeenCalled();
+  stopFormer?.();
+});
+
 const deviceChoice = () => readView(SCOPE, "solo:default-agent", null);
 
 /** Opens Change and confirms Bea in place of Ada. */
@@ -173,7 +240,7 @@ it("puts this device back on the account's Bestie when a failed Change is closed
   const user = userEvent.setup();
   const { relay, mainAgent } = community(ada.pubkey);
   mainAgent.write.mockRejectedValueOnce(new Error("offline"));
-  const tab = bestieTab(relay, host([]).agents);
+  const tab = bestieTab(relay, host([]).agents, navigation, settingsCards);
   const stop = tab.subscribe?.(() => {});
   await vi.waitFor(() => expect(tab.when?.(ada)).toBe(true));
   const Tab = tab.component;
@@ -187,6 +254,32 @@ it("puts this device back on the account's Bestie when a failed Change is closed
   stop?.();
 });
 
+it("keeps the Bestie an agent saved when its tab closes over a failed Change", async () => {
+  const user = userEvent.setup();
+  const { relay, mainAgent } = community(ada.pubkey);
+  mainAgent.write.mockRejectedValueOnce(new Error("offline"));
+  const tab = bestieTab(relay, host([]).agents, navigation, settingsCards);
+  const subscribe = tab.subscribe ?? (() => () => {});
+  const stop = subscribe(() => {});
+  await vi.waitFor(() => expect(tab.when?.(ada)).toBe(true));
+  const Tab = tab.component;
+  // As the side panel does, it drops the tab once Ada stops being Bestie.
+  function Panel() {
+    const shown = useSyncExternalStore(subscribe, () => !!tab.when?.(ada));
+    return shown ? <Tab agent={ada} /> : null;
+  }
+  render(<Panel />);
+  const confirmation = await switchToBea(user);
+  expect(await within(confirmation).findByRole("alert")).toBeVisible();
+  // An agent saves Bea, as bestie_set does, while the failure shows.
+  const { session } = relay.snapshot() as unknown as { session: RelaySession };
+  await act(() => chooseDefaultAgent(session, SCOPE, bea.pubkey));
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  expect(mainAgent.write).toHaveBeenLastCalledWith(bea.pubkey);
+  expect(deviceChoice()).toBe(bea.pubkey);
+  stop();
+});
+
 it("puts this device back when a Change still saving fails after the panel closes", async () => {
   const user = userEvent.setup();
   const { relay, mainAgent } = community(ada.pubkey);
@@ -197,7 +290,7 @@ it("puts this device back when a Change still saving fails after the panel close
         fail = reject;
       }),
   );
-  const tab = bestieTab(relay, host([]).agents);
+  const tab = bestieTab(relay, host([]).agents, navigation, settingsCards);
   const stop = tab.subscribe?.(() => {});
   await vi.waitFor(() => expect(tab.when?.(ada)).toBe(true));
   const Tab = tab.component;
@@ -214,7 +307,12 @@ it("offers a remote agent in Change, and says what it can't do before switching"
   const user = userEvent.setup();
   const cara = { ...member("Cara", "c"), place: "hosted" } as Agent;
   const { relay, mainAgent } = community(ada.pubkey, [ada, bea, cara]);
-  const Tab = bestieTab(relay, host([], [ada, bea, cara]).agents).component;
+  const Tab = bestieTab(
+    relay,
+    host([], [ada, bea, cara]).agents,
+    navigation,
+    settingsCards,
+  ).component;
   await act(async () => {
     render(<Tab agent={ada} />);
   });
@@ -238,7 +336,12 @@ it("offers a remote agent in Change, and says what it can't do before switching"
 it("says nothing of remote agents when switching to one on this device", async () => {
   const user = userEvent.setup();
   const { relay } = community(ada.pubkey);
-  const Tab = bestieTab(relay, host([]).agents).component;
+  const Tab = bestieTab(
+    relay,
+    host([]).agents,
+    navigation,
+    settingsCards,
+  ).component;
   await act(async () => {
     render(<Tab agent={ada} />);
   });
@@ -258,7 +361,7 @@ it("shows a hosted Bestie's switches as unavailable when its provider has no ins
   } as Agent;
   const { relay } = community(ada.pubkey);
   const { agents, save } = host(["block.builderlab/builderlab"], [remote, bea]);
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   await act(async () => {
     render(<Tab agent={remote} />);
   });
@@ -308,7 +411,7 @@ function hostedBestie(text: string) {
 
 it("shows a hosted Bestie's tab, not one on another device's", async () => {
   const { relay } = community(ada.pubkey);
-  const tab = bestieTab(relay, host().agents);
+  const tab = bestieTab(relay, host().agents, navigation, settingsCards);
   const stop = tab.subscribe?.(() => {});
   await vi.waitFor(() => expect(tab.when?.(ada)).toBe(true));
   stop?.();
@@ -320,7 +423,7 @@ it("turns a hosted Bestie's memory on and off through its provider, and never to
   const user = userEvent.setup();
   const { relay } = community(ada.pubkey);
   const { remote, agents, save, get, set } = hostedBestie("Be brief.");
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   await act(async () => {
     render(<Tab agent={remote} />);
   });
@@ -342,19 +445,18 @@ it("turns a hosted Bestie's memory on and off through its provider, and never to
   expect(set.mock.calls[1]?.[0]).toBe("Be brief.");
   expect(save).not.toHaveBeenCalled();
   // Its timers never run here.
-  expect(
-    screen.queryByRole("switch", { name: "Every hour" }),
-  ).not.toBeInTheDocument();
+  for (const name of ["Hourly notes", "Nightly review"])
+    expect(screen.queryByRole("switch", { name })).not.toBeInTheDocument();
   expect(
     screen.getAllByText("Not available with remote agents yet."),
-  ).toHaveLength(1);
+  ).toHaveLength(2);
 });
 
 it("never replaces a hosted Bestie's instructions edited elsewhere since the tab read them", async () => {
   const user = userEvent.setup();
   const { relay } = community(ada.pubkey);
   const { remote, agents, get, set, editElsewhere } = hostedBestie("Be brief.");
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   await act(async () => {
     render(<Tab agent={remote} />);
   });
@@ -384,7 +486,7 @@ it("says why a hosted Bestie's instructions can't be read or saved, and lets eit
   const { relay } = community(ada.pubkey);
   const { remote, agents, get, set } = hostedBestie("Be brief.");
   get.mockRejectedValueOnce(new Error("Builderlab is down."));
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   await act(async () => {
     render(<Tab agent={remote} />);
   });
@@ -410,7 +512,12 @@ it("says why a hosted Bestie's instructions can't be read or saved, and lets eit
 
 it("keeps Change unavailable while there is no other agent to choose", async () => {
   const { relay } = community(ada.pubkey, [ada]);
-  const Tab = bestieTab(relay, host().agents).component;
+  const Tab = bestieTab(
+    relay,
+    host().agents,
+    navigation,
+    settingsCards,
+  ).component;
   await act(async () => {
     render(<Tab agent={ada} />);
   });
@@ -426,7 +533,12 @@ it("asks before making a remote former Bestie your Bestie again, and Cancel chan
     place: "elsewhere",
     config: { instructions: withFeature("Be brief.", memory, true) },
   } as Agent;
-  const Tab = formerBestieTab(relay, host([], [bea, remote]).agents).component;
+  const Tab = formerBestieTab(
+    relay,
+    host([], [bea, remote]).agents,
+    navigation,
+    settingsCards,
+  ).component;
   await act(async () => {
     render(<Tab agent={remote} />);
   });
@@ -456,7 +568,7 @@ it("asks before making a remote former Bestie your Bestie again, and Cancel chan
 
 it("tells the host only when the Bestie or its community changes", async () => {
   const { relay, reconnect } = community(ada.pubkey);
-  const tab = bestieTab(relay, host([]).agents);
+  const tab = bestieTab(relay, host([]).agents, navigation, settingsCards);
   const changed = vi.fn();
   const stop = tab.subscribe?.(changed);
   await vi.waitFor(() => expect(tab.when?.(ada)).toBe(true));
@@ -475,7 +587,7 @@ it("turns memory on and off as a marked section of the instructions", async () =
   const user = userEvent.setup();
   const { relay } = community(ada.pubkey);
   const { agents, save } = host();
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   const base = { instructions: "head-1" };
   const agent = {
     ...ada,
@@ -485,8 +597,12 @@ it("turns memory on and off as a marked section of the instructions", async () =
   const { rerender } = render(<Tab agent={agent} />);
   const remembers = screen.getByRole("switch", { name: "Remembers you" });
   expect(remembers).not.toBeChecked();
+  // The Memory tab only reads, so the row says how to clear a memory instead.
+  expect(remembers).toHaveAccessibleDescription(
+    "Adds memory rules to Bestie's instructions. Off removes them. Nothing Bestie remembered is deleted, and its core memory still goes into every prompt. To clear a memory, ask Bestie to forget it.",
+  );
   expect(
-    screen.getByText(/Nothing Bestie remembered is deleted/),
+    screen.getByText(/To clear a memory, ask Bestie to forget it\./),
   ).toBeVisible();
 
   await user.click(remembers);
@@ -497,7 +613,7 @@ it("turns memory on and off as a marked section of the instructions", async () =
     base,
   });
   expect(on).toMatch(
-    /^Be brief\.\n\n<!-- buzz:bestie\/memory v1 -->\n# Memory\n/,
+    /^Be brief\.\n\n<!-- buzz:bestie\/memory v2 -->\n# Memory\n/,
   );
 
   // The saved instructions are what the switch shows.
@@ -516,7 +632,7 @@ it("keeps memory on through the owner's edits, and offers Restore for edited mar
   const user = userEvent.setup();
   const { relay } = community(ada.pubkey);
   const { agents, save } = host();
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   const base = { instructions: "head-2" };
   const on = withFeature("Be brief.", memory, true);
   const close = "<!-- /buzz:bestie/memory -->";
@@ -550,10 +666,11 @@ it("keeps memory on through the owner's edits, and offers Restore for edited mar
   expect(screen.queryByRole("button", { name: "Restore" })).toBeNull();
   expect(screen.getByText(/Fix its start and end lines there/)).toBeVisible();
   // Check-ins wait on memory.
-  expect(screen.getByRole("switch", { name: "Every hour" })).toHaveAttribute(
-    "aria-disabled",
-    "true",
-  );
+  for (const name of ["Hourly notes", "Nightly review"])
+    expect(screen.getByRole("switch", { name })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
 });
 
 it("says why a save failed and lets the switch be tried again", async () => {
@@ -561,7 +678,7 @@ it("says why a save failed and lets the switch be tried again", async () => {
   const { relay } = community(ada.pubkey);
   const { agents, save } = host();
   save.mockRejectedValueOnce(new Error("Connect to the community to save"));
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   render(<Tab agent={{ ...ada, config: {} } as Agent} />);
   const remembers = screen.getByRole("switch", { name: "Remembers you" });
   await user.click(remembers);
@@ -579,7 +696,7 @@ it("says why a save failed and lets the switch be tried again", async () => {
 it("offers no switch while the agent's instructions can't be read here", () => {
   const { relay } = community(ada.pubkey);
   const { agents, save } = host();
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   render(
     <Tab
       agent={
@@ -595,15 +712,15 @@ it("offers no switch while the agent's instructions can't be read here", () => {
   // Each setting's row says why, check-ins too.
   expect(
     screen.getAllByText("This agent's instructions could not be read"),
-  ).toHaveLength(2);
+  ).toHaveLength(3);
   expect(save).not.toHaveBeenCalled();
 });
 
-it("checks in every hour only while memory is on, with a timer in the owner's DM", async () => {
+it("checks in only while memory is on, hourly and nightly apart, each as an Interest and a timer in the owner's DM", async () => {
   const user = userEvent.setup();
   const { relay } = community(ada.pubkey);
   const { agents, save } = host();
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   const base = { instructions: "head-1" };
   const remembering = withFeature("Be brief.", memory, true);
   const off = {
@@ -612,28 +729,28 @@ it("checks in every hour only while memory is on, with a timer in the owner's DM
     configBase: base,
   };
   const { rerender } = render(<Tab agent={off as Agent} />);
-  const hourly = () => screen.getByRole("switch", { name: "Every hour" });
+  const hourly = () => screen.getByRole("switch", { name: "Hourly notes" });
+  const nightly = () => screen.getByRole("switch", { name: "Nightly review" });
   // Memory is off, so check-ins can't be turned on.
   expect(hourly()).toHaveAttribute("aria-disabled", "true");
-  expect(screen.getByText("Turn on Remembers you first.")).toBeVisible();
+  expect(nightly()).toHaveAttribute("aria-disabled", "true");
+  expect(screen.getAllByText("Turn on Remembers you first.")).toHaveLength(2);
 
   const on = { ...off, config: { instructions: remembering } } as Agent;
   rerender(<Tab agent={on} />);
   expect(hourly()).not.toBeChecked();
   await user.click(hourly());
-  // The timer first, then the instructions that say what it is for.
-  expect(save).toHaveBeenCalledTimes(2);
-  const [[, timers], [, instructions]] = save.mock.calls as [
-    [string, AgentChange],
-    [string, AgentChange],
-  ];
-  expect(instructions).toEqual({
-    config: { instructions: withFeature(remembering, checkinHourly, true) },
-    base,
+  // The Interest and timer only: what every turn carries is left alone.
+  expect(save).toHaveBeenCalledTimes(1);
+  const [[, timers]] = save.mock.calls as [[string, AgentChange]];
+  expect(timers.config).toBeUndefined();
+  expect(timers.attention?.["interest/bestie-notes"]).toEqual({
+    type: "interest",
+    instructions: notes.timer?.interest,
   });
-  expect(timers.attention?.["watch/bestie-hourly-check-in"]).toMatchObject({
+  expect(timers.attention?.["watch/bestie-notes"]).toMatchObject({
     type: "timer",
-    interest_id: "bestie-hourly-check-in",
+    interest_id: "bestie-notes",
     interval_secs: 3600,
     max_occurrences: null,
     expires_at: null,
@@ -644,15 +761,12 @@ it("checks in every hour only while memory is on, with a timer in the owner's DM
   for (const [slug, value] of Object.entries(timers.attention ?? {}))
     expect(validateObject(slug, value)).toBeUndefined();
 
-  // On means the section and the timer are both there.
+  // On means the Interest and the timer are both there.
   const checking = {
     ...on,
-    config: { instructions: withFeature(remembering, checkinHourly, true) },
     attention: {
-      "interest/bestie-hourly-check-in": { value: { type: "interest" } },
-      "watch/bestie-hourly-check-in": {
-        value: { type: "timer", enabled: true },
-      },
+      "interest/bestie-notes": { value: { type: "interest" } },
+      "watch/bestie-notes": { value: { type: "timer", enabled: true } },
     },
   } as unknown as Agent;
   rerender(<Tab agent={checking} />);
@@ -665,46 +779,80 @@ it("checks in every hour only while memory is on, with a timer in the owner's DM
   expect(hourly()).not.toBeChecked();
   rerender(<Tab agent={checking} />);
 
-  const removed = {
-    attention: {
-      "interest/bestie-hourly-check-in": null,
-      "watch/bestie-hourly-check-in": null,
-    },
-  };
-  // Memory off takes check-ins with it, and leaves Attention's switch alone.
+  // Nightly review is its own switch: Hourly notes off leaves it alone.
   save.mockClear();
-  await user.click(screen.getByRole("switch", { name: "Remembers you" }));
-  expect(save.mock.calls).toEqual([
-    [ada.key, removed],
-    [ada.key, { config: { instructions: "Be brief." }, base }],
+  rerender(<Tab agent={on} />);
+  await user.click(nightly());
+  expect(save).toHaveBeenCalledTimes(1);
+  const [[, review]] = save.mock.calls as [[string, AgentChange]];
+  expect(Object.keys(review.attention ?? {})).toEqual([
+    "interest/bestie-dream",
+    "watch/bestie-dream",
   ]);
+  expect(review.attention?.["watch/bestie-dream"]).toMatchObject({
+    interest_id: "bestie-dream",
+    interval_secs: 86_400,
+    channel: DM,
+  });
+  const dreamTimer = review.attention?.["watch/bestie-dream"] as
+    | { armed_at: number }
+    | undefined;
+  expect(new Date((dreamTimer?.armed_at ?? 0) * 1000).getHours()).toBe(3);
+  for (const [slug, value] of Object.entries(review.attention ?? {}))
+    expect(validateObject(slug, value)).toBeUndefined();
 
-  // Check-ins off removes only their section and timer.
+  const both = {
+    ...checking,
+    attention: {
+      ...checking.attention,
+      "interest/bestie-dream": { value: { type: "interest" } },
+      "watch/bestie-dream": { value: { type: "timer", enabled: true } },
+    },
+  } as unknown as Agent;
+  rerender(<Tab agent={both} />);
+  expect(hourly()).toBeChecked();
+  expect(nightly()).toBeChecked();
+  // Hourly notes off removes only its Interest and timer.
   save.mockClear();
   await user.click(hourly());
   expect(save.mock.calls).toEqual([
-    [ada.key, removed],
-    [ada.key, { config: { instructions: remembering.trimEnd() }, base }],
+    [
+      ada.key,
+      {
+        attention: {
+          "interest/bestie-notes": null,
+          "watch/bestie-notes": null,
+        },
+      },
+    ],
+  ]);
+  // Memory off takes both with it, and leaves Attention's switch alone.
+  save.mockClear();
+  await user.click(screen.getByRole("switch", { name: "Remembers you" }));
+  expect(save.mock.calls).toEqual([
+    [
+      ada.key,
+      {
+        attention: {
+          "interest/bestie-notes": null,
+          "watch/bestie-notes": null,
+          "interest/bestie-dream": null,
+          "watch/bestie-dream": null,
+        },
+      },
+    ],
+    [ada.key, { config: { instructions: "Be brief." }, base }],
   ]);
 
   // Left on after memory went some other way, it can still be turned off.
   rerender(
-    <Tab
-      agent={
-        {
-          ...checking,
-          config: {
-            instructions: withFeature("Be brief.", checkinHourly, true),
-          },
-        } as Agent
-      }
-    />,
+    <Tab agent={{ ...both, config: { instructions: "Be brief." } } as Agent} />,
   );
   expect(hourly()).toBeChecked();
   expect(hourly()).not.toHaveAttribute("aria-disabled", "true");
 });
 
-/** Ada with memory on and check-ins off, ready to turn Every hour on. */
+/** Ada with memory on and check-ins off, ready to turn Hourly notes on. */
 function remembering(attentionEnabled = false) {
   return {
     ...ada,
@@ -712,75 +860,63 @@ function remembering(attentionEnabled = false) {
     attentionEnabled,
   } as Agent;
 }
-const TIMER = "watch/bestie-hourly-check-in";
-const INTEREST = "interest/bestie-hourly-check-in";
+const TIMER = "watch/bestie-notes";
+const INTEREST = "interest/bestie-notes";
 
-it("undoes a failed check-in's timer, so none runs behind a switch that reads off", async () => {
+it("says why a check-in couldn't be saved and lets its switch be tried again", async () => {
   const user = userEvent.setup();
   const { relay } = community(ada.pubkey);
   const { agents, save } = host();
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   render(<Tab agent={remembering()} />);
-  const hourly = screen.getByRole("switch", { name: "Every hour" });
-  save
-    .mockResolvedValueOnce()
-    .mockRejectedValueOnce(new Error("Instructions changed elsewhere"));
+  const hourly = screen.getByRole("switch", { name: "Hourly notes" });
+  save.mockRejectedValueOnce(new Error("Connect to the community to save"));
   await user.click(hourly);
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Instructions changed elsewhere",
+    "Connect to the community to save",
   );
-  // The timer and its Interest are removed again.
-  expect(save).toHaveBeenCalledTimes(3);
-  expect(save.mock.calls[2]).toEqual([
-    ada.key,
-    { attention: { [INTEREST]: null, [TIMER]: null } },
-  ]);
   expect(hourly).not.toBeChecked();
+  expect(save).toHaveBeenCalledTimes(1);
   // Trying again saves it all again.
   save.mockClear();
   await user.click(hourly);
-  expect(save).toHaveBeenCalledTimes(2);
+  expect(save).toHaveBeenCalledTimes(1);
   expect(screen.queryByRole("alert")).toBeNull();
 });
 
-it("offers to remove a timer left without its section when undoing fails too", async () => {
+it("offers to remove what is left of a check-in whose Interest or timer is gone", async () => {
   const user = userEvent.setup();
   const { relay } = community(ada.pubkey);
   const { agents, save } = host();
-  const Tab = bestieTab(relay, agents).component;
-  const { rerender } = render(<Tab agent={remembering()} />);
-  save
-    .mockResolvedValueOnce()
-    .mockRejectedValueOnce(new Error("Instructions changed elsewhere"))
-    .mockRejectedValueOnce(new Error("Offline"));
-  await user.click(screen.getByRole("switch", { name: "Every hour" }));
-  expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Instructions changed elsewhere Its timer may still be saved; remove it below.",
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
+  const left = (slug: string, value: object) =>
+    ({
+      ...remembering(true),
+      attention: { [slug]: { slug, value, modifiedAt: 1 } },
+    }) as unknown as Agent;
+  const { rerender } = render(
+    <Tab agent={left(TIMER, { type: "timer", enabled: true })} />,
   );
-  // The agent as saved: the timer is there, its section isn't.
-  const [[, timers]] = save.mock.calls as [[string, AgentChange]];
-  const left = {
-    ...remembering(),
-    attentionEnabled: true,
-    attention: Object.fromEntries(
-      Object.entries(timers.attention ?? {}).map(([slug, value]) => [
-        slug,
-        { slug, value, modifiedAt: 1 },
-      ]),
-    ),
-  } as unknown as Agent;
-  rerender(<Tab agent={left} />);
-  expect(screen.getByRole("switch", { name: "Every hour" })).not.toBeChecked();
-  save.mockClear();
-  await user.click(
+  expect(
+    screen.getByRole("switch", { name: "Hourly notes" }),
+  ).not.toBeChecked();
+  const remove = () =>
     screen.getByRole("button", {
       name: "Remove",
-      description: "Every hour's timer is still saved",
-    }),
-  );
+      description: "Hourly notes is partly saved",
+    });
+  await user.click(remove());
   expect(save.mock.calls[0]).toEqual([
     ada.key,
-    { attention: { [INTEREST]: null, [TIMER]: null } },
+    { attention: { [TIMER]: null } },
+  ]);
+  // The same when the Interest is what is left, which holds the steps.
+  save.mockClear();
+  rerender(<Tab agent={left(INTEREST, { type: "interest" })} />);
+  await user.click(remove());
+  expect(save.mock.calls[0]).toEqual([
+    ada.key,
+    { attention: { [INTEREST]: null } },
   ]);
 });
 
@@ -788,28 +924,21 @@ it("says a check-in paused in Attention is paused, and how to restart it", async
   const user = userEvent.setup();
   const { relay } = community(ada.pubkey);
   const { agents, save } = host();
-  const Tab = bestieTab(relay, agents).component;
+  const Tab = bestieTab(relay, agents, navigation, settingsCards).component;
   const paused = {
     ...remembering(true),
-    config: {
-      instructions: withFeature(
-        withFeature("Be brief.", memory, true),
-        checkinHourly,
-        true,
-      ),
-    },
     attention: {
       [INTEREST]: { value: { type: "interest" } },
       [TIMER]: { value: { type: "timer", enabled: false } },
     },
   } as unknown as Agent;
   render(<Tab agent={paused} />);
-  const hourly = screen.getByRole("switch", { name: "Every hour" });
+  const hourly = screen.getByRole("switch", { name: "Hourly notes" });
   // Still on, so Off still removes it.
   expect(hourly).toBeChecked();
   expect(
     screen.getByText(
-      "Paused in Attention. Turn Every hour off and on again to restart it.",
+      "Paused in Attention. Turn Hourly notes off and on again to restart it.",
     ),
   ).toBeVisible();
   await user.click(hourly);
@@ -822,7 +951,7 @@ it("says a check-in paused in Attention is paused, and how to restart it", async
 it("shows a Former Bestie tab while a former Bestie has a setting on, with a way back", async () => {
   const user = userEvent.setup();
   const { relay, mainAgent } = community(bea.pubkey);
-  const tab = formerBestieTab(relay, host().agents);
+  const tab = formerBestieTab(relay, host().agents, navigation, settingsCards);
   const remembering = {
     ...ada,
     config: { instructions: withFeature("Be brief.", memory, true) },
@@ -843,9 +972,9 @@ it("shows a Former Bestie tab while a former Bestie has a setting on, with a way
     screen.getByText("Ada is no longer your Bestie. These are still on."),
   ).toBeVisible();
   expect(screen.getByRole("switch", { name: "Remembers you" })).toBeChecked();
-  const hourly = screen.getByRole("switch", { name: "Every hour" });
+  const hourly = screen.getByRole("switch", { name: "Hourly notes" });
   expect(hourly).toHaveAttribute("aria-disabled", "true");
-  expect(screen.getByText("Only your Bestie checks in.")).toBeVisible();
+  expect(screen.getAllByText("Only your Bestie checks in.")).toHaveLength(2);
   expect(screen.getByText("Private channels Ada can read")).toBeVisible();
 
   await user.click(
@@ -869,8 +998,8 @@ it("removes the Bestie after asking, and shows the agent as a Former Bestie", as
   const user = userEvent.setup();
   const { relay, mainAgent } = community(ada.pubkey);
   const agents = host().agents;
-  const tab = bestieTab(relay, agents);
-  const former = formerBestieTab(relay, agents);
+  const tab = bestieTab(relay, agents, navigation, settingsCards);
+  const former = formerBestieTab(relay, agents, navigation, settingsCards);
   const remembering = {
     ...ada,
     config: { instructions: withFeature("Be brief.", memory, true) },
@@ -921,7 +1050,7 @@ it("shows a hosted former Bestie's Former Bestie tab while its memory is on, rea
   const { remote, agents, get, set, save } = hostedBestie(
     withFeature("Be brief.", memory, true),
   );
-  const tab = formerBestieTab(relay, agents);
+  const tab = formerBestieTab(relay, agents, navigation, settingsCards);
   const listener = vi.fn();
   const stop = tab.subscribe?.(listener);
   // Its instructions aren't on this device until its provider is read.
@@ -975,7 +1104,7 @@ it("keeps a hosted former Bestie's tab when an older background read ends after 
   const user = userEvent.setup();
   const { relay } = community(bea.pubkey);
   const { remote, agents, get } = hostedBestie("Be brief.");
-  const tab = formerBestieTab(relay, agents);
+  const tab = formerBestieTab(relay, agents, navigation, settingsCards);
   const stop = tab.subscribe?.(() => {});
   await vi.waitFor(() => expect(tab.when?.(bea)).toBe(false));
   // The background read starts while memory is off, and answers late.
@@ -1008,7 +1137,7 @@ it("keeps a hosted former Bestie's tab when an older background read ends after 
 it("keeps a hosted former Bestie's tab while a newer read is under way, whatever an older one answers", async () => {
   const { relay } = community(bea.pubkey);
   const { remote, agents } = hostedBestie("Be brief.");
-  const tab = formerBestieTab(relay, agents);
+  const tab = formerBestieTab(relay, agents, navigation, settingsCards);
   const stop = tab.subscribe?.(() => {});
   await vi.waitFor(() => expect(tab.when?.(bea)).toBe(false));
   // A failed read shows the tab, which reads again when it opens.
@@ -1034,7 +1163,7 @@ it("keeps a hosted former Bestie's tab while a newer read is under way, whatever
 it("counts an older read's answer once a newer read is abandoned, from the moment it aborts", async () => {
   const { relay } = community(bea.pubkey);
   const { remote, agents } = hostedBestie("Be brief.");
-  const tab = formerBestieTab(relay, agents);
+  const tab = formerBestieTab(relay, agents, navigation, settingsCards);
   const stop = tab.subscribe?.(() => {});
   await vi.waitFor(() => expect(tab.when?.(bea)).toBe(false));
   const remembering = withFeature("Be brief.", memory, true);
@@ -1065,7 +1194,7 @@ it("shows a hosted former Bestie's tab from a background read that answers after
   const { remote, agents, get } = hostedBestie(
     withFeature("Be brief.", memory, true),
   );
-  const tab = formerBestieTab(relay, agents);
+  const tab = formerBestieTab(relay, agents, navigation, settingsCards);
   const stop = tab.subscribe?.(() => {});
   await vi.waitFor(() => expect(tab.when?.(bea)).toBe(false));
   let answer = (_text: string) => {};
@@ -1114,7 +1243,7 @@ it("shows a Former Bestie tab for a hosted agent its provider holds no instructi
   let list = listed([OWNER, remote.pubkey]);
   session.channels.list = () => list;
   writeView(SCOPE, "bestie:former", [ada.pubkey]);
-  const tab = formerBestieTab(relay, agents);
+  const tab = formerBestieTab(relay, agents, navigation, settingsCards);
   const stop = tab.subscribe?.(() => {});
   await vi.waitFor(() => expect(tab.when?.(remote)).toBe(true));
   const Tab = tab.component;
@@ -1137,7 +1266,7 @@ it("keeps a hosted former Bestie's tab after a failed read, until a read shows n
   const user = userEvent.setup();
   const { relay } = community(bea.pubkey);
   const { remote, agents, get } = hostedBestie("Be brief.");
-  const tab = formerBestieTab(relay, agents);
+  const tab = formerBestieTab(relay, agents, navigation, settingsCards);
   const stop = tab.subscribe?.(() => {});
   await vi.waitFor(() => expect(tab.when?.(bea)).toBe(false));
   get.mockRejectedValueOnce(new Error("Builderlab is down."));
@@ -1161,7 +1290,7 @@ it("keeps a hosted former Bestie's tab when memory saved on but reading it back 
   const user = userEvent.setup();
   const { relay } = community(bea.pubkey);
   const { remote, agents, get, set } = hostedBestie("Be brief.");
-  const tab = formerBestieTab(relay, agents);
+  const tab = formerBestieTab(relay, agents, navigation, settingsCards);
   const stop = tab.subscribe?.(() => {});
   await vi.waitFor(() => expect(tab.when?.(bea)).toBe(false));
   const Tab = tab.component;
@@ -1189,7 +1318,12 @@ it("keeps a hosted former Bestie's tab when memory saved on but reading it back 
 it("shows no Former Bestie tab while the account's choice is unread or unreadable", async () => {
   const { relay, mainAgent } = community(undefined);
   mainAgent.read.mockRejectedValueOnce(new Error("offline"));
-  const former = formerBestieTab(relay, host().agents);
+  const former = formerBestieTab(
+    relay,
+    host().agents,
+    navigation,
+    settingsCards,
+  );
   const remembering = {
     ...ada,
     config: { instructions: withFeature("Be brief.", memory, true) },
@@ -1210,7 +1344,12 @@ it("shows a Former Bestie tab on an account that saved none, not on one with no 
     [null, true],
   ] as const) {
     const { relay, mainAgent } = community(record);
-    const former = formerBestieTab(relay, host().agents);
+    const former = formerBestieTab(
+      relay,
+      host().agents,
+      navigation,
+      settingsCards,
+    );
     const stop = former.subscribe?.(() => {});
     await act(async () => {});
     expect(mainAgent.read).toHaveBeenCalled();
@@ -1226,7 +1365,12 @@ it("offers no Remove without an account to save none to", async () => {
   delete (relay.snapshot() as { session: { mainAgent?: unknown } }).session
     .mainAgent;
   setDefaultAgent(SCOPE, ada.pubkey);
-  const Tab = bestieTab(relay, host().agents).component;
+  const Tab = bestieTab(
+    relay,
+    host().agents,
+    navigation,
+    settingsCards,
+  ).component;
   await act(async () => {
     render(<Tab agent={ada} />);
   });
@@ -1238,27 +1382,26 @@ it("lets a former Bestie's leftover check-in be turned off", async () => {
   const user = userEvent.setup();
   const { relay } = community(bea.pubkey);
   const { agents, save } = host();
-  const Tab = formerBestieTab(relay, agents).component;
+  const Tab = formerBestieTab(
+    relay,
+    agents,
+    navigation,
+    settingsCards,
+  ).component;
   const checking = {
     ...ada,
-    config: {
-      instructions: withFeature(
-        withFeature("Be brief.", memory, true),
-        checkinHourly,
-        true,
-      ),
-    },
+    config: { instructions: withFeature("Be brief.", memory, true) },
     attention: {
-      "interest/bestie-hourly-check-in": {},
-      "watch/bestie-hourly-check-in": {},
+      "interest/bestie-notes": {},
+      "watch/bestie-notes": {},
     },
   } as unknown as Agent;
   render(<Tab agent={checking} />);
-  const hourly = screen.getByRole("switch", { name: "Every hour" });
+  const hourly = screen.getByRole("switch", { name: "Hourly notes" });
   expect(hourly).toBeChecked();
   expect(hourly).not.toHaveAttribute("aria-disabled", "true");
   await user.click(hourly);
   expect(save).toHaveBeenLastCalledWith(ada.key, {
-    config: { instructions: withFeature("Be brief.", memory, true) },
+    attention: { "interest/bestie-notes": null, "watch/bestie-notes": null },
   });
 });

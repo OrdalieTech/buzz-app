@@ -4,6 +4,7 @@ import type { GifShortcut } from "./gif-shortcut";
 import { useConversationPresentation } from "../../features/conversation/ConversationPresentation";
 import { Tabs } from "../../shared/design-system/ui/Tabs";
 import { Button } from "../../shared/design-system/ui/Button";
+import { LoadingRegion } from "../../shared/design-system/ui/LoadingRegion";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
 import {
   type RefObject,
@@ -13,7 +14,9 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import { createPortal } from "react-dom";
 import {
+  PlusIcon,
   SmileyIcon,
   SmileyPlusIcon,
 } from "../../shared/design-system/icons/index";
@@ -33,12 +36,30 @@ import {
 import styles from "./Emoji.module.css";
 import { GifPicker } from "./GifPicker";
 import type { EmojiSearchSelection } from "./emoji-mart";
+import { PREVIEW_ACTION_SLOT, type AddEmoji } from "./add-emoji";
+import { SKIN_TONE_SLOT, defaultSkinTone, toneHand } from "./skin-tone";
+import { rootFontSize, spaciousGrid } from "./picker-layout";
+const NO_ADD_EMOJI = {
+  snapshot: () => undefined,
+  subscribe: () => () => {},
+};
 
-const EMOJI_SIZE = 36;
-const EMOJI_SLOT = 48;
+// Picker-sized glyphs in control-sized cells, resolved from the tokens so
+// text-size preferences scale them. Fallbacks are their 1rem values.
+const EMOJI_SIZE = "--size-emoji-picker";
+const EMOJI_SLOT = "--size-control";
+const MAX_PER_LINE = 8;
 const PICKER_COLUMN_CHROME = 44;
-// Two balanced scrollbar lanes plus five gaps between six fixed-size slots.
+// Two balanced scrollbar lanes plus the gaps between fixed-size slots.
 const PICKER_CHROME = 72;
+function tokenPx(document: Document, token: string, fallback: number) {
+  const probe = document.createElement("div");
+  probe.style.cssText = `position:absolute;visibility:hidden;width:var(${token})`;
+  document.body.appendChild(probe);
+  const width = probe.getBoundingClientRect().width;
+  probe.remove();
+  return width || fallback;
+}
 const NO_ENTRIES: readonly CustomEmoji[] = [];
 
 /** Reusable composer picker; data/signing remain owned by the community session. */
@@ -51,9 +72,11 @@ export function EmojiPicker({
   gifRequests = relayGifRequests,
   externalTrigger,
   gifShortcut,
+  addEmoji = NO_ADD_EMOJI,
 }: {
-  session: ComposerSession;
+  session: Pick<ComposerSession, "emoji" | "media">;
   gifShortcut?: GifShortcut;
+  addEmoji?: Pick<AddEmoji, "snapshot" | "subscribe"> | undefined;
   scope: string;
   disabled: boolean;
   insert(value: string): void;
@@ -61,6 +84,10 @@ export function EmojiPicker({
   gifRequests?: GifRequests | undefined;
   externalTrigger?: {
     ref: RefObject<HTMLButtonElement | null>;
+    /** Form pickers can anchor to the complete field without changing toolbar defaults. */
+    anchor?: RefObject<HTMLDivElement | null>;
+    side?: "top" | "bottom";
+    remove?: (() => void) | undefined;
     id: string;
     close(): void;
     finalFocus(): HTMLButtonElement | false;
@@ -76,16 +103,40 @@ export function EmojiPicker({
     error?: string;
   }>();
   const [gifDiscoveryRequested, setGifDiscoveryRequested] = useState(false);
-  const [{ perLine, availableWidth, scale }, setLayout] = useState({
-    perLine: 0,
-    availableWidth: 0,
-    scale: 1,
-  });
+  const [{ perLine, availableWidth, scale, emojiSize, slot }, setLayout] =
+    useState({
+      perLine: 0,
+      availableWidth: 0,
+      scale: 1,
+      emojiSize: 28,
+      slot: 40,
+    });
+  // The category bar spans the popup, so its room is the popup's width, not
+  // the grid's: wider cells must not hide it in a pane where it still fits.
+  const popupWidth = Math.min(
+    availableWidth,
+    perLine * slot + PICKER_CHROME * scale + 2,
+  );
+  const spacious = spaciousGrid(
+    popupWidth - PICKER_COLUMN_CHROME * scale,
+    scale * 16,
+  );
   const [error, setError] = useState<string>();
   const [attempt, retry] = useState(0);
   const trigger = useRef<HTMLButtonElement>(null);
   const controls = useRef<HTMLFieldSetElement>(null);
   const [host, setHost] = useState<HTMLDivElement | null>(null);
+  // Mart's element; its light-DOM children render through the preview slot.
+  const [mart, setMart] = useState<HTMLElement | null>(null);
+  const [skinTone, setSkinTone] = useState(() => ({
+    tone: defaultSkinTone(),
+    open: false,
+  }));
+  const openAddEmoji = useSyncExternalStore(
+    addEmoji.subscribe,
+    addEmoji.snapshot,
+    addEmoji.snapshot,
+  );
   const search = useRef("");
   const searchSelection = useRef<EmojiSearchSelection | undefined>(undefined);
   const onInsert = useRef(insert);
@@ -127,18 +178,20 @@ export function EmojiPicker({
     if (!open || disabled || !(container instanceof HTMLElement)) return;
     const root = document.documentElement;
     const resize = () => {
-      const scale =
-        (Number.parseFloat(getComputedStyle(root).fontSize) || 16) / 16;
+      const scale = rootFontSize(document) / 16;
+      const emojiSize = tokenPx(document, EMOJI_SIZE, 28 * scale);
+      const slot = tokenPx(document, EMOJI_SLOT, 40 * scale);
       setLayout({
         scale,
+        emojiSize,
+        slot,
         availableWidth: container.clientWidth,
         perLine: Math.max(
           1,
           Math.min(
-            6,
+            MAX_PER_LINE,
             Math.floor(
-              (container.clientWidth - PICKER_COLUMN_CHROME * scale) /
-                (EMOJI_SLOT * scale),
+              (container.clientWidth - PICKER_COLUMN_CHROME * scale) / slot,
             ),
           ),
         ),
@@ -149,7 +202,10 @@ export function EmojiPicker({
     observer.observe(container);
     // Reaction pickers can keep the same viewport width while the root scale changes.
     const appearance = new MutationObserver(resize);
-    appearance.observe(root, { attributes: true, attributeFilter: ["style"] });
+    appearance.observe(root, {
+      attributes: true,
+      attributeFilter: ["style", "data-font-size"],
+    });
     return () => {
       observer.disconnect();
       appearance.disconnect();
@@ -236,10 +292,12 @@ export function EmojiPicker({
         dispose = mountEmojiMart({
           host: container,
           colorMode,
+          preview: true,
           scope,
           perLine,
-          emojiSize: EMOJI_SIZE * scale,
-          emojiButtonSize: EMOJI_SLOT * scale,
+          emojiSize,
+          emojiButtonSize: slot,
+          navigation: spacious,
           search: search.current,
           searchSelection,
           searchChange: (value) => {
@@ -253,7 +311,14 @@ export function EmojiPicker({
             setOpen(false);
           },
           close: () => setOpen(false),
+          skinToneChange: (tone, menuOpen) =>
+            setSkinTone((current) =>
+              current.tone === tone && current.open === menuOpen
+                ? current
+                : { tone, open: menuOpen },
+            ),
         });
+        setMart(container.querySelector<HTMLElement>("em-emoji-picker"));
       })
       .catch((reason: unknown) => {
         if (!cancelled)
@@ -267,6 +332,11 @@ export function EmojiPicker({
           ?.shadowRoot?.querySelector<HTMLInputElement>('input[type="search"]')
           ?.value ?? search.current;
       dispose?.();
+      setMart(null);
+      // A menu open at unmount is gone with its picker.
+      setSkinTone((current) =>
+        current.open ? { ...current, open: false } : current,
+      );
     };
   }, [
     open,
@@ -276,14 +346,66 @@ export function EmojiPicker({
     entries,
     attempt,
     perLine,
-    scale,
+    emojiSize,
+    slot,
+    spacious,
     tab,
     host,
     colorMode,
   ]);
+  const addEmojiAction =
+    mart &&
+    openAddEmoji &&
+    createPortal(
+      <span slot={PREVIEW_ACTION_SLOT}>
+        {!spacious ? (
+          <IconButton
+            size="sm"
+            variant="ghost"
+            type="button"
+            aria-label="Add emoji"
+            title="Add emoji"
+            hint="familiar"
+            icon={<PlusIcon size="1rem" aria-hidden="true" />}
+            onClick={addCustomEmoji}
+          />
+        ) : (
+          <Button size="sm" variant="ghost" onClick={addCustomEmoji}>
+            <PlusIcon size="1rem" aria-hidden="true" />
+            Add emoji
+          </Button>
+        )}
+      </span>,
+      mart,
+    );
+  const skinToneAction =
+    mart &&
+    createPortal(
+      <span slot={SKIN_TONE_SLOT}>
+        <IconButton
+          size="sm"
+          variant="ghost"
+          type="button"
+          aria-label="Choose default skin tone"
+          title="Choose default skin tone"
+          hint="familiar"
+          aria-expanded={skinTone.open}
+          emoji={toneHand(skinTone.tone)}
+        />
+      </span>,
+      mart,
+    );
+  function addCustomEmoji() {
+    // Settings takes focus; do not return it to the composer behind it.
+    accepted.current = true;
+    setOpen(false);
+    openAddEmoji?.();
+  }
   const emojiContent = (
     <div className={styles.emojiMart}>
       <div ref={setHost} tabIndex={-1} />
+      {addEmojiAction}
+      {skinToneAction}
     </div>
   );
   const gifContent = community && (
@@ -321,6 +443,23 @@ export function EmojiPicker({
   );
   const picker = (
     <div className={styles.emojiContent} data-tabs={showGifTab || undefined}>
+      {externalTrigger?.remove && (
+        <div className={styles.emojiRemove}>
+          <Button
+            type="button"
+            variant="ghost"
+            shape="control"
+            size="row"
+            onClick={() => {
+              externalTrigger.remove?.();
+              accepted.current = true;
+              setOpen(false);
+            }}
+          >
+            Remove emoji
+          </Button>
+        </div>
+      )}
       <Tabs
         variant="panel"
         label="Media type"
@@ -341,7 +480,15 @@ export function EmojiPicker({
           </Button>
         </div>
       )}
-      {tab === "emoji" && catalog.error && (
+      {/* Session recovery retries a transient failure; Unicode stays usable. */}
+      {tab === "emoji" &&
+        (catalog.status === "loading" ||
+          (catalog.status === "error" && catalog.transient)) && (
+          <LoadingRegion pending label="Loading community emoji…">
+            {null}
+          </LoadingRegion>
+        )}
+      {tab === "emoji" && catalog.error && !catalog.transient && (
         <div className={styles.emojiStatus}>
           <p role="alert">{catalog.error}</p>
           <Button type="button" onClick={() => void session.emoji.refresh()}>
@@ -382,7 +529,8 @@ export function EmojiPicker({
       className={styles.emojiPicker}
       onKeyDownCapture={(event) => {
         // Mart stops search key events before they bubble out of its shadow root.
-        if (event.key === "Escape" && open) {
+        // An open skin-tone menu takes Escape first, closing only itself.
+        if (event.key === "Escape" && open && !skinTone.open) {
           event.preventDefault();
           event.stopPropagation();
           setOpen(false);
@@ -404,24 +552,29 @@ export function EmojiPicker({
       )}
       <PopoverPopup
         colorMode={colorMode}
-        side={reaction && !externalTrigger ? "bottom" : "top"}
+        side={
+          externalTrigger?.side ??
+          (reaction && !externalTrigger ? "bottom" : "top")
+        }
         anchor={
           reaction
-            ? externalTrigger?.ref
+            ? (externalTrigger?.anchor ?? externalTrigger?.ref)
             : () => controls.current?.closest("form") ?? trigger.current
         }
         sideOffset={reaction ? 6 : 4}
         collisionPadding={16}
+        collisionAvoidance={
+          externalTrigger?.anchor
+            ? { side: "flip", align: "shift", fallbackAxisSide: "none" }
+            : undefined
+        }
         // Each media panel focuses its search after its asynchronous content mounts.
         initialFocus={false}
         padding="none"
         id={externalTrigger?.id}
         aria-label="Emoji picker"
         style={{
-          width: Math.min(
-            availableWidth,
-            (perLine * EMOJI_SLOT + PICKER_CHROME) * scale + 2,
-          ),
+          width: popupWidth,
           overflow: "hidden",
         }}
         finalFocus={

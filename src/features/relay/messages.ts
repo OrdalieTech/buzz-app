@@ -1,3 +1,11 @@
+import {
+  forwardBody,
+  forwardQuote,
+  forwardTag,
+  snapshotMessage,
+  snapshotAttachments,
+} from "./forwarded-message";
+import { byteSize, OUTBOX_INPUT_MAX_BYTES } from "./budget";
 import { attestedOwner } from "../agents/owner-attestation";
 import { hasEventProof } from "./events";
 import type { ProfileQueries } from "./profile-directory";
@@ -11,6 +19,7 @@ import { reactionTarget as reactionTargetId } from "./reaction-target";
 import { safeMessageUrl } from "./message-content";
 import type { EventData } from "./events";
 import type { Outbox, OutboxRecovery } from "./outbox";
+import { signedMessageTokenTags } from "../messages/message-tokens";
 
 /** Owner authorization is supplied only after the agent's signed profile is verified. */
 export type AgentOwnerAuthorization = Readonly<{
@@ -297,7 +306,131 @@ export function createMessages(
       );
     return operations[0] as string;
   };
+  const prepareForward = (
+    channelId: string,
+    row: ChannelMessage,
+    authorName: string,
+    note: string,
+  ) => {
+    const original = find(row.id);
+    if (
+      !original ||
+      !hasEventProof(original) ||
+      row.channelId !== original.tags.find(([name]) => name === "h")?.[1] ||
+      (row.delivery && !["accepted", "seen"].includes(row.delivery))
+    )
+      throw new Error("Reload the message before forwarding it.");
+    const attachmentSource = find(row.attachmentSourceId ?? row.id);
+    if (
+      !attachmentSource ||
+      !hasEventProof(attachmentSource) ||
+      (attachmentSource.id !== original.id &&
+        (attachmentSource.kind !== 40003 ||
+          !attachmentSource.tags.some(
+            ([name, id]) => name === "e" && id === row.id,
+          ) ||
+          attachmentSource.tags.some(
+            ([name, id]) => name === "h" && id !== row.channelId,
+          )))
+    )
+      throw new Error("Reload the message attachments before forwarding it.");
+    const snapshot = snapshotMessage(row, authorName, profiles?.snapshot());
+    const sourceAttachments = snapshotAttachments(row);
+    const sourceUrls = new Set(
+      [...sourceAttachments, ...(snapshot.emoji ?? [])].map(({ url }) => {
+        try {
+          return new URL(url, relayOrigin).href;
+        } catch {
+          return url;
+        }
+      }),
+    );
+    const mediaTags = attachmentSource.tags.filter(
+      ([name, ...fields]) =>
+        name === "imeta" &&
+        (!row.forward ||
+          fields.some((field) => {
+            if (!field.startsWith("url ")) return false;
+            try {
+              return sourceUrls.has(new URL(field.slice(4), relayOrigin).href);
+            } catch {
+              return sourceUrls.has(field.slice(4));
+            }
+          })),
+    );
+    // Free-text local media URLs grant no destination download access. An
+    // admitted upload tag is required; never invent MIME/hash/size metadata.
+    const localHash = (value: string) => {
+      if (!relayOrigin) return undefined;
+      try {
+        const url = new URL(value, relayOrigin);
+        if (url.host !== new URL(relayOrigin).host) return undefined;
+        return /^\/media\/([0-9a-f]{64})(?:\.[a-z0-9]{1,8}|\.thumb\.(?:jpg|webp))?$/.exec(
+          url.pathname,
+        )?.[1];
+      } catch {
+        return undefined;
+      }
+    };
+    const sharedHashes = new Set(
+      mediaTags.flatMap((tag) =>
+        tag
+          .slice(1)
+          .flatMap((field) =>
+            /^(url|image) /.test(field)
+              ? [localHash(field.slice(field.indexOf(" ") + 1))]
+              : [],
+          ),
+      ),
+    );
+    if (
+      [...sourceAttachments, ...(snapshot.emoji ?? [])].some((attachment) => {
+        const hash = localHash(attachment.url);
+        return hash && !sharedHashes.has(hash);
+      })
+    )
+      throw new Error(
+        "This message contains an attachment that can’t be forwarded. Copy its link instead.",
+      );
+    const event = {
+      kind: 9,
+      content: forwardBody(snapshot, note),
+      tags: [
+        ["h", channelId],
+        forwardTag(snapshot),
+        ...mentionTags(channelId, withDmAgents(channelId, [])),
+        ...mediaTags,
+        ...(snapshot.emoji ?? []).map(({ shortcode, url }) => [
+          "emoji",
+          shortcode,
+          url,
+        ]),
+        ...signedMessageTokenTags(),
+      ],
+    };
+    // Reserve the outbox's client-id and millisecond tags as well.
+    if (byteSize(event) + 160 > OUTBOX_INPUT_MAX_BYTES)
+      throw new Error(
+        "This message is too long to forward. Copy its link instead.",
+      );
+    return event;
+  };
   return Object.freeze({
+    forwardProblem(
+      channelId: string,
+      row: ChannelMessage,
+      authorName: string,
+      note: string,
+    ): string | undefined {
+      try {
+        prepareForward(channelId, row, authorName, note);
+        return undefined;
+      } catch (error) {
+        return error instanceof Error
+          ? error.message
+          : "This message cannot be forwarded.";
+      }
+    },
     send(
       channelId: string,
       content: string,
@@ -320,10 +453,78 @@ export function createMessages(
             ...pickTags(channelId, mentions, picks),
             ...emojiTags(content),
             ...message.tags,
+            ...signedMessageTokenTags(),
           ],
         },
         ...(recovery ? [recovery] : []),
       );
+    },
+    /** Forward only the reconciled row supplied by an authorized source reader. */
+    forward(
+      channelId: string,
+      row: ChannelMessage,
+      authorName: string,
+      note: string,
+      recovery?: OutboxRecovery,
+      options?: {
+        rootId?: string;
+        parentId?: string;
+        mediaTargetUrl?: string;
+        mentions?: readonly string[];
+        references?: readonly string[];
+        attachments?: readonly UploadedAttachment[];
+        picks?: MentionPicks;
+      },
+    ) {
+      const event = prepareForward(channelId, row, authorName, note);
+      if (options) {
+        const root = options.rootId;
+        const parent = options.parentId ?? root;
+        if (
+          (root && !/^[0-9a-f]{64}$/.test(root)) ||
+          (parent && !/^[0-9a-f]{64}$/.test(parent))
+        )
+          throw new Error("A valid thread is required");
+        const mediaTarget = options.mediaTargetUrl
+          ? safeMessageUrl(options.mediaTargetUrl)
+          : undefined;
+        if (options.mediaTargetUrl && !mediaTarget)
+          throw new Error("A valid media target is required");
+        const caption = attachmentMessage(
+          note,
+          options.attachments ?? [],
+          relayOrigin,
+        );
+        event.content = [
+          caption.content.trim(),
+          forwardQuote(snapshotMessage(row, authorName, profiles?.snapshot())),
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+        event.tags = [
+          ...event.tags.filter(([tag]) => tag !== "p" && tag !== "mention"),
+          ...(root && parent
+            ? [
+                ...(parent === root ? [] : [["e", root, "", "root"]]),
+                ["e", parent, "", "reply"],
+              ]
+            : []),
+          ...mentionTags(
+            channelId,
+            withDmAgents(channelId, options.mentions ?? []),
+          ),
+          ...referenceTags(options.references ?? []),
+          ...pickTags(channelId, options.mentions ?? [], options.picks ?? {}),
+          ...(mediaTarget ? [[MEDIA_TARGET_TAG, mediaTarget]] : []),
+          ...emojiTags(note),
+          ...caption.tags,
+        ];
+        if (byteSize(event) + 160 > OUTBOX_INPUT_MAX_BYTES)
+          throw new Error(
+            "This message is too long to forward. Shorten your note and try again.",
+          );
+      }
+      return writer(9, channelId).send(event, ...(recovery ? [recovery] : []));
     },
     /** Copy an authored reply as a fresh top-level event, preserving its displayed semantics. */
     sendToChannel(row: ChannelMessage, root?: ChannelMessage) {
@@ -443,6 +644,7 @@ export function createMessages(
           ...(mediaTarget ? [[MEDIA_TARGET_TAG, mediaTarget]] : []),
           ...emojiTags(content),
           ...message.tags,
+          ...signedMessageTokenTags(),
         ],
       });
     },

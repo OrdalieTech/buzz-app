@@ -23,7 +23,7 @@ import {
 import { CaretDownIcon } from "../../shared/design-system/icons";
 import { ToastNotice } from "../../shared/design-system/ui/Toast";
 import type { Identity } from "./service";
-import { writeClipboardText } from "../../shared/clipboard";
+import { writeClipboardSecret } from "../../shared/clipboard";
 
 // Mount only while Profile is active. Late native results must never repopulate a hidden key.
 export function PrivateKey({
@@ -105,10 +105,10 @@ export function PrivateKey({
       const value = secret || (await identity.exportKey());
       if (current !== generation.current) return;
       if (copy) {
-        await writeClipboardText(value);
+        await writeClipboardSecret(value);
         if (current === generation.current)
           setMessage(
-            "Private key copied. Keep it somewhere safe; your clipboard now contains it.",
+            "Private key copied. Paste it somewhere safe now: Buzz tries to clear it from your clipboard in a minute.",
           );
       } else {
         focusReveal.current =
@@ -252,7 +252,7 @@ export function PrivateKey({
     presentation === "magnetic" && !failed ? (
       <ToastNotice
         title="Private key copied"
-        description="Keep it somewhere safe; your clipboard now contains it."
+        description="Paste it somewhere safe now: Buzz tries to clear it from your clipboard in a minute."
         tone="success"
         timeout={5000}
         onDismiss={() => setMessage("")}

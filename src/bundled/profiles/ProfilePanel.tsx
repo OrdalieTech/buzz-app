@@ -27,6 +27,7 @@ import { StatusEditor } from "../../features/user-status/StatusEditor";
 import { useStatusEditor } from "../../features/user-status/useStatusEditor";
 import { useUserStatus } from "../../features/user-status/useUserStatus";
 import { ProfilePublicMetadata } from "./ProfilePublicMetadata";
+import { ProfileLocalTime } from "../../features/profiles/ProfileLocalTime";
 import { relayOrigin } from "../../features/communities/destination";
 import type { Navigation } from "../../features/navigation/controller";
 import { ProfileChannels } from "./ProfileChannels";
@@ -38,21 +39,26 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type ReactNode,
 } from "react";
 import {
   CheckCircleIcon,
   CopyIcon,
+  RobotIcon,
 } from "../../shared/design-system/icons/index";
 import { Avatar } from "../../shared/design-system/ui/Avatar";
 import { AgentAvatar } from "../../features/agents/AgentAvatar";
+import { TranscriptFocus } from "../../features/agents/ActivityTranscript";
 import { useKnownAgentPubkeys } from "../../features/agents/use-known";
 import { Button } from "../../shared/design-system/ui/Button";
 import { Tabs } from "../../shared/design-system/ui/Tabs";
 import type { PanelProps } from "../../features/panels/service";
 import {
   claimProfileTranscript,
+  claimTranscriptFocus,
   profileActivityViewKey,
   profileTranscriptRequest,
+  readerInputs,
   subscribeProfileTranscripts,
   profileAgentHint,
   profilePanelKey,
@@ -119,6 +125,12 @@ function openedFrom(session: RelaySession, context: PanelProps["context"]) {
   };
 }
 
+/** Optional Info composition for a panel specializing canonical person profiles. */
+export type PersonProfileInfoContent = {
+  renderPersonInfo?: ((content: ReactNode) => ReactNode) | undefined;
+};
+const plainInfo = (content: ReactNode) => content;
+
 export function ProfilePanel({
   relay,
   target,
@@ -128,14 +140,16 @@ export function ProfilePanel({
   communities,
   linkRenderers,
   close,
-}: PanelProps & {
-  relay: RelayData;
-  navigation?: Navigation;
-  /** Agents show their type's tabs. */
-  agents?: Agents;
-  communities?: CommunityReader | undefined;
-  linkRenderers?: ConversationExtensions["links"] | undefined;
-}) {
+  renderPersonInfo,
+}: PanelProps &
+  PersonProfileInfoContent & {
+    relay: RelayData;
+    navigation?: Navigation;
+    /** Agents show their type's tabs. */
+    agents?: Agents;
+    communities?: CommunityReader | undefined;
+    linkRenderers?: ConversationExtensions["links"] | undefined;
+  }) {
   const connection = useRelayConnection(relay);
   const activityKey = profileActivityViewKey(target);
   const opening = activityKey ? "activity" : "info";
@@ -148,11 +162,33 @@ export function ProfilePanel({
   );
   const [held, setHeld] = useState<number>();
   const [offered, setOffered] = useState(0);
+  // The latest opening's message, until its transcript has shown it.
+  const [focus, setFocus] = useState<{
+    opening: number;
+    events: readonly string[];
+    inputs: number;
+  }>();
   // biome-ignore lint/correctness/useExhaustiveDependencies: each new opening is claimed.
   useEffect(() => {
     const claimed = claimProfileTranscript(target);
-    if (claimed !== undefined) setHeld(claimed);
+    if (claimed === undefined) return;
+    setHeld(claimed);
+    const events = claimTranscriptFocus(claimed);
+    // Claimed as it opens: presses and keys from here on are the reader's own.
+    setFocus(events && { opening: claimed, events, inputs: readerInputs() });
   }, [asked, target]);
+  const shown = useMemo(
+    () =>
+      focus && {
+        events: focus.events,
+        inputs: focus.inputs,
+        done: () =>
+          setFocus((current) =>
+            current?.opening === focus.opening ? undefined : current,
+          ),
+      },
+    [focus],
+  );
   const pending = asked ?? held;
   const request =
     pending !== undefined && pending > offered ? pending : undefined;
@@ -176,50 +212,53 @@ export function ProfilePanel({
     navigation,
     panelCommunity(connection.scope, connection.viewer),
   );
-  if (
+  const owner =
     agents &&
     owned &&
     owned.agent.owner === connection.viewer &&
     !owned.agent.unfinished &&
-    owned.agent.place !== "elsewhere"
-  )
-    return (
-      <OwnedAgentProfile
-        linkRenderers={linkRenderers}
-        target={target}
-        key={`${connection.scope}:${connection.generation}:${pubkey}:${opening}`}
-        agents={agents}
-        communities={communities}
-        initialActivity={!!activityKey}
-        initialTranscript={initialTranscript}
-        pubkey={pubkey}
-        relay={relay}
-        session={connection.session}
-        scope={panelCommunity(connection.scope, connection.viewer)}
-        navigation={navigation}
-        context={context}
-        openConversation={openConversation}
-        close={close}
-      />
-    );
+    owned.agent.place !== "elsewhere";
   return (
-    <ProfileDetails
-      linkRenderers={linkRenderers}
-      key={`${connection.scope}:${connection.generation}:${pubkey}:${opening}`}
-      initialTab={activityKey ? "activity" : "info"}
-      initialTranscript={initialTranscript}
-      session={connection.session}
-      pubkey={pubkey}
-      agentHint={profileAgentHint(target) || !!activityKey}
-      context={context}
-      navigation={navigation}
-      agents={agents}
-      communities={communities}
-      scope={connection.scope}
-      viewer={connection.viewer}
-      openConversation={openConversation}
-      close={close}
-    />
+    <TranscriptFocus.Provider value={shown}>
+      {owner ? (
+        <OwnedAgentProfile
+          linkRenderers={linkRenderers}
+          target={target}
+          key={`${connection.scope}:${connection.generation}:${pubkey}:${opening}`}
+          agents={agents}
+          communities={communities}
+          initialActivity={!!activityKey}
+          initialTranscript={initialTranscript}
+          pubkey={pubkey}
+          relay={relay}
+          session={connection.session}
+          scope={panelCommunity(connection.scope, connection.viewer)}
+          navigation={navigation}
+          context={context}
+          openConversation={openConversation}
+          close={close}
+        />
+      ) : (
+        <ProfileDetails
+          renderPersonInfo={renderPersonInfo}
+          linkRenderers={linkRenderers}
+          key={`${connection.scope}:${connection.generation}:${pubkey}:${opening}`}
+          initialTab={activityKey ? "activity" : "info"}
+          initialTranscript={initialTranscript}
+          session={connection.session}
+          pubkey={pubkey}
+          agentHint={profileAgentHint(target) || !!activityKey}
+          context={context}
+          navigation={navigation}
+          agents={agents}
+          communities={communities}
+          scope={connection.scope}
+          viewer={connection.viewer}
+          openConversation={openConversation}
+          close={close}
+        />
+      )}
+    </TranscriptFocus.Provider>
   );
 }
 function OwnedAgentProfile({
@@ -362,7 +401,8 @@ function ProfileDetails({
   viewer,
   openConversation,
   close,
-}: {
+  renderPersonInfo = plainInfo,
+}: PersonProfileInfoContent & {
   agents: Agents | undefined;
   linkRenderers: ConversationExtensions["links"] | undefined;
   communities: CommunityReader | undefined;
@@ -406,6 +446,8 @@ function ProfileDetails({
   const [tab, setTab] = useState<
     "info" | "activity" | "channels" | `agent:${string}`
   >(initialTab);
+  const versionHistoryPanel = useRef<HTMLDivElement>(null);
+  const [focusVersionHistory, setFocusVersionHistory] = useState(false);
   // A new transcript request shows Activity, as choosing its tab would.
   const opening = initialTranscript?.opening;
   const [asked, setAsked] = useState(opening);
@@ -442,6 +484,13 @@ function ProfileDetails({
           conversation: openedFrom(session, context),
           initialTranscript,
           close,
+          openVersionHistory:
+            tab === "agent:settings"
+              ? undefined
+              : () => {
+                  setTab("agent:settings");
+                  setFocusVersionHistory(true);
+                },
           ...(openConversation && { openConversation }),
           ...(settings.settingsHost
             ? { settingsHost: settings.settingsHost }
@@ -501,6 +550,16 @@ function ProfileDetails({
   const verifiedOwner = ownership.owner;
   const selectedTab =
     requestedTab.startsWith("agent:") && !section ? "info" : requestedTab;
+  useEffect(() => {
+    if (!focusVersionHistory) return;
+    if (selectedTab === "agent:settings")
+      versionHistoryPanel.current
+        ?.querySelector<HTMLButtonElement>(
+          'button[aria-label="Previous versions"]',
+        )
+        ?.focus();
+    setFocusVersionHistory(false);
+  }, [focusVersionHistory, selectedTab]);
   const community = panelCommunity(scope, viewer);
   const communityOrigin = community?.communityOrigin;
   const npub = profileTarget(pubkey)?.slice(6) ?? pubkey;
@@ -546,13 +605,9 @@ function ProfileDetails({
     viewer,
     agent: displayAgent,
     enabled: !!scoped,
-    onOpened(channelId) {
-      void scoped?.navigation.open({
-        version: 1,
-        kind: "conversation",
-        channelId,
-        scope: scoped.scope,
-      });
+    onOpened(link) {
+      const target = scoped && buzzLinkTarget(link, scoped.scope);
+      if (target) void scoped.navigation.open(target);
     },
   });
   const canEdit = !!scoped && viewer === pubkey;
@@ -596,7 +651,10 @@ function ProfileDetails({
             />
           </div>
           <div className={styles.identity}>
-            <h2 className="text-body-lg">{name}</h2>
+            <h2 className="text-body-lg">
+              {displayAgent && <RobotIcon className={styles.agentIcon} />}
+              {name}
+            </h2>
             {profile?.verified && (
               <p
                 className={`${styles.verifiedName} text-body-sm text-secondary`}
@@ -622,12 +680,16 @@ function ProfileDetails({
             {presence !== "unknown" && (
               <p className="text-body-sm text-primary">
                 {
-                  { online: "Active", away: "Away", offline: "Offline" }[
+                  { online: "Online", away: "Away", offline: "Offline" }[
                     presence
                   ]
                 }
               </p>
             )}
+            <ProfileLocalTime
+              timeZone={profile?.tz}
+              className="text-body-sm text-secondary"
+            />
             <StatusDisplay session={session} status={userStatus} />
           </div>
           {(canSetStatus || canMessage || canEdit) && (
@@ -681,122 +743,129 @@ function ProfileDetails({
           label="Profile sections"
           variant="panel"
           renderPanel={(selected) => (
-            <div className={styles.tabContent}>
+            <div
+              ref={
+                selected === "agent:settings" ? versionHistoryPanel : undefined
+              }
+              className={styles.tabContent}
+            >
               {selected.startsWith("agent:") ? (
                 sections.find((item) => item.value === selected)?.render()
               ) : selected === "info" ? (
-                <>
-                  {profile?.verified && (
-                    <SettingsGroup>
-                      <PreferenceRow
-                        title={`Name verified by ${profile.verified.issuerLabel}`}
-                        subtitle={
-                          <>
-                            Last verified{" "}
-                            <time dateTime={verificationIso}>
-                              {verificationIso
-                                ? verificationDate?.toLocaleString()
-                                : `Unix time ${profile.verified.verifiedAt}`}
-                            </time>
-                            .{" "}
-                            {profile.verified.status === "cached"
-                              ? "Cached evidence; reconnect to check for updates. "
-                              : ""}
-                            This verifies the name and public key at that time,
-                            and does not confirm current account access or
-                            current issuer endorsement.
-                          </>
-                        }
-                      />
-                    </SettingsGroup>
-                  )}
-                  {profile?.about && (
-                    <SettingsGroup layout="form">
-                      <p className={styles.about}>{profile.about}</p>
-                    </SettingsGroup>
-                  )}
-                  {plugin && agents && plugin.agent.place !== "elsewhere" && (
-                    <div>
-                      <AgentDelete
-                        agents={agents}
-                        agent={plugin.agent}
-                        onRemoved={close}
-                      />
+                (displayAgent ? plainInfo : renderPersonInfo)(
+                  <>
+                    {profile?.verified && (
+                      <SettingsGroup>
+                        <PreferenceRow
+                          title={`Name verified by ${profile.verified.issuerLabel}`}
+                          subtitle={
+                            <>
+                              Last verified{" "}
+                              <time dateTime={verificationIso}>
+                                {verificationIso
+                                  ? verificationDate?.toLocaleString()
+                                  : `Unix time ${profile.verified.verifiedAt}`}
+                              </time>
+                              .{" "}
+                              {profile.verified.status === "cached"
+                                ? "Cached evidence; reconnect to check for updates. "
+                                : ""}
+                              This verifies the name and public key at that
+                              time, and does not confirm current account access
+                              or current issuer endorsement.
+                            </>
+                          }
+                        />
+                      </SettingsGroup>
+                    )}
+                    {profile?.about && (
+                      <SettingsGroup layout="form">
+                        <p className={styles.about}>{profile.about}</p>
+                      </SettingsGroup>
+                    )}
+                    {plugin && agents && plugin.agent.place !== "elsewhere" && (
+                      <div>
+                        <AgentDelete
+                          agents={agents}
+                          agent={plugin.agent}
+                          onRemoved={close}
+                        />
+                      </div>
+                    )}
+                    <div className={styles.publicKey}>
+                      <SettingsGroup>
+                        <PreferenceRow
+                          title="Public key"
+                          subtitle={
+                            <code className={styles.keyValue}>{npub}</code>
+                          }
+                          trailing={
+                            <Button
+                              size="compact"
+                              variant="ghost"
+                              aria-label="Copy npub"
+                              onClick={() => {
+                                setCopyStatus("");
+                                void Promise.resolve()
+                                  .then(() => writeClipboardText(npub))
+                                  .then(
+                                    () => setCopyStatus("Public key copied."),
+                                    () =>
+                                      setCopyStatus(
+                                        "Could not copy. Select the public key above to copy it.",
+                                      ),
+                                  );
+                              }}
+                            >
+                              <CopyIcon size={16} aria-hidden="true" />
+                              Copy
+                            </Button>
+                          }
+                        />
+                      </SettingsGroup>
+                      <span role="status" className={styles.feedback}>
+                        {copyStatus}
+                      </span>
                     </div>
-                  )}
-                  <div className={styles.publicKey}>
-                    <SettingsGroup>
-                      <PreferenceRow
-                        title="Public key"
-                        subtitle={
-                          <code className={styles.keyValue}>{npub}</code>
-                        }
-                        trailing={
-                          <Button
-                            size="compact"
-                            variant="ghost"
-                            aria-label="Copy npub"
-                            onClick={() => {
-                              setCopyStatus("");
-                              void Promise.resolve()
-                                .then(() => writeClipboardText(npub))
-                                .then(
-                                  () => setCopyStatus("Public key copied."),
-                                  () =>
-                                    setCopyStatus(
-                                      "Could not copy. Select the public key above to copy it.",
-                                    ),
-                                );
-                            }}
-                          >
-                            <CopyIcon size={16} aria-hidden="true" />
-                            Copy
-                          </Button>
-                        }
+                    {knownAgent && verifiedOwner && (
+                      <ProfileAgentIdentity
+                        session={session}
+                        owner={verifiedOwner}
+                        viewer={viewer}
+                        context={context}
                       />
-                    </SettingsGroup>
-                    <span role="status" className={styles.feedback}>
-                      {copyStatus}
-                    </span>
-                  </div>
-                  {knownAgent && verifiedOwner && (
-                    <ProfileAgentIdentity
-                      session={session}
-                      owner={verifiedOwner}
-                      viewer={viewer}
-                      context={context}
-                    />
-                  )}
-                  <ProfilePublicMetadata nip05={profile?.nip05} />
-                  {/* A verified overlay can exist while its kind-0 read failed. */}
-                  {(!profile ||
-                    (profile.verified && (status === "error" || retrying))) &&
-                    (status === "loading" ? (
-                      <p role="status">Loading profile…</p>
-                    ) : (
-                      <p role={status === "error" ? "alert" : undefined}>
-                        {status === "error"
-                          ? "Could not load this profile."
-                          : "No profile metadata is available in this community."}
-                      </p>
-                    ))}
-                  {((!profile && status !== "loading") ||
-                    (profile?.verified && status === "error") ||
-                    retrying ||
-                    ownership.failed) && (
-                    <Button
-                      ref={retryButton}
-                      size="compact"
-                      loading={retrying}
-                      onClick={() => {
-                        setRetrying(true);
-                        retry((value) => value + 1);
-                      }}
-                    >
-                      Retry profile
-                    </Button>
-                  )}
-                </>
+                    )}
+                    <ProfilePublicMetadata nip05={profile?.nip05} />
+                    {/* A verified overlay can exist while its kind-0 read failed. */}
+                    {(!profile ||
+                      (profile.verified && (status === "error" || retrying))) &&
+                      (status === "loading" ? (
+                        <p role="status">Loading profile…</p>
+                      ) : (
+                        <p role={status === "error" ? "alert" : undefined}>
+                          {status === "error"
+                            ? "Could not load this profile."
+                            : "No profile metadata is available in this community."}
+                        </p>
+                      ))}
+                    {((!profile && status !== "loading") ||
+                      (profile?.verified && status === "error") ||
+                      retrying ||
+                      ownership.failed) && (
+                      <Button
+                        ref={retryButton}
+                        size="compact"
+                        loading={retrying}
+                        onClick={() => {
+                          setRetrying(true);
+                          retry((value) => value + 1);
+                        }}
+                      >
+                        Retry profile
+                      </Button>
+                    )}
+                  </>,
+                )
               ) : (
                 <ProfileChannels
                   session={session}

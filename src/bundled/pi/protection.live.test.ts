@@ -162,7 +162,7 @@ const reply=checked.completeSimple(model,input,{sessionId:'known'});await entere
 assert.equal(captured.context.messages[1].content,'reviewed');assert.ok(JSON.stringify(sources).includes('untrusted memory text'));assert.ok(!JSON.stringify(sources).includes('tool metadata '));assert.ok(sources.every(source=>Buffer.byteLength(JSON.stringify(source))<65536));assert.notEqual(captured.actual.id,'mutated');result.exactModel=true;
 const count=faux.state.callCount;await checked.completeSimple(faux.getModel(),input,{sessionId:'unknown'});assert.equal(faux.state.callCount,count);result.unknownSession=true;
 for(const method of ['streamDeferred','fetchDeferred','cancelDeferred'])assert.throws(()=>checked[method](faux.getModel(),{}),/does not support deferred/);
-assert.throws(()=>checked.streamSimple(faux.getModel(),input,{onPayload:()=>({})}),/payload override/);result.closedOverrides=true;
+const passed=protectModels({streamSimple:(_model,_input,options)=>options},async()=>{},()=>1);const body={};assert.equal(await passed.streamSimple(faux.getModel(),input,{onPayload:payload=>payload}).onPayload(body),undefined);await assert.rejects(passed.streamSimple(faux.getModel(),input,{onPayload:()=>({})}).onPayload(body),/payload override/);result.closedOverrides=true;
 console.log(JSON.stringify(result));
 `;
 it.skipIf(!deps)(

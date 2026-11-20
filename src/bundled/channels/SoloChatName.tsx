@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
+import { useIsPresent } from "motion/react";
 import type { RelaySession } from "../../features/relay/session";
 import { useLifetime } from "../../features/solo/Lifetime";
 import { Button } from "../../shared/design-system/ui/Button";
@@ -13,19 +14,26 @@ export function SoloChatName({
   session,
   id,
   title,
+  className,
+  onAbandon,
   close,
 }: {
   session: RelaySession;
   id: string;
   title: string;
+  className?: string | undefined;
+  onAbandon?: (() => void) | undefined;
   close(focus: boolean): void;
 }) {
+  const present = useIsPresent();
   const name = useLifetime({ session, id, enabled: true });
   const input = useRef<HTMLInputElement>(null);
   const form = useRef<HTMLFormElement>(null);
   const active = useRef(true);
   const saving = useRef(false);
   const selectedInitialName = useRef(false);
+  const abandon = useRef(onAbandon);
+  abandon.current = onAbandon;
   useEffect(() => {
     active.current = true;
     return () => {
@@ -35,6 +43,14 @@ export function SoloChatName({
   useLayoutEffect(() => {
     input.current?.focus();
     input.current?.select();
+    const editor = form.current;
+    return () => {
+      if (!active.current || !editor?.contains(document.activeElement)) return;
+      queueMicrotask(() => {
+        if (!editor.isConnected && document.activeElement === document.body)
+          abandon.current?.();
+      });
+    };
   }, []);
   useEffect(() => {
     if (!name.base || selectedInitialName.current) return;
@@ -47,6 +63,7 @@ export function SoloChatName({
   };
   const save = async (focus: boolean) => {
     if (
+      !present ||
       !active.current ||
       saving.current ||
       name.busy ||
@@ -75,7 +92,9 @@ export function SoloChatName({
   return (
     <form
       ref={form}
-      className={styles.nameEditor}
+      className={
+        className ? `${styles.nameEditor} ${className}` : styles.nameEditor
+      }
       aria-label={`Rename ${title}`}
       aria-busy={(!name.base && !name.error) || name.busy}
       onSubmit={(event) => {

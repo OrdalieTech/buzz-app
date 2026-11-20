@@ -308,6 +308,7 @@ const relay: RelayData = {
     };
   },
   retry() {},
+  tryAgain() {},
   disconnect() {},
   clearCache: () => owner.clearCache(),
 };

@@ -3,11 +3,14 @@ import type { EventData } from "./events.ts";
 export type CustomEmoji = Readonly<{ shortcode: string; url: string }>;
 export const EMOJI_SET = "buzz:custom-emoji";
 export const EMOJI_SET_KIND = 30030;
-const CUSTOM_REACTION = /^:([a-z0-9_-]{1,64}):$/i;
+export const CUSTOM_REACTION = /^:([a-z0-9_-]{1,64}):$/i;
 /** Reaction text stays small, while a valid custom token gets its two delimiters. */
 export function validReactionContent(value: string): boolean {
   return [...value].length <= 64 || CUSTOM_REACTION.test(value);
 }
+/** A `:shortcode:` token, which a reaction slot must never show as text. */
+export const isReactionShortcode = (value: string) =>
+  CUSTOM_REACTION.test(value);
 export function normalizeShortcode(value: string): string | undefined {
   const code = value
     .trim()
@@ -82,17 +85,32 @@ export function emojiTags(event: {
 export const messageParts = (content: string) =>
   content.split(/(https?:\/\/[^\s<>"`]+)/g);
 export const linkPart = (part: string) => /^https?:\/\//.test(part);
-const shortcodePattern = () => /(?=(:([a-zA-Z0-9_-]{1,64}):))/g;
+/** Keep numeric fragments after digits literal, including 12:25:30:. */
+export function isNumericTimeShortcode(
+  content: string,
+  start: number,
+  shortcode: string,
+) {
+  return /^\d+$/.test(shortcode) && /\d/.test(content[start - 1] ?? "");
+}
+function* shortcodeMatches(content: string) {
+  for (const match of content.matchAll(/(?=(:([a-zA-Z0-9_-]{1,64}):))/g)) {
+    if (isNumericTimeShortcode(content, match.index, match[2] ?? "")) continue;
+    yield match;
+  }
+}
 export function* emojiMatches(
   content: string,
-  entries: readonly CustomEmoji[],
+  entries: readonly CustomEmoji[] | ReadonlyMap<string, CustomEmoji>,
 ) {
   let end = 0;
-  for (const match of content.matchAll(shortcodePattern())) {
+  for (const match of shortcodeMatches(content)) {
     if (match.index < end) continue;
-    const emoji = entries.find(
-      (entry) => entry.shortcode === match[2]?.toLowerCase(),
-    );
+    const code = match[2]?.toLowerCase() ?? "";
+    const emoji =
+      "get" in entries
+        ? entries.get(code)
+        : entries.find((entry) => entry.shortcode === code);
     if (!emoji) continue;
     end = match.index + (match[1]?.length ?? 0);
     yield { emoji, start: match.index, end };
@@ -140,9 +158,7 @@ export function referencedEmoji(content: string): string[] {
       messageParts(content).flatMap((part) =>
         linkPart(part)
           ? []
-          : [...part.matchAll(shortcodePattern())].map((m) =>
-              (m[2] ?? "").toLowerCase(),
-            ),
+          : [...shortcodeMatches(part)].map((m) => (m[2] ?? "").toLowerCase()),
       ),
     ),
   ];

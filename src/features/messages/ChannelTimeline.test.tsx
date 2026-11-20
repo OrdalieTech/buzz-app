@@ -32,6 +32,7 @@ vi.mock("./TypingIndicator", () => ({
 vi.mock("./use-reading", () => ({
   useReading: vi.fn(),
   readingPositioned: vi.fn(),
+  readingDocumentActive: () => true,
 }));
 const hooks = vi.hoisted(() => ({
   refs: [] as { current: unknown }[],
@@ -232,6 +233,7 @@ function setup({
       mounted.map(({ id, y }) => ({
         dataset: { messageId: id },
         getBoundingClientRect: () => ({ top: y, bottom: y + 100 }),
+        closest: () => null,
         querySelector: () => ({
           getBoundingClientRect: () => ({ top: y + 32, bottom: y + 80 }),
         }),
@@ -340,9 +342,12 @@ function setup({
       });
     }
     key = scoped.key;
-    section = (scoped.type as (props: typeof scoped.props) => Section)(
-      scoped.props,
-    );
+    // The feed renders inside the list's message context menu host.
+    section = (
+      scoped.type as (
+        props: typeof scoped.props,
+      ) => ReactElement<{ children: Section }>
+    )(scoped.props).props.children;
     section.props.ref.current = element;
     const edge = section.props.children[0] as ReactElement<{
       ref: { current: unknown };

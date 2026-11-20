@@ -8,6 +8,7 @@ import {
   resolveLineup,
 } from "../channel-templates/model";
 import { splitPartition } from "../relay/partition";
+import { readView, writeView } from "../../shared/view-state";
 import type { RelaySession } from "../relay/session";
 
 export type Workspace = {
@@ -17,6 +18,17 @@ export type Workspace = {
 };
 const prefix = "<!-- buzz-session-workspace:v1 ";
 const end = "<!-- /buzz-session-workspace -->";
+/** In both workspace block delimiters. */
+const marker = "buzz-session-workspace";
+const worktreeRule =
+  "- Make code changes in that new worktree. A task that only reads code, or does not use a repository, usually does not need one.";
+// What earlier versions wrote instead, which Canvases saved then still hold.
+const earlierWorktreeRule = "- Make all changes in that new worktree.";
+// What an agent reads with the block, which no Canvas holds.
+const ownerRule =
+  "The owner wrote the worktree rules of this block. They replace this conversation's working-location rule.";
+const followUpRule = (location: string) =>
+  `- These steps are for new work. For follow-up work on an existing branch or pull request, keep using that branch: reuse its linked worktree, or add one under \`${location}\` if it has none.`;
 export const emptyWorkspace = (): Workspace => ({ folders: [], canvas: "" });
 
 export function validateWorkspace(value: Workspace): Workspace {
@@ -48,6 +60,27 @@ export function validateWorkspace(value: Workspace): Workspace {
   return { folders, ...(worktree ? { worktree } : {}), canvas: value.canvas };
 }
 
+/** What the workspace block tells an agent about its folders. */
+function instructions(value: Workspace) {
+  return value.worktree
+    ? [
+        "## Workspace instructions",
+        "",
+        ...value.folders.map(
+          (folder) =>
+            `- Use \`${folder}\` for review only. Do not make changes directly in it.`,
+        ),
+        `- Before starting new work, fetch the latest \`${value.worktree.baseBranch}\` branch from origin.`,
+        `- For each repository that needs changes, create a new worktree under \`${value.worktree.location}\` from \`origin/${value.worktree.baseBranch}\`.`,
+        worktreeRule,
+      ]
+    : [
+        "## Project folders",
+        "",
+        ...value.folders.map((folder) => `- \`${folder}\``),
+      ];
+}
+
 /** Workspace preferences remain ordinary Canvas instructions, as in the reference workflow. */
 export function workspaceCanvas(input: Workspace): string {
   const value = validateWorkspace(input);
@@ -60,26 +93,9 @@ export function workspaceCanvas(input: Workspace): string {
   })
     .replaceAll("<", "\\u003c")
     .replaceAll(">", "\\u003e");
-  const instructions = value.worktree
-    ? [
-        "## Workspace instructions",
-        "",
-        ...value.folders.map(
-          (folder) =>
-            `- Use \`${folder}\` for review only. Do not make changes directly in it.`,
-        ),
-        `- Before starting new work, fetch the latest \`${value.worktree.baseBranch}\` branch from origin.`,
-        `- For each repository that needs changes, create a new worktree under \`${value.worktree.location}\` from \`origin/${value.worktree.baseBranch}\`.`,
-        "- Make all changes in that new worktree.",
-      ]
-    : [
-        "## Project folders",
-        "",
-        ...value.folders.map((folder) => `- \`${folder}\``),
-      ];
   const canvas = [
     `${prefix}${metadata} -->`,
-    ...instructions,
+    ...instructions(value),
     end,
     "",
     value.canvas,
@@ -94,12 +110,88 @@ export function workspaceCanvas(input: Workspace): string {
 export function readWorkspace(content: string): Workspace {
   if (!content.startsWith(prefix)) return { folders: [], canvas: content };
   const value = parseWorkspace(content);
+  // Saved content can fit even when the current managed header is longer.
+  // Check its exact format here; the writer enforces the current size budget.
+  const canvas = workspaceCanvas({ ...value, canvas: "" }) + value.canvas;
   // Never silently discard manually edited instructions inside the managed block.
-  if (workspaceCanvas(value) !== content)
+  if (
+    canvas !== content &&
+    canvas.replace(worktreeRule, earlierWorktreeRule) !== content
+  )
     throw new Error(
       "Workspace instructions were edited in Canvas. Use the raw Canvas editor to preserve those changes.",
     );
   return value;
+}
+
+/** A workspace Canvas's instructions, safe to copy to a shared Canvas: empty
+ * when any workspace metadata remains (misplaced, nested or malformed), since
+ * it names local folders. */
+export function shareableInstructions(content: string): string {
+  try {
+    const { canvas } = readWorkspace(content);
+    return canvas.includes(marker) ? "" : canvas;
+  } catch {
+    return "";
+  }
+}
+
+/** A Canvas's workspace block: its settings, and whether its text is other
+ * than what Buzz generates from them, so its owner edited it by hand.
+ * Undefined when the Canvas has no block or it cannot be read. */
+function workspaceBlock(content: string) {
+  if (!content.startsWith(prefix)) return undefined;
+  try {
+    const value = parseWorkspace(content);
+    const generated = workspaceCanvas({ ...value, canvas: "" });
+    if (!generated) return undefined;
+    return {
+      value,
+      edited:
+        !content.startsWith(generated) &&
+        !content.startsWith(
+          generated.replace(worktreeRule, earlierWorktreeRule),
+        ),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether the Canvas's workspace block has worktree rules that its owner
+ * edited by hand. They are the owner's rule for the chat, also when the
+ * conversation works in a folder of its own. */
+export function ownerWorktreeRules(content: string) {
+  const block = workspaceBlock(content);
+  return !!block?.edited && !!block.value.worktree;
+}
+
+/** A Canvas as its agent reads it. A workspace block that Buzz generated is
+ * printed again from its settings, so what an agent is told can change
+ * without changing what Canvases hold. `ownFolder`: the conversation works in
+ * a folder of its own, so the block only lists the folders. A block edited by
+ * hand stays as written, as does one that cannot be read. When the owner
+ * wrote the Canvas, its worktree rules are then the owner's rule for this
+ * chat, which the text says. */
+export function agentCanvas(
+  content: string,
+  ownFolder = false,
+  ownerWrote = true,
+): string {
+  const block = workspaceBlock(content);
+  if (!block) return content;
+  const { value } = block;
+  if (block.edited) {
+    if (!ownFolder || !value.worktree || !ownerWrote) return content;
+    const at = content.length - value.canvas.length;
+    return `${content.slice(0, at)}${ownerRule}\n\n${content.slice(at)}`;
+  }
+  const lines = instructions(
+    ownFolder ? { ...value, worktree: undefined } : value,
+  );
+  if (!ownFolder && value.worktree)
+    lines.push(followUpRule(value.worktree.location));
+  return `${lines.join("\n")}\n\n${value.canvas}`;
 }
 
 /** The folders a Canvas's workspace block lets an agent work in: its project
@@ -159,6 +251,18 @@ function parseWorkspace(content: string): Workspace {
   });
 }
 
+// Channel templates are on this device, so which one a workspace last applied
+// is too; its settings reopen showing it.
+const appliedTemplateKey = (projectId: string) =>
+  `solo:workspace-template:${projectId}`;
+export const appliedTemplate = {
+  read: (scope: string, projectId: string) =>
+    readView(scope, appliedTemplateKey(projectId), ""),
+  /** Custom settings (`""`) forgets it. */
+  write: (scope: string, projectId: string, templateId: string) =>
+    writeView(scope, appliedTemplateKey(projectId), templateId || null),
+};
+
 /** One existing encrypted template record per project. */
 export async function projectTemplateId(projectId: string) {
   const hash = await crypto.subtle.digest(
@@ -206,19 +310,12 @@ export function templateEntry(entries: readonly KitEntry[], id: string) {
 }
 export function projectDefault(
   entries: readonly KitEntry[],
-  projectId: string,
   overrideId: string,
+  defaultId?: string,
   requireDefault = false,
 ) {
   const override = templateEntry(entries, overrideId);
   if (override?.record.value.type === "template") return override.record.value;
-  const groups = entries.find(
-    (entry) => !entry.record.deleted && entry.record.value.type === "groups",
-  )?.record.value;
-  const defaultId =
-    groups?.type === "groups"
-      ? groups.groups.find((group) => group.id === projectId)?.defaultTemplateId
-      : undefined;
   const fallback = defaultId
     ? templateEntry(entries, defaultId)?.record.value
     : undefined;
@@ -262,7 +359,7 @@ export async function loadChatSetup(
   session: RelaySession,
   projectId: string,
 ): Promise<ChatSetup & { revision: string }> {
-  const store = session.soloPreferences;
+  const store = session.sidebarPreferences;
   await store.refresh();
   const preferences = store.snapshot();
   if (
@@ -282,8 +379,8 @@ export async function loadChatSetup(
   const revision = defaultsRevision(kit);
   const template = projectDefault(
     kit.entries,
-    projectId,
     await projectTemplateId(projectId),
+    preferences.data.legacyTemplates?.[projectId],
     true,
   );
   if (!template) return { projectId, canvas: "", agents: [], revision };

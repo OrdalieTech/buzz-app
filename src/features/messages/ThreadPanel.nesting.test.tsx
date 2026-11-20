@@ -40,9 +40,11 @@ vi.mock("./MessageRow", () => ({
     day,
     repliedAgents,
     stoppedRequest,
+    recordedActivity,
   }: MessageRowProps) => (
     <article
       data-message-id={row.id}
+      data-request={recordedActivity?.requestId}
       data-replied-agents={repliedAgents?.join(",")}
       data-stopped-request={stoppedRequest?.id}
       data-layout={layout}
@@ -157,6 +159,7 @@ function setup(messageId = "root") {
       subscribe: () => () => {},
       snapshot: () => undefined,
       attention: () => ({ unread: false }),
+      threadReadThrough: () => -1,
     },
   } as unknown as RelaySession;
   render(
@@ -177,14 +180,36 @@ function setup(messageId = "root") {
         for (const fn of listeners) fn();
       });
     },
-    update(replies: ChannelMessage[]) {
+    update(replies: ChannelMessage[], patch: Partial<ThreadSnapshot> = {}) {
       act(() => {
-        snapshot = { ...snapshot, replies };
+        snapshot = { ...snapshot, ...patch, replies };
         for (const fn of listeners) fn();
       });
     },
   };
 }
+it("binds a flattened update to the request it claims in another reply level", () => {
+  const h = setup();
+  const agent = "b".repeat(64);
+  const update = (id: string): ChannelMessage => ({
+    ...row(id, "root"),
+    threadRootId: "root",
+    authorId: agent,
+    audience: "agents",
+  });
+  h.update([
+    update("old"),
+    { ...row("follow-up", "old"), threadRootId: "root" },
+    // Its send names the nested follow-up, but its reply link is the root.
+    { ...update("current"), request: "follow-up" },
+  ]);
+  fireEvent.click(
+    screen.getByRole("button", { name: /^Show activity history:/ }),
+  );
+  const article = (text: string) => screen.getByText(text).closest("article");
+  expect(article("current")).toHaveAttribute("data-request", "follow-up");
+  expect(article("old")).toHaveAttribute("data-request", "root");
+});
 it("keeps a stopped note on the agent's latest reply that a collapsed branch cannot hide", () => {
   const h = setup();
   const agent = "b".repeat(64);
@@ -496,6 +521,21 @@ it("keeps a reply target chosen while a background send is still publishing", ()
   act(() => heldSend?.("new"));
   expect(composer).toHaveAttribute("data-parent", "child");
 });
+it("says an earlier reply is unavailable only once no history that could hold it is left to read", () => {
+  const h = setup();
+  const orphan = [row("orphan", "missing")];
+  const note = () =>
+    screen.queryByText("Earlier reply unavailable in loaded history.");
+  h.update(orphan, { seeking: true });
+  expect(screen.getByText("orphan")).toBeVisible();
+  expect(note()).not.toBeInTheDocument();
+  h.update(orphan, { seeking: undefined });
+  expect(note()).toBeVisible();
+  // Every reply answers a root that is still loading.
+  h.update([row("orphan", "root")], { root: undefined });
+  expect(screen.getByText("orphan")).toBeVisible();
+  expect(note()).not.toBeInTheDocument();
+});
 it("reveals all available ancestors for a selected descendant, including late history", () => {
   const h = setup("grandchild");
   expect(screen.getByText("grandchild")).toBeVisible();
@@ -536,6 +576,47 @@ it("does not silently retarget a deleted parent to the root", () => {
   expect(
     screen.getByRole("button", { name: "Send fixture reply" }),
   ).toBeEnabled();
+});
+/** What the banner reads below its "Replying to …" line after choosing Reply on `target`. */
+function replyBannerText(target: Partial<ChannelMessage>) {
+  setup().update([{ ...row("target", "root"), ...target }]);
+  const reply = document.querySelector('[data-message-id="target"]');
+  fireEvent.click(
+    within(reply as HTMLElement).getByRole("button", { name: /^Reply to / }),
+  );
+  const label = within(screen.getByLabelText("Composer")).getByText(
+    /^Replying to /,
+  );
+  // The text column holds the label and whatever is said about the target.
+  return label.parentElement?.textContent.slice(label.textContent.length);
+}
+it("summarises the reply target as prose, not its Markdown source", () => {
+  expect(
+    replyBannerText({
+      content:
+        "**Status:** two items left, see [the rollout PR](https://github.com/example-org/app/pull/42) and run `just iterate` first.",
+    }),
+  ).toBe(
+    "Status: two items left, see the rollout PR and run just iterate first.",
+  );
+});
+it("names only the author when the reply target has no prose to show", () => {
+  expect(
+    replyBannerText({ content: "[rollout]: https://example.org/rollout" }),
+  ).toBe("");
+});
+it("summarises a diff reply target by its file and description, not its patch", () => {
+  expect(
+    replyBannerText({
+      content:
+        "diff --git a/src/__init__.py b/src/__init__.py\n+Hello *world*\n",
+      diff: {
+        filePath: "src/__init__.py",
+        description: "Greet the world",
+        truncated: false,
+      },
+    }),
+  ).toBe("Diff: src/__init__.py — Greet the world");
 });
 
 it("starts replies with a full author header and only groups replies within the time window", () => {

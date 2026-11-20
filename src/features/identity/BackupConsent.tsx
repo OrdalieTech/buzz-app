@@ -217,7 +217,7 @@ export function BackupPrompt({
   return (
     <AlertDialog
       title="Back up your key?"
-      description="Buzz will save an encrypted copy of your identity key with your Builderlab account. That copy can restore your identity, including in other apps where you use the same key."
+      description="Buzz will save an encrypted copy of your identity key with your Builderlab account. That copy can restore your identity, including in other apps where you use the same key. If you manage your own key, keep a copy of your private key: you need it to use this account on another device or if you lose access to this one."
       onClose={onClose}
       initialFocus={sync}
       finalFocus={finalFocus}

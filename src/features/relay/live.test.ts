@@ -1,3 +1,4 @@
+import { ARTIFACT_KIND } from "../agents/agent-config-artifacts";
 import { getLogger, setLogLevel } from "../developer/logging";
 import {
   verifyEvent,
@@ -11,6 +12,7 @@ import {
   LIVE_CHECK_TIMEOUT_MS,
   LIVE_RECOVERY_INTERVAL,
   liveChannels,
+  LIVE_RESTART_SPREAD_MS,
   liveReconnectDelay,
   LIVE_RESUME_LAG,
   liveResumeSince,
@@ -28,6 +30,8 @@ import {
   scriptedTransport,
 } from "./testing";
 import type { SignatureVerifier } from "./events";
+import type { ReadTransport } from "./transport";
+import type { SidebarDecoder } from "./sidebar-preferences";
 import { yieldToHost } from "./yield";
 import { createRelaySession } from "./session";
 import { liveRecoveryStatus } from "./live-recovery";
@@ -114,7 +118,9 @@ function setup(
   channels = ["a", "b"],
   admission = createLiveAdmission(),
   batchSize = 10,
-  random?: () => number,
+  // Zero keeps the drop of an authenticated connection from waiting out the
+  // reconnect spread in tests that are not about it.
+  random: () => number = () => 0,
   signatures?: SignatureVerifier,
 ) {
   const key = keypair(),
@@ -392,6 +398,13 @@ it("uses independent explicit channel routes and self-p globals; equal interests
     "#t": ["system"],
     since: expect.any(Number),
     limit: 500,
+  });
+  const membershipRequest = h.first.requests()[1];
+  assert(membershipRequest);
+  expect(filtersOf(membershipRequest)).toContainEqual({
+    kinds: [13534],
+    since: expect.any(Number),
+    limit: 1,
   });
   const before = h.first.sent.length;
   h.owner.update(["b", "a", "a"]);
@@ -1429,7 +1442,7 @@ function captureLog() {
 
 it("verifies a reconnect's replayed events once and still rejects a changed copy", async () => {
   vi.useFakeTimers();
-  const h = setup(["a"], undefined, undefined, () => 0.5);
+  const h = setup(["a"], undefined, undefined);
   const log = captureLog();
   try {
     await h.first.auth();
@@ -1726,7 +1739,7 @@ it("isolates denial, fences removed/readded routes and late sockets, and dispose
 });
 it("restores prompt reconnects after each healthy connection across repeated rollouts", async () => {
   vi.useFakeTimers();
-  const h = setup([]);
+  const h = setup([], undefined, undefined, () => 0.5);
   try {
     for (let cycle = 0; cycle < 7; cycle++) {
       const socket = h.sockets[cycle];
@@ -1737,8 +1750,12 @@ it("restores prompt reconnects after each healthy connection across repeated rol
         await socket.receive(["EOSE", request[1]]);
       await vi.advanceTimersByTimeAsync(60000);
       expect(h.callbacks.state.mock.lastCall?.[0].status).toBe("connected");
+      // Half the spread each time: without the reset, the sixth drop's
+      // backoff (16s) would widen it to 8s.
       socket.close();
-      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(h.sockets).toHaveLength(cycle + 1);
+      await vi.advanceTimersByTimeAsync(1);
       expect(h.sockets).toHaveLength(cycle + 2);
     }
   } finally {
@@ -1751,19 +1768,24 @@ it.each([0, 0.5])(
   "keeps jittered recovery capped through auth flaps and a prolonged outage (random=%s)",
   async (sample) => {
     vi.useFakeTimers();
-    const random = vi.spyOn(Math, "random").mockReturnValue(sample);
-    const h = setup([]);
+    const h = setup([], undefined, undefined, () => sample);
     try {
       const ceilings = [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000];
       for (const [cycle, ceiling] of ceilings.entries()) {
         const socket = h.sockets[cycle];
         assert.exists(socket);
-        // Authentication alone must not reset backoff on a flapping relay.
-        if (cycle < 4) await socket.auth();
+        // Authentication alone must not reset backoff on a flapping relay;
+        // the drop of an authenticated connection is spread instead.
+        const established = cycle < 4;
+        if (established) await socket.auth();
         socket.close();
-        const delay = ceiling * (0.5 + sample / 2);
-        await vi.advanceTimersByTimeAsync(delay - 1);
-        expect(h.sockets).toHaveLength(cycle + 1);
+        const delay = established
+          ? sample * Math.max(LIVE_RESTART_SPREAD_MS, ceiling)
+          : ceiling * (0.5 + sample / 2);
+        if (delay > 0) {
+          await vi.advanceTimersByTimeAsync(delay - 1);
+          expect(h.sockets).toHaveLength(cycle + 1);
+        }
         await vi.advanceTimersByTimeAsync(1);
         expect(h.sockets).toHaveLength(cycle + 2);
       }
@@ -1783,7 +1805,6 @@ it.each([0, 0.5])(
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       h.owner.dispose();
-      random.mockRestore();
     }
   },
 );
@@ -1816,13 +1837,22 @@ it.each([
   ["other closes back off at half the backoff", 1006, 500, 0, 250],
   ["other closes back off at three quarters", undefined, 500, 0.5, 375],
   ["other closes back off at most the backoff", 1000, 8000, 1, 8000],
+  ["an established drop is spread from zero", 1006, 500, 0, 0, true],
+  [
+    "an established drop without a code is spread",
+    undefined,
+    500,
+    0.5,
+    5000,
+    true,
+  ],
+  ["an established drop widens with the backoff", 1006, 16000, 0.5, 8000, true],
 ] as const)(
   "liveReconnectDelay: %s",
-  (_name, code, backoff, sample, expected) => {
-    expect(liveReconnectDelay(code, backoff, () => sample)).toBeCloseTo(
-      expected,
-      6,
-    );
+  (_name, code, backoff, sample, expected, established?: boolean) => {
+    expect(
+      liveReconnectDelay(code, backoff, () => sample, established),
+    ).toBeCloseTo(expected, 6);
   },
 );
 
@@ -1854,7 +1884,7 @@ it("resumes a rebuilt route sixteen minutes before its connection last heard the
     const heard = Math.floor(Date.now() / 1000);
     await vi.advanceTimersByTimeAsync(30_000);
     h.first.close();
-    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(5000);
     const first = Math.floor(Date.now() / 1000) - 300;
     const next = h.sockets[1];
     assert.exists(next);
@@ -1880,7 +1910,7 @@ it("resumes a rebuilt route sixteen minutes before its connection last heard the
 
 it("never resumes from before the session's first window", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup(["a"], undefined, undefined, () => 0.5);
+  const h = setup(["a"], undefined, undefined);
   try {
     await h.first.auth();
     await vi.advanceTimersByTimeAsync(750);
@@ -1902,7 +1932,7 @@ it("never resumes from before the session's first window", async () => {
 
 it("takes a batch's resume point from its earliest channel", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, undefined, () => 0.5);
+  const h = setup([], undefined, undefined);
   try {
     age();
     h.owner.update(["a", "b"], ["a", "b"]);
@@ -1932,7 +1962,7 @@ it("takes a batch's resume point from its earliest channel", async () => {
 
 it("resumes from when a silent socket last answered, not from when it was replaced", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup(["a"], undefined, undefined, () => 0.5);
+  const h = setup(["a"], undefined, undefined);
   try {
     age();
     await h.first.auth();
@@ -1987,7 +2017,7 @@ async function rebuilt(h: ReturnType<typeof setup>) {
 
 it("resumes large live batches and their separate replay from the established cursor", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, 2048, () => 0.5);
+  const h = setup([], undefined, 2048);
   try {
     age();
     const ids = Array.from({ length: 11 }, (_, i) => `channel-${i}`);
@@ -2058,7 +2088,7 @@ describe("a joined batch over the replay batch size", () => {
 
   it("establishes each channel when its replay ends, with that replay's continuity", async () => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 2048, () => 0.5);
+    const h = setup([], undefined, 2048);
     try {
       const { next, replay } = await reconnected(h);
       expect(scopeOf(replay)).toEqual(ids);
@@ -2087,7 +2117,7 @@ describe("a joined batch over the replay batch size", () => {
 
   it("reports a combined replay continuous only for channels it finished on a page below the limit", async () => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 2048, () => 0.5);
+    const h = setup([], undefined, 2048);
     try {
       const { next, replay } = await reconnected(h);
       const now = Math.floor(Date.now() / 1000);
@@ -2140,7 +2170,7 @@ describe("a joined batch over the replay batch size", () => {
 
   it("does not report a channel continuous when the limit cut its replay", async () => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 2048, () => 0.5);
+    const h = setup([], undefined, 2048);
     try {
       const { next, replay } = await reconnected(h);
       const now = Math.floor(Date.now() / 1000);
@@ -2164,7 +2194,7 @@ describe("a joined batch over the replay batch size", () => {
 
   it("establishes a channel whose replay failed at once, to catch up", async () => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 2048, () => 0.5);
+    const h = setup([], undefined, 2048);
     try {
       const { next, replay } = await reconnected(h);
       await next.receive(["CLOSED", replay[1], "error: replay unavailable"]);
@@ -2176,7 +2206,7 @@ describe("a joined batch over the replay batch size", () => {
 
   it("reports no channel continuous when a grant re-sends the batch during its replay", async () => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 2048, () => 0.5);
+    const h = setup([], undefined, 2048);
     try {
       const { next, replay } = await reconnected(h);
       await grant(h, "channel-3", next);
@@ -2196,7 +2226,7 @@ describe("a joined batch over the replay batch size", () => {
 
   it("reports no channel continuous when a grant during its retry re-sends the batch during its replay", async () => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 2048, () => 0.5);
+    const h = setup([], undefined, 2048);
     try {
       const { next, replay } = await reconnected(h);
       const batch = next
@@ -2233,7 +2263,7 @@ describe("a joined batch over the replay batch size", () => {
 
   it("establishes a channel whose live batch failed during its replay only when the batch is live again", async () => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 2048, () => 0.5);
+    const h = setup([], undefined, 2048);
     try {
       const { next, replay } = await reconnected(h);
       const batch = next
@@ -2262,7 +2292,7 @@ describe("a joined batch over the replay batch size", () => {
 
   it("keeps the earlier cursor of a channel whose replay a drop interrupted", async () => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 2048, () => 0.5);
+    const h = setup([], undefined, 2048);
     try {
       age();
       h.owner.update(ids, ids);
@@ -2298,7 +2328,7 @@ describe("a joined batch over the replay batch size", () => {
 
 it("resumes a joined batch closed during its renewal from the source it kept", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, undefined, () => 0.5);
+  const h = setup([], undefined, undefined);
   try {
     const { heard } = await renewing(h);
     h.first.close();
@@ -2313,7 +2343,7 @@ it("resumes a joined batch closed during its renewal from the source it kept", a
 
 it("resumes a joined batch whose renewal failed but kept its source", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, undefined, () => 0.5);
+  const h = setup([], undefined, undefined);
   try {
     const { heard, renewal } = await renewing(h);
     // After one tick, a frame proves the relay only as far as the AUTH.
@@ -2330,7 +2360,7 @@ it("resumes a joined batch whose renewal failed but kept its source", async () =
 
 it("resumes a silent joined batch from its last frame, though its renewal never answered", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, undefined, () => 0.5);
+  const h = setup([], undefined, undefined);
   try {
     age();
     h.owner.update(["a", "b"], ["a", "b"]);
@@ -2361,7 +2391,7 @@ it("resumes a silent joined batch from its last frame, though its renewal never 
 
 it("gives a renewal's kept source no cursor for a channel the renewal dropped", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, undefined, () => 0.5);
+  const h = setup([], undefined, undefined);
   try {
     age();
     h.owner.update(["a", "b"], ["a", "b"]);
@@ -2388,7 +2418,7 @@ it("gives a renewal's kept source no cursor for a channel the renewal dropped", 
 
 it("resumes a batch rebuilt before its EOSE from the cursor, not the last five minutes", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, undefined, () => 0.5);
+  const h = setup([], undefined, undefined);
   try {
     age();
     h.owner.update(["a", "b", "c"], ["a", "b", "c"]);
@@ -2493,7 +2523,7 @@ it.each([
 
 it("keeps a route's cursor through a connection that never established it", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup(["a"], undefined, undefined, () => 0.5);
+  const h = setup(["a"], undefined, undefined);
   try {
     age();
     await h.first.auth();
@@ -2531,7 +2561,7 @@ it.each([
   "requires the full resume lag for channel and global continuity at session age %is",
   async (seconds, continuous) => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup(["a"], undefined, 10, () => 0.5);
+    const h = setup(["a"], undefined, 10);
     try {
       // The original replay starts 300s before startup; the cursor needs another
       // 660s before its full 960s safety window fits beyond that floor.
@@ -2556,7 +2586,7 @@ it.each([
 
 it("reports a global route continuous only when it resumed from a cursor and its replay stayed under the limit", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, undefined, () => 0.5);
+  const h = setup([], undefined, undefined);
   const globals = () =>
     h.callbacks.established.mock.calls.flatMap(([channels, global]) =>
       channels === undefined ? [global] : [],
@@ -2606,7 +2636,7 @@ it("reports a global route continuous only when it resumed from a cursor and its
 
 it("reports per channel which replays closed their gap: a cursor and fewer events than the limit", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, 10, () => 0.5);
+  const h = setup([], undefined, 10);
   const channels = () =>
     h.callbacks.established.mock.calls.flatMap((call) =>
       call[0] === undefined ? [] : [call],
@@ -2677,7 +2707,7 @@ it("reports per channel which replays closed their gap: a cursor and fewer event
 
 it("reports a channel continuous only when the session can apply its whole replay", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, 10, () => 0.5);
+  const h = setup([], undefined, 10);
   const channels = () =>
     h.callbacks.established.mock.calls.flatMap((call) =>
       call[0] === undefined ? [] : [call],
@@ -2748,7 +2778,7 @@ it.each([
   "catches up a channel granted while its refused batch was %s",
   async (_, after) => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 10, () => 0.5);
+    const h = setup([], undefined, 10);
     try {
       age();
       h.owner.update(["a", "b", "c"], ["a", "b", "c"]);
@@ -2799,7 +2829,7 @@ it.each([
   "keeps a channel owed when it is granted %s while that REQ is in flight",
   async (_, shift) => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 10, () => 0.5);
+    const h = setup([], undefined, 10);
     try {
       age();
       h.owner.update(["a", "b"], ["a", "b"]);
@@ -2844,7 +2874,7 @@ it.each([
   "resumes a granted channel on the next connection only %s",
   async (_, finish, continuous) => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 10, () => 0.5);
+    const h = setup([], undefined, 10);
     try {
       age();
       h.owner.update(["a", "b"], ["a", "b"]);
@@ -2871,7 +2901,7 @@ it.each([
 
 it("catches up a channel granted while its batch waits to retry its first REQ", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, 10, () => 0.5);
+  const h = setup([], undefined, 10);
   try {
     age();
     h.owner.update(["a", "b"], ["a", "b"]);
@@ -2918,7 +2948,7 @@ it.each([
   "reports no channel of a batch continuous after it dropped %s",
   async (_, event) => {
     vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const h = setup([], undefined, 10, () => 0.5);
+    const h = setup([], undefined, 10);
     const log = captureLog();
     try {
       age();
@@ -2947,7 +2977,7 @@ it.each([
 
 it("reports a global route not continuous after it dropped an undecodable replay event, and counts it against the limit", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup([], undefined, undefined, () => 0.5);
+  const h = setup([], undefined, undefined);
   const log = captureLog();
   const globals = () =>
     h.callbacks.established.mock.calls.flatMap(([channels, global]) =>
@@ -2997,7 +3027,7 @@ it("reports a global route not continuous after it dropped an undecodable replay
 
 it("reports a singleton channel route's continuity with its establishment", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup(["a"], undefined, 10, () => 0.5);
+  const h = setup(["a"], undefined, 10);
   try {
     age();
     await establish(h.first);
@@ -3016,7 +3046,7 @@ it("reports a singleton channel route's continuity with its establishment", asyn
 
 it("forgets the cursor of a channel that left the interests before a rebuild", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup(["a", "b"], undefined, undefined, () => 0.5);
+  const h = setup(["a", "b"], undefined, undefined);
   try {
     age();
     await h.first.auth();
@@ -3109,7 +3139,7 @@ it("does not take a late EOSE for a superseded REQ as the replacement's catch-up
     await h.first.receive(["EOSE", first[1]]);
     await vi.advanceTimersByTimeAsync(30_000);
     h.first.close();
-    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(5000);
     const floor = Math.floor(Date.now() / 1000) - 300;
     const next = h.sockets[1];
     assert.exists(next);
@@ -3124,7 +3154,7 @@ it("does not take a late EOSE for a superseded REQ as the replacement's catch-up
 
 it("keeps an earlier cursor when the replacement REQ on the same socket has not caught up", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup(["a"], undefined, undefined, () => 0.5);
+  const h = setup(["a"], undefined, undefined);
   try {
     age();
     await h.first.auth();
@@ -3160,7 +3190,7 @@ it("keeps an earlier cursor when the replacement REQ on the same socket has not 
 
 it("keeps the earlier cursor when a channel is unsubscribed and subscribed again before its late EOSE", async () => {
   vi.useFakeTimers({ now: 1_700_000_000_000 });
-  const h = setup(["a"], undefined, undefined, () => 0.5);
+  const h = setup(["a"], undefined, undefined);
   try {
     age();
     await h.first.auth();
@@ -3208,10 +3238,10 @@ it("keeps the earlier cursor when a channel is unsubscribed and subscribed again
 it.each([
   [1012, 9000],
   [1001, 9000],
-  [1006, 475],
-  [undefined, 475],
+  [1006, 9000],
+  [undefined, 9000],
 ])(
-  "waits for the jitter its close code calls for before reconnecting (code %s)",
+  "spreads the reconnect after an authenticated connection drops (code %s)",
   async (code, delay) => {
     vi.useFakeTimers();
     const h = setup(["a"], undefined, undefined, () => 0.9);
@@ -3227,6 +3257,79 @@ it.each([
     }
   },
 );
+
+it.each([1006, undefined])(
+  "keeps the fast backoff for a connection that never authenticated (code %s)",
+  async (code) => {
+    vi.useFakeTimers();
+    const h = setup(["a"], undefined, undefined, () => 0.9);
+    try {
+      h.first.close(code);
+      await vi.advanceTimersByTimeAsync(474);
+      expect(h.sockets).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(h.sockets).toHaveLength(2);
+    } finally {
+      h.owner.dispose();
+    }
+  },
+);
+
+it.each([
+  ["an authenticated", true, 9000],
+  ["a never-authenticated", false, 475],
+])(
+  "times the reconnect from the error when %s socket errors before closing",
+  async (_, authenticated, delay) => {
+    vi.useFakeTimers();
+    const h = setup(["a"], undefined, undefined, () => 0.9);
+    try {
+      if (authenticated) await h.first.auth();
+      // An abrupt TCP drop fires error, then close 1006.
+      // The close arrives later, so only the error can meet the deadline.
+      // A local close() stays silent: the one close notification is the
+      // socket's own, 10ms after the error.
+      const socket = h.first;
+      socket.close = () => {
+        socket.readyState = 3;
+      };
+      socket.onerror?.(new Event("error"));
+      await vi.advanceTimersByTimeAsync(10);
+      socket.readyState = 3;
+      socket.onclose?.({ code: 1006 });
+      await vi.advanceTimersByTimeAsync(delay - 11);
+      expect(h.sockets).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(h.sockets).toHaveLength(2);
+      // The late close must not schedule a second reconnect, which would
+      // come at the doubled backoff.
+      await vi.advanceTimersByTimeAsync(500);
+      expect(h.sockets).toHaveLength(2);
+    } finally {
+      h.owner.dispose();
+    }
+  },
+);
+
+it("spreads only the first reconnect after an authenticated drop, then backs off normally", async () => {
+  vi.useFakeTimers();
+  const draws = [0, 0.5];
+  const h = setup(["a"], undefined, undefined, () => draws.shift() ?? 0.5);
+  try {
+    await h.first.auth();
+    h.first.close(1006);
+    await vi.advanceTimersByTimeAsync(0);
+    const second = h.sockets[1];
+    assert.exists(second);
+    second.close(1006);
+    await vi.advanceTimersByTimeAsync(749);
+    expect(h.sockets).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.sockets).toHaveLength(3);
+  } finally {
+    h.owner.dispose();
+  }
+});
 
 it("reconnects at once when the spread draws zero, then backs off normally after a plain failure", async () => {
   vi.useFakeTimers();
@@ -4018,7 +4121,7 @@ it.each(["reconnect", "cooldown"])(
     expect(admission.presenceIdle()).toBe(false);
     if (mode === "reconnect") {
       first.close();
-      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(LIVE_RESTART_SPREAD_MS);
       const next = sockets[1];
       assert.exists(next);
       await next.auth();
@@ -4373,6 +4476,43 @@ it("fills three publication slots at one clock instant and refills on matching O
     h.owner.dispose();
   }
   expect(vi.getTimerCount()).toBe(0);
+});
+
+it("publishes a message while artifact updates occupy their reserved slots", async () => {
+  vi.useFakeTimers();
+  const h = setup([]);
+  const results: Promise<unknown>[] = [];
+  try {
+    assert.exists(h.owner.publish);
+    const signal = new AbortController().signal;
+    const artifacts = Array.from({ length: 3 }, (_, index) =>
+      signed(h.key, { kind: ARTIFACT_KIND, content: String(index), tags: [] }),
+    );
+    const publish = h.owner.publish;
+    results.push(...artifacts.map((event) => publish(event, signal)));
+    await h.first.auth();
+    const writes = () =>
+      h.first.sent
+        .filter((frame) => frame[0] === "EVENT")
+        .map((frame) => (frame[1] as { id: string }).id);
+    expect(writes()).toEqual(artifacts.slice(0, 2).map((event) => event.id));
+    const chat = message(h.key, "a", "priority message", 1700000000);
+    const sentChat = publish(chat, signal);
+    results.push(sentChat);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(writes().at(-1)).toEqual(chat.id);
+    await h.first.receive(["OK", chat.id, true, ""]);
+    await sentChat;
+    expect(writes()).toHaveLength(3);
+    await h.first.receive(["OK", artifacts[0]?.id, true, ""]);
+    expect(writes().at(-1)).toEqual(artifacts[2]?.id);
+    for (const event of artifacts.slice(1))
+      await h.first.receive(["OK", event.id, true, ""]);
+    await Promise.all(results);
+  } finally {
+    h.owner.dispose();
+    await Promise.allSettled(results);
+  }
 });
 
 it("presence and ordinary publications correlate independently and share only real cooldown", async () => {
@@ -5598,12 +5738,10 @@ it.each([
       expect(incoming).toHaveBeenCalledTimes(order === "live-first" ? 1 : 0);
       if (order === "replay-finite-live") await finite();
       await h.first.receive(["EVENT", source[1], event]);
-      const count =
-        order === "known-history" || order === "finite-first" ? 0 : 1;
-      expect(incoming).toHaveBeenCalledTimes(count);
+      expect(incoming).toHaveBeenCalledOnce();
       await h.first.receive(["EVENT", replay[1], event]);
       await h.first.receive(["EVENT", source[1], event]);
-      expect(incoming).toHaveBeenCalledTimes(count);
+      expect(incoming).toHaveBeenCalledOnce();
     } finally {
       owner.dispose();
     }
@@ -6433,5 +6571,135 @@ it("gives no resume point to a profile sync whose EOSE is still being verified",
   } finally {
     release();
     h.owner.dispose();
+  }
+});
+
+it("subscribes to own sidebar coordinates alongside read state and verifies delivery", async () => {
+  vi.useFakeTimers();
+  const h = setup([]);
+  try {
+    await h.first.auth();
+    const event = signed(h.key, {
+      kind: 30078,
+      created_at: Math.floor(Date.now() / 1000),
+      content: "encrypted",
+      tags: [
+        ["d", "channel-sections"],
+        ["t", "channel-sections"],
+      ],
+    });
+    const route = h.first
+      .requests()
+      .find((request) =>
+        filtersOf(request).some((filter) => matchesEvent(event, filter)),
+      );
+    assert.exists(route);
+    expect(
+      filtersOf(route).some((filter) =>
+        matchesEvent({ ...event, pubkey: keypair().pubkey }, filter),
+      ),
+    ).toBe(false);
+    expect(
+      filtersOf(route).some((filter) =>
+        matchesEvent({ ...event, tags: [["d", "other"]] }, filter),
+      ),
+    ).toBe(false);
+    const readState = signed(h.key, {
+      kind: 30078,
+      created_at: event.created_at,
+      content: "marker",
+      tags: [
+        ["d", `read-state:${"ab".repeat(16)}`],
+        ["t", "read-state"],
+      ],
+    });
+    expect(
+      filtersOf(route).some((filter) => matchesEvent(readState, filter)),
+    ).toBe(true);
+    await h.first.receive([
+      "EVENT",
+      route[1],
+      { ...event, sig: "0".repeat(128) },
+    ]);
+    expect(h.callbacks.receive).not.toHaveBeenCalled();
+    await h.first.receive(["EVENT", route[1], event]);
+    expect(h.callbacks.receive).toHaveBeenCalledWith([event], {
+      phase: "replay",
+    });
+  } finally {
+    h.owner.dispose();
+  }
+});
+
+it("delivers a canonical sidebar event through the emitted wire into the real session store", async () => {
+  vi.useFakeTimers();
+  const h = setup([]);
+  const relay = keypair();
+  const read = vi.fn<ReadTransport["query"]>(async () => []);
+  const data = {
+    sections: [{ id: "work", name: "Work", order: 0 }],
+    assignments: { alpha: "work" },
+    starred: ["beta"],
+    muted: [],
+  };
+  const decode = vi.fn<SidebarDecoder>(async () => data);
+  const owner = createRelaySession({
+    viewer: h.key.pubkey,
+    relayAuthor: relay.pubkey,
+    media: () => undefined,
+    query: read,
+    decodeSidebarPreferences: decode,
+    subscribe(callbacks) {
+      h.callbacks.receive.mockImplementation(callbacks.receive);
+      return h.owner;
+    },
+  });
+  try {
+    await owner.session.sidebarPreferences.ensure();
+    await h.first.auth();
+    const event = signed(h.key, {
+      kind: 30078,
+      created_at: Math.floor(Date.now() / 1000),
+      content: "encrypted",
+      tags: [
+        ["d", "channel-sections"],
+        ["t", "channel-sections"],
+      ],
+    });
+    const route = h.first
+      .requests()
+      .find((request) =>
+        filtersOf(request).some((filter) => matchesEvent(event, filter)),
+      );
+    assert.exists(route);
+    await h.first.receive(["EOSE", route[1]]);
+    decode.mockResolvedValueOnce({
+      ...data,
+      assignments: { alpha: "work", gamma: "work" },
+    });
+    await h.first.receive(["EVENT", route[1], event]);
+    await owner.session.sidebarPreferences.ensure();
+    expect(
+      owner.session.sidebarPreferences.snapshot().data?.assignments,
+    ).toEqual({ alpha: "work", gamma: "work" });
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(read.mock.calls[1]?.[0]).toEqual(
+      [
+        "channel-sections",
+        "channel-stars",
+        "channel-mutes",
+        "channel-sort",
+        "channel-filter",
+      ].map((coordinate) => ({
+        kinds: [30078],
+        authors: [h.key.pubkey],
+        "#d": [coordinate],
+        limit: 1,
+        consistency: "strong",
+      })),
+    );
+    expect(decode).toHaveBeenCalledTimes(2);
+  } finally {
+    owner.dispose();
   }
 });

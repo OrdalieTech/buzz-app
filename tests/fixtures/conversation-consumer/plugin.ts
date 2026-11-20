@@ -10,6 +10,27 @@ export function apply(ctx: Context) {
   const h = React.createElement;
   const ui = ctx.conversation;
   const relay = ctx.relay;
+  function RetainedReplies() {
+    const [open, setOpen] = React.useState(false);
+    return h(ui.ui.ReplyBranch, {
+      message: h("p", { "data-message-id": "example-root" }, "Example root"),
+      layout: "thread",
+      summary: h(ui.ui.ReplySummary, {
+        count: 1,
+        participants: [],
+        resolveName: (_id, fallback) => fallback,
+        media: () => undefined,
+      }),
+      label: "View 1 reply",
+      collapseLabel: "Collapse example reply",
+      hasReplies: true,
+      open,
+      depth: 0,
+      onExpand: () => setOpen(true),
+      onCollapse: () => setOpen(false),
+      children: h("p", { "data-message-id": "example-reply" }, "Example reply"),
+    });
+  }
   const target = "consumer://message/inspect";
   ctx.panels.register({
     id: "inspect",
@@ -39,6 +60,8 @@ export function apply(ctx: Context) {
     );
     React.useEffect(() => session.channels.ensureList(), [session]);
     const [selected, select] = React.useState("");
+    const [sharing, setSharing] = React.useState(false);
+    const shareTrigger = React.useRef<HTMLButtonElement>(null);
     const channel =
       list.channels.find((item) => item.id === selected) ?? list.channels[0];
     return h(
@@ -54,6 +77,7 @@ export function apply(ctx: Context) {
         { title: ui.format.fullTimestamp(Date.now() / 1000) },
         `Consumer dates ${ui.format.dayGroupLabel(Date.now() / 1000)}, ${ui.format.itemTimestamp(Date.now() / 1000 - 86_400)}, ${ui.format.relativeTimestamp(Date.now() / 1000 - 300)}`,
       ),
+      h(RetainedReplies),
       h(
         "label",
         null,
@@ -70,6 +94,45 @@ export function apply(ctx: Context) {
           ),
         ),
       ),
+      channel &&
+        h(
+          "button",
+          {
+            ref: shareTrigger,
+            type: "button",
+            onClick: () => setSharing(true),
+          },
+          "Share consumer record",
+        ),
+      sharing &&
+        channel &&
+        h(ui.ui.MembersDialog, {
+          key: `${session.scope}:${channel.id}`,
+          session,
+          channelId: channel.id,
+          trigger: shareTrigger,
+          close: () => setSharing(false),
+          title: "Record access",
+          shareLink:
+            "buzz://plugin?id=test.conversation-consumer&record=general",
+          memberActions: {
+            canAdd: false,
+            pending: false,
+            async change() {
+              throw new Error("Consumer is read only");
+            },
+          },
+          accessSettings: h(ui.ui.GeneralAccess, {
+            capability: session.channelDetails,
+            channelId: channel.id,
+            channel: { ...channel, readOnly: true, visibility: "private" },
+            policy: {
+              subject: "record",
+              allowPublic: false,
+              visibilityDescription: () => "Record access changes.",
+            },
+          }),
+        }),
       channel
         ? h(Conversation, {
             connection,

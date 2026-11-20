@@ -17,6 +17,7 @@ const nonIconDependencies = new Set([
   "@earendil-works/chord", // The Pi host's packages, which pi.sh installs.
   "@earendil-works/pi-ai",
   "@earendil-works/pi-durable",
+  "@earendil-works/pi-schema",
   "@emoji-mart/data",
   "@fontsource-variable/inter",
   "@fontsource/jetbrains-mono",
@@ -25,7 +26,9 @@ const nonIconDependencies = new Set([
   "@modelcontextprotocol/server", // The standalone Buzz MCP server.
   "@noble/curves",
   "@playwright/test",
+  "@pierre/diffs", // Diff renderer and syntax highlighting, not an icon catalog.
   "@pydantic/genai-prices", // LLM price data for Usage estimates.
+  "@shikijs/langs", // Syntax grammars for diff highlighting, not an icon catalog.
   "@tailwindcss/postcss",
   "@tanstack/react-router",
   "@tauri-apps/api",
@@ -48,8 +51,10 @@ const nonIconDependencies = new Set([
   "d3-scale", // Chart scales and ticks; marks are Buzz-rendered SVG.
   "diff", // Text line diffs for Canvas history, not an icon library.
   "dockview-react",
+  "echarts", // Chart marks; not an icon library.
   "emoji-mart",
   "flexlayout-react",
+  "gitdiff-parser", // Validates patch structure before rendering, not an icon library.
   "jsdom",
   "mdast", // Type-only module supplied by @types/mdast.
   "mdast-util-from-markdown",
@@ -71,7 +76,6 @@ const nonIconDependencies = new Set([
   "prosemirror-view",
   "react",
   "react-day-picker", // Calendar behavior; navigation icons use our Tabler gateway.
-  "react-diff-view", // Patch tables/parser, not an icon library.
   "react-dom",
   "react-markdown",
   "remark-breaks",

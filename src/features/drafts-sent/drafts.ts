@@ -97,7 +97,7 @@ function draftEntry(
   );
   const text = draft.text.trim();
   const fingerprint = signature(
-    `${count}:${draft.chatCards?.length ?? 0}:${draft.gifs?.length ?? 0}:${text}`,
+    `${count}:${draft.chatCards?.length ?? 0}:${draft.gifs?.length ?? 0}:${text}${draft.forward ? `:${JSON.stringify(draft.forward)}` : ""}`,
   );
   const changed = activity[key]?.[0] !== fingerprint;
   if (changed) activity[key] = [fingerprint, nowSeconds];
@@ -109,7 +109,9 @@ function draftEntry(
       text ||
       (count
         ? `${count} attached file${count === 1 ? "" : "s"}`
-        : "Attached chat or GIF"),
+        : draft.forward
+          ? "Forwarded message"
+          : "Attached chat or GIF"),
     ...(text ? {} : { placeholder: true as const }),
     createdAt: activity[key]?.[1] ?? nowSeconds,
     signature: fingerprint,
@@ -191,7 +193,7 @@ export function readDrafts(
  * reloads the empty draft, or keeps unsaved edits as a conflict. Throws when
  * storage could not forget it, before discarding any files. */
 export function clearDraft(session: Session, key: string) {
-  clearView(session.scope, key);
+  clearView(session.scope, key, `${key}:files`);
   clearAttachmentDraft(
     session as Parameters<typeof clearAttachmentDraft>[0],
     `${session.scope}:${key}`,

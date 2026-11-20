@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 import { expect, it, vi } from "vitest";
 import { pngChunks, snapshotChunk } from "../messages/image-metadata";
-import { avatarPreview, uploadAvatar } from "./avatar-upload";
+import {
+  avatarCropBox,
+  avatarPictureError,
+  avatarPreview,
+  profilePictureError,
+  uploadAvatar,
+} from "./avatar-upload";
 
 const uploadAttachment = vi.fn(async (file: File) => ({
   type: file.type,
@@ -150,4 +156,38 @@ it("forwards the requested size so previews share the message-row thumbnail URL"
   );
   // The editor keeps the original for its large frame.
   expect(avatarPreview(picture, community)).toBe(proxied(picture));
+});
+
+it("keeps a panned and zoomed image covering the avatar frame", () => {
+  // A 2:1 image covers the frame at zoom 1 and pans only sideways.
+  expect(avatarCropBox(2, { zoom: 1, x: 0.8, y: 0.3 })).toEqual({
+    crop: { zoom: 1, x: 0.5, y: 0 },
+    width: 2,
+    height: 1,
+    left: 0,
+    top: 0,
+  });
+  expect(avatarCropBox(1, { zoom: 2, x: -0.2, y: 0.9 })).toEqual({
+    crop: { zoom: 2, x: -0.2, y: 0.5 },
+    width: 2,
+    height: 2,
+    left: -0.7,
+    top: 0,
+  });
+});
+
+it("saves Buzz mobile's emoji avatar as-is in a personal profile only", () => {
+  const emoji = `data:image/svg+xml,${encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" rx="256" fill="#FFB84D"/><text x="50%" y="56%" dominant-baseline="middle" text-anchor="middle" font-size="258">🛹</text></svg>',
+  )}`;
+  for (const picture of [
+    emoji,
+    ` ${emoji}\n`,
+    " https://images.example/a.png ",
+  ])
+    expect(profilePictureError(picture)).toBeUndefined();
+  expect(profilePictureError("data:image/svg+xml,%3Csvg%3E")).toBeDefined();
+  // Agents save HTTPS pictures only.
+  expect(avatarPictureError(emoji)).toBeDefined();
+  expect(avatarPictureError(" https://images.example/a.png ")).toBeUndefined();
 });

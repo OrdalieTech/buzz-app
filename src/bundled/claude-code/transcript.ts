@@ -5,6 +5,7 @@ import { isMessageTool } from "../../buzz-mcp/session-tools";
 import { readEventBody } from "../../features/agent-harness/turn-records";
 import { readFile } from "../../buzz-mcp/app-client";
 import {
+  postedAs,
   promptMessage,
   promptSections,
   STEER,
@@ -40,6 +41,7 @@ export type Conversation = Readonly<{
   /** The agent's membership key, as its turn prompts name it. */
   agent: string;
   sessionId?: string;
+  community?: true;
   channelId: string;
   root?: string;
 }>;
@@ -80,7 +82,10 @@ function prompt(
   at: number,
   raw: string,
   name?: Names,
-): TranscriptItem {
+): {
+  item: Extract<TranscriptItem, { type: "prompt" }>;
+  hasMessage: boolean;
+} {
   let sections = promptSections(raw);
   const steer = sections.find((section) => section.tag === STEER);
   // An older steer wraps a whole turn.
@@ -88,19 +93,53 @@ function prompt(
     sections = promptSections(steer.body);
   const { text, author, authorPubkey } = promptMessage(sections, name);
   return {
-    id,
-    at,
-    type: "prompt",
-    text: text || raw,
-    ...(author ? { author } : {}),
-    ...(authorPubkey ? { authorPubkey } : {}),
-    sections,
-    steer: !!steer,
+    item: {
+      id,
+      at,
+      type: "prompt",
+      text: text || raw,
+      ...(author ? { author } : {}),
+      ...(authorPubkey ? { authorPubkey } : {}),
+      sections,
+      steer: !!steer,
+    },
+    hasMessage: !!(text || author || authorPubkey),
   };
 }
 
-/** Transcript lines as turns, each opened by a prompt. Claude Code's own
- * entries (metadata, subagents, attachments) are left out. */
+/** `turns` with each notice right after the prompt Claude saved under the
+ * id of the message it came with. A notice whose message Claude never took
+ * matches no prompt, so it shows nowhere rather than on another turn. */
+export function withNotices(
+  turns: readonly TranscriptTurn[],
+  notices: ReadonlyMap<string, string>,
+): TranscriptTurn[] {
+  return turns.map((turn) =>
+    turn.items.some((item) => item.type === "prompt" && notices.has(item.id))
+      ? {
+          ...turn,
+          items: turn.items.flatMap((item): TranscriptItem[] => {
+            const text =
+              item.type === "prompt" ? notices.get(item.id) : undefined;
+            return text
+              ? [
+                  item,
+                  {
+                    id: `${item.id}:notice`,
+                    at: item.at,
+                    type: "status",
+                    text,
+                  },
+                ]
+              : [item];
+          }),
+        }
+      : turn,
+  );
+}
+
+/** Transcript lines as turns, each opened by a prompt. Claude Code records
+ * some Buzz steers as queued-command attachments within the active turn. */
 export function claudeTurns(
   file: string,
   conversation: Session,
@@ -112,7 +151,10 @@ export function claudeTurns(
   /** Messages sent with send, until their result says whether they were posted. */
   const sends = new Map<
     string,
-    { turn: TranscriptTurn; message: { posted?: boolean } }
+    {
+      turn: TranscriptTurn;
+      message: { posted?: boolean; messageId?: string };
+    }
   >();
   let last = 0;
   const turn = (id: string, at: number, partial: boolean) => {
@@ -141,22 +183,28 @@ export function claudeTurns(
       continue;
     }
     if (!entry || entry.isSidechain || entry.isMeta) continue;
-    const message = object(entry.message);
     const id = str(entry.uuid);
+    if (!id) continue;
     const at = Date.parse(str(entry.timestamp)) || last;
-    if (
-      !message ||
-      !id ||
-      (entry.type !== "user" && entry.type !== "assistant")
-    )
+    if (entry.type === "attachment") {
+      const attachment = object(entry.attachment);
+      if (attachment?.type !== "queued_command") continue;
+      const { item, hasMessage } = prompt(id, at, str(attachment.prompt), name);
+      if (item.steer && hasMessage) {
+        (turns.at(-1) ?? turn(id, at, true)).items.push(item);
+        last = at;
+      }
+      continue;
+    }
+    const message = object(entry.message);
+    if (!message || (entry.type !== "user" && entry.type !== "assistant"))
       continue;
     const results = blocks(message.content).filter(
       (block) => block.type === "tool_result",
     );
     if (entry.type === "user" && !results.length) {
-      const item = prompt(id, at, text(message.content), name);
-      const current =
-        item.type === "prompt" && item.steer ? turns.at(-1) : undefined;
+      const { item } = prompt(id, at, text(message.content), name);
+      const current = item.steer ? turns.at(-1) : undefined;
       (current ?? turn(id, at, false)).items.push(item);
       last = at;
       continue;
@@ -165,7 +213,8 @@ export function claudeTurns(
     last = at;
     for (const result of results) {
       const sent = sends.get(str(result.tool_use_id));
-      if (sent && !result.is_error) sent.message.posted = true;
+      if (sent && !result.is_error)
+        Object.assign(sent.message, postedAs(text(result.content)));
       else if (sent) {
         sent.turn.items.push({
           id: `${id}:${str(result.tool_use_id)}`,
@@ -268,11 +317,15 @@ export function startedFor(file: string, conversation: Conversation) {
     const agent = field("Agent");
     return (
       (agent === undefined || agent === conversation.agent) &&
-      !!field("Channel")?.endsWith(`(#${conversation.channelId})`) &&
-      (conversation.root
-        ? field("Session scope") === "thread" &&
-          field("Thread root") === conversation.root
-        : field("Session scope") !== "thread")
+      (conversation.community
+        ? field("Session scope") === "community"
+        : field("Session scope") !== "community" &&
+          !!field("Channel")?.endsWith(`(#${conversation.channelId})`)) &&
+      (conversation.community ||
+        (conversation.root
+          ? field("Session scope") === "thread" &&
+            field("Thread root") === conversation.root
+          : field("Session scope") !== "thread"))
     );
   }
   return false;
@@ -283,21 +336,30 @@ export function startedFor(file: string, conversation: Conversation) {
  * the first prompt once the file is read. */
 const indexedFor = (start: Start, conversation: Conversation) =>
   (start.agent === undefined || start.agent === conversation.agent) &&
-  start.channelId === conversation.channelId &&
-  (conversation.root
-    ? start.scope === "thread" && start.root === conversation.root
-    : start.scope !== "thread");
+  (conversation.community
+    ? start.scope === "community"
+    : start.scope !== "community" &&
+      start.channelId === conversation.channelId &&
+      (conversation.root
+        ? start.scope === "thread" && start.root === conversation.root
+        : start.scope !== "thread"));
 
 /** How long finding the agent's workspace may take. */
 const WORKSPACE_TIMEOUT_MS = 10_000;
+
+/** Where a conversation's sessions ran: the agent's workspace, found by
+ * starting there, or the folder a plugin gave the conversation, kept already
+ * resolved, so it is never visited: that would create a removed one again. */
+export type SessionsPlace = string | Readonly<{ folder: string }>;
 
 /** The Claude Code project directory name for the agent's workspace, or
  * undefined when it is too long to be one. */
 export async function workspaceProject(
   spawn: Spawn,
-  workspace: string,
+  workspace: SessionsPlace,
   signal: AbortSignal,
 ) {
+  if (typeof workspace !== "string") return limited(workspace.folder);
   let directory = "";
   const process = await spawn("workspace", {
     cwd: workspace,
@@ -315,9 +377,12 @@ export async function workspaceProject(
   });
   signal.throwIfAborted();
   if (code !== 0) throw new Error("Could not find the agent's workspace");
-  const project = projectName(directory.trim());
-  return project.length > PROJECT_NAME_LIMIT ? undefined : project;
+  return limited(directory.trim());
 }
+const limited = (directory: string) => {
+  const project = projectName(directory);
+  return project.length > PROJECT_NAME_LIMIT ? undefined : project;
+};
 
 /** MiB per page of a session too large to read whole, under its 50 MB. */
 const PAGE_MIB = 32;
@@ -363,18 +428,23 @@ const oversized = new Map<string, number>();
 /** The whole turns in the last {@link LATEST_MIB} MiB of the conversation's
  * saved session, oldest first; undefined with no saved session. While a turn
  * is larger than that, none, so what is shown stays, except undefined every
- * {@link OVERSIZED_READ_MS} to read it in full. */
+ * {@link OVERSIZED_READ_MS} to read it in full. The same fallback recovers
+ * delivered steers when the window omits their turn's opening prompt. */
 export async function readLatestTurns(
   spawn: Spawn,
-  workspace: string,
+  workspace: SessionsPlace,
   conversation: Conversation,
   working: boolean,
   signal: AbortSignal,
   nameOf?: Names,
 ): Promise<TranscriptTurn[] | undefined> {
-  if (!projects.has(workspace))
+  // A folder's project is known without a lookup to keep.
+  if (typeof workspace === "string" && !projects.has(workspace))
     projects.set(workspace, await workspaceProject(spawn, workspace, signal));
-  const project = projects.get(workspace);
+  const project =
+    typeof workspace === "string"
+      ? projects.get(workspace)
+      : await workspaceProject(spawn, workspace, signal);
   const { sessionId } = conversation;
   if (!project || !sessionId) return undefined;
   const path = `./${project}/${sessionId}.jsonl`;
@@ -407,11 +477,22 @@ export async function readLatestTurns(
     },
     working,
     nameOf,
-  ).filter((turn) => !turn.partial);
-  if (from && turns[0]) turns[0].newSession = false;
-  if (from && !turns.length) return tooLarge();
-  oversized.delete(path);
-  return turns;
+  );
+  const first = turns[0];
+  const whole = turns.filter((turn) => !turn.partial);
+  if (
+    from &&
+    (!whole.length ||
+      (first?.partial &&
+        first.items.some((item) => item.type === "prompt" && item.steer)))
+  ) {
+    const fallback = tooLarge();
+    if (!fallback || !whole.length) return fallback;
+  } else {
+    oversized.delete(path);
+  }
+  if (from && whole[0]) whole[0].newSession = false;
+  return whole;
 }
 
 /** A session file in `~/.claude/projects`. One too large to read whole is
@@ -474,7 +555,7 @@ async function readSession(
  * record), or undefined before it has one. */
 export async function readSessionTitle(
   spawn: Spawn,
-  workspace: string,
+  workspace: SessionsPlace,
   sessionId: string,
   signal: AbortSignal,
 ): Promise<string | undefined> {
@@ -513,7 +594,7 @@ export async function readSessionTitle(
  * no longer uses. */
 export async function readTranscript(
   spawn: Spawn,
-  workspace: string,
+  workspace: SessionsPlace,
   conversation: Conversation,
   working: boolean,
   signal: AbortSignal,

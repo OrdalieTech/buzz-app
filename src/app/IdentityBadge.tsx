@@ -34,7 +34,7 @@ export function IdentityBadge({
   picture,
   photoContext,
   backup,
-  backupLocation = "Builderlab",
+  backupAccount = "your Builderlab account",
   onCopy,
   children,
 }: {
@@ -43,7 +43,8 @@ export function IdentityBadge({
   picture?: string | undefined;
   photoContext?: string | undefined;
   backup?: "pending" | "confirmed" | "attention" | "running" | undefined;
-  backupLocation?: string | undefined;
+  /** Where the backup is, e.g. "your Builderlab account". */
+  backupAccount?: string | undefined;
   onCopy(): void;
   children(
     active: boolean,
@@ -169,7 +170,7 @@ export function IdentityBadge({
                     <div className={styles.backupCaption}>
                       {backup === "confirmed" ? (
                         <Tooltip
-                          content={`Your private key is saved on this device and backed up with your ${backupLocation} account.`}
+                          content={`Your private key is saved on this device and backed up with ${backupAccount}.`}
                         >
                           <span
                             // biome-ignore lint/a11y/noNoninteractiveTabindex: Keyboard users focus this informational pill to read its destination tooltip.

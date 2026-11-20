@@ -110,15 +110,20 @@ export function createBackupStatus(send: Send = invoke) {
   };
 }
 
-/** A first-run backup that did not complete, with the table's copy as its message. */
+/** A first-run backup that did not complete, with the table's copy as its
+ * message. `retryable` is the table's unless the step's own Try again does
+ * more than repeat the pass, as signing in again does. */
 export class BackupError extends Error {
   readonly kind: BackupFailureKind;
   readonly retryable: boolean;
-  constructor(kind: BackupFailureKind) {
+  constructor(
+    kind: BackupFailureKind,
+    retryable: boolean = BACKUP_FAILURES[kind].retryable,
+  ) {
     super(BACKUP_FAILURES[kind].message);
     this.name = "BackupError";
     this.kind = kind;
-    this.retryable = BACKUP_FAILURES[kind].retryable;
+    this.retryable = retryable;
   }
 }
 

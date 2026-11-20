@@ -35,6 +35,11 @@ it("reveals completed cached artwork on mount without waiting for a load event",
     "loading",
     "lazy",
   );
+  // Async decoding paints ready artwork as empty for a frame in WebKit.
+  expect(view.container.querySelector("img")).toHaveAttribute(
+    "decoding",
+    "sync",
+  );
 });
 
 it("uses the fallback for an already completed broken image", () => {
@@ -49,7 +54,7 @@ it("uses the fallback for an already completed broken image", () => {
   expect(screen.getByRole("img", { name: "Agent" })).toHaveTextContent("A");
 });
 
-it("defers new sources, uses eager loading after success, and forgets a failed remount", () => {
+it("defers new sources, uses eager loading after success, and shows a failed source's fallback on remount", () => {
   vi.spyOn(HTMLImageElement.prototype, "complete", "get").mockReturnValue(
     false,
   );
@@ -63,6 +68,8 @@ it("defers new sources, uses eager loading after success, and forgets a failed r
   if (!image) throw new Error("Expected initial artwork");
   expect(image).toHaveAttribute("loading", "lazy");
   fireEvent.load(image);
+  // Artwork that arrives after mount keeps decoding off the main thread.
+  expect(image).toHaveAttribute("decoding", "async");
   first.unmount();
 
   const second = render(<Avatar {...props} />);
@@ -76,11 +83,16 @@ it("defers new sources, uses eager loading after success, and forgets a failed r
   expect(screen.getByRole("img", { name: "Agent" })).toHaveTextContent("A");
   second.unmount();
 
+  // A remount after failure shows the fallback at once, not a blank circle,
+  // while it still requests the source in case it recovered.
   const retry = render(<Avatar {...props} />);
-  expect(retry.container.querySelector("img")).toHaveAttribute(
-    "loading",
-    "lazy",
-  );
+  const retried = retry.container.querySelector("img");
+  expect(retried).toHaveAttribute("loading", "lazy");
+  expect(screen.getByRole("img", { name: "Agent" })).toHaveTextContent("A");
+  if (!retried) throw new Error("Expected retried artwork");
+  fireEvent.load(retried);
+  expect(retried).toHaveAttribute("data-loaded", "true");
+  expect(screen.getByRole("img", { name: "Agent" })).toHaveTextContent("");
 });
 
 it("bounds remembered sources and retains recently used artwork", () => {

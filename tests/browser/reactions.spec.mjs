@@ -5,6 +5,7 @@ import {
 import { test, expect } from "./source-fixture.mjs";
 import { watchPageErrors } from "./page-errors.mjs";
 import { animationsSettled } from "./animations.mjs";
+import { chooseDefaultSkinTone } from "./skin-tone.mjs";
 
 test("reaction plus opens a visible emoji-only picker, restores focus and publishes custom emoji", async ({
   page,
@@ -16,6 +17,7 @@ test("reaction plus opens a visible emoji-only picker, restores focus and publis
       body: '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22"><circle cx="11" cy="11" r="10" fill="purple"/></svg>',
     }),
   );
+  await chooseDefaultSkinTone(page);
   await page.goto("/tests/fixtures/emoji.html?reactions");
   const root = page
     .locator("[data-message-id]")
@@ -58,6 +60,12 @@ test("reaction plus opens a visible emoji-only picker, restores focus and publis
       const { x, y, width, height } = node.getBoundingClientRect();
       return { x, y, width, height };
     });
+  // Hover reveals the bar in a later render, and only then does its entrance
+  // animation start. Waiting for animations before the bar opens returns at
+  // once and measures a closed or still-animating bar.
+  await expect
+    .poll(() => actions.evaluate((bar) => bar.matches(":popover-open")))
+    .toBe(true);
   await animationsSettled(actions);
   const actionsBefore = await bounds(actions);
   const plusBefore = await bounds(plus);

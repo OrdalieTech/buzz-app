@@ -245,6 +245,9 @@ export class AcpProcess {
       /** Replaces the harness's own base prompt with `systemPrompt` instead
        * of appending it, for small models that a long prompt throws off. */
       replacePrompt?: boolean;
+      /** Keys the harness can find the session by later; only a harness
+       * whose `newSessionMeta` sends them keeps them. */
+      tags?: Readonly<Record<string, string>>;
       /** Given the session as soon as the harness has opened it, before it
        * is set up, so a caller can close one whose open then fails. */
       onSession?: (session: AcpSession) => void;
@@ -303,6 +306,7 @@ export class AcpProcess {
               ...(title ? { title } : {}),
               provider,
               ...(launch.platform ? { platform: launch.platform } : {}),
+              ...(launch.tags ? { tags: launch.tags } : {}),
             }),
           }),
         },
@@ -341,6 +345,16 @@ export class AcpProcess {
       throw error;
     }
     return session;
+  }
+
+  /** Whether an open session can be given a new system prompt in place. */
+  get repromptable() {
+    return !!this.hooks.systemPrompt;
+  }
+  /** Gives an open session `systemPrompt` in place of the one it was opened
+   * with, keeping its conversation. */
+  async reprompt(session: AcpSession, systemPrompt: string) {
+    await this.hooks.systemPrompt?.(this, session.id, systemPrompt);
   }
 
   private names() {
@@ -521,11 +535,11 @@ export class AcpProcess {
   ): Promise<Wire | undefined> {
     const { id, method = "", params } = (message ?? {}) as Wire;
     if (id === undefined || id === null) return undefined;
-    const response = (await tools(session?.conversation, {
-      id,
-      method,
-      params,
-    })) as Wire;
+    const response = (await tools(
+      session?.conversation,
+      { id, method, params },
+      session?.signal ?? AbortSignal.abort(new Error("The turn has ended")),
+    )) as Wire;
     const call = (params ?? {}) as {
       name?: unknown;
       arguments?: { final?: unknown };

@@ -157,6 +157,7 @@ async function fixture(archived = false) {
     snapshot: () => snapshot,
     subscribe: () => () => {},
     retry() {},
+    tryAgain() {},
     disconnect() {},
     clearCache: owner.clearCache,
   };
@@ -222,6 +223,10 @@ it.each([false, true])(
               createNavigationController(createMemoryHistory()).navigation
             }
             panels={{
+              ui: {
+                Workspace: () => null,
+                useSplit: vi.fn(),
+              },
               snapshot: () => empty,
               subscribe: () => () => {},
               register() {},
@@ -356,7 +361,10 @@ it("announces eager preparation, then background upload after Send, while editor
   const editor = screen.getByRole("textbox");
   editor.focus();
   fireEvent.paste(editor, {
-    clipboardData: { items: [{ kind: "file", getAsFile: () => source }] },
+    clipboardData: {
+      getData: () => "",
+      items: [{ kind: "file", getAsFile: () => source }],
+    },
   });
   const status = screen.getByRole("status", { name: "" });
   expect(status).toHaveAttribute("aria-live", "polite");

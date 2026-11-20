@@ -34,6 +34,109 @@ function memory() {
   };
 }
 
+function gate() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+it.each(["live", "restored"])(
+  "keeps a verified echo received during recovery's storage read (%s)",
+  async (source) => {
+    const store = memory();
+    let event = signed(viewer, input);
+    if (source === "restored")
+      store.save([{ event, signed: event, delivery: "unknown" }]);
+    const publishing = gate();
+    const reading = gate();
+    const resume = gate();
+    const h = setup(
+      {
+        ...store,
+        async load(options) {
+          const records = store.load();
+          if (options?.readOnly) {
+            reading.release();
+            await resume.promise;
+          }
+          return records;
+        },
+      },
+      vi.fn(async () => publishing.promise),
+    );
+    const consume = vi.fn();
+    try {
+      await h.outbox.ready();
+      if (source === "live") {
+        h.outbox.send(input);
+        await vi.waitFor(() => expect(h.publish).toHaveBeenCalledOnce());
+        const published = h.publish.mock.calls[0]?.[0];
+        assert.exists(published);
+        event = published;
+      }
+      const recovering = h.outbox.recover(event.id, recovery, consume);
+      await reading.promise;
+      h.observe([event]);
+      expect(h.local.snapshot()[0]?.delivery).toBe("seen");
+      resume.release();
+      await recovering;
+      expect(h.outbox.snapshot()[0]).toMatchObject({
+        event: { id: event.id },
+        signed: event,
+        recovery,
+        delivery: "seen",
+      });
+      expect(store.load()[0]).toMatchObject({ recovery, delivery: "seen" });
+      expect(consume).toHaveBeenCalledOnce();
+    } finally {
+      resume.release();
+      publishing.release();
+    }
+  },
+);
+
+it.each(["dismiss", "dispose"])(
+  "does not adopt a receipt after %s during recovery's storage read",
+  async (action) => {
+    const store = memory();
+    const event = signed(viewer, input);
+    store.save([{ event, signed: event, delivery: "failed" }]);
+    const reading = gate();
+    const resume = gate();
+    const h = setup({
+      ...store,
+      async load(options) {
+        const records = store.load();
+        if (options?.readOnly) {
+          reading.release();
+          await resume.promise;
+        }
+        return records;
+      },
+    });
+    const consume = vi.fn();
+    try {
+      await h.outbox.ready();
+      const recovering = h.outbox.recover(event.id, recovery, consume);
+      const rejected = expect(recovering).rejects.toThrow(
+        action === "dismiss" ? "unavailable" : "Relay session closed",
+      );
+      await reading.promise;
+      if (action === "dismiss") await h.outbox.dismiss(event.id);
+      else h.dispose();
+      resume.release();
+      await rejected;
+      expect(store.load().some((item) => item.recovery)).toBe(false);
+      expect(consume).not.toHaveBeenCalled();
+      expect(h.publish).not.toHaveBeenCalled();
+    } finally {
+      resume.release();
+    }
+  },
+);
+
 it("stores recovery with intent before publication and blocks publication on storage failure", async () => {
   const store = memory();
   let release: () => void = () => {};
@@ -698,5 +801,150 @@ it("does not expose replacement intent to an earlier queued save", async () => {
       expect(
         records.find((item) => item.event.id === event.id)?.acknowledged,
       ).toBe(true);
+  }
+});
+
+it("fences a fresh local recovery against another owner's durable dismissal", async () => {
+  const store = memory();
+  const a = setup(store);
+  await a.outbox.ready();
+  const id = a.outbox.send({ ...input, kind: 9007 }, recovery);
+  await vi.waitFor(() => expect(store.load()[0]?.delivery).toBe("accepted"));
+  const b = setup(store);
+  await b.outbox.ready();
+  await b.outbox.dismiss(id, recovery);
+  const publish = vi.fn(async () => {});
+  assert.exists(a.outbox.withRecovery);
+  await expect(a.outbox.withRecovery(id, recovery, publish)).rejects.toThrow(
+    "removed or changed",
+  );
+  expect(publish).not.toHaveBeenCalled();
+  assert.exists(a.outbox.finishRecovery);
+  await expect(a.outbox.finishRecovery(id, recovery)).rejects.toThrow(
+    "removed or changed",
+  );
+  expect(await a.outbox.recovery(recovery.key)).toBeUndefined();
+  expect(a.outbox.snapshot()).toEqual([]);
+  a.outbox.send({ ...input, content: "New explicit Send" });
+  await vi.waitFor(() => expect(a.publish).toHaveBeenCalledTimes(2));
+  expect(store.load().some((item) => item.event.id === id)).toBe(false);
+});
+
+it("holds shared recovery ownership through publication before dismissal can commit", async () => {
+  const store = memory();
+  const event = signed(viewer, { ...input, kind: 9007 });
+  store.save([{ event, signed: event, delivery: "accepted", recovery }]);
+  let tail = Promise.resolve();
+  let requests = 0;
+  const queued = gate();
+  const shared: OutboxStorage = {
+    ...store,
+    async lock(id, run) {
+      expect(id).toBe(event.id);
+      const before = tail;
+      const next = gate();
+      tail = next.promise;
+      if (++requests === 2) queued.release();
+      await before;
+      try {
+        return await run();
+      } finally {
+        next.release();
+      }
+    },
+  };
+  const a = setup(shared),
+    b = setup(shared);
+  await Promise.all([a.outbox.ready(), b.outbox.ready()]);
+  const entered = gate(),
+    release = gate();
+  const order: string[] = [];
+  assert.exists(a.outbox.withRecovery);
+  try {
+    const publication = a.outbox.withRecovery(event.id, recovery, async () => {
+      entered.release();
+      await release.promise;
+      order.push("published");
+    });
+    await entered.promise;
+    const dismissal = b.outbox.dismiss(event.id, recovery).then(() => {
+      order.push("dismissed");
+    });
+    await queued.promise;
+    expect(order).toEqual([]);
+    expect(store.load()).toHaveLength(1);
+    release.release();
+    await Promise.all([publication, dismissal]);
+    expect(order).toEqual(["published", "dismissed"]);
+    expect(store.load()).toEqual([]);
+    await expect(a.outbox.dismiss(event.id, recovery)).resolves.toBeUndefined();
+    expect(a.outbox.snapshot()).toEqual([]);
+  } finally {
+    release.release();
+  }
+});
+
+it.each(["key", "value"] as const)(
+  "refuses dismissal, publication and completion after shared recovery %s changes",
+  async (field) => {
+    const store = memory();
+    const event = signed(viewer, { ...input, kind: 9007 });
+    store.save([{ event, signed: event, delivery: "accepted", recovery }]);
+    const h = setup(store);
+    await h.outbox.ready();
+    const changed = { ...recovery, [field]: "different owner" };
+    store.save([
+      { event, signed: event, delivery: "accepted", recovery: changed },
+    ]);
+    const publish = vi.fn(async () => {});
+    assert.exists(h.outbox.withRecovery);
+    assert.exists(h.outbox.finishRecovery);
+    await expect(h.outbox.dismiss(event.id, recovery)).rejects.toThrow(
+      "removed or changed",
+    );
+    await expect(
+      h.outbox.withRecovery(event.id, recovery, publish),
+    ).rejects.toThrow("removed or changed");
+    await expect(h.outbox.finishRecovery(event.id, recovery)).rejects.toThrow(
+      "removed or changed",
+    );
+    expect(publish).not.toHaveBeenCalled();
+    expect(store.load()[0]?.recovery).toEqual(changed);
+  },
+);
+
+it("does not release dependent work by joining a pending abandonment", async () => {
+  const store = memory();
+  const event = signed(viewer, { ...input, kind: 9007 });
+  store.save([{ event, signed: event, delivery: "seen", recovery }]);
+  const deleting = gate(),
+    release = gate();
+  const h = setup({
+    ...store,
+    async save(records) {
+      if (!records.length) {
+        deleting.release();
+        await release.promise;
+      }
+      store.save(records);
+    },
+  });
+  await h.outbox.ready();
+  assert.exists(h.outbox.finishRecovery);
+  const deliver = vi.fn();
+  try {
+    const abandonment = h.outbox.dismiss(event.id, recovery);
+    await deleting.promise;
+    const completion = h.outbox
+      .finishRecovery(event.id, recovery)
+      .then(deliver);
+    const refused = expect(completion).rejects.toThrow("removed or changed");
+    release.release();
+    await abandonment;
+    await refused;
+    expect(deliver).not.toHaveBeenCalled();
+    expect(store.load()).toEqual([]);
+  } finally {
+    release.release();
   }
 });

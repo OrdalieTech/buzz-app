@@ -176,7 +176,7 @@ export const COMPONENTS: readonly ComponentDefinition[] = [
     purpose:
       "Compact feedback without moving the page or hiding recovery actions.",
     behavior:
-      "Sonner owns bottom-right placement, announcements, expiry and swipe dismissal. Buzz supplies themed content and an expanded, scrollable recovery stack. F6 focuses notifications.",
+      "Sonner owns top-right stacking, hover expansion, announcements, expiry and swipe dismissal. Buzz supplies themed content with trailing actions and hover/focus dismissal. F6 focuses notifications.",
     variants: ["transient", "actionable", "dismissible", "navigable"],
     status: "core",
     collection: "components",
@@ -215,7 +215,7 @@ export const COMPONENTS: readonly ComponentDefinition[] = [
     name: "Dialog",
     purpose: "A shared modal frame with title, content and actions.",
     behavior:
-      "Shared title/description header and secondary Close; 2rem insets (1rem at viewport widths up to 30rem) and a fixed 1rem minimum gutter above footer buttons outside scrolling content. Compact dialogs center; task modals start 8rem from the top. Base UI owns focus, default outside dismissal and transition presence; shared motion tokens animate entry and exit. The host can preserve native titlebar dragging through the backdrop.",
+      "Shared title/description header and secondary Close; one 12px heading-to-body gap, 2rem outer insets (1rem at viewport widths up to 30rem) and a fixed 1rem minimum gutter above footer buttons outside scrolling content. Compact dialogs center; task modals start 8rem from the top. Base UI owns focus, default outside dismissal and transition presence; shared motion tokens animate entry and exit. The host can preserve native titlebar dragging through the backdrop.",
     variants: [
       "compact (25rem)",
       "default (40rem)",
@@ -255,12 +255,13 @@ export const COMPONENTS: readonly ComponentDefinition[] = [
     slug: "radio-group",
     name: "RadioGroup",
     purpose:
-      "Choose one option, including labelled settings cards and text-only tiles.",
+      "Choose one option, including labelled settings cards, text-only tiles, and compact checkmarked rows.",
     behavior: "Base UI owns form and keyboard semantics.",
     variants: [
       "default",
       "card",
       "tile",
+      "row",
       "size: sm | md",
       "disabled",
       "invalid",
@@ -390,6 +391,21 @@ export const COMPONENTS: readonly ComponentDefinition[] = [
     composes: ["field", "radio-group"],
   },
   {
+    slug: "badge",
+    name: "Badge",
+    purpose:
+      "Present concise, non-interactive metadata such as a search result’s Best match label.",
+    behavior:
+      "XS text capsule with neutral and success tones. Not focusable or interactive.",
+    variants: ["xs neutral", "xs success"],
+    status: "proposed",
+    collection: "components",
+    owner: "Global search",
+    source: "shared/design-system/ui/Badge.tsx",
+    baseUi: [],
+    composes: [],
+  },
+  {
     slug: "count-badge",
     name: "CountBadge",
     purpose:
@@ -422,14 +438,29 @@ export const COMPONENTS: readonly ComponentDefinition[] = [
     slug: "settings-group",
     name: "SettingsGroup",
     purpose:
-      "A subtle bordered container for related settings rows or form fields, or a stack of individually bordered cards.",
+      "A subtle bordered container for related settings rows or form fields, or a stack of individually bordered cards. SettingsGroupExpand reveals rows in place under a choice.",
     behavior:
-      "Presentation only; children retain their labels, state, and interactions.",
-    variants: ["rows", "form", "cards"],
+      "Presentation only; children retain their labels, state, and interactions. Expanded rows mount when first opened; closed again, they are inert and keep their state.",
+    variants: ["rows", "form", "cards", "expand"],
     status: "proposed",
     collection: "components",
     owner: "Buzz Settings",
     source: "shared/design-system/ui/SettingsGroup.tsx",
+    baseUi: [],
+    composes: [],
+  },
+  {
+    slug: "value-chip",
+    name: "ValueChip",
+    purpose:
+      "A short read-only value in running text, such as the model a setting chose, with an optional mark.",
+    behavior:
+      "Presentation only; long values ellipsize, and an optional label names the value for assistive technology.",
+    variants: ["text", "icon"],
+    status: "proposed",
+    collection: "components",
+    owner: "Buzz Settings",
+    source: "shared/design-system/ui/ValueChip.tsx",
     baseUi: [],
     composes: [],
   },
@@ -483,6 +514,7 @@ export const COMPONENTS: readonly ComponentDefinition[] = [
       "ghost",
       "destructive",
       "outline",
+      "outline-subtle: standard border for quiet secondary actions",
       "attention (proposed): light dashed danger outline with slow marching ants",
       "glass",
       "glass-ghost (proposed): quiet artwork control with glass hover/open states",
@@ -553,6 +585,7 @@ export const COMPONENTS: readonly ComponentDefinition[] = [
       "bare (no background in any state; glyph-state toggles use 20px artwork at sm; row-revealed actions retain standard artwork sizing)",
       "shape: inset (container radius minus inset via --control-inset-radius) | control (default, 10px) | round (avatar default) | row-end | squircle (prominent avatar edit action)",
       "size: xs (20px, 12px icon) | sm (default, 32px, 16px icon) | md (40px) | lg (52px)",
+      "emoji: a glyph in place of the icon, at --size-emoji-inline",
       "legacy aliases: quiet, solid, compact, toolbar, default, large",
     ],
     status: "proposed",

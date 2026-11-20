@@ -190,16 +190,23 @@ class LegacyUnusable extends Error {}
 /**
  * A transport failure (no status), a rate limit or a 5xx may clear on its own,
  * as the native uploader reads them, so the failed page offers Try again; a
- * refusal or an answer we rejected will not. kgoose's challenge route answers
- * 429 `too_many_attempts` once five challenges are open. A host refusal (an
- * undeclared origin) also arrives with no status: native host requests reject
- * with untyped strings, so it cannot be told from a transport failure here.
+ * refusal or an answer we rejected is not promised to clear. Only an ended
+ * sign-in (401) is marked `retryable: false`: Try again would send the same
+ * credential, while signing in again can help. Other refusals keep Try again,
+ * which is the only way past a failed unlink after Start over. kgoose's
+ * challenge route answers 429 `too_many_attempts` once five challenges are
+ * open. A host refusal (an undeclared origin) also arrives with no status:
+ * native host requests reject with untyped strings, so it cannot be told from
+ * a transport failure here.
  */
 const transient = (error: unknown, status?: number) =>
-  error instanceof Error &&
-  (status === undefined || status === 429 || status >= 500)
-    ? Object.assign(error, { retryable: true })
-    : error;
+  !(error instanceof Error)
+    ? error
+    : status === undefined || status === 429 || status >= 500
+      ? Object.assign(error, { retryable: true })
+      : status === 401 && !("retryable" in error)
+        ? Object.assign(error, { retryable: false })
+        : error;
 
 /**
  * kgoose identity codes (`BuzzNostrIdentityErrorCode`) the hosted card's table

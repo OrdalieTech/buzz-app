@@ -9,7 +9,7 @@ import { useListedChannel } from "../relay/listed-channel";
 import { InlineChip } from "../../shared/design-system/ui/InlineChip";
 import type { ConversationExtensions } from "../conversation/contracts";
 import type { Profile } from "../relay/contracts";
-import type { CustomEmoji } from "../relay/emoji";
+import { emojiMatches, type CustomEmoji } from "../relay/emoji";
 import type { ComposerSession } from "./composer-session";
 import { profileKey } from "../profiles/target";
 import { scanMarkdown } from "../relay/message-content";
@@ -21,6 +21,7 @@ import {
   composerMarkdownContext,
 } from "./composer-document";
 import { messageLinkParts } from "./message-link-parts";
+import { parseBuzzLink } from "../navigation/buzz-links";
 import { messageReferences } from "./message-references";
 import { EditableInput, type EditableInputProps } from "./EditableInput";
 
@@ -215,9 +216,8 @@ export function RichComposerInput({
     () => emoji.filter((entry) => !!session.media(entry.url)),
     [emoji, session],
   );
-  const shortcodes = useMemo(
-    () =>
-      new Set(renderableEmoji.map((entry) => entry.shortcode.toLowerCase())),
+  const emojiByShortcode = useMemo(
+    () => new Map(renderableEmoji.map((entry) => [entry.shortcode, entry])),
     [renderableEmoji],
   );
   // The normalizer, the render and the token reconcile decorate the same
@@ -334,8 +334,20 @@ export function RichComposerInput({
       profileLinks.set(start, { pubkey, label: label.replace(/^@/, "") });
       add(start, end, undefined, true);
     }
-    messageLinkParts(context.text, undefined, (start, end) =>
-      add(start, end, undefined, true),
+    // A labeled channel link is one chip, like a mention: editing never
+    // exposes its Markdown or separates its label from its channel.
+    messageLinkParts(
+      context.text,
+      (start, end, _label, url) => {
+        const link = parseBuzzLink(url);
+        add(
+          start,
+          end,
+          undefined,
+          !(link?.format === "legacy" && !link.messageId),
+        );
+      },
+      (start, end) => add(start, end, undefined, true),
     );
     const inputs = [profiles, directory.named, directory.agents];
     if (
@@ -355,9 +367,8 @@ export function RichComposerInput({
       };
     for (const reference of referenced.current.references)
       add(reference.start, reference.end, undefined, true);
-    for (const match of context.text.matchAll(/:([a-z0-9_-]{1,64}):/gi))
-      if (shortcodes.has(match[1]?.toLowerCase() ?? ""))
-        add(match.index, match.index + match[0].length);
+    for (const match of emojiMatches(context.text, emojiByShortcode))
+      add(match.start, match.end);
     for (const [start, { end }] of gifPreviews)
       if (!ranges.some((range) => start < range.end && end > range.start))
         ranges.push({ start, end });

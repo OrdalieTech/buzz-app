@@ -16,6 +16,7 @@ import {
   MenuTrigger,
 } from "../../shared/design-system/ui/Menu";
 import styles from "./WorkspaceControl.module.css";
+import { useRegionWorkspace } from "./chat-workspace";
 
 export function WorkspaceControl({
   session,
@@ -31,19 +32,25 @@ export function WorkspaceControl({
   disabled?: boolean;
 }) {
   const regions = useSoloNavigation(session);
+  // A region's chat is filed by its region, when the region offers that.
+  const filed = useRegionWorkspace(session, channelId);
   const [snapshot, setSnapshot] = useState(() =>
-    session.soloPreferences.snapshot(),
+    session.sidebarPreferences.snapshot(),
   );
   useEffect(() => {
-    const subscribe = session.soloPreferences.subscribe;
+    const subscribe = session.sidebarPreferences.subscribe;
     if (typeof subscribe !== "function") return;
-    return subscribe(() => setSnapshot(session.soloPreferences.snapshot()));
+    return subscribe(() => setSnapshot(session.sidebarPreferences.snapshot()));
   }, [session]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const projectId =
     value ??
-    (channelId ? snapshot.data?.assignments[channelId] : undefined) ??
+    (filed
+      ? filed.id
+      : channelId
+        ? snapshot.data?.assignments[channelId]
+        : undefined) ??
     "";
   const project = snapshot.data?.sections.find((item) => item.id === projectId);
   const choose = (next: string) => {
@@ -53,34 +60,42 @@ export function WorkspaceControl({
       return;
     }
     if (!channelId) return;
-    const blocked = prepareSoloMove(session, channelId);
+    const blocked = filed ? undefined : prepareSoloMove(session, channelId);
     if (blocked) {
       setError(blocked);
       return;
     }
     setBusy(true);
-    void session.soloPreferences
-      .assign(channelId, next || undefined)
+    void (
+      filed
+        ? filed.file(next || undefined)
+        : session.sidebarPreferences.assign(channelId, next || undefined)
+    )
       .catch((reason: unknown) =>
         setError(reason instanceof Error ? reason.message : String(reason)),
       )
       .finally(() => setBusy(false));
   };
   const name = project ? `Workspace: ${project.name}` : "Add workspace";
-  if (channelId && regions.excluded.has(channelId)) return null;
+  if (channelId && regions.managed.has(channelId) && !filed) return null;
   return (
     <span className={styles.control}>
-      <MenuRoot>
+      {/* Saving keeps the trigger focusable, so the choice returns focus to it. */}
+      <MenuRoot
+        onOpenChange={(open, details) => {
+          if (open && busy) details.cancel();
+        }}
+      >
         <MenuTrigger
           disabled={
             disabled ||
-            busy ||
-            snapshot.status === "idle" ||
-            snapshot.status === "loading"
+            (!snapshot.data &&
+              (snapshot.status === "idle" || snapshot.status === "loading"))
           }
           render={(props) => (
             <Button
               {...props}
+              aria-disabled={busy || undefined}
               variant="ghost"
               size="sm"
               shape={project ? "capsule" : "icon"}
@@ -114,7 +129,7 @@ export function WorkspaceControl({
             ))}
           </MenuRadioGroup>
           {snapshot.status === "error" && (
-            <MenuItem onClick={() => void session.soloPreferences.refresh()}>
+            <MenuItem onClick={() => void session.sidebarPreferences.refresh()}>
               Retry workspaces
             </MenuItem>
           )}

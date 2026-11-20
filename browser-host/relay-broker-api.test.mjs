@@ -3,6 +3,7 @@ import { Context } from "@deepseek-ai/cordis";
 import { HostService } from "../src/features/host/service.ts";
 import { authTagOwner } from "../src/features/agents/owner-attestation.ts";
 import { publishAgentRecord } from "../src/features/agents/relay-removal.ts";
+import { publishProfile } from "../src/features/communities/api.ts";
 import { logSocketFrame } from "../src/features/developer/traffic.ts";
 import { getLogger, setLogLevel } from "../src/features/developer/logging.ts";
 import { brokerSocket, openBrokerSocket } from "../tests/broker-socket.mjs";
@@ -1303,6 +1304,37 @@ test.each([
   },
 );
 
+test("each community has its own query capacity", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const h = await harness(async (call, count, event) => {
+    await held;
+    return success(call, count, event);
+  });
+  const controllers = [];
+  const post = (route) => {
+    const controller = new AbortController();
+    controllers.push(controller);
+    return h.post(route, filters, controller.signal);
+  };
+  try {
+    const primary = Array.from({ length: 6 }, () => post("primary/query"));
+    await vi.waitFor(() => expect(h.calls).toHaveLength(6));
+    expect((await h.post("primary/query", filters)).status).toBe(429);
+    const secondary = post("secondary/query");
+    await vi.waitFor(() => expect(h.calls).toHaveLength(7));
+    release();
+    for (const response of [...primary, secondary])
+      expect((await response).status).toBe(200);
+  } finally {
+    release();
+    for (const c of controllers) c.abort();
+    await h.close();
+  }
+});
+
 test("local capacity is explicitly unsent, not relay quota; unknown upstream publication is never resent", async () => {
   let release;
   const held = new Promise((resolve) => {
@@ -2216,6 +2248,55 @@ test("message/reaction deletions pass real signing and publication without admit
   }
 });
 
+test("a profile save keeps a Buzz mobile emoji avatar through the broker, never other SVG", async () => {
+  const h = await harness(success);
+  try {
+    const http = globalThis.fetch;
+    vi.stubGlobal("fetch", (url, input) => http(new URL(url, h.base), input));
+    // Buzz mobile's emojiAvatarDataUrl("🛹", 0xFFFFB84D).
+    const svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" rx="256" fill="#FFB84D"/><text x="50%" y="56%" dominant-baseline="middle" text-anchor="middle" font-size="258">🛹</text></svg>';
+    const picture = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+    const published = () =>
+      h.calls.filter((call) => call.url.endsWith("/events"));
+    await publishProfile(
+      fixtureRelayUrl,
+      { name: "Changed", picture, about: "Keep this" },
+      { picture, website: "https://example.org" },
+    );
+    expect(published()).toHaveLength(1);
+    const event = published()[0].body;
+    expect(verifyEvent(event)).toBe(true);
+    expect(event).toMatchObject({ kind: 0, pubkey: h.event.pubkey });
+    expect(JSON.parse(event.content)).toEqual({
+      picture,
+      website: "https://example.org",
+      name: "Changed",
+      display_name: "Changed",
+      about: "Keep this",
+    });
+    for (const rejected of [
+      "data:image/svg+xml,%3Csvg%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E%3C%2Fsvg%3E",
+      `data:image/svg+xml,${encodeURIComponent(svg.replace("<text ", '<text onclick="alert(1)" '))}`,
+      `data:image/svg+xml,${encodeURIComponent(svg.replace("#FFB84D", "url(https://example.org/x)"))}`,
+      "data:image/png;base64,AA==",
+      "http://example.org/avatar.png",
+      `https://example.org/${"a".repeat(2048)}`,
+    ])
+      await expect(
+        publishProfile(
+          fixtureRelayUrl,
+          { name: "Changed", picture: rejected },
+          {},
+        ),
+      ).rejects.toThrow(/optional HTTPS picture URL/);
+    expect(published()).toHaveLength(1);
+  } finally {
+    vi.unstubAllGlobals();
+    await h.close();
+  }
+});
+
 test("agent profile saves publish owner-signed listings through the broker outbox", async () => {
   const h = await harness(success);
   let traffic;
@@ -2455,6 +2536,106 @@ test("direct-message transport signs only bounded participants and binds the ret
       expect((await h.post("direct-message", { pubkeys })).status).toBe(400);
     }
     expect(h.calls).toHaveLength(2);
+  } finally {
+    await h.close();
+  }
+});
+
+test("direct-message transport opens and adds to a DM with or without its history", async () => {
+  const channelId = "11111111-1111-4111-8111-111111111111";
+  const h = await harness((call) =>
+    Response.json({
+      accepted: true,
+      event_id: call.body.id,
+      message: `response:${JSON.stringify({ channel_id: channelId })}`,
+    }),
+  );
+  try {
+    const transport = await connectBrokerTransport(h.base);
+    const person = "a".repeat(64);
+    for (const includeHistory of [true, false])
+      await expect(
+        transport.openDirectMessage([person], new AbortController().signal, {
+          channelId,
+          includeHistory,
+        }),
+      ).resolves.toBe(channelId);
+    await expect(
+      transport.openDirectMessage([person], new AbortController().signal, {
+        includeHistory: true,
+      }),
+    ).resolves.toBe(channelId);
+    const [grown, forked, shared] = h.calls.map((call) => call.body);
+    expect(verifyEvent(grown)).toBe(true);
+    expect(grown.kind).toBe(41011);
+    expect(grown.tags.filter(([tag]) => tag !== "client")).toEqual([
+      ["h", channelId],
+      ["p", person],
+      ["history", "include"],
+    ]);
+    expect(forked.kind).toBe(41011);
+    expect(forked.tags.filter(([tag]) => tag !== "client")).toEqual([
+      ["h", channelId],
+      ["p", person],
+    ]);
+    expect(shared.kind).toBe(41010);
+    expect(shared.tags.filter(([tag]) => tag !== "client")).toEqual([
+      ["p", person],
+      ["history", "include"],
+    ]);
+    for (const body of [
+      { pubkeys: [person], channel: "not-a-channel", includeHistory: true },
+      { pubkeys: [person], channel: channelId },
+      { pubkeys: [person], channel: channelId, includeHistory: "yes" },
+      { pubkeys: [person], includeHistory: "yes" },
+    ])
+      expect((await h.post("direct-message", body)).status).toBe(400);
+    expect(h.calls).toHaveLength(3);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an addition can ask the relay first, and its refusal reaches the app as words to show", async () => {
+  const channelId = "11111111-1111-4111-8111-111111111111";
+  const reasons = [
+    "needs-choice: history",
+    'invalid: history must be "include", got "ask"',
+    "invalid: DM supports at most 9 people",
+    'invalid: history must be "include", got "x"',
+  ];
+  const h = await harness(() =>
+    Response.json({ error: reasons.shift() }, { status: 400 }),
+  );
+  try {
+    const transport = await connectBrokerTransport(h.base);
+    const person = "a".repeat(64);
+    const ask = () =>
+      transport.openDirectMessage([person], new AbortController().signal, {
+        channelId,
+        includeHistory: "ask",
+      });
+    await expect(ask()).rejects.toThrow("needs-choice: history");
+    await expect(ask()).rejects.toThrow("needs-choice: history");
+    await expect(ask()).rejects.toThrow(
+      "Couldn’t add them. A DM holds up to 9 people, not counting agents.",
+    );
+    await expect(ask()).rejects.toThrow("Couldn’t add them. Try again.");
+    expect(h.calls[0].body.tags.filter(([tag]) => tag !== "client")).toEqual([
+      ["h", channelId],
+      ["p", person],
+      ["history", "ask"],
+    ]);
+    // Only an addition asks.
+    expect(
+      (
+        await h.post("direct-message", {
+          pubkeys: [person],
+          includeHistory: "ask",
+        })
+      ).status,
+    ).toBe(400);
+    expect(h.calls).toHaveLength(4);
   } finally {
     await h.close();
   }
@@ -3924,6 +4105,66 @@ test("details routes are narrow, require the live owner, and do not widen lifecy
   }
 });
 
+test("later Admin additions cross the broker and replay the exact saved event after restart", async () => {
+  const h = await harness(success);
+  let first;
+  let restored;
+  let live;
+  let records = [];
+  const storage = {
+    load: () => structuredClone(records),
+    save: (next) => {
+      records = structuredClone(next);
+    },
+  };
+  try {
+    const transport = await connectBrokerTransport(h.base);
+    first = createOutbox(transport.viewer, transport.writer, storage);
+    await first.outbox.ready();
+    const id = first.outbox.send({
+      kind: 9000,
+      content: "",
+      tags: [
+        ["h", "11111111-1111-4111-8111-111111111111"],
+        ["p", getPublicKey(new Uint8Array(32).fill(5))],
+        ["role", "admin"],
+      ],
+    });
+    await vi.waitFor(() =>
+      expect(first.outbox.snapshot()[0]?.delivery).toBe("failed"),
+    );
+    // Signing succeeds through the purpose-bound route. Publication needs a live socket.
+    const signed = first.outbox.snapshot()[0]?.signed;
+    expect(signed).toBeDefined();
+    const saved = JSON.parse(JSON.stringify(signed));
+    expect(verifyEvent(structuredClone(saved))).toBe(true);
+    expect(saved.tags).toContainEqual(["role", "admin"]);
+    expect(saved.tags.at(-1)?.[0]).toBe("client-id");
+    expect(h.publications).toHaveLength(0);
+    expect((await h.post("sign", saved)).status).toBe(400);
+    expect((await h.post("publish", saved)).status).toBe(400);
+    first.dispose();
+    wallClock += 10000;
+    const resumed = await connectBrokerTransport(h.base);
+    live = await openBrokerSocket(resumed);
+    restored = createOutbox(resumed.viewer, resumed.writer, storage);
+    await restored.outbox.ready();
+    restored.outbox.retry(id);
+    await vi.waitFor(() =>
+      expect(restored.outbox.snapshot()[0]?.delivery).toBe("accepted"),
+    );
+    expect(h.publications).toEqual([saved]);
+    expect(
+      JSON.parse(JSON.stringify(restored.outbox.snapshot()[0]?.signed)),
+    ).toEqual(saved);
+  } finally {
+    first?.dispose();
+    restored?.dispose();
+    live?.dispose();
+    await h.close();
+  }
+});
+
 test("member administration uses isolated shape-limited routes and the current community socket", async () => {
   const h = await harness(success);
   let live;
@@ -3980,6 +4221,26 @@ test("member administration uses isolated shape-limited routes and the current c
       { ...template, tags: [...template.tags, ["h", id]] },
       { ...template, tags: null },
       { ...template, tags: [null] },
+      ...[
+        [...template.tags, ["client-id", "invalid"]],
+        [
+          ...template.tags,
+          ["client-id", "22222222-2222-4222-8222-222222222222"],
+          ["p", target],
+        ],
+        [
+          template.tags[0],
+          ["p", transport.viewer],
+          template.tags[2],
+          ["client-id", "22222222-2222-4222-8222-222222222222"],
+        ],
+        [
+          template.tags[0],
+          template.tags[1],
+          ["role", "owner"],
+          ["client-id", "22222222-2222-4222-8222-222222222222"],
+        ],
+      ].map((tags) => ({ ...template, tags })),
     ];
     for (const event of invalid)
       for (const route of [

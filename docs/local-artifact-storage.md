@@ -43,10 +43,53 @@ transactions. Restart a query after a notification when rows can move between pa
 Notifications follow commit and reach other windows through BroadcastChannel.
 They contain no saved content. Subscribe before the first read, then read again.
 
+## Changed-entry hints
+
+New hosts also expose optional `collection.subscribeChanges(listener)`. Feature
+detect it for older hosts. Each hint is `{ ids: readonly string[] }` or
+`{ reset: true }`. A hint only invalidates local reads. It supplies no content,
+access proof, revision order, or relay synchronization. Re-read each ID with
+`get`, including IDs no longer present in the consumer's index. Remove its old
+index state when the entry is absent or no longer qualifies. Check availability
+before using shared content.
+
+The feed covers committed shared revisions, availability changes, imports, and
+device preferences. IDs are deduplicated within a batch. Unchanged writes,
+import markers, checkpoints, and refresh errors produce no changed-entry hint.
+An aborted transaction produces none. The original `subscribe` still reports
+those metadata commits so error and progress consumers retain their behavior.
+All open handles for the same viewer, relay, plugin, and collection receive
+hints, including handles in other windows. Notifications may merge; they are
+not a durable log or one callback per commit.
+
+The host bounds a hint and its queued IDs to 512 IDs and 16,384 string code units.
+Overflow produces `reset`. Purge, index upgrades, legacy or unknown broadcasts,
+and unreadable messages also reset the index. Old handles reject reads after a
+schema change or purge; close and reopen them. The host resets live consumers
+when their document becomes visible or returns from the back-forward cache.
+These events cover browser suspension; a consumer must still rebuild whenever
+it reopens, resubscribes, or cannot establish delivery continuity.
+
+Build an index with this ordering:
+
+1. Subscribe before the first paged read. Capture the current community generation.
+2. Buffer changed IDs while scanning. Bound this buffer too; overflow restarts the scan.
+3. After the final page, drain the buffered IDs through bounded `get` calls.
+   Serialize reads for an ID, or discard older completions with a generation guard.
+4. Publish only after the scan and buffered reads settle. Keep the subscription
+   active and apply later IDs with the same ordering guard.
+5. A reset invalidates both the index and in-flight reads. Restart the scan.
+   Discard all completions from a closed handle or an old community generation.
+
+Subscribe alone does not send an initial snapshot. An older host without this
+method needs the consumer's existing fallback. Adding a subscription starts no
+relay reads and does not open another collection.
+
 ## Device data
 
 `preferences.update(id, change)` reads the latest preference, calls the synchronous
-callback, saves the result, and rebuilds that row's indexes in one transaction.
+callback, saves the result, and updates that row's indexes in one transaction.
+Unchanged index entries stay saved, including when only device preferences change.
 Preferences stay in a separate store. Values such as `false` and `null` remain
 explicit. The callback must return JSON and must not start asynchronous work.
 
@@ -126,12 +169,27 @@ edits. Sync and delivery own this boundary; the row store does not merge optimis
 edits into confirmed state. Publication conflicts remain failed edits with the
 attempted value retained. Offline shared edits remain undecided.
 
+## Artifact publication outcomes
+
+`session.configArtifactWriter.isNotSent(error)` returns true only when the host
+proves that the rejected publication did not deliver the event. A caller can then
+retry its saved event after a transient refusal. It must check current access
+before each attempt. The method does not grant access or waive relay validation.
+
+The method is optional for older hosts and other writers. Without a true result,
+the caller must treat the send as uncertain and read back its outcome before a
+retry. Do not classify delivery from error text or a class name. An accepted
+receipt confirms publication; a network error does not prove non-delivery.
+
 ## Storage costs
 
 Writes request strict durability. Transactions include only the object stores that each operation uses. Row writes
 and indexed pages use all four stores. Metadata operations use only metadata.
-Large row batches can still delay other collections' reads or writes. A changed row rewrites
-its indexes. Index upgrades scan the collection. Delta completion does not scan records.
+Large row batches can still delay other collections' reads or writes. A changed row
+recomputes its projected indexes but writes only added or removed entries. Index
+upgrades scan the collection. Delta completion does not scan records.
+An unchanged record and preference need no row writes or index rebuild.
+Source, refresh, and revision checks still run before this comparison.
 Ancestry comparison and separate source-membership writes are absent. The database upgrade removes the obsolete membership store, builds the host
 channel index, and preserves records and device preferences. Leaving a community purges only its saved partition. If database
 opening fails, close that handle and open another after the cause clears.

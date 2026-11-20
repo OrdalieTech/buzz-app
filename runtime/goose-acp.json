@@ -1,26 +1,26 @@
 {
-  "version": "1.58.1",
-  "revision": "c97af00bca96442611bb95155c56d6109afa42d6",
+  "version": "1.60.1",
+  "revision": "b4e789ef5fd0243415243d7dfd9113c91b517c3c",
   "assets": {
     "aarch64-apple-darwin": {
-      "url": "https://github.com/aaif-goose/goose/releases/download/v1.58.1/goose-acp-aarch64-apple-darwin.tar.gz",
-      "sha256": "e6667ba0741efc959f09a7ccadbad368f0ca3c47de77395d4d5d120a81301d4f"
+      "url": "https://github.com/aaif-goose/goose/releases/download/v1.60.1/goose-acp-aarch64-apple-darwin.tar.gz",
+      "sha256": "9ed35767856e0f234c088043e93ce36239902eb5dcbcb18296effe911ae75a5d"
     },
     "aarch64-unknown-linux-gnu": {
-      "url": "https://github.com/aaif-goose/goose/releases/download/v1.58.1/goose-acp-aarch64-unknown-linux-gnu.tar.gz",
-      "sha256": "63cb3912ab90cef0393ac7ce1972f13f90a8a3ff02addd56d185327e30e7a4db"
+      "url": "https://github.com/aaif-goose/goose/releases/download/v1.60.1/goose-acp-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "2c78ba5fd57c5e7299513026903c5c76b9c259c925de66003eb3d0d12cc64704"
     },
     "x86_64-apple-darwin": {
-      "url": "https://github.com/aaif-goose/goose/releases/download/v1.58.1/goose-acp-x86_64-apple-darwin.tar.gz",
-      "sha256": "9ea41333d67ebbc22824d83125dc28ba4b828e60995996d8efc2ab32b9e9c225"
+      "url": "https://github.com/aaif-goose/goose/releases/download/v1.60.1/goose-acp-x86_64-apple-darwin.tar.gz",
+      "sha256": "dd9a59bcc5681d0495a23701ef6f24712c9bc26a25ca20f9f8f1f03b4ed39222"
     },
     "x86_64-pc-windows-msvc": {
-      "url": "https://github.com/aaif-goose/goose/releases/download/v1.58.1/goose-acp-x86_64-pc-windows-msvc.zip",
-      "sha256": "06497e124803b157829a09bc61b8d812fa6001d482fc49710cf7dbb025d130bc"
+      "url": "https://github.com/aaif-goose/goose/releases/download/v1.60.1/goose-acp-x86_64-pc-windows-msvc.zip",
+      "sha256": "3bc797e74c9cb4f2bdb9b8209cf91f6d1f42e29665259ef659f2cf393abbafdc"
     },
     "x86_64-unknown-linux-gnu": {
-      "url": "https://github.com/aaif-goose/goose/releases/download/v1.58.1/goose-acp-x86_64-unknown-linux-gnu.tar.gz",
-      "sha256": "b1f09fa20da82efc74a7b025ee46c1f8fac2c51588776a266b3e5f847a66839e"
+      "url": "https://github.com/aaif-goose/goose/releases/download/v1.60.1/goose-acp-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "3725d3d385605a9d516bf810edcb0b7405ca774c0a4f32bab75c86d37bcbeedf"
     }
   }
 }

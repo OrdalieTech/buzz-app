@@ -40,11 +40,21 @@ test("qualifies a whitespace namesake in Members and opens its exact profile", a
   expect(errors.unexplained()).toEqual([]);
 });
 
-test("transient profiles replace without retiring Back/Forward return paths", async ({
+test("specialized profile panels preserve Back/Forward, explicit Close and reopening", async ({
   page,
 }) => {
-  await page.goto("/tests/fixtures/profiles.html");
+  await page.goto("/tests/fixtures/profiles.html?specialized-profile");
   await page.waitForFunction(() => !!window.profilesFixture);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.profilesFixture.panels.resolve(
+            window.profilesFixture.targets.viewer,
+          )?.key,
+      ),
+    )
+    .toBe("example.profiles/enriched");
   const read = () =>
     page.evaluate(() => window.profilesFixture.navigation.snapshot());
   const channel = (await read()).entry.id;
@@ -60,6 +70,16 @@ test("transient profiles replace without retiring Back/Forward return paths", as
     return (await read()).entry.id;
   };
   const viewer = await view("Viewer");
+  const extra = page.getByRole("button", {
+    name: "Extra profile action",
+    exact: true,
+  });
+  await expect(extra).toBeVisible();
+  await extra.focus();
+  await page.keyboard.press("Tab");
+  await expect(
+    page.getByRole("button", { name: "Copy npub", exact: true }),
+  ).toBeFocused();
   const mic = await view("Mic");
   const tabs = page.getByRole("tablist", { name: "Panel tabs" });
   await expect(tabs.getByRole("tab")).toHaveCount(1);
@@ -91,6 +111,7 @@ test("transient profiles replace without retiring Back/Forward return paths", as
   await page.goForward();
   await expect.poll(async () => (await read()).entry.id).toBe(closed);
   expect((await read()).canGoForward).toBe(false);
+  expect(await view("Mic")).not.toBe(mic);
 });
 
 // Real relay-session replacement and native history traversal exercise the
@@ -927,12 +948,14 @@ for (const local of [false, true]) {
         [],
       );
     } else {
+      // Without a DM, Message drafts one: Pinky sees nothing until a send.
       await message.click();
-      await expect
-        .poll(() => page.evaluate(() => window.profilesFixture.dmOpens))
-        .toEqual([
-          [await page.evaluate(() => window.profilesFixture.keys.pinky)],
-        ]);
+      await expect(
+        page.getByRole("button", { name: "Remove Pinky" }),
+      ).toBeVisible();
+      expect(await page.evaluate(() => window.profilesFixture.dmOpens)).toEqual(
+        [],
+      );
     }
     expect(errors.unexplained()).toEqual([]);
   });
@@ -1295,7 +1318,9 @@ test("member Send message navigates a human DM without sending or returning focu
   page,
 }) => {
   const errors = watchPageErrors(page);
-  await page.goto("/tests/fixtures/profiles.html?member-message");
+  await page.goto("/tests/fixtures/profiles.html?member-message&existing-dm");
+  // The existing DM opens first; Members starts from channel One.
+  await page.locator('[data-channel-id="one"]').click();
   await page
     .getByRole("button", { name: "Manage members of One", exact: true })
     .click();

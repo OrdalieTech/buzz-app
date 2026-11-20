@@ -83,8 +83,9 @@ remain distinct. Shared tabs connect related views of one object; route destinat
 retain navigation semantics except for the shell dock described in
 [Chrome route navigation](#chrome-route-navigation). When replacing a focused page heading with shared
 chrome, preserve a meaningful destination focus target, such as a named content
-region. Do not add a duplicate title or discard the focus handoff just because the
-shared heading has no ref or tabIndex prop. [Inbox](../../bundled/inbox/InboxPage.tsx) demonstrates
+region. Do not add a duplicate title or discard the focus handoff: pass `ref` and
+`tabIndex={-1}` to the shared heading to make it a focus landing after an action
+removes the controls it introduces; its recipe draws the keyboard-only ring. [Inbox](../../bundled/inbox/InboxPage.tsx) demonstrates
 body filters and list/detail ownership; [Solo chats](../../bundled/channels/ChannelsPage.tsx)
 demonstrates a working area with a persistent composer. Neither is a blanket visual
 template: check the adoption review before copying their surrounding chrome.
@@ -131,6 +132,13 @@ Keep group headings outside SettingsGroup, and use the documented field/section
 gaps rather than each plugin inventing its own rhythm. Dependent preferences retain
 the row's alignment. A row is not an extra click target around its input. Preserve
 visible labels and connect help/error text; placeholders cannot replace labels.
+When a choice in a row reveals more settings, such as Manual under an Automatic
+or Manual select, wrap those rows in `SettingsGroupExpand` inside the same `rows`
+group rather than opening a second group or a disclosure. The revealed rows line
+up with the choice's title after its icon, enter with the panel motion (none
+with reduced motion), mount when first opened, and then stay mounted but inert
+while closed, so a draft survives switching back. Show what a choice picked as a `ValueChip` in the row's
+subtitle; keep it to the value itself, not how it was chosen.
 Use `Accordion` for optional details, retaining mounted draft input where needed.
 Use `Accordion variant="settings"` for disclosures alongside preference rows.
 Inside a row-layout `SettingsGroup`, it shares the group's frame and content inset,
@@ -440,12 +448,14 @@ Sign in, Cancel, and Sign out at narrow widths with enlarged text.
 
 Source plugins can import the shared components directly. External plugins must
 use the actual supported author contract and exposed CSS roles; source paths are
-not a published component SDK. These are composition requirements for Buzz UI,
-not a claim that arbitrary external code is automatically constrained. Do not
-introduce a private reset, theme provider, palette, body-level stylesheet, global
-control override, or parallel dialog/toast system to make one contribution fit.
-Keep plugin styles scoped to owned layout/content. Renderer exceptions do not
-exempt surrounding controls from shared appearance.
+not a published component SDK. The author contract's preview `ui` service offers a
+few of these controls to plugins with narrower props (`src/features/plugin-ui`).
+These are composition requirements for Buzz UI, not a claim that arbitrary
+external code is automatically constrained. Do not introduce a private reset,
+theme provider, palette, body-level stylesheet, global control override, or
+parallel dialog/toast system to make one contribution fit. Keep plugin styles
+scoped to owned layout/content. Renderer exceptions do not exempt surrounding
+controls from shared appearance.
 
 For a genuinely new surface, describe its task and the nearest recipe first.
 State the missing capability and smallest extension in its existing owner. Keep
@@ -468,6 +478,12 @@ An affordance is a control or action color. CSS spells these `--surface-panel`,
 Tailwind utilities include `bg-surface-panel`, `text-standard`,
 `border-prominent` and `bg-affordance-subtle-hover`. Text and border registrations
 stay in separate namespaces so they cannot accidentally share a value.
+
+Shared Markdown has a deliberate content exception: inline snippets, fenced
+code frames, and the backing behind pinned code actions use `affordance-subtle`
+to keep one code fill in both themes. Their text uses the renderer's existing
+text roles. This exception belongs to the shared Markdown renderer; other
+recessed content continues to use `surface-inset`.
 
 Enabled sidebar section headings, disclosure chevrons and quiet section actions
 use `text-subtle`, not `text-unavailable`. Disabled controls keep their shared
@@ -651,7 +667,7 @@ in identity, guidance, transitions, and ceremony. Use color to convey meaning.
 Use the surface that matches the content and its position in the interface.
 
 - **Panels:** the shell joins sidebar navigation and the main content workspace into one surface beside the app dock. The sidebar resize grip sits on their shared `border-standard` seam. Both retain opaque surfaces when navigation overlays at narrow widths. Nested Panels keep their opaque fill and clipping but lose independent borders, corners, and shadows. The layout owner separates adjacent regions with `border-standard` hairlines. Standalone Panels use `radius-container` (24px) corners and `shadow-panel` for a translucent contour and subtle lift, rather than an opaque depth border.
-- **Recessed regions:** use `bg-inset` for a region pushed into its surrounding surface. Use quiet fills where they communicate separation; reserve outlines for boundaries that need to be identified.
+- **Recessed regions:** use `bg-inset` for a region pushed into its surrounding surface. Use `surface-inset-subtle` for a quieter reading pane, such as a search preview: it mixes the panel and inset surfaces equally in both modes. Use quiet fills where they communicate separation; reserve outlines for boundaries that need to be identified.
 - **Shell:** `bg-app` is a solid color, neutral-quiet-hover in light mode and neutral 2 in dark. The shell owns one continuous `texture-dots` grid beneath its header, rail and panes. Dots derive from this background: darker in light mode, lighter in dark mode, never an unrelated gray. The app root owns the background and its texture together. Do not override a descendant background and expect inherited texture colors to recompute. The pattern is decorative; do not increase its contrast to communicate state. The one exception to the solid shell is a backdrop a plugin explicitly registers ([shell backdrops](../../../docs/plugin-architecture.md#shell-backdrops)); the default shell has none. A backdrop may cover the dots and gutters only. Panes stay opaque, and the host keeps solid `bg-app` beneath each header control group and the app dock so their ink, fills and focus rings keep this background's contrast. The host shows no backdrop under reduced motion, reduced transparency or forced colors.
 - **Reading surfaces:** documentation and dense prose sit on opaque `bg-panel`. Keep the dot grid outside reading panes. Do not add gradient backgrounds to the app shell.
 - **Borders:** use `border-standard` for quiet separators, `border-prominent` for controls, and `border-focus` for keyboard-focus recipes. Errors and warnings have their own boundary roles. Measure the actual pairing in both themes.
@@ -1062,8 +1078,15 @@ other IconButtons.
 IconButton also offers `xs` (20px with 12px icons) for dense formatting actions. Mode
 toggles remain `sm`.
 
+An IconButton takes either `icon` or `emoji`. Use `emoji` when the action is
+best shown as an emoji, such as a skin-tone choice shown as a hand in that tone.
+The glyph uses `--font-emoji` at `--size-emoji-inline`, centred in the same
+control. Its accessible name still comes from `aria-label`.
+
 An `xs` Button whose label starts with an icon reduces its leading padding to its
 4px vertical padding, so the icon sits evenly in the capsule's leading corner.
+An `xs` Button with a small leading dot uses `data-leading-dot` for a 10px leading
+inset; its trailing inset remains 12px.
 
 Utility icon actions share the rounded rectangle in resting, hover, pressed, and
 selected states. Avatar controls default to round; use `shape="round"` for deliberate
@@ -1315,7 +1338,7 @@ PanelHeader owns one consistent header frame: leading `navigation`, title/icon,
 and trailing `actions`. `PanelHeaderLabel` supplies the smaller tab-aligned
 label role; omit its optional icon for image and video detail titles. Use a small IconButton with ArrowLeft for a local back
 action and X for closing the panel. The default 2.5rem (40px at the default root size) minimum height aligns conversation,
-thread, profile, tabbed workspace, and Todos headers. The compact variant shares
+thread, profile and tabbed workspace headers. The compact variant shares
 this height. Headers use 0.25rem inline padding (matching the centered 2rem controls’
 block inset), 1rem identity icons, and
 0.25rem gaps between action buttons without reducing their hit areas. Navigation
@@ -1397,15 +1420,20 @@ or explicit-save actions inside the content, rather than a modal-wide Save foote
 
 Use `text-label` (16px, 500 weight at the default scale) for the shared Dialog
 title. Group the title and optional description with `--space-2` (8px), beside
-the close button so its hit area does not enlarge the text gap. The body owns
-vertical padding matching the dialog's horizontal `--dialog-padding`: `2rem`,
-or `1rem` at viewport widths up to `30rem`. Do not add an outer flex gap
-on top of that body padding. Footers following body content also reserve a fixed
+the close button so its hit area does not enlarge the text gap. Dialog uses one
+`--space-3` (12px) heading-to-body gap at every breakpoint. Sticky headers do not
+add another gap; omit `headerGap` in callers. `headerGap="compact"` remains a
+compatible alias. AlertDialog
+retains its body inset matching the horizontal `--dialog-padding`: `2rem`, or
+`1rem` at viewport widths up to `30rem`. Dialog body-bottom padding also retains
+that responsive inset. Do not add an outer flex gap on top of the shared spacing.
+Search and integrated navigation retain their own framing.
+Padded chrome keeps the gap on its fixed header rather than inside the body
+scrollport.
+Footers following body content also reserve a fixed
 `--space-4` (`1rem`) top gutter outside the scrollport, so scrolling content never
 meets the buttons directly. Header-only confirmations retain their header-to-action
-gap. Create/Edit channel forms and plugin update reviews opt into
-`headerGap="compact"` for a 12px heading-to-body gap at every breakpoint;
-other dialog compositions retain their default spacing. Channel privacy confirmation
+gap. Channel privacy confirmation
 steps also opt into `footerGap="compact"` for `0.5rem` of body-bottom padding
 before the fixed footer gutter; returning to the form restores the normal
 body-bottom padding.
@@ -1486,18 +1514,19 @@ Base UI instant states and keyboard navigation skip transitions; reduced motion
 keeps only the fade.
 
 ToastProvider mounts one headless [Sonner](https://sonner.emilkowal.ski) Toaster
-in the host, portaled outside the app layout to the bottom right. Features and
+in the host, portaled outside the app layout to the top right. Features and
 plugins use the shared Toast API, never their own Toaster or direct Sonner calls.
 Toast cards reuse `floating-surface`, including its `--shadow-panel` elevation; the
 scrollable viewport leaves room for the shadow and keyboard focus.
 Buzz owns the floating surface, semantic colors, type roles, Button and IconButton;
 headless content inherits the host theme and text size without an OS-theme override.
 Group title and description with `space-1` (4px), then separate actions with
-`space-3` (12px). Use `space-3` padding on every card edge. The dismiss slot is
-independent of the text group so its 32px hit target cannot open a gap between
-title and description. It extends 8px toward the trailing edge and 4px vertically
-into the padding; title-only confirmations stay centered beside it. Descriptions
-use secondary text, and actions align with the message's leading edge.
+`space-3` (12px). Use `space-4` padding on every card edge. The close control floats at the upper
+leading corner and appears on hover or keyboard focus, remaining visible on
+touch. Descriptions use subtle text; actions trail the message and wrap below
+it when space is limited.
+Ordinary Tab or Shift+Tab entry expands the stack, and it remains expanded and
+scrollable while it contains focus, including when the pointer leaves.
 The pinned Sonner patch preserves intentional focus destinations when leaving a
 toast; fallback restoration still applies when focus is otherwise lost. Expiry
 pauses while the stack is hovered, focused or being dragged, independently of
@@ -1531,10 +1560,12 @@ expiry. Keep source-owned recovery on ToastNotice.
 Use a finite timeout for transient feedback. Recovery defaults to no expiry and
 no dismissal unless the source supplies onDismiss; preserve all recovery actions.
 The expanded, bounded, scrollable stack keeps every recovery action available.
-It sits at the bottom right with safe-area insets, including narrow windows; do
-not add feature-specific top offsets. Surfaces docked at the bottom of the
-window (the composer, the preview's Join notice) call `useToastClearance` with
-their element, and the stack rises above them so a notice never covers Send.
+It sits at the top right with safe-area insets. The app shell registers its
+header with `useToastClearance(ref)` and reserves the workspace header
+height on non-Mac shells. Mac uses a 12px top inset and an 8px right inset. Integrated Windows/Linux
+chrome aligns the card with the room/content divider. On touch,
+notices form a bounded scrolling list. Trailing actions wrap below the message
+when their intrinsic width cannot fit beside it.
 F6 enters notifications, Tab reaches actions. Modals remain above the stack. Content updates do not restart expiry; timeout changes do.
 
 Tabs with content use renderPanel, which lets Base UI connect each tab and panel.
@@ -1603,9 +1634,11 @@ separate from status text and the overflow action.
 Selected rows can expand without painting the entire branch in the accent color.
 
 Its `text` variant is a text-only row action, such as a capped list's Show
-more and Show less: the base navigation item's type and padding with no fill, resting in
+more and Show fewer: the base navigation item's type and padding with no fill, resting in
 `--text-subtle` and strengthening to `--text-standard` on hover and keyboard
-focus. Use it where a fill would read as another destination.
+focus. Use it where a fill would read as another destination. A capped list
+puts both on one line: **Show more**, with a leading caret, on the row icons and
+titles, and **Show fewer** at the end, ending where row trailing content ends.
 
 PreviewCard may expose supplemental actions through `actionRef`, such as copying
 an identity's full npub. Focus opens every preview at once, so immediate Tab
@@ -1710,9 +1743,10 @@ Values scale with the host interface-size preference.
   independent from caption even though their sizes currently match. `text-mono-lg` and
   `text-mono-sm` are compatibility aliases for this same setting, not extra sizes.
 - Caption uses 12/16 and 0.0133em tracking. Buzz’s `text-body` uses 14/20; `text-label` uses 16/24 and `text-body-lg` uses 20/28.
-- Message prose uses `text-message`: 14px with 22/14 leading (22px at
-  default), keeping a compact reading rhythm for both sent and received
-  messages. The message renderer uses `space-4` between prose blocks, with
+- Message prose and composer text use `text-message`: 14px with 21.5/14 leading
+  (21.5px at default), Regular (400) weight and -0.01em tracking, keeping the
+  same compact reading rhythm while writing and reading messages. The message
+  renderer uses `space-4` between prose blocks, with
   `space-2` between an introductory paragraph and its following list. Labels,
   controls, code, tables and headings retain their existing type roles.
 - Preserve text preferences and browser zoom. Author values in scaled rem and
@@ -1785,7 +1819,7 @@ inside a group than between groups.
 - Dense data uses edge-to-edge rows and dividers where a line helps track the row.
 - Distinct swatches, type samples, and avatars often need only space between them. Avoid adding a card or divider when the content already separates itself.
 - Show samples on the surface where they will be used. Glass needs a backdrop; a white swatch on white needs a quiet boundary.
-- Cards group widgets, gallery items, or settings. They sit on `bg-panel` with spacing or a hairline and have no default fill. Use `bg-hover` only for an interactive card’s hover state. There is no `bg-card` role; `bg-inset` is for recessed content such as inputs or code blocks.
+- Cards group widgets, gallery items, or settings. They sit on `bg-panel` with spacing or a hairline and have no default fill. Use `bg-hover` only for an interactive card's hover state. There is no `bg-card` role; `bg-inset` is for recessed content such as inputs. Shared Markdown code follows the content exception in [Semantic colors](#semantic-colors).
 - Use native thin scrollbars: `scrollbar-width: thin` and `scrollbar-color: var(--scrollbar-thumb-quiet) transparent`. Use the sidebar’s subtle gray thumb in both modes. Load the shared recipe into vendor shadow roots and let the browser control scrolling and visibility.
 
 ## Motion
@@ -2148,8 +2182,11 @@ accessible selected state.
 Dock artwork stays still on hover and press. Bestie uses its configured avatar
 from the shared page presentation, at the standard avatar size.
 Dock labels remain accessible and use the dock label hover bucket to the right of each vertical dock
-button (beneath horizontal docks); badges overlay the tile. A tile with a page
-preview shows its label on keyboard focus and while its preview is closed.
+button (beneath horizontal docks); badges overlay the tile. CountBadge uses a compact
+corner capsule straddling the top-right edge, with `surface-dock-count` and
+`text-dock-count` keeping dark fill and readable accent ink in both modes. The
+shell scrollport preserves gutter space for the full capsule and focus ring.
+A tile with a page preview shows its label on keyboard focus and while its preview is closed.
 Up/Down arrow keys move focus in the side dock without selecting; Enter, Space or
 pointer selection changes the page while focus stays on its tab. Horizontal dock
 compositions use Left/Right. The host passes per-opening focus intent so page
@@ -2218,14 +2255,18 @@ Inline search settings use the search variant of PreferenceRow with a gear icon 
 ### Conversation identity icons (proposed)
 
 Proposed pending designer sign-off, as a narrow exception to the chat and
-conversation icon rule under Icons. Use `ChatCircleIcon` for a Solo chat in navigation, headers, tabs and chat cards.
-Use `MessageReplyIcon` (Tabler MessageReply) for thread tabs, thread links and
-Reply actions. Keep private Team channels' lock icon; privacy alone does not
-replace a Solo chat's identity icon. Accessible chat cards end with a right
-chevron. Unavailable chat cards retain a lock and unavailable accessible text;
-unknown access does not earn a chevron. Display chat cards as **Chat:**, while
-accepting legacy **Session:** and **Session ·** authored links without rewriting
-historical messages or their receipts.
+conversation icon rule under Icons. Use `ChatCircleIcon` for a Solo chat in
+navigation, headers, tabs and inline chat links.
+Use `ThreadIcon` (Tabler Message2) for message links, thread links, thread tabs,
+and Reply actions. The text lines identify links to messages and threads.
+Keep private Team channels' lock icon; privacy alone does not
+replace a Solo chat’s identity icon. A withheld link uses the lock.
+
+Chat links use the ordinary inline link treatment in the composer and messages;
+keep their authored position and label. New shares use the chat title as the label.
+Legacy **Chat:**, **Session:** and **Session ·** labels remain authored text without
+rewriting historical messages or their receipts. Rich previews use the existing
+link/preview contribution boundaries rather than chat-specific attachment chrome.
 
 
 ### Mobile-aligned onboarding

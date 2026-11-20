@@ -217,64 +217,24 @@
 .body {
   overflow-wrap: anywhere;
 }
+/* GitHub links keep the body's ink, as on GitHub. */
 .body a {
   color: var(--text-standard);
-  text-decoration: underline;
-  text-underline-offset: 2px;
 }
 .plainBody {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 .paragraph,
-.body ul,
-.body ol,
-.body blockquote,
-.body pre,
 .attachment {
   margin: var(--space-3) 0;
-}
-.body :is(h1, h2, h3, h4, h5, h6) {
-  margin: var(--space-4) 0 var(--space-2);
-  font-size: var(--text-body-lg);
-  line-height: var(--text-body-lg--line-height);
-  letter-spacing: var(--text-body-lg--letter-spacing);
-}
-.body ul,
-.body ol {
-  padding-left: var(--space-5);
-}
-.body ul {
-  list-style: disc;
-}
-.body ol {
-  list-style: decimal;
 }
 .body [class~="contains-task-list"] {
   list-style: none;
 }
-.body blockquote {
-  margin-left: 0;
-  padding-left: var(--space-3);
-  border-left: 2px solid var(--border-standard);
-  color: var(--text-subtle);
-}
-.body pre,
 .tableScroll {
   max-width: 100%;
   overflow-x: auto;
-}
-.body pre {
-  padding: var(--space-3);
-  background: var(--surface-panel);
-}
-.body table {
-  border-collapse: collapse;
-}
-.body th,
-.body td {
-  padding: var(--space-2);
-  border: 1px solid var(--border-standard);
 }
 .attachment > a {
   display: block;
@@ -284,6 +244,11 @@
   margin-top: var(--space-6);
   padding-top: var(--space-3);
   border-top: 1px solid var(--border-standard);
+}
+/* GitHub gives an image's authored width but not its height; holding the
+   frame to that width keeps it near its final size before the image loads. */
+.attachment [data-media-preview] {
+  max-width: min(100%, var(--attachment-width, 100%));
 }
 /* Paint above the image: matching-color content cannot cover its edge. */
 .attachment [data-image-preview]::after {

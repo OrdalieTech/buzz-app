@@ -168,7 +168,7 @@ async function fixture(signedIn = true, openIdentity?: () => void) {
   };
 }
 async function loadedInstructions() {
-  const field = screen.getByRole("textbox", { name: "Instructions" });
+  const field = await screen.findByRole("textbox", { name: "Instructions" });
   await waitFor(() => expect(field).toBeEnabled());
   return field;
 }
@@ -254,11 +254,19 @@ it.each(["cancel", "timeout"] as const)(
         name: "Sign in to Builderlab",
       });
       expect(retry).toBeEnabled();
-      const guidance = screen.getByText(
-        "Sign in to edit settings. You can still message this agent.",
-      );
-      expect(row).not.toContainElement(guidance);
-      expect(row?.parentElement).toContainElement(guidance);
+      if (outcome === "cancel") {
+        const guidance = screen.getByText(
+          "Sign in to edit settings. You can still message this agent.",
+        );
+        expect(row).not.toContainElement(guidance);
+        expect(row?.parentElement).toContainElement(guidance);
+      } else {
+        // The failure beside Sign in replaces the guidance: one message.
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "Builderlab authentication timed out",
+        );
+        expect(screen.queryByText(/Sign in to edit settings/)).toBeNull();
+      }
       expect(screen.queryByRole("region")).toBeNull();
       expect(h.acquire).toHaveBeenCalledOnce();
       expect(h.request).not.toHaveBeenCalled();
@@ -1022,7 +1030,12 @@ it("opens Activity without login and keeps Identity's login running after leavin
     await signIn.mock.results[0]?.value;
   });
   expect(h.session.snapshot().status).toBe("signed-in");
-  expect(h.request).not.toHaveBeenCalled();
+  // Signed in, Activity reads only the agent's stored session list.
+  await waitFor(() =>
+    expect(
+      h.request.mock.calls.map(([input]) => input.url.split("/").at(-1)),
+    ).toEqual(["list-agents", "list-agent-sessions"]),
+  );
   expect(screen.queryByRole("textbox", { name: "Instructions" })).toBeNull();
   await user.click(screen.getByRole("tab", { name: "Identity" }));
   expect(await loadedInstructions()).toHaveValue("First instructions.");
@@ -1231,7 +1244,9 @@ it("keeps hosted instructions on cancellation and resets a confirmed discard", a
   expect(runtime.closest(".buzz-settings-group")).toHaveTextContent(
     "Workspace",
   );
-  expect(runtime.closest(".buzz-settings-group")).toHaveTextContent("Sessions");
+  expect(runtime.closest(".buzz-settings-group")).toHaveTextContent(
+    "Session scope",
+  );
   expect(screen.queryByRole("button", { name: /^Model:/ })).toBeNull();
   expect(screen.queryByRole("combobox", { name: "Thinking" })).toBeNull();
   await user.click(screen.getByRole("tab", { name: "Identity" }));

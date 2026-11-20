@@ -12,7 +12,7 @@ Find and mention people, agents, and teams while you write.
 
 # Mention rules
 
-`version 3` · `client contract` · `uses existing tags`
+`version 4` · `client contract` · `uses existing tags`
 
 ## Abstract
 
@@ -64,8 +64,11 @@ permission, and Solo chat invitation rules stay the authority. Labels are
 presentation only. Clients MUST send and store exact keys, not labels.
 
 This contract does not define profile validation, archive state, presence, or
-agent ownership proof. Ownership here is a display hint from profile metadata,
-not authorization.
+agent ownership proof. Ownership here is a ranking hint, not authorization: an
+agent is the viewer's when it is one of the viewer's own agents, or when the
+client has verified the owner claim in its signed profile and that owner is the
+viewer. An owner claim the client has not verified can still qualify the
+agent's label (`Wes’s Sol`), but it never makes the agent the viewer's.
 
 ## 1. Choice set
 
@@ -73,15 +76,27 @@ For any known channel (stream, untyped channel, forum or DM) that is not
 archived and not read-only, the choice set is:
 
 1. the channel's members;
-2. the agents that the client offers for mention in this channel;
+2. the agents that the client offers for mention in this channel. The desktop
+   offers the viewer's own agents of this community in a stream or forum where
+   the viewer can add members, and in a DM, which adds no one: there they are
+   outside choices that are named but not notified;
 3. the viewer's own agents from their other communities, which the client can
    bring into this one (section 7); and
 4. people and agents found by a community directory search for the current query.
 
-Solo chats MUST NOT add directory people or agents from other communities. This
-follows the channel type, so it also holds in Solo chat composers that do not
-invite agents, such as media comments and edits. A Solo chat that invites agents uses its own agent list
-instead of items 3 and 4. Archived or read-only channels have
+Solo chats MUST NOT add agents from other communities. A Solo chat composer
+that invites agents (the chat and its threads, the owner's or a shared chat's)
+offers the Solo chat's own agent list instead of item 3, and also offers item 4
+so people can name anyone. It never adds directory people: an outside key that
+is not one of the viewer's own agents is a reference (section 7). When the
+owner's composer limits members to its own roster, the directory MUST NOT
+bring back a member that the roster leaves out, nor one of the viewer's own
+agents that it leaves out, such as an agent a region's plugin refuses. A New chat's composer follows the
+same rule before its chat is listed: its reserved id stands for a Solo chat
+holding only the viewer. The Solo toolbar's agent menu picks agents only and
+MUST NOT search the directory. Other Solo chat composers, such as media
+comments and edits, do not invite agents and offer the members only.
+Archived or read-only channels have
 no choices. Clients MUST exclude invalid keys and identities known to be
 archived, except the viewer's own key: a user always sees themself. Unknown
 archive state does not exclude a key.
@@ -174,26 +189,37 @@ Remove choices that do not match. Sort the rest by the first rule that differs:
 1. Members before outside choices.
 2. Everyone in this community before the viewer's agents from their other
    communities.
-3. Lower match.
-4. Lower best alias tier (the **base match**). This lets `Fizz` rank above
+3. **Leading** choices before the others. Only a choice whose label matches
+   the query (section 3, any tier) can lead, and only its aliases decide it,
+   never generated label parts such as an owner prefix or key qualifier. A
+   person leads when an alias equals the query. An agent that the viewer owns
+   leads when an alias equals the query or is longer and continues it with a
+   new word: the next code point after the query is not a letter, mark or
+   digit, so `Sol 6` and `Sol-6` continue `sol` but `Solana` does not. Compare
+   with the section 3 normalization. Other agents never lead, and an empty
+   query leads no one. So `sol` puts the viewer's `Sol 6` above another
+   person's agent named `Sol`, but not above a person named `Sol`.
+4. Lower match.
+5. Lower best alias tier (the **base match**). This lets `Fizz` rank above
    `Fast Fizz` when both labels match at the same tier.
-5. Agents that the viewer owns before all other choices, people included.
-6. Block label, by UTF-16 code unit order of normalized labels. Agents with the
-   same values for rules 1 to 5 and the same normalized name form one **block**.
+6. Agents that the viewer owns before all other choices, people included.
+7. Block label, by UTF-16 code unit order of normalized labels. Agents with the
+   same values for rules 1 to 6 and the same normalized name form one **block**.
    A block's label is the lowest normalized label among its agents. A person, or
    an agent with a name of its own, is a block by itself.
-7. On an equal block label: a person before an agent block. Two agent blocks
+8. On an equal block label: a person before an agent block. Two agent blocks
    are ordered by normalized name, and two people by key.
-8. Inside a block:
+9. Inside a block:
    1. more recent explicit choice in this channel first;
    2. managed agents first;
    3. presence: online, then away, then unknown.
-9. Normalized label, by UTF-16 code unit order.
-10. Key.
+10. Normalized label, by UTF-16 code unit order.
+11. Key.
 
 Every rule is a key of one choice, so the order is the same for any input order.
 A person or another name never sorts between two agents of one block. Ownership
-and recency never override membership or match. Recency is the
+and recency never override membership. Ownership overrides match only through
+rule 3, and recency never does. Recency is the
 client's memory of explicit selections in this channel. The desktop keeps it in
 memory for 100 channels and 100 keys each.
 
@@ -214,7 +240,10 @@ set of choices when all of these are true:
   A literal name `Honey (agent)` still continues `honey`. A choice's own longer
   name does not continue the query when that same choice also has an alias or
   label equal to it: an agent known as both `Example` and `Example Agent` is one
-  identity, not a namesake of itself, so `example` selects it.
+  identity, not a namesake of itself, so `example` selects it. When a member
+  with aliases has an alias or label equal to the query, only members' names
+  count here: an outside choice's longer name never keeps a member's name from
+  selecting (`Honey Bee` outside the channel does not block a member `Honey`).
 
 An exact public key (Terms) is the exact name of the choice with that key, even
 one with no aliases, and of no other choice, and no name continues it: a key
@@ -236,27 +265,38 @@ the whole set, not only the shown rows.
 
 Local choices show before directory results (section 6), so a unique local name
 selects at once: directory results cannot make it ambiguous, whether or not the
-search has found them yet. A longer directory name still blocks Space once the
-search reports it, but not before. A member whose name is not known yet may be a
-namesake, so until it is, only step 2 applies. A member whose profile read
-completed without finding a profile has no name, so it cannot be a namesake and
-does not hold step 1 back; a failed read is not evidence. A name that only a
-directory result has could still gain a namesake from a pending search, so Space
-MUST NOT select it before the search finishes. Otherwise Space is a normal
+search has found them yet. A longer directory name never blocks a member's
+name; it blocks another local name once the search reports it, but not before.
+A member whose name is not known yet may be a namesake, so until it is, only
+step 2 applies. A member whose profile read completed without finding a profile
+has no name, so it cannot be a namesake and does not hold step 1 back; a failed
+read is not evidence. A name that only a directory result has could still gain
+a namesake from a pending search, so Space MUST NOT select it before the search
+finishes. Otherwise Space is a normal
 space. Tab, Enter, and a click select the highlighted row.
 
 Closing punctuation typed straight after the query (`,` `.` `!` `?` `;` `:` `)`
 or a closing quote `'` `’` `"` `”`) SHOULD select exactly as Space does, and the
 client keeps the character after the mention in place of the space, so
 `@Honey's` mentions Honey. Where Space would not select, the character is typed
-into the query instead. A longer known name that continues the query blocks
-every one of these characters, as it blocks Space, whichever character comes
-next in that name: `'` after `Pat O` while `Pat O'Brien` is known stays in the
-query, and so does `,` after `Wes` while `Wes Smith` is known. A saved team with
-the same or a longer name blocks them too. Where Space may hold a pending
-mention, so may this character, kept after the chip. A selected or pending
-mention ends at a name boundary: the next character that is not a letter, mark,
-digit or underscore.
+into the query instead. A longer known name that blocks Space blocks every one
+of these characters too, whichever character comes next in that name: `'`
+after `Pat O` while a member `Pat O'Brien` is known stays in the query, and so
+does `,` after `Wes` while a member `Wes Smith` is known. A saved team with
+the same or a longer name blocks them too. Since an outside choice's longer
+name never blocks a member's exact name, it cannot be typed out past one of
+these characters or Space: with a member `Wes`, `@Wes Smith` mentions Wes,
+followed by the text ` Smith`, even while `Wes Smith` outside the channel is
+listed, and a member `Pat O` takes `@Pat O'Brien` the same way. This holds
+for the agents the client offers outside the channel (section 1, items 2 and
+3, or a Solo chat's own agent list) as for directory results: with a member
+agent `Claude` and the viewer's offered `Claude Code`, `@Claude Code` mentions
+Claude. The user picks such a choice from the list instead. One that
+continues the member's name with another character, such as `Wes-Smith`, can
+still be typed in full. Where
+Space may hold a pending mention, so may this character, kept after the chip.
+A selected or pending mention ends at a name boundary: the next character that
+is not a letter, mark, digit or underscore.
 
 While the client cannot yet decide — the member list, member names or agent
 list is still loading, or a directory search for the query is waiting or
@@ -268,13 +308,16 @@ anything else, including a failed or truncated search or a bounded wait
 expiring (desktop: 8 s), returns the text to prose. A name the client has
 already declined is not pending: a trailing space or punctuation, a multi-word
 query that continues no name, a saved team with the same or a longer name, or
-a known choice whose name continues the query (a loaded member `Mira Example`
-for `mira`) keeps Space a normal space. Such a longer name blocks whatever
-else arrives, and the next word may complete it (`@mira Example ` selects the
-member), which a chip that ended the query could not. A pending name that,
-once the full choice set is known, only longer known names keep from selecting
-(`Mira Example`, found by the directory search for `mira` after the chip was
-held) MAY instead extend over the words typed after the chip when they spell
+a known choice whose name continues the query and blocks it whatever else
+arrives (a loaded member `Mira Example` for `mira`) keeps Space a normal
+space. The next word may complete the longer name (`@mira Example ` selects
+the member), which a chip that ended the query could not. An outside choice's
+longer name declines Space only once every member's name is known or known to
+be absent: until then a member may still have the exact name, which an outside
+name does not block. A pending name that, once the full choice set is known,
+only longer known names keep from selecting (`Mira Example`, found by the
+directory search for `mira` after the chip was held, while no member is named
+`mira`) MAY instead extend over the words typed after the chip when they spell
 one of those names up to a name boundary (`@mira Example hi` becomes a pending
 `@mira Example` with ` hi` outside it), taking the longest name the words
 complete, as Space would have needed all of it typed; this section then applies
@@ -287,8 +330,9 @@ for the pending name already settles the directory for every query extending
 it (section 6), so no search is waiting and the Space that completes the
 longer name selects it: `@mira Exam` returned to prose, then `ple ` selects
 `Mira Example`. In a
-DM a pending name that resolves to someone outside the DM returns to prose,
-since the chooser's "Will not be notified" row was never shown. Sending while
+DM, or in a Solo chat when the person is not one of the viewer's agents, a
+pending name that resolves to someone outside the destination returns to
+prose, since the chooser's "Will not be notified" row was never shown. Sending while
 a mention is pending waits for it, through such an extension; if a mention the
 send waited for returns to prose, the client MUST NOT send in that same action,
 since the user saw the name held and would notify no one: it keeps the draft,
@@ -346,8 +390,15 @@ A DM has fixed participants, so there is no choice to make. The client MUST NOT
 ask. It sends outside keys in a DM as references, which do not notify them. The
 chooser row says so before the user picks the person.
 
-A Solo chat MUST NOT ask either, in any Solo chat composer. Its recipients follow
-the Solo chat choice policy.
+A Solo chat MUST NOT ask either, in any Solo chat composer. A composer that
+invites agents adds the viewer's available agents that the draft names. Every
+other outside key is a reference, as in a DM, and the chooser row says so
+before the user picks the person. Classifying an unknown key as a reference
+needs complete agent inventory evidence: until the agent read is complete, the
+composer offers and accepts no outside key, so a row never calls the viewer's
+own agent a reference, and the send refuses a reference if its read is
+incomplete. A partial read still adds the agents it lists. A reference
+addresses nobody, so it does not replace the toolbar's agents.
 
 An agent from the viewer's other communities (section 1, item 3) is not a
 member here and cannot be added until it joins this community. Before the

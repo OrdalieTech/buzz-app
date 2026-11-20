@@ -11,6 +11,7 @@ import type {
 } from "../../features/host/service";
 import { ClaudeAuth } from "./auth";
 import { ClaudeProcess, ENV, type ClaudeModel, type Spawn } from "./claude";
+import { PROCESS_LIMIT, withRoom } from "./sessions";
 import script from "./claude.sh?raw";
 import {
   PROTECTED_CLAUDE_ROOT,
@@ -27,12 +28,17 @@ export type ClaudeStatus =
   | Readonly<{ state: "error"; message: string }>;
 
 const CHECK_TIMEOUT_MS = 15_000;
+/** Claude lists the models its account's flags allow, and refreshes those
+ * flags after it starts, so a list can predate a model's rollout: a picker
+ * looks for it again once it is this old. */
+const MODELS_STALE_MS = 60 * 60_000;
 export type Request = (input: HostRequest) => Promise<HostResponse>;
 
 /** Where Anthropic publishes each release with its checksums. */
 const RELEASES = "https://downloads.claude.ai/claude-code-releases";
-/** Model discovery disables customizations with --safe-mode (2.1.169+). */
-export const MIN_VERSION = "2.1.169";
+/** Sessions pass --system-prompt-snapshot (2.1.267+); model discovery also
+ * needs --safe-mode (2.1.169+). */
+export const MIN_VERSION = "2.1.267";
 /** `uname -sm` to the release's platform name. */
 const PLATFORMS: Readonly<Record<string, string>> = {
   "Darwin arm64": "darwin-arm64",
@@ -47,6 +53,7 @@ const STEPS: Readonly<Record<string, string>> = {
   install: "install",
   use: "use",
   review: "review",
+  "inherited-headers": "inherited-headers",
 };
 /** Starts `claude` and its other steps as steps of `claude.sh`, which the
  * manifest grants as `bash -c`; other processes start as declared. */
@@ -191,9 +198,22 @@ async function testRelease(spawn: Spawn, version: string) {
   ]);
   if (code !== 0 || !stdout.startsWith(version))
     throw new Error(stderr.trim() || "it did not report its version");
-  const claude = await ClaudeProcess.start(release, {
-    cwd: "~",
-    systemPrompt: "",
+  // Its last words, which say why it quit, e.g. a setting it refused. It
+  // can quit before taking the first request, so this is kept out here.
+  let said = "";
+  const lastWords = () => said.trim().split("\n").at(-1);
+  const claude = await ClaudeProcess.start(
+    (id, options) =>
+      release(id, {
+        ...options,
+        onStderr: (data) => {
+          said = (said + data).slice(-4_000);
+          options?.onStderr?.(data);
+        },
+      }),
+    { cwd: "~", systemPrompt: "" },
+  ).catch((error: unknown) => {
+    throw new Error(lastWords() || message(error));
   });
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -201,11 +221,19 @@ async function testRelease(spawn: Spawn, version: string) {
       claude.models(),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
-          () => reject(new Error("it did not list its models")),
+          () =>
+            reject(
+              new Error(
+                `it did not list its models within ${CHECK_TIMEOUT_MS / 1000} seconds`,
+              ),
+            ),
           CHECK_TIMEOUT_MS,
         );
       }),
     ]);
+    // A release that quits answers nothing, so its stderr is the reason.
+    if (!claude.running)
+      throw new Error(lastWords() || "it quit before listing its models");
     if (!models.length) throw new Error("it did not list its models");
   } finally {
     clearTimeout(timer);
@@ -245,7 +273,8 @@ export class ClaudeSetup {
   private modelRequest: AbortController | undefined;
   private modelWork: Promise<void> | undefined;
   private cataloging: Promise<SetupState["models"]> | undefined;
-  private modelsLoaded = false;
+  /** When the last discovery ended; undefined until one has. */
+  private modelsLoadedAt: number | undefined;
   /** Cancel was asked for before the running step's process was returned. */
   private cancelled = false;
   /** Releases that failed their test, not downloaded again until restart. */
@@ -310,16 +339,23 @@ export class ClaudeSetup {
       });
       return;
     }
-    if (this.state.checking || this.state.running) return;
+    if (this.state.running) return;
+    // Callers wait for a check under way, so none reads its status early.
+    if (this.state.checking) return this.checkWork;
+    this.checkWork = this.runCheck(this.spawn, refreshModels);
+    return this.checkWork;
+  }
+  private checkWork?: Promise<void>;
+  private async runCheck(spawn: Spawn, refreshModels: boolean) {
     const previous = this.state.status;
     this.set({ checking: true });
-    const status = await checkClaude(this.spawn, this.auth);
+    const status = await checkClaude(spawn, this.auth);
     const invalidate =
       refreshModels || JSON.stringify(previous) !== JSON.stringify(status);
     if (invalidate) {
       this.modelRequest?.abort();
       this.modelRequest = undefined;
-      this.modelsLoaded = false;
+      this.modelsLoadedAt = undefined;
     }
     this.set({
       status,
@@ -330,47 +366,92 @@ export class ClaudeSetup {
     });
   }
 
-  /** Loads optional model copy only for surfaces that display the catalog.
-   * Callers during a load wait for it. */
+  /** Loads optional model copy only for surfaces that display the catalog,
+   * and again once it is stale. Callers during a load wait for it. */
   loadModels(retry = false) {
     if (this.modelRequest) return this.modelWork;
+    const loadedAt = this.modelsLoadedAt;
     if (
       !this.spawn ||
       this.state.status?.state !== "ready" ||
       this.state.checking ||
-      (this.modelsLoaded && !retry)
+      (loadedAt !== undefined &&
+        !retry &&
+        Date.now() - loadedAt < MODELS_STALE_MS)
     )
       return Promise.resolve();
+    // Refreshing a list it has keeps that list usable, failure included.
+    const quiet = !retry && this.state.models.length > 0;
     const request = new AbortController();
     this.modelRequest = request;
-    this.set({ modelsChecking: true, modelsError: "" });
-    this.modelWork = this.discoverModels(this.spawn, request);
+    if (!quiet) this.set({ modelsChecking: true, modelsError: "" });
+    this.modelWork = this.discoverModels(this.spawn, request, quiet);
     return this.modelWork;
   }
-  private async discoverModels(spawn: Spawn, request: AbortController) {
+  private async discoverModels(
+    spawn: Spawn,
+    request: AbortController,
+    quiet: boolean,
+  ) {
     try {
       const models = await queryModels(spawn, request.signal);
       if (!models.length) throw new Error("Claude did not list its models");
-      if (this.modelRequest === request) this.set({ models });
+      // The same listing keeps the list it has, so nothing keyed on it reruns.
+      if (
+        this.modelRequest === request &&
+        JSON.stringify(models) !== JSON.stringify(this.state.models)
+      )
+        this.set({ models });
     } catch (error) {
-      if (this.modelRequest === request && !request.signal.aborted)
+      if (this.modelRequest === request && !request.signal.aborted && !quiet)
         this.set({
           modelsError: error instanceof Error ? error.message : String(error),
         });
     } finally {
       if (this.modelRequest === request) {
         this.modelRequest = undefined;
-        this.modelsLoaded = true;
+        this.modelsLoadedAt = Date.now();
         this.set({ modelsChecking: false });
       }
     }
   }
-  /** The catalog for a surface that opens without the model picker: found
-   * once, and looked for again only after a discovery that listed nothing. */
+  /** Whether Claude is installed and signed in here and lists `model`, by
+   * its name or the model an alias stands for, on `effort` when it takes one.
+   * Rejects when a failed or unfinished check, or a failed model listing,
+   * leaves that unknown, so the answer is unsure rather than no. */
+  async offers({ model, effort }: Readonly<{ model: string; effort: string }>) {
+    // A refresh under way keeps the last status meanwhile: wait for its answer.
+    if (this.state.checking || this.state.status?.state !== "ready")
+      await this.check();
+    const state = this.state.status?.state;
+    if (state !== "ready") {
+      if (
+        !this.state.running &&
+        (state === "missing" || state === "outdated" || state === "signed-out")
+      )
+        return false;
+      throw new Error("Claude couldn't say whether it is ready");
+    }
+    const models = await this.catalog();
+    if (!models.length) throw new Error("Claude didn't list its models");
+    const listed = models.find(
+      (item) => item.value === model || item.resolvedModel === model,
+    );
+    return (
+      !!listed &&
+      (!listed.supportsEffort ||
+        !!listed.supportedEffortLevels?.includes(effort))
+    );
+  }
+  /** The catalog for a surface that opens without the model picker: looked
+   * for again after a discovery that listed nothing, or once it is stale. A
+   * listed catalog answers at once while its refresh finishes behind it. */
   catalog() {
     this.cataloging ??= (async () => {
       if (!this.state.status) await this.check();
-      await this.loadModels(!this.state.models.length);
+      const listed = this.state.models.length > 0;
+      const loading = this.loadModels(!listed);
+      if (!listed) await loading;
       return this.state.models;
     })().finally(() => {
       this.cataloging = undefined;
@@ -396,15 +477,17 @@ export class ClaudeSetup {
 
   /** Holds a delivery while Buzz looks for its copy and downloads a first
    * one, so a mention sent meanwhile is answered rather than lost to a
-   * missing copy. Once a copy is found, updating it holds nothing. */
+   * missing copy. A copy too old for Buzz waits for its update too, and
+   * refuses the delivery if it is still too old. Once a usable copy is found,
+   * updating it holds nothing. */
   async installed(signal: AbortSignal) {
-    const found = () => {
-      const status = this.state.status;
-      return status !== undefined && status.state !== "missing";
+    const unusable = () => {
+      const state = this.state.status?.state;
+      return state === "missing" || state === "outdated";
     };
-    // After a first download failed, a mention tries it again.
-    if (!this.holding && this.state.status?.state === "missing")
-      void this.update(true);
+    const found = () => this.state.status !== undefined && !unusable();
+    // After a first download or an update failed, a mention tries it again.
+    if (!this.holding && unusable()) void this.update(true);
     for (let work = this.holding; work && !found(); work = this.holding) {
       const ended = work;
       await new Promise<void>((resolve, reject) => {
@@ -429,6 +512,11 @@ export class ClaudeSetup {
         if (signal.aborted) abort();
       });
     }
+    const status = this.state.status;
+    if (status?.state === "outdated")
+      throw new Error(
+        `Claude ${status.version} is older than Buzz needs (${MIN_VERSION}), and updating it failed. Update it in Settings.`,
+      );
   }
   /** Makes `work` what deliveries wait on, until it ends. */
   private hold(work: Promise<void>) {
@@ -591,30 +679,38 @@ export class ClaudeSetup {
   }
 
   private protectedDownload: Promise<void> | undefined;
-  async protectedInstalled(signal: AbortSignal) {
+  /** `room` makes a place for the check when the host runs all the
+   * processes it allows, as for the turn it precedes. */
+  async protectedInstalled(signal: AbortSignal, room?: () => Promise<boolean>) {
     signal.throwIfAborted();
     const spawn = this.spawn;
     if (!spawn) throw new Error("Protected Claude needs the desktop app");
-    const pinned = await protectedRuntime(spawn);
+    // Its helpers count toward the host's limit too.
+    const check = withRoom(spawn, room, () => !signal.aborted);
+    const pinned = await protectedRuntime(check);
     // Contained, the host starts only its own copy, once that matches the
     // manifest's pin; it never runs the download folder's file. Its hook
     // guard stops a `--version` answer, so starting is the check.
     const verified = async () => {
-      const process = await spawn(pinned, {
+      const process = await check(pinned, {
         args: ["--version"],
         protection: { readOnlyPaths: [PROTECTED_CLAUDE_ROOT], hiddenPaths: [] },
       });
+      // Its place is free for the turn only once it has exited.
       await process.kill();
+      await process.exited;
     };
     try {
       await abortable(verified(), signal);
       return;
-    } catch {
+    } catch (error) {
       signal.throwIfAborted();
+      // A full host is not a missing copy.
+      if (error === PROCESS_LIMIT) throw error;
     }
     this.protectedDownload ??= (async () => {
       const platform =
-        PLATFORMS[(await collect(spawn, "platform", [])).stdout.trim()];
+        PLATFORMS[(await collect(check, "platform", [])).stdout.trim()];
       if (!platform)
         throw new Error("Claude is not available for this computer");
       const manifest = JSON.parse(
@@ -623,7 +719,7 @@ export class ClaudeSetup {
       const checksum = manifest.platforms?.[platform]?.checksum;
       if (!checksum || !/^[a-f0-9]{64}$/.test(checksum))
         throw new Error("The protected Claude release has no valid checksum");
-      const process = await spawn("install", {
+      const process = await check("install", {
         args: [PROTECTED_CLAUDE_VERSION, platform, checksum],
       });
       if ((await process.exited) !== 0)

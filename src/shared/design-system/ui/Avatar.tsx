@@ -20,17 +20,19 @@ type AvatarSize = "tiny" | "compact" | "small" | "default" | "large" | "fill";
 type ImageStatus = "loading" | "loaded" | "failed";
 
 // WebKit re-requests cached custom-scheme images on lazy remounts. Remember a
-// bounded set of successful sources so only their subsequent mounts are eager.
-// This is a loading hint; the real image still decides whether artwork is ready.
-const loadedAvatarSources = new Set<string>();
-function rememberAvatar(src: string) {
-  loadedAvatarSources.delete(src);
-  loadedAvatarSources.add(src);
-  if (loadedAvatarSources.size > 128) {
-    const oldest = loadedAvatarSources.values().next().value;
-    if (oldest !== undefined) loadedAvatarSources.delete(oldest);
+// bounded set of source outcomes: successful sources mount eagerly, and failed
+// ones show their fallback at once instead of blank until the error returns.
+// These are hints; the real image still decides whether artwork is ready.
+const avatarOutcomes = new Map<string, "loaded" | "failed">();
+function rememberAvatar(src: string, outcome: "loaded" | "failed") {
+  avatarOutcomes.delete(src);
+  avatarOutcomes.set(src, outcome);
+  if (avatarOutcomes.size > 128) {
+    const oldest = avatarOutcomes.keys().next().value;
+    if (oldest !== undefined) avatarOutcomes.delete(oldest);
   }
-  for (const retry of failedAvatars.get(src) ?? []) retry();
+  if (outcome === "loaded")
+    for (const retry of failedAvatars.get(src) ?? []) retry();
 }
 // A failed request may be transient (relay, network or native proxy), and a
 // mounted avatar gets no new source to reset it. Behind the fallback, retry the
@@ -48,19 +50,24 @@ function AvatarArtwork({
   loading: "eager" | "lazy" | undefined;
 }) {
   const [status, setStatus] = useState<ImageStatus>("loading");
-  const [showFallback, setShowFallback] = useState(false);
+  const [outcome] = useState(() => avatarOutcomes.get(src));
+  const [showFallback, setShowFallback] = useState(outcome === "failed");
   const [attempt, setAttempt] = useState(0);
-  const [previouslyLoaded] = useState(() => loadedAvatarSources.has(src));
+  // WebKit paints a ready async-decoded image (even with `auto`) as empty
+  // until a later frame. Decode artwork that is ready at mount in the paint
+  // that reveals it; network loads keep decoding off the main thread.
+  const [readyAtMount, setReadyAtMount] = useState(false);
   const image = useRef<HTMLImageElement>(null);
   useLayoutEffect(() => {
     // Cached artwork is already ready at mount; reveal it before the first paint
     // instead of waiting for another asynchronous load event after navigation.
     if (image.current?.complete) {
       if (image.current.naturalWidth > 0) {
-        rememberAvatar(src);
+        rememberAvatar(src, "loaded");
+        setReadyAtMount(true);
         setStatus("loaded");
       } else {
-        loadedAvatarSources.delete(src);
+        rememberAvatar(src, "failed");
         setStatus("failed");
       }
     }
@@ -101,15 +108,15 @@ function AvatarArtwork({
         src={src}
         data-loaded={status === "loaded" ? "true" : undefined}
         alt=""
-        loading={loading ?? (previouslyLoaded ? "eager" : "lazy")}
-        decoding="async"
+        loading={loading ?? (outcome === "loaded" ? "eager" : "lazy")}
+        decoding={readyAtMount ? "sync" : "async"}
         referrerPolicy="no-referrer"
         onLoad={() => {
-          rememberAvatar(src);
+          rememberAvatar(src, "loaded");
           setStatus("loaded");
         }}
         onError={() => {
-          loadedAvatarSources.delete(src);
+          rememberAvatar(src, "failed");
           setStatus("failed");
         }}
       />

@@ -1,4 +1,4 @@
-import { archiveHides } from "../relay/identity-archives";
+import { agentUnavailable } from "../agents/choices";
 import type { RelaySession } from "../relay/session";
 import type { ChannelSummary } from "../relay/contracts";
 import type { LocalEvents, OutgoingEvent } from "../relay/outbox";
@@ -10,7 +10,8 @@ const keyPattern = /^[0-9a-f]{64}$/;
  * are its readers, for example the agents a plugin shares its records with. */
 const expandable = new Set(["stream", "forum", "system"]);
 
-/** The relay remains authoritative; never offer role changes or DM expansion. */
+/** The relay remains authoritative; never offer role changes. DMs grow
+ * through `canAddToDirectMessage` instead. */
 export function canAddMembers(
   session: {
     viewer?: string | undefined;
@@ -27,6 +28,29 @@ export function canAddMembers(
     expandable.has(channel.channelType ?? "") &&
     (channel.members?.includes(session.viewer) ||
       (channel.readOnly && !channel.private && channel.joinRole !== "guest"))
+  );
+}
+
+/** A DM member may add people and agents to it; the relay decides whether a
+ * person joins this DM or a new one (see `directMessages.add`). The relay's
+ * moderation DM only carries its notices, so no one is added to it. */
+export function canAddToDirectMessage(
+  session: {
+    viewer?: string | undefined;
+    relayAuthor?: string | undefined;
+    directMessages: { available: boolean };
+  },
+  channel?: ChannelSummary,
+) {
+  return !!(
+    session.viewer &&
+    session.directMessages.available &&
+    channel?.channelType === "dm" &&
+    channel.viewerRole !== "guest" &&
+    !channel.archived &&
+    !channel.cached &&
+    channel.members?.includes(session.viewer) &&
+    !(session.relayAuthor && channel.members.includes(session.relayAuthor))
   );
 }
 
@@ -164,9 +188,9 @@ async function addOneMember(
       throw new Error(
         "This channel cannot add members right now. Refresh and try again.",
       );
-    if (archiveHides(session.archives, pubkey, session.viewer))
+    if (agentUnavailable(session, pubkey))
       throw new Error(
-        "Archived identities cannot be added. Choose someone else.",
+        "Archived identities and agents being deleted cannot be added. Choose someone else.",
       );
   };
   checkAccess();
@@ -497,7 +521,7 @@ export async function addChannelMembersAtOnce(
       !intents.get(key)?.retry &&
       !pending.has(key) &&
       !legacy.has(key) &&
-      !archiveHides(session.archives, key, session.viewer) &&
+      !agentUnavailable(session, key) &&
       // A Solo chat's agents keep their own receipts, so a recovering share
       // can finish its exact Bot grant.
       !(soloParticipant && knownAgent(session, key)),
@@ -539,7 +563,7 @@ export async function addChannelMembersAtOnce(
             (key) =>
               !roster?.members?.includes(key) &&
               // Archives may refresh during any read, as the single addition rechecks.
-              !archiveHides(session.archives, key, session.viewer),
+              !agentUnavailable(session, key),
           );
           if (!recipients.length) continue;
           dispatched = true;

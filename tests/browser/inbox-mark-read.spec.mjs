@@ -1,6 +1,6 @@
 import { test, expect } from "./fixture.mjs";
 import { openPage } from "./navigation.mjs";
-import { readJournal } from "./reading.mjs";
+import { readJournal, releasing } from "./reading.mjs";
 
 const channel = "f12918e7-88d0-4ddd-aa6b-d4888ff6d3bd";
 const conversations = (inbox) =>
@@ -79,21 +79,39 @@ test("Activity filter choices combine, persist, and hold menu focus through row 
 
   await expect(trigger).toHaveAccessibleName("From anyone");
   await expect(rows).toHaveCount(1);
-  // The unread row's ✓ waits for hover, where it takes the date's place.
+  // The unread dot is the row's ✓: hover turns the dot into the check, in the
+  // dot's place, and the date stays.
   const check = rows.getByRole("button", { name: /^Mark as read / });
+  const dot = rows.getByRole("img", { name: "Unread" });
+  const date = rows.locator("[data-inbox-date]");
   await page.mouse.move(0, 0);
   await expect(check.locator("xpath=..")).toHaveCSS("opacity", "0");
+  await expect(dot).toHaveCSS("opacity", "1");
+  const center = async (locator) => {
+    const { x, y, width, height } = await locator.boundingBox();
+    return { x: x + width / 2, y: y + height / 2 };
+  };
+  const [checkCenter, dotCenter] = [await center(check), await center(dot)];
+  expect(Math.abs(checkCenter.x - dotCenter.x)).toBeLessThan(1);
+  expect(Math.abs(checkCenter.y - dotCenter.y)).toBeLessThan(1);
+  // The check's hover fill clears the date.
+  const [checkBox, dateBox] = [
+    await check.boundingBox(),
+    await date.boundingBox(),
+  ];
+  expect(dateBox.x + dateBox.width).toBeLessThanOrEqual(checkBox.x);
   await rows.hover();
   await expect(check.locator("xpath=..")).toHaveCSS("opacity", "1");
+  await expect(dot).toHaveCSS("opacity", "0");
+  await expect(date).toHaveCSS("opacity", "1");
 
   await choose(page, inbox, "Activity type", "Mentions");
   await choose(page, inbox, "Sender", "Agents");
   await unreadSwitch(inbox).click();
   await rows.getByRole("button", { name: /^Open / }).focus();
   await page.keyboard.press("Shift+F10");
-  await expect(
-    page.getByRole("menuitem", { name: "Mark unread", exact: true }),
-  ).toBeDisabled();
+  // An unread row offers only Mark as read.
+  await expect(page.getByRole("menuitem")).toHaveText(["Mark as read"]);
   await page
     .getByRole("menuitem", { name: "Mark as read", exact: true })
     .click();
@@ -468,7 +486,7 @@ test("with Unread off, an unselected row's ✓ reads it in place and preserves t
   const target = conversations(inbox).locator(
     `[data-message-id="${app.inboxWindow.replies[0].id}"]`,
   );
-  await expect(target).toBeInViewport();
+  await releasing(app, () => expect(target).toBeInViewport({ timeout: 100 }));
   // Finish entry reveal and its next-frame acknowledgement before taking the
   // editor/row-focus baseline; list aria-busy does not cover reader positioning.
   await page.evaluate(

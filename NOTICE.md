@@ -35,6 +35,9 @@ The Emoji Mart picker configuration and search-input focus/correction behavior i
 `b9392d9d78744df365f9276e1ffe8c1baa5ea903`. The adapter adds scoped custom IDs,
 explicit dictionary cleanup, and lazy loading for the session-owned catalog.
 
+The chart grammar, option sanitizer and data-row tables in `src/bundled/charts`
+are adapted from a Charts plugin by Alessandro Joabar (GitHub `sandro-sq`).
+
 OneDrive is a trademark of Microsoft.
 
 ## Harness brand marks

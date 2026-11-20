@@ -12,7 +12,12 @@ import {
 import { gfmStrikethrough } from "micromark-extension-gfm-strikethrough";
 import type { Emphasis, PhrasingContent, Root, Text } from "mdast";
 import type { MentionDraft } from "./mention-draft";
-import type { Node as EditorNode, NodeType } from "prosemirror-model";
+import { prepareMarkdown } from "./markdown-preparation";
+import {
+  Fragment,
+  type Node as EditorNode,
+  type NodeType,
+} from "prosemirror-model";
 import {
   composerSchema,
   readComposerDocument,
@@ -40,24 +45,161 @@ const strike: Handle & { peek?: Handle } = (node, parent, state, info) => {
 };
 strike.peek = () => "~";
 
+export type ComposerMarkdownMode = "chat" | "document";
+
 /** Plain portions are authored Markdown, not rich-editor literal text. Keeping
  * their source verbatim avoids normalizing formats this slice does not edit.
- * Marked content uses CommonMark/GFM delimiter escaping and flanking rules. */
-export function composerMarkdown(draft: MentionDraft): string {
-  const doc = readComposerDocument(draft, []);
-  return [
-    ...(draft.chatCards ?? []),
-    blocksMarkdown(doc),
-    ...(draft.gifs ?? []),
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+ * Marked content uses CommonMark/GFM delimiter escaping and flanking rules.
+ * A chip is its label as literal text in place. Copy passes `authored` to keep
+ * the typed source without the namesake qualifiers a send adds. */
+export function composerMarkdown(
+  draft: MentionDraft,
+  {
+    authored = false,
+    mode = "chat",
+  }: { authored?: boolean; mode?: ComposerMarkdownMode } = {},
+): string {
+  const project = (node: EditorNode): EditorNode =>
+    node.type.name === "token" && node.attrs.semantic
+      ? node.mark(composerSchema.marks.literal.create().addToSet(node.marks))
+      : node.isLeaf
+        ? node
+        : node.copy(Fragment.fromArray(node.content.content.map(project)));
+  const doc = project(readComposerDocument(draft, [], mode));
+  const wire = (body: EditorNode) =>
+    [
+      ...(draft.chatCards ?? []),
+      blocksMarkdown(body, mode, !authored && mode === "chat"),
+      ...(draft.gifs ?? []),
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+  const qualified = authored ? doc : qualifyNamesakes(doc, mode);
+  if (qualified === doc) return wire(doc);
+  // The timeline renders a too-deep or too-long body as plain text, where no
+  // span binds, so qualifiers there would only add characters.
+  const sent = wire(qualified);
+  return prepareMarkdown(sent).kind === "plain" ? wire(doc) : sent;
 }
 
-function blocksMarkdown(doc: EditorNode): string {
+/** The empty paragraph a code block exit opens at an edge of the draft, a
+ * quote or a list item sends only the blank line that separates it from the
+ * code block. One is dropped per edge, so the exit fits at the length limit
+ * while every other blank line, and every empty line of prose, still counts.
+ * The rule is positional: an authored or pasted empty paragraph in the same
+ * place is dropped too, even where no exit would open one. A list item's leading paragraph is kept, since no exit opens one and
+ * dropping it lets a nested marker join the item's own. */
+function withoutCodeBlockExits(doc: EditorNode): EditorNode {
+  const blank = (edge: EditorNode, beside: EditorNode) =>
+    edge.type.name === "paragraph" &&
+    !edge.childCount &&
+    beside.type.name === "code_block";
+  let { content } = doc;
+  const count = () => content.childCount;
+  if (
+    doc.type.name !== "list_item" &&
+    count() > 1 &&
+    blank(content.child(0), content.child(1))
+  )
+    content = content.cut(content.child(0).nodeSize);
+  const last = () => content.child(count() - 1);
+  if (count() > 1 && blank(last(), content.child(count() - 2)))
+    content = content.cut(0, content.size - last().nodeSize);
+  return content === doc.content ? doc : doc.copy(content);
+}
+
+/** The timeline binds a bare `@Name` only when one tagged key carries the name.
+ * Chips of different keys sharing a name, ignoring case, are therefore sent as
+ * `@Name (<hex>)`, the form that names one key. A chip the timeline cannot bind,
+ * inside code, a link, an image, a definition or HTML, stays as typed. */
+function qualifyNamesakes(
+  doc: EditorNode,
+  mode: "chat" | "document",
+): EditorNode {
+  const person = (
+    node?: EditorNode,
+  ): { pubkey: string; name: string } | undefined =>
+    node?.attrs.recipient ??
+    composerSchema.marks.recipient.isInSet(node?.marks ?? [])?.attrs;
+  const keys = new Map<string, Set<string>>();
+  doc.descendants((node) => {
+    const found = person(node);
+    // Mobile readers match names case-insensitively, so case-only namesakes
+    // collide too; each occurrence keeps its own spelling.
+    if (found)
+      keys.set(
+        found.name.toLowerCase(),
+        (keys.get(found.name.toLowerCase()) ?? new Set()).add(found.pubkey),
+      );
+  });
+  if (![...keys.values()].some((set) => set.size > 1)) return doc;
+  const { code, link } = composerSchema.marks;
+  const visit = (
+    node: EditorNode,
+    authored?: () => SourceRange[],
+  ): EditorNode => {
+    if (node.type.spec.code) return node;
+    const children: EditorNode[] = [];
+    // Paragraph offsets match authoredLiteralRanges, as blocksMarkdown reads them.
+    const paragraphs = node.isTextblock
+      ? undefined
+      : authoredLiteralRanges(node, mode);
+    let start = 0;
+    node.forEach((child, offset, index) => {
+      if (!node.isTextblock) {
+        children.push(visit(child, paragraphs?.get(offset)));
+        return;
+      }
+      const from = start;
+      start += child.isText
+        ? child.textContent.length
+        : child.type.name === "hard_break"
+          ? 1
+          : child.attrs.source.length;
+      const found = person(child);
+      if (
+        !found ||
+        (keys.get(found.name.toLowerCase())?.size ?? 0) < 2 ||
+        code.isInSet(child.marks) ||
+        link.isInSet(child.marks) ||
+        authored?.().some((range) => from < range.end && start > range.start)
+      ) {
+        children.push(child);
+        return;
+      }
+      const qualifier = ` (${found.pubkey.toLowerCase()})`;
+      if (!child.isText) {
+        children.push(
+          child.type.create(
+            { ...child.attrs, source: child.attrs.source + qualifier },
+            null,
+            child.marks,
+          ),
+        );
+        return;
+      }
+      children.push(child);
+      // A marked run of text takes the qualifier once, after its last node.
+      const next = node.maybeChild(index + 1);
+      if (!next?.isText || person(next)?.pubkey !== found.pubkey)
+        children.push(composerSchema.text(qualifier, child.marks));
+    });
+    return node.copy(Fragment.from(children));
+  };
+  return visit(doc);
+}
+
+/** `exits` drops code block exit paragraphs, as a send does; an authored copy
+ * keeps every blank line the user typed. */
+function blocksMarkdown(
+  container: EditorNode,
+  mode: ComposerMarkdownMode,
+  exits: boolean,
+): string {
+  const doc = exits ? withoutCodeBlockExits(container) : container;
   const blocks: string[] = [];
   let previous: EditorNode | undefined;
-  const authored = authoredLiteralRanges(doc);
+  const authored = authoredLiteralRanges(doc, mode);
   // Two lists of one kind separated only by blank lines read as one list, so
   // adjacent lists alternate their marker as mdast-util-to-markdown does: `-`
   // then `*` for bullets, `.` then `)` for numbers. A block that serialises to
@@ -67,19 +209,26 @@ function blocksMarkdown(doc: EditorNode): string {
   let lastList: NodeType | undefined;
   let alternate = false;
   doc.forEach((block, offset) => {
-    // Blank separation prevents lazy quote continuation and adjacent blocks
-    // merging on send; ordinary authored paragraph newlines remain unchanged.
-    if (previous)
-      blocks.push(
-        previous.type.name === "paragraph" && block.type.name === "paragraph"
-          ? "\n"
-          : "\n\n",
-      );
+    // The trailing caret after a table needs an empty paragraph in the view.
+    // It becomes Markdown only when the user adds content to it.
+    if (
+      previous?.type.name === "markdown_table" &&
+      block.type.name === "paragraph" &&
+      block.content.size === 0 &&
+      offset + block.nodeSize === doc.content.size
+    )
+      return;
+    const paragraphs =
+      previous?.type.name === "paragraph" && block.type.name === "paragraph";
     const list =
       block.type.name === "bullet_list" || block.type.name === "ordered_list";
+    const tightItem =
+      mode === "document" && doc.type.name === "list_item" && !doc.attrs.spread;
     if (list) alternate = lastList === block.type && !alternate;
     let output: string;
-    if (block.type.name === "code_block") {
+    if (block.type.name === "markdown_table") {
+      output = block.attrs.source;
+    } else if (block.type.name === "code_block") {
       const language: unknown = block.attrs.language;
       output = toMarkdown(
         {
@@ -96,7 +245,7 @@ function blocksMarkdown(doc: EditorNode): string {
         { fences: true },
       ).slice(0, -1);
     } else if (block.type.name === "blockquote") {
-      output = blocksMarkdown(block)
+      output = blocksMarkdown(block, mode, exits)
         .split("\n")
         .map((line) => (line ? `> ${line}` : ">"))
         .join("\n");
@@ -111,7 +260,7 @@ function blocksMarkdown(doc: EditorNode): string {
             : alternate
               ? "* "
               : "- ";
-        const lines = blocksMarkdown(item).split("\n");
+        const lines = blocksMarkdown(item, mode, exits).split("\n");
         items.push(
           prefix +
             lines
@@ -121,8 +270,32 @@ function blocksMarkdown(doc: EditorNode): string {
               .join("\n"),
         );
       });
-      output = items.join("\n");
-    } else output = paragraphMarkdown(block, authored.get(offset));
+      output = items.join(
+        mode === "document" && block.attrs.spread ? "\n\n" : "\n",
+      );
+    } else output = paragraphMarkdown(block, authored.get(offset), mode);
+    const setextHeading =
+      block.type.name === "heading" && /\n(?:=+|-+)$/.test(output);
+    const previousType = previous?.type.name;
+    // Empty and non-1 ordered lists cannot interrupt a paragraph. A Setext
+    // heading starts with prose, which can also continue a nested container.
+    const needsBlankLine =
+      (previous?.type.name === "paragraph" &&
+        previous.content.size > 0 &&
+        ((list && block.firstChild?.firstChild?.content.size === 0) ||
+          (block.type.name === "ordered_list" && block.attrs.order !== 1) ||
+          setextHeading)) ||
+      ((block.type.name === "paragraph" || setextHeading) &&
+        (previousType === "bullet_list" ||
+          previousType === "ordered_list" ||
+          previousType === "blockquote"));
+    if (previous)
+      blocks.push(
+        (mode === "chat" && paragraphs) ||
+          (tightItem && !paragraphs && !needsBlankLine)
+          ? "\n"
+          : "\n\n",
+      );
     blocks.push(output);
     if (list) lastList = block.type;
     else if (/\S/.test(output)) {
@@ -136,7 +309,7 @@ function blocksMarkdown(doc: EditorNode): string {
 
 /** Parse each contiguous paragraph run once, lazily. Rich text is masked so
  * only authored source defines code, links and HTML; offsets stay unchanged. */
-function authoredLiteralRanges(doc: EditorNode) {
+function authoredLiteralRanges(doc: EditorNode, mode: ComposerMarkdownMode) {
   const ranges = new Map<number, () => SourceRange[]>();
   let run: { source: string; ranges?: SourceRange[] } | undefined;
   doc.forEach((block, offset) => {
@@ -159,7 +332,7 @@ function authoredLiteralRanges(doc: EditorNode) {
           : value;
     });
     const end = context.source.length;
-    context.source += "\n";
+    context.source += mode === "document" ? "\n\n" : "\n";
     ranges.set(offset, () => {
       if (!context.ranges) {
         context.ranges = [];
@@ -198,7 +371,27 @@ function authoredLiteralRanges(doc: EditorNode) {
 function paragraphMarkdown(
   block: EditorNode,
   authoredLiterals?: () => SourceRange[],
+  mode: ComposerMarkdownMode = "chat",
 ): string {
+  const heading = block.type.name === "heading";
+  let inlineCount = block.childCount;
+  if (heading) {
+    // Blank final lines cannot carry a heading's hard breaks. Code spans
+    // and links still produce Markdown content when their text is whitespace.
+    for (let index = inlineCount - 1; index >= 0; index--) {
+      const node = block.child(index);
+      if (node.type.name === "hard_break") {
+        inlineCount = index;
+      } else if (
+        !node.isText ||
+        /[^ \t]/.test(node.textContent) ||
+        composerSchema.marks.code.isInSet(node.marks) ||
+        composerSchema.marks.link.isInSet(node.marks)
+      ) {
+        break;
+      }
+    }
+  }
   let text = "";
   const formats = [
     { mark: composerSchema.marks.spoiler, type: "spoiler" },
@@ -211,8 +404,12 @@ function paragraphMarkdown(
   const ranges: (SourceRange & { href?: string })[][] = formats.map(() => []);
   const literals: SourceRange[] = [];
   const recipients: SourceRange[] = [];
-  block.forEach((node) => {
+  const hardBreaks: number[] = [];
+  for (let index = 0; index < inlineCount; index++) {
+    const node = block.child(index);
     const start = text.length;
+    if (mode === "document" && node.type.name === "hard_break")
+      hardBreaks.push(start);
     text += node.isText
       ? node.textContent
       : node.type.name === "hard_break"
@@ -239,7 +436,7 @@ function paragraphMarkdown(
         previous.end = text.length;
       else spans.push({ start, end: text.length, ...(href ? { href } : {}) });
     });
-  });
+  }
   // A spoiler is inline syntax. Close/reopen it across authored blank lines so
   // every resulting Markdown paragraph stays hidden after publication.
   ranges[0] = (ranges[0] ?? []).flatMap((range) => {
@@ -255,7 +452,13 @@ function paragraphMarkdown(
     if (start < range.end) parts.push({ start, end: range.end });
     return parts;
   });
-  if (!literals.length && ranges.every((spans) => !spans.length)) return text;
+  if (
+    !heading &&
+    !hardBreaks.length &&
+    !literals.length &&
+    ranges.every((spans) => !spans.length)
+  )
+    return text;
   const raw = new WeakMap<Text, SourceRange>();
   const literal = new WeakSet<Text>();
   const attention = new WeakMap<Text, SourceRange[]>();
@@ -387,7 +590,19 @@ function paragraphMarkdown(
     linked = false,
   ): PhrasingContent[] => {
     const format = formats[depth];
-    if (!format) return source(start, end, marked, linked);
+    if (!format) {
+      const children: PhrasingContent[] = [];
+      let offset = start;
+      for (const point of hardBreaks) {
+        if (point < start || point >= end) continue;
+        children.push(...source(offset, point, marked, linked), {
+          type: "break",
+        });
+        offset = point + 1;
+      }
+      children.push(...source(offset, end, marked, linked));
+      return children;
+    }
     const children: PhrasingContent[] = [];
     let offset = start;
     for (const range of ranges[depth] ?? []) {
@@ -396,11 +611,16 @@ function paragraphMarkdown(
       if (from >= to) continue;
       const value = text.slice(from, to);
       if (format.type === "inlineCode") {
-        children.push(...source(offset, from, marked, linked));
+        children.push(...content(offset, from, depth + 1, marked, linked));
         // CommonMark folds newlines inside a code span to spaces. Separate spans
         // preserve authored line breaks without inventing a fenced block.
         value.split("\n").forEach((line, index) => {
-          if (index) children.push({ type: "text", value: "\n" });
+          if (index)
+            children.push(
+              mode === "document"
+                ? { type: "break" }
+                : { type: "text", value: "\n" },
+            );
           if (line) children.push({ type: "inlineCode", value: line });
         });
         offset = to;
@@ -533,6 +753,25 @@ function paragraphMarkdown(
         value = value.replace(/[`\\]+$/, (tail) =>
           tail.replace(/[\\`]/g, "\\$&"),
         );
+      // The ATX parser strips a closing hash run after whitespace.
+      if (
+        parent?.type === "heading" &&
+        state.stack.includes("headingAtx") &&
+        info.after === "\n"
+      )
+        value = value.replace(/(^|[ \t])(#+)(?=[ \t]*$)/, "$1\\$2");
+      // An odd authored slash must not escape the generated hard-break slash.
+      if (
+        mode === "document" &&
+        parent &&
+        "children" in parent &&
+        parent.children[
+          parent.children.findIndex((child) => child === node) + 1
+        ]?.type === "break"
+      )
+        value = value.replace(/\\+$/, (tail) =>
+          tail.length % 2 ? `${tail}\\` : tail,
+        );
       return value;
     }
     const value = defaultHandlers.text(node, parent, state, info);
@@ -593,7 +832,13 @@ function paragraphMarkdown(
   const tree: Root = {
     type: "root",
     children: [
-      { type: "paragraph", children: content(0, text.length, 0, false) },
+      heading
+        ? {
+            type: "heading",
+            depth: block.attrs.level,
+            children: content(0, text.length, 0, false),
+          }
+        : { type: "paragraph", children: content(0, text.length, 0, false) },
     ],
   };
   // Root adds exactly one final line ending; authored trailing newlines stay.

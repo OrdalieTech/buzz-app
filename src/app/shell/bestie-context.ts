@@ -13,7 +13,8 @@ export function isBestiePage(target: OpenTarget | null | undefined) {
 export type BestieMark = {
   label: string;
   detail: "Bestie";
-  avatar: { src: string | undefined; shape: "squircle" };
+  avatar?: { src: string | undefined; shape: "squircle" };
+  placeholder?: true;
 };
 export const BestieNavigationContext = createContext<BestieMark | undefined>(
   undefined,

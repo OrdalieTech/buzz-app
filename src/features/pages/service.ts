@@ -5,6 +5,7 @@ import {
   createContributions,
   type Contribution,
 } from "../../plugins/contributions.ts";
+import { isBundledOwner } from "../../plugins/provenance";
 
 export type PageProps = {
   companion?: ReactNode | undefined;
@@ -32,6 +33,8 @@ export type Page = Readonly<{
   component: ComponentType<PageProps>;
   /** Replace the conversation sidebar while this page is selected. */
   sidebar?: ComponentType<PageSidebarProps>;
+  /** Keep the Messages sidebar and dock selection while this page is open. */
+  conversationNavigation?: boolean;
   layout?: "document" | "workspace";
   // Opt in only when every page state places the supplied companion card.
   companion?: boolean;
@@ -75,7 +78,20 @@ export type PagesReader = {
   snapshot: () => readonly RegisteredPage[];
   subscribe: (listener: () => void) => () => void;
 };
-export type Pages = PagesReader & { register(page: Page): void };
+/** A bundled plugin's component the app shell mounts once while the plugin
+ * is on, such as a notice or a dialog, which places itself. The design
+ * system's toasts and dialogs work in it. */
+export type AppOverlay = Readonly<{ id: string; component: ComponentType }>;
+export type RegisteredOverlay = Contribution<AppOverlay>;
+export type Pages = PagesReader & {
+  register(page: Page): void;
+  /** Bundled plugins only. */
+  registerOverlay(overlay: AppOverlay): void;
+  readonly overlays: Readonly<{
+    snapshot: () => readonly RegisteredOverlay[];
+    subscribe: (listener: () => void) => () => void;
+  }>;
+};
 declare module "@deepseek-ai/cordis" {
   interface Context {
     pages: Pages;
@@ -86,9 +102,27 @@ const dataImageUrl = /^data:image\/[\w.+-]+(?:;[^,]*)?,/i;
 
 export class PagesService extends Service implements Pages {
   private readonly contributions;
+  private readonly overlayContributions;
   constructor(ctx: Context) {
     super(ctx, "pages");
     this.contributions = createContributions<Page>(ctx);
+    this.overlayContributions = createContributions<AppOverlay>(ctx);
+    // Read-only: registering goes through `registerOverlay`'s check.
+    const { snapshot, subscribe } = this.overlayContributions;
+    this.overlays = Object.freeze({ snapshot, subscribe });
+  }
+  readonly overlays;
+  registerOverlay(overlay: AppOverlay) {
+    if (!this.ctx.pluginOwner || !isBundledOwner(this.ctx.pluginOwner))
+      throw new Error("App overlays are available only to bundled plugins");
+    if (
+      !overlay ||
+      typeof overlay.id !== "string" ||
+      !/^[a-z0-9][a-z0-9._-]*$/.test(overlay.id) ||
+      typeof overlay.component !== "function"
+    )
+      throw new Error("An app overlay needs an id and a React component");
+    this.overlayContributions.register(this.ctx, overlay);
   }
   snapshot = () => this.contributions.snapshot();
   subscribe = (listener: () => void) => this.contributions.subscribe(listener);
@@ -101,6 +135,8 @@ export class PagesService extends Service implements Pages {
       !page.title.trim() ||
       typeof page.component !== "function" ||
       (page.sidebar !== undefined && typeof page.sidebar !== "function") ||
+      (page.conversationNavigation !== undefined &&
+        typeof page.conversationNavigation !== "boolean") ||
       (page.layout !== undefined &&
         page.layout !== "document" &&
         page.layout !== "workspace") ||

@@ -521,6 +521,17 @@ fn recovery_validates_scalars_and_metadata_and_deduplicates_public_choices() {
 }
 
 async fn recover_with(service: &Service, host: &NsecBackupHost) -> Result<RestoreResult> {
+    let result = recover_returning(host, "code=synthetic-code").await;
+    // Keep the service borrowed through completion; no OS credential store is involved.
+    assert_eq!(
+        service.state.lock().unwrap().requests.get("/v1/auth/me"),
+        Some(&1)
+    );
+    result
+}
+
+/// A restore whose browser step returns `query` (after `state`).
+async fn recover_returning(host: &NsecBackupHost, query: &str) -> Result<RestoreResult> {
     let callback = OAuthCallbackHost::default();
     let authorization = Arc::new(Mutex::new(String::new()));
     let capture = authorization.clone();
@@ -577,14 +588,51 @@ async fn recover_with(service: &Service, host: &NsecBackupHost) -> Result<Restor
     let callback_url = url::Url::parse(&oauth.callback_url).unwrap();
     let authority = format!("127.0.0.1:{}", callback_url.port().unwrap());
     let mut stream = TcpStream::connect(&authority).await.unwrap();
-    stream.write_all(format!("GET /synthetic?state={state}&code=synthetic-code HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes()).await.unwrap();
-    let result = task.await.unwrap();
-    // Keep the service borrowed through completion; no OS credential store is involved.
+    stream
+        .write_all(
+            format!("GET /synthetic?state={state}&{query} HTTP/1.1\r\nHost: {authority}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    task.await.unwrap()
+}
+
+#[tokio::test]
+async fn a_declined_browser_sign_in_reads_as_canceled_and_other_errors_as_retry() {
+    for (query, expected) in [
+        ("error=access_denied", CANCELED),
+        ("error=server_error", RETRY),
+    ] {
+        let service = Service::new().await;
+        let directory = tempfile::tempdir().unwrap();
+        let host = service.host(directory.path());
+        let result = recover_returning(&host, query).await;
+        assert_eq!(result.err().as_deref(), Some(expected), "{query}");
+        assert!(service.state.lock().unwrap().requests.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn an_unreachable_builderlab_reads_as_offline_not_retry() {
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let service = Service::new().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut host = service.host(directory.path());
+    host.config = Arc::new(Some(Config {
+        service_url: root,
+        namespace: "backup/staging".into(),
+    }));
+    let result = recover_returning(&host, "code=synthetic-code").await;
+    assert_eq!(result.err().as_deref(), Some(OFFLINE));
+    // A backup pass still reports it as unreachable, as before.
+    assert_eq!(String::from(ReadError::Unreachable), OFFLINE);
     assert_eq!(
-        service.state.lock().unwrap().requests.get("/v1/auth/me"),
-        Some(&1)
+        Stop::from(ReadError::Unreachable),
+        Stop::Failed(Failure::Unreachable)
     );
-    result
 }
 
 #[tokio::test]
@@ -2096,12 +2144,12 @@ async fn management_requires_a_scoped_confirmed_receipt_and_survives_session_los
     host.trigger(identity.clone());
     finish_background(&host).await;
     assert!(host.status().management.unwrap().initial_backup_confirmed);
-    // A fresh process starts conservatively, then verifies the same scoped
-    // durable receipt without uploading another copy.
+    // A fresh process starts from the durable receipt, then verifies it
+    // without uploading another copy.
     let restored = service.host(directory.path());
     restored.initialize_management(&identity).await.unwrap();
     assert!(
-        !restored
+        restored
             .status()
             .management
             .unwrap()
@@ -2132,6 +2180,75 @@ async fn management_requires_a_scoped_confirmed_receipt_and_survives_session_los
             .unwrap()
             .initial_backup_confirmed
     );
+}
+
+fn confirmed(host: &NsecBackupHost) -> bool {
+    host.status().management.unwrap().initial_backup_confirmed
+}
+
+#[tokio::test]
+async fn a_saved_receipt_shows_the_backup_until_the_signed_in_account_contradicts_it() {
+    let service = Service::new().await;
+    let directory = tempfile::tempdir().unwrap();
+    let identity = IdentityHost::fixture();
+    let first = service.host(directory.path());
+    service.enable(&first).await;
+    first.state.lock().unwrap().session = Some(service.session());
+    first.trigger(identity.clone());
+    finish_background(&first).await;
+    assert!(confirmed(&first));
+    // Launched again with Builderlab unreachable: the receipt answers with no
+    // request, and the launch's own session handoff keeps it.
+    service.state.lock().unwrap().me_status = 500;
+    let host = service.host(directory.path());
+    host.initialize_management(&identity).await.unwrap();
+    assert!(confirmed(&host));
+    host.handoff(1, Some(service.session()), identity.clone())
+        .unwrap()
+        .unwrap();
+    finish_background(&host).await;
+    assert_eq!(
+        serde_json::to_value(host.status()).unwrap()["kind"],
+        "unreachable"
+    );
+    assert!(confirmed(&host));
+    // A signed-out re-check is not a missing backup either.
+    service.state.lock().unwrap().me_status = 401;
+    host.trigger(identity.clone());
+    finish_background(&host).await;
+    assert_eq!(
+        serde_json::to_value(host.status()).unwrap()["kind"],
+        "signed_out"
+    );
+    assert!(confirmed(&host));
+    // An account that links another key, or none, holds no backup of this one.
+    service.state.lock().unwrap().me_status = 200;
+    for (mapping, outcome) in [
+        (Some(pubkey([2; 32])), "other_key_linked"),
+        (None, "not_linked"),
+    ] {
+        service.state.lock().unwrap().mapping = mapping;
+        let host = service.host(directory.path());
+        host.initialize_management(&identity).await.unwrap();
+        assert!(confirmed(&host));
+        host.state.lock().unwrap().session = Some(service.session());
+        host.trigger(identity.clone());
+        finish_background(&host).await;
+        let status = serde_json::to_value(host.status()).unwrap();
+        assert!(
+            status["kind"] == outcome || status["reason"] == outcome,
+            "{status}"
+        );
+        assert!(!confirmed(&host), "{outcome}");
+        // The next account handoff starts again from the receipt; that
+        // account's re-check does not finish.
+        service.state.lock().unwrap().me_status = 500;
+        host.handoff(1, Some(service.session()), identity.clone())
+            .unwrap();
+        finish_background(&host).await;
+        assert!(confirmed(&host), "{outcome}");
+        service.state.lock().unwrap().me_status = 200;
+    }
 }
 
 #[tokio::test]

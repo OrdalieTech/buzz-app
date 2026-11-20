@@ -1,7 +1,14 @@
 // FOUNDATION: Target-based panel contributions, independent of page layout.
 import { Service, type Context } from "@deepseek-ai/cordis";
 import type { ComponentType } from "react";
-import type { ChannelSummary } from "../relay/contracts";
+import {
+  PanelWorkspace,
+  usePanelTabTitle,
+  type PanelWorkspaceProps as HostPanelWorkspaceProps,
+  type PanelWorkspaceItem as HostPanelWorkspaceItem,
+} from "./PanelWorkspace";
+import { usePluginPanelSplit } from "./usePanelSplit";
+import type { Attachment, ChannelSummary } from "../relay/contracts";
 import type { RelaySession } from "../relay/session";
 import {
   createContributions,
@@ -10,11 +17,23 @@ import {
   type MatchOrder,
 } from "../../plugins/contributions";
 
+/** Plugin tab data; host opening, drag and menu lifetimes stay private. */
+export type PanelWorkspaceItem = Pick<
+  HostPanelWorkspaceItem,
+  "id" | "label" | "icon" | "content" | "close" | "toolbar"
+>;
+export type PanelWorkspaceProps = Pick<
+  HostPanelWorkspaceProps,
+  "value" | "select" | "actions" | "label" | "focusOnMount"
+> & { items: PanelWorkspaceItem[] };
+
 export type PanelContext = Readonly<{
   /** Originating conversation, not a claim of thread-level scope or access. */
   channelId: string;
   /** Thread root of the message the panel was opened from, when there is one. */
   rootId?: string;
+  /** Open an image or video in the host conversation viewer. False when retired. */
+  openMedia?(messageId: string, attachment: Attachment): boolean;
   canOpen(target: string): boolean;
   /**
    * Open a target through the host. A tab replaces itself; a channel drawer or
@@ -58,6 +77,8 @@ export type PanelProps = {
 export type Panel = Readonly<{
   id: string;
   title: string;
+  /** Optional decorative icon for channel tabs. */
+  tabIcon?: ComponentType;
   matches: (url: string) => boolean;
   /** Claim strength when several panels match a target; see `MatchOrder`. */
   order?: MatchOrder | undefined;
@@ -80,6 +101,8 @@ export type Panel = Readonly<{
   /** Tabs opened from links stay until closed, like a channel tool's, instead
    * of giving way to the next link or thread. */
   keepOpen?: boolean;
+  /** Opt into conversation detail addresses and Back/Forward/Close behavior. */
+  addressable?: true;
   /** Mount tab content on first selection, then retain it for the workspace visit.
    * Component-provided titles and local detail tabs are also deferred. */
   deferUntilShown?: boolean;
@@ -113,6 +136,12 @@ export type PanelOpenRequest = Readonly<{
   rootId?: string;
 }>;
 export type Panels = {
+  /** Host presentation, available to installed modules through injection. */
+  ui: {
+    Workspace: ComponentType<PanelWorkspaceProps>;
+    /** Stable names should include the plugin ID; scope is the session workspace. */
+    useSplit: typeof usePluginPanelSplit;
+  };
   register(panel: Panel): void;
   resolve(target: string): RegisteredPanel | undefined;
   snapshot(): readonly RegisteredPanel[];
@@ -124,6 +153,11 @@ export type Panels = {
   handleOpenRequests(
     handler: (request: PanelOpenRequest) => boolean,
   ): () => void;
+  /** React hook for a panel component: names its tab, in place of the static
+   * `title`, while mounted, with an optional icon. Also works in a host workspace.
+   * Does nothing outside a tab. Absent on hosts
+   * that predate it, so feature-detect before calling. */
+  useTabTitle?: typeof usePanelTabTitle;
 };
 declare module "@deepseek-ai/cordis" {
   interface Context {
@@ -131,6 +165,10 @@ declare module "@deepseek-ai/cordis" {
   }
 }
 export class PanelsService extends Service implements Panels {
+  readonly ui: Panels["ui"] = Object.freeze({
+    Workspace: PanelWorkspace,
+    useSplit: usePluginPanelSplit,
+  });
   private readonly panels;
   constructor(ctx: Context) {
     super(ctx, "panels");
@@ -139,6 +177,7 @@ export class PanelsService extends Service implements Panels {
   private readonly openHandlers = new Set<
     (request: PanelOpenRequest) => boolean
   >();
+  useTabTitle = usePanelTabTitle;
   snapshot = () => this.panels.snapshot();
   subscribe = (listener: () => void) => this.panels.subscribe(listener);
   requestOpen = (request: PanelOpenRequest) => {
@@ -206,6 +245,8 @@ export class PanelsService extends Service implements Panels {
       throw new Error("A channel placement must be bottom, side or tab");
     if (panel.keepOpen !== undefined && typeof panel.keepOpen !== "boolean")
       throw new Error("A panel's keepOpen must be a boolean");
+    if (panel.addressable !== undefined && panel.addressable !== true)
+      throw new Error("A panel's addressable must be true when set");
     if (
       panel.deferUntilShown !== undefined &&
       typeof panel.deferUntilShown !== "boolean"

@@ -1,3 +1,4 @@
+import type { ForwardSnapshot } from "./forwarded-message";
 import type { VerifiedProfile } from "./verified-profile";
 import type { ReadFilter } from "./events";
 import type { CustomEmoji } from "./emoji";
@@ -88,6 +89,8 @@ export type Profile = Readonly<{
   about?: string;
   /** Self-declared NIP-05 identifier; not proof of DNS verification. */
   nip05?: string;
+  /** Self-declared IANA time zone, already checked to be one this runtime knows. */
+  tz?: string;
   /** Self-declared display hint, not proof of ownership, membership or authority. */
   isAgent?: true;
   /** Owner named by the profile auth tag; display metadata, never authorization. */
@@ -135,11 +138,16 @@ export type ChannelMessage = Readonly<{
   content: string;
   /** Unprojected current body when attachment presentation removed Markdown. */
   sourceContent?: string;
+  /** Unverified forwarded copy; the ordinary content remains readable on older clients. */
+  forward?: Readonly<{ snapshot: ForwardSnapshot; note: string }>;
   /** Original kind 40002, regardless of edits; self-declared display evidence, not authority. */
   agentEnvelope?: true;
   /** Signed `audience` tag of the original event: `agents` is coordination
    * between agents, shown quietly. Absent means everyone; unknown values too. */
   audience?: "agents";
+  /** Signed `buzz:request` tag: the agent's claim of the triggering message
+   * this update belongs to, separate from its flattened reply link. */
+  request?: string;
   /** Signed display metadata for an automatic execution-failure reply. */
   notice?: "execution-failure";
   /** Original kind 40008. Untrusted display metadata; content stays a raw patch. */
@@ -161,6 +169,8 @@ export type ChannelMessage = Readonly<{
   }>;
   /** Current body came from a replacement edit; original recipients do not bind its prose. */
   edited?: true;
+  /** The edit supplying the current body; absent when unedited. */
+  editId?: string;
   /** Offsets in `content` where attachment removal joined once-separate text; a
    * bound name never spans one. */
   attachmentSeams?: readonly number[];
@@ -168,6 +178,8 @@ export type ChannelMessage = Readonly<{
   mentions: readonly string[];
   /** Signed two-field mention tags bind display only; never notification recipients. */
   mentionReferences?: readonly string[];
+  /** Frozen display labels inside a forwarded copy; never notification intent. */
+  mentionLabels?: readonly { id: string; names: readonly string[] }[];
   /** Authorized edit supplying current imeta; absent when sourced from the original. */
   attachmentSourceId?: string;
   attachments: readonly Attachment[];
@@ -200,7 +212,12 @@ export type ChannelList = Readonly<{
   status: ListStatus;
   /** Set when the viewer's roster read hit its cap; omitted channels are then not evidence of removal. */
   coverage?: "partial";
+  /** When discovery last committed: live roster and metadata events, exact
+   * reads and complete roster reads all move it. */
   asOf?: number;
+  /** When a complete viewer-scoped roster read last committed, the only read
+   * whose omissions prove absence; `asOf` of that commit. */
+  rosterAsOf?: number;
   /** Initial Recent ordering observation, independent of roster/access readiness. */
   activityStatus?: "idle" | "loading" | "ready" | "error" | "unavailable";
   channels: readonly ChannelSummary[];
@@ -263,6 +280,9 @@ export type ChannelReference =
        * open; `looking` while that lookup is queued or in flight. */
       readable?: false;
       looking?: true;
+      /** A completed lookup admitted no readable channel. Absent before the
+       * first answer or after access/cache reset; retained during rechecks. */
+      answered?: true;
     }>;
 /** Reads are side-effect-free; snapshots retain identity until their value changes.
  * Commands are idempotent requests; the store decides whether network work is needed. */
@@ -375,6 +395,11 @@ export interface ChannelQueries {
   ): void;
   /** Drops a started chat the relay did not confirm. */
   abandon?(channelId: string): void;
+  /** Reads every listed channel's newest activity, as an activity sort or
+   * filter does, until the returned release; `list().activityStatus` and
+   * each channel's `activityKnown` report progress. Absent when the session
+   * reads no activity. */
+  demandActivity?(): () => void;
   subscribeList(listener: () => void): () => void;
   window(channelId: string): ChannelWindow;
   subscribeWindow(channelId: string, listener: () => void): () => void;

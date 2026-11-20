@@ -17,6 +17,8 @@ import { createAgentLibrary } from "../../features/agents/library";
 import { localAgentsFixture } from "../../features/agents/local-testing";
 import type { RegisteredPage } from "../../features/pages/service";
 import type { RelayData, RelaySnapshot } from "../../features/relay/service";
+import type { ProfileQueries } from "../../features/relay/profile-directory";
+import type { Profile } from "../../features/relay/contracts";
 import { createRelaySession } from "../../features/relay/session";
 import { createSidebarPreferencesStore } from "../../features/relay/sidebar-preferences-store";
 import {
@@ -39,7 +41,7 @@ import {
 } from "../../features/solo/default-agent";
 import { BestieNavigationProvider } from "./BestieNavigation";
 import { PageNavigation } from "./PageNavigation";
-import { PrimarySidebar } from "./PrimarySidebar";
+import { PrimarySidebar } from "./sidebar-section-testing";
 import { ChannelNavigationProvider } from "../../features/channel-navigation/ChannelNavigationState";
 import type { Navigation } from "../../features/navigation/controller";
 import { PageSearch } from "./PageSearch";
@@ -84,22 +86,26 @@ const page: RegisteredPage = {
   component: () => null,
 };
 
-async function fixture() {
+async function fixture(firstAgent = false) {
   const owner = createRelaySession(null);
   const libraryRead = vi.fn(async () => ({
     definitions: [],
-    identities: [{ pubkey: fizz, name: "Fizz" }],
+    identities: firstAgent ? [] : [{ pubkey: fizz, name: "Fizz" }],
   }));
   const library = createAgentLibrary(libraryRead);
-  const native = localAgentsFixture([
-    {
-      pubkey: pollen,
-      name: "Pollen",
-      picture: portrait.url,
-      owner: viewer,
-      relayUrl: "wss://example.test",
-    },
-  ]);
+  const native = localAgentsFixture(
+    firstAgent
+      ? []
+      : [
+          {
+            pubkey: pollen,
+            name: "Pollen",
+            picture: portrait.url,
+            owner: viewer,
+            relayUrl: "wss://example.test",
+          },
+        ],
+  );
   const lifetime = new AbortController();
   const choices = createAgentChoices({
     scope,
@@ -108,7 +114,22 @@ async function fixture() {
     signal: lifetime.signal,
   });
   await choices.refresh(false);
-  const session = { ...owner.session, viewer, agentChoices: choices };
+  let profileMap: ReadonlyMap<string, Profile> = new Map();
+  const profileListeners = new Set<() => void>();
+  let evictions = 0;
+  const ensured = vi.fn<ProfileQueries["ensure"]>(async () => {});
+  const profiles: ProfileQueries = {
+    snapshot: () => profileMap,
+    evictions: () => evictions,
+    subscribe(listener) {
+      profileListeners.add(listener);
+      return () => {
+        profileListeners.delete(listener);
+      };
+    },
+    ensure: ensured,
+  };
+  const session = { ...owner.session, viewer, agentChoices: choices, profiles };
   let snapshot: RelaySnapshot = {
     status: "ready",
     generation: 1,
@@ -126,6 +147,7 @@ async function fixture() {
       };
     },
     retry() {},
+    tryAgain() {},
     disconnect() {},
     async clearCache() {},
   };
@@ -138,6 +160,15 @@ async function fixture() {
     relay,
     native,
     libraryRead,
+    ensured,
+    publishProfile(pubkey: string, profile: Profile) {
+      profileMap = new Map([...profileMap, [pubkey, profile]]);
+      for (const listener of profileListeners) listener();
+    },
+    cancelProfileReads() {
+      evictions++;
+      for (const listener of profileListeners) listener();
+    },
     update(patch: Partial<RelaySnapshot>) {
       snapshot = { ...snapshot, ...patch };
       for (const listener of listeners) listener();
@@ -145,7 +176,7 @@ async function fixture() {
   };
 }
 
-it("uses the configured Bestie avatar in the dock and follows selection changes", async () => {
+it("shows the creation invitation in the dock, then follows the configured Bestie avatar", async () => {
   const f = await fixture();
   render(
     <BestieNavigationProvider pages={[page]} relay={f.relay}>
@@ -157,6 +188,11 @@ it("uses the configured Bestie avatar in the dock and follows selection changes"
       />
     </BestieNavigationProvider>,
   );
+  const invitation = await screen.findByRole("tab", {
+    name: "Create an agent",
+  });
+  expect(invitation.querySelector("img")).not.toBeNull();
+  expect(invitation).toHaveAttribute("aria-selected", "true");
   act(() => setDefaultAgent(scope, pollen));
   const pollenTab = await screen.findByRole("tab", { name: "Pollen" });
   expect(pollenTab.querySelector("img")).toHaveAttribute(
@@ -169,8 +205,88 @@ it("uses the configured Bestie avatar in the dock and follows selection changes"
   expect(fizzTab).toHaveTextContent("F");
 });
 
-it("shows the exact choice as Bestie in navigation and search", async () => {
+it("shows the Bestie's published profile picture over its agent definition art", async () => {
   const f = await fixture();
+  const published = agentAvatars[1];
+  if (!published) throw new Error("Expected a second bundled avatar");
+  setDefaultAgent(scope, pollen);
+  render(
+    <BestieNavigationProvider pages={[page]} relay={f.relay}>
+      <PageNavigation
+        pages={[page]}
+        selected={page.key}
+        onSelect={() => {}}
+        placement="dock"
+      />
+    </BestieNavigationProvider>,
+  );
+  const tab = await screen.findByRole("tab", { name: "Pollen" });
+  // The definition's art covers the wait for the profile it asked for.
+  expect(tab.querySelector("img")).toHaveAttribute("src", portrait.preview);
+  await waitFor(() =>
+    expect(f.ensured).toHaveBeenCalledWith([pollen], "background"),
+  );
+  act(() =>
+    f.publishProfile(pollen, { name: "Pollen", picture: published.url }),
+  );
+  expect(
+    screen.getByRole("tab", { name: "Pollen" }).querySelector("img"),
+  ).toHaveAttribute("src", published.preview);
+});
+
+it("shows initials once the Bestie's published profile drops its picture", async () => {
+  const f = await fixture();
+  const published = agentAvatars[1];
+  if (!published) throw new Error("Expected a second bundled avatar");
+  setDefaultAgent(scope, pollen);
+  render(
+    <BestieNavigationProvider pages={[page]} relay={f.relay}>
+      <PageNavigation
+        pages={[page]}
+        selected={page.key}
+        onSelect={() => {}}
+        placement="dock"
+      />
+    </BestieNavigationProvider>,
+  );
+  await screen.findByRole("tab", { name: "Pollen" });
+  act(() =>
+    f.publishProfile(pollen, { name: "Pollen", picture: published.url }),
+  );
+  act(() => f.publishProfile(pollen, { name: "Pollen" }));
+  const tab = screen.getByRole("tab", { name: "Pollen" });
+  expect(tab.querySelector("img")).toBeNull();
+  expect(tab).toHaveTextContent("P");
+});
+
+it("asks again for the Bestie's profile after a cache shrink cancels the read", async () => {
+  const f = await fixture();
+  setDefaultAgent(scope, pollen);
+  render(
+    <BestieNavigationProvider pages={[page]} relay={f.relay}>
+      <PageNavigation
+        pages={[page]}
+        selected={page.key}
+        onSelect={() => {}}
+        placement="dock"
+      />
+    </BestieNavigationProvider>,
+  );
+  await screen.findByRole("tab", { name: "Pollen" });
+  await waitFor(() =>
+    expect(f.ensured).toHaveBeenCalledWith([pollen], "background"),
+  );
+  const before = f.ensured.mock.calls.length;
+  act(() => f.cancelProfileReads());
+  await waitFor(() =>
+    expect(f.ensured.mock.calls.length).toBeGreaterThan(before),
+  );
+  expect(f.ensured).toHaveBeenLastCalledWith([pollen], "background");
+});
+
+it("offers first-agent creation, then shows the exact Bestie in navigation and search", async () => {
+  const f = await fixture(true);
+
   const select = vi.fn();
   render(
     <StrictMode>
@@ -187,8 +303,30 @@ it("shows the exact choice as Bestie in navigation and search", async () => {
     </StrictMode>,
   );
   const nav = screen.getByRole("navigation", { name: "Pages" });
-  expect(within(nav).getByRole("button", { name: "Bestie" })).toBeVisible();
+  const placeholder = await within(nav).findByRole("button", {
+    name: "Create an agent",
+  });
+  expect(placeholder).toBeVisible();
+  await waitFor(() => expect(placeholder.querySelector("img")).not.toBeNull());
+  expect(select).not.toHaveBeenCalled();
   act(() => {
+    f.native.set({
+      agents: [
+        {
+          pubkey: pollen,
+          name: "Pollen",
+          picture: portrait.url,
+          owner: viewer,
+          relayUrl: "wss://example.test",
+        },
+        {
+          pubkey: fizz,
+          name: "Fizz",
+          owner: viewer,
+          relayUrl: "wss://example.test",
+        },
+      ],
+    });
     setDefaultAgent(scope, pollen);
   });
   const pollenRow = await within(nav).findByRole("button", { name: "Pollen" });
@@ -236,8 +374,10 @@ it("shows the exact choice as Bestie in navigation and search", async () => {
   act(() => {
     forgetDefaultAgent(fizz);
   });
+  // An unassigned shortcut is the creation invitation even while the shared
+  // library offers existing agents. Their presence does not make one Bestie.
   expect(
-    within(nav).getByRole("button", { name: "Bestie" }),
+    within(nav).getByRole("button", { name: "Create an agent" }),
   ).toBeInTheDocument();
   act(() => {
     setDefaultAgent(scope, "d".repeat(64));
@@ -292,7 +432,9 @@ it("follows roster changes and community replacement without remounting content 
   act(() => {
     f.update({ status: "ready", scope: `https://other.test:${viewer}` });
   });
-  expect(screen.getByRole("button", { name: "Bestie" })).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Create an agent" }),
+  ).toBeInTheDocument();
   expect(screen.getByRole("textbox", { name: "Draft" })).toHaveValue(
     "keep this",
   );
@@ -495,7 +637,7 @@ it("honors the promoted DM's mute and unread state through reads and Bestie repl
   });
   expect(
     screen
-      .getByRole("tab", { name: "Bestie" })
+      .getByRole("tab", { name: "Create an agent" })
       .querySelector("[data-channel-priority]"),
   ).toBeNull();
 });

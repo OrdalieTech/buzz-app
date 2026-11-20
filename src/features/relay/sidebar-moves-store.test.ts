@@ -44,6 +44,9 @@ async function setup() {
               {
                 id: intent.createSection.id,
                 name: intent.createSection.name,
+                ...(intent.createSection.icon
+                  ? { icon: intent.createSection.icon }
+                  : {}),
                 order: -1,
               },
               ...data.sections,
@@ -97,6 +100,37 @@ async function setup() {
     sort,
   };
 }
+
+it("cleans up a confirmed deletion without recording a user move", async () => {
+  const h = await setup();
+  h.assignment.mockRejectedValueOnce(new Error("offline"));
+  await expect(h.owner.forgetDeletedFiling("alpha")).rejects.toThrow("offline");
+  expect(h.prefs.snapshot().moves).toBeUndefined();
+  expect(h.prefs.snapshot().data?.assignments.alpha).toBe("work");
+
+  await h.owner.forgetDeletedFiling("alpha");
+  expect(h.assignment).toHaveBeenLastCalledWith(
+    { channelId: "alpha" },
+    expect.any(AbortSignal),
+  );
+  expect(h.prefs.snapshot().data?.assignments).toEqual({ beta: "work" });
+  expect(h.star).not.toHaveBeenCalled();
+  expect(h.prefs.snapshot().moves).toBeUndefined();
+});
+
+it("skips deletion cleanup in a partial migration and dismisses a stale move retry", async () => {
+  const h = await setup();
+  const data = h.prefs.snapshot().data;
+  assert(data);
+  h.read.mockResolvedValueOnce({ ...data, workspaceMigrationPending: true });
+  await h.prefs.refresh();
+  await expect(h.prefs.assign("alpha", "later")).rejects.toThrow("unavailable");
+  expect(h.prefs.snapshot().moves).toHaveLength(1);
+
+  await h.owner.forgetDeletedFiling("alpha");
+  expect(h.assignment).not.toHaveBeenCalled();
+  expect(h.prefs.snapshot().moves).toBeUndefined();
+});
 
 it("moves immediately, keeps later intent through older failure, and serializes both records", async () => {
   const h = await setup();
@@ -175,6 +209,7 @@ it.each([undefined, "first"] as const)(
     const section = {
       id: "12345678-1234-1234-1234-123456789abc",
       name: "Launch",
+      icon: "📚",
       ...(position ? { position } : {}),
     };
     try {
@@ -184,6 +219,13 @@ it.each([undefined, "first"] as const)(
         section.id,
       );
       expect(h.prefs.snapshot().data?.assignments.alpha).toBe(section.id);
+      expect(
+        h.prefs.snapshot().data?.sections.at(position ? 0 : -1),
+      ).toMatchObject({
+        id: section.id,
+        name: section.name,
+        icon: section.icon,
+      });
       expect(h.prefs.snapshot().data?.starred).toEqual([]);
       await flush();
       gate.reject(new Error("offline"));
@@ -596,6 +638,7 @@ it("creates an empty section through the queued writer without altering stars or
   const section = {
     id: "12345678-1234-1234-1234-123456789abc",
     name: "Launch",
+    icon: ":launch:",
   };
   try {
     expect(h.prefs.sectionCreationWritable).toBe(true);
@@ -628,7 +671,7 @@ it("refreshes an accepted creation before reporting a lost response, superseding
   });
   h.read.mockImplementationOnce(() => stale.promise);
   const oldRefresh = h.prefs.refresh();
-  const section = { id: "accepted", name: "Launch" };
+  const section = { id: "accepted", name: "Launch", icon: "📚" };
   try {
     await expect(h.prefs.createSection(section)).rejects.toThrow(
       "response lost",
@@ -644,6 +687,57 @@ it("refreshes an accepted creation before reporting a lost response, superseding
     h.owner.dispose();
   }
 });
+
+it.each([{ name: "Renamed", icon: "📚" }, { name: "Launch" }])(
+  "reconciles changed creation state after a lost response: %j",
+  async (remote) => {
+    const h = await setup();
+    const save = h.assignment.getMockImplementation();
+    assert(save);
+    h.assignment.mockImplementationOnce(async (intent) => {
+      await save(intent);
+      throw new Error("response lost");
+    });
+    const section = { id: "accepted", name: "Launch", icon: "📚" };
+    h.readAfterWrite.mockImplementation(async () => {
+      const current = await h.read();
+      const recovered = {
+        ...current,
+        sections: current.sections.map((entry) =>
+          entry.id === section.id
+            ? { id: entry.id, order: entry.order, ...remote }
+            : entry,
+        ),
+      };
+      h.read.mockResolvedValue(recovered);
+      return recovered;
+    });
+    try {
+      // Recovering authoritative preferences is not confirmation of this intent.
+      await expect(h.prefs.createSection(section)).rejects.toThrow(
+        "response lost",
+      );
+      expect(h.prefs.snapshot()).toMatchObject({ status: "ready" });
+      expect(h.prefs.snapshot().data?.sections.at(-1)).toEqual({
+        id: section.id,
+        order: 2,
+        ...remote,
+      });
+      expect(h.prefs.writable).toBe(true);
+      expect(h.prefs.sectionCreationWritable).toBe(true);
+      await h.prefs.refresh();
+      expect(h.prefs.snapshot()).toMatchObject({ status: "ready" });
+      expect(h.prefs.snapshot().data?.sections.at(-1)).toEqual({
+        id: section.id,
+        order: 2,
+        ...remote,
+      });
+      expect(h.assignment).toHaveBeenCalledOnce(); // Never replay the stale creation.
+    } finally {
+      h.owner.dispose();
+    }
+  },
+);
 
 it.each([false, true])(
   "gates new creation until writer reconciliation succeeds (clear cache: %s)",

@@ -212,11 +212,13 @@ async function channelsPage({ root = true, cached = false } = {}) {
       return () => listeners.delete(listener);
     },
     retry() {},
+    tryAgain() {},
     disconnect() {},
     clearCache: async () => {},
   };
   const none: ReturnType<Panels["snapshot"]> = [];
   const panels: Panels = {
+    ui: { Workspace: () => null, useSplit: vi.fn() },
     snapshot: () => none,
     subscribe: () => () => {},
     resolve: () => undefined,

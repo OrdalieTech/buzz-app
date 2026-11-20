@@ -691,27 +691,37 @@ test("long native reactions and unavailable shortcode artwork stay inside the hi
     .locator("[data-message-id]")
     .first()
     .getByTestId("reaction-row");
-  for (const content of ["f".repeat(64), `:${"a".repeat(64)}:`]) {
+  const native = "f".repeat(64);
+  const shortcode = `:${"a".repeat(64)}:`;
+  for (const content of [native, shortcode]) {
     const pill = row.locator(`button[data-reaction="${content}"]`);
     await expect(pill).toHaveCount(1);
     await expect(pill).toHaveAttribute(
       "aria-label",
       `${content}: Fixture Member`,
     );
-    const bounds = await pill.evaluate((button) => {
-      const glyph = button.querySelector("[data-reaction-glyph] > span");
+    const bounds = await pill.evaluate((button, isShortcode) => {
+      const glyph = button.querySelector(
+        isShortcode
+          ? "[data-reaction-glyph] svg"
+          : "[data-reaction-glyph] > span",
+      );
+      const rect = glyph.getBoundingClientRect();
       const chip = button.getBoundingClientRect();
       return {
-        glyphWidth: glyph.getBoundingClientRect().width,
-        glyphLeft: glyph.getBoundingClientRect().left,
-        glyphRight: glyph.getBoundingClientRect().right,
+        glyphWidth: rect.width,
+        glyphLeft: rect.left,
+        glyphRight: rect.right,
         chipLeft: chip.left,
         chipRight: chip.right,
         truncated: glyph.scrollWidth > glyph.clientWidth,
+        text: button.querySelector("[data-reaction-glyph]").textContent,
       };
-    });
+    }, content === shortcode);
     expect(bounds.glyphWidth).toBeLessThanOrEqual(26);
-    expect(bounds.truncated).toBe(true);
+    if (content === native) expect(bounds.truncated).toBe(true);
+    // Unavailable shortcode artwork draws the placeholder icon, never its text.
+    else expect(bounds.text).toBe("");
     expect(bounds.glyphLeft).toBeGreaterThanOrEqual(bounds.chipLeft);
     expect(bounds.glyphRight).toBeLessThanOrEqual(bounds.chipRight);
   }
@@ -758,47 +768,42 @@ test.describe("reaction control rendering", () => {
       .toBe(false);
     const bounds = await plus.boundingBox();
     const original = await plus.screenshot();
-    await emoji
-      .locator("[data-reaction-glyph] > :first-child")
-      .evaluate((el) => {
-        el.addEventListener(
-          "transitionrun",
-          () => {
-            for (const animation of el.getAnimations()) {
-              animation.pause();
-              animation.currentTime =
-                Number(animation.effect.getTiming().duration) / 2;
-            }
-          },
-          { once: true },
-        );
-      });
+    const glyph = emoji.locator("[data-reaction-glyph] > :first-child");
+    // Hold the actual hover lift at its midpoint instead of racing its
+    // duration. Pause from the poll, not a one-shot transitionrun listener:
+    // on CI's slow renderer that listener paused nothing and the 150ms lift
+    // ran out. The poll pauses whichever transform transition exists, and
+    // the lift is stretched first so it cannot end before the first poll.
+    await glyph.evaluate((el) =>
+      el.style.setProperty("--duration-state", "60s"),
+    );
     try {
       await emoji.hover();
       await expect
         .poll(() =>
-          emoji
-            .locator("[data-reaction-glyph] > :first-child")
-            .evaluate((el) =>
-              el
-                .getAnimations()
-                .some((animation) => animation.playState === "paused"),
-            ),
+          glyph.evaluate((el) => {
+            const lift = el
+              .getAnimations()
+              .find(
+                (animation) => animation.transitionProperty === "transform",
+              );
+            if (!lift) return false;
+            lift.pause();
+            lift.currentTime = Number(lift.effect.getTiming().duration) / 2;
+            return lift.playState === "paused";
+          }),
         )
         .toBe(true);
       expect(await plus.boundingBox()).toEqual(bounds);
       expect((await plus.screenshot()).equals(original)).toBe(true);
     } finally {
-      await emoji
-        .locator("[data-reaction-glyph] > :first-child")
-        .evaluate((el) => {
-          for (const animation of el.getAnimations()) animation.finish();
-        });
+      await glyph.evaluate((el) => {
+        for (const animation of el.getAnimations()) animation.finish();
+        el.style.removeProperty("--duration-state");
+      });
     }
     await row.hover({ position: rest });
-    await expect(
-      emoji.locator("[data-reaction-glyph] > :first-child"),
-    ).toHaveCSS("transform", "none");
+    await expect(glyph).toHaveCSS("transform", "none");
     expect(await plus.boundingBox()).toEqual(bounds);
     expect((await plus.screenshot()).equals(original)).toBe(true);
     await plus.hover();

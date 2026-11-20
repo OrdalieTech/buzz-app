@@ -7,6 +7,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -14,10 +15,14 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { PageSearch, type SearchServices } from "./PageSearch";
 import { BestieConversationContext } from "./bestie-context";
 import type { RegisteredPage } from "../../features/pages/service";
-import { createShortcutBindings } from "../../features/shortcuts/preferences";
+import {
+  createShortcutBindings,
+  SHORTCUT_BINDINGS_KEY,
+} from "../../features/shortcuts/preferences";
 import { ShortcutsService } from "../../features/shortcuts/service";
 import { isApplePlatform } from "../../features/shortcuts/format";
 import { createRelaySession } from "../../features/relay/session";
+import type { ChannelList } from "../../features/relay/contracts";
 import type { RelaySnapshot } from "../../features/relay/service";
 import {
   keypair,
@@ -26,7 +31,11 @@ import {
   roster,
   scriptedTransport,
 } from "../../features/relay/testing";
+import { setUnreadFirstPreference } from "../../features/search/unread-first-preference";
 import { SEARCH_DEBOUNCE_MS } from "../../shared/search-debounce";
+import { ToastProvider } from "../../shared/design-system/ui/Toast";
+import { readView, writeView } from "../../shared/view-state";
+import { soloDraftTarget } from "../../features/channel-navigation/routes";
 
 // jsdom lacks scrollIntoView; the palette reveals its typed-text selection.
 beforeEach(() => {
@@ -34,6 +43,7 @@ beforeEach(() => {
     "ResizeObserver",
     class {
       observe() {}
+      unobserve() {}
       disconnect() {}
     },
   );
@@ -521,7 +531,7 @@ async function bestieSearch() {
   };
 }
 
-it("scopes Command F and Command K's conversation row to the Bestie page's DM", async () => {
+it("scopes Command F to the Bestie page's DM, from outside search and inside it, keeping the typed text", async () => {
   const f = await bestieSearch();
   try {
     f.press("f");
@@ -541,16 +551,22 @@ it("scopes Command F and Command K's conversation row to the Bestie page's DM", 
     );
     f.press("k");
     const search = await screen.findByRole("dialog", { name: "Search Buzz" });
-    fireEvent.click(
-      await within(search).findByRole("option", {
-        name: /Search conversation with Pollen/,
-      }),
-    );
+    const field = within(search).getByRole("combobox", { name: "Search Buzz" });
+    fireEvent.change(field, { target: { value: "deploy" } });
+    expect(
+      within(search).queryByRole("option", { name: /Search conversation/ }),
+    ).toBeNull();
+    f.press("f");
     expect(
       await within(search).findByRole("button", {
         name: "Remove Pollen search scope",
       }),
     ).toBeVisible();
+    expect(
+      within(search).getByRole("combobox", {
+        name: "Search this conversation",
+      }),
+    ).toHaveValue("deploy");
   } finally {
     await f.dispose();
   }
@@ -596,7 +612,7 @@ it("opens nothing with Command F on another page while a Bestie DM exists", asyn
   }
 });
 
-it("does not open a DM that finishes starting after search closed and reopened", async () => {
+it("does not open a DM that finishes opening after search closed and reopened", async () => {
   const root = new Context();
   root.provide("pluginStatus", {
     isActive: () => true,
@@ -613,10 +629,32 @@ it("does not open a DM that finishes starting after search closed and reopened",
   });
   let started!: (channelId: string) => void;
   let attempt!: AbortSignal;
+  // Bob already has a DM, so choosing him waits on its confirmed open.
+  let listed: [ChannelList, ChannelList] | undefined;
   const session = {
     ...owner.session,
     channels: {
       ...owner.session.channels,
+      list: () => {
+        const base = owner.session.channels.list();
+        if (listed?.[0] !== base)
+          listed = [
+            base,
+            {
+              ...base,
+              channels: [
+                ...base.channels,
+                {
+                  id: "bob-dm",
+                  name: "",
+                  channelType: "dm",
+                  participants: [bob.pubkey],
+                },
+              ],
+            },
+          ];
+        return listed[1];
+      },
       // The started DM is known, so only the closed palette stops it.
       get: (id: string) =>
         id === "bob-dm"
@@ -796,12 +834,12 @@ it("ranks pages by match when no community is connected", async () => {
     );
     await user.click(screen.getByRole("button", { name: "Search Buzz" }));
     const input = await screen.findByRole("combobox", { name: "Search Buzz" });
-    // "ses" starts Sessions, appears inside Processes, and only fuzzily
-    // matches Settings.
+    // "ses" starts Sessions and appears inside Processes. Settings only holds
+    // its letters scattered, so it does not match.
     await user.type(input, "ses");
     expect(
       screen.getAllByRole("option").map((option) => option.textContent),
-    ).toEqual(["Sessions", "Processes", "Settings"]);
+    ).toEqual(["Sessions", "Processes"]);
     await user.keyboard("{Enter}");
     expect(select).toHaveBeenCalledExactlyOnceWith("test/sessions");
   } finally {
@@ -1068,7 +1106,7 @@ it("finds and opens saved conversations while the community is unreachable or st
           return () => listeners.delete(listener);
         },
         snapshot: () => connection,
-        retry,
+        tryAgain: retry,
       },
     },
   } as unknown as SearchServices;
@@ -1093,19 +1131,21 @@ it("finds and opens saved conversations while the community is unreachable or st
     fireEvent.click(screen.getByRole("button", { name: "Search Buzz" }));
     const dialog = screen.getByRole("dialog", { name: "Search Buzz" });
     const field = within(dialog).getByRole("combobox", { name: "Search Buzz" });
-    // Recent activity lists the saved conversations.
+    // Recents lists the saved conversations.
     const recent = within(dialog).getByRole("group", {
-      name: "Recent activity",
+      name: "Recents",
     });
     expect(
       within(recent)
         .getAllByRole("option")
         .map((option) => option.textContent)
         .sort(),
-    ).toEqual(["AlphaConversation", "BetaConversation"]);
+    ).toEqual(["AlphaConversation · 1 member", "BetaConversation · 1 member"]);
     // A saved session has no message scope or open-channel view to offer.
     expect(within(dialog).queryByText(/^Search in Alpha/)).toBeNull();
-    expect(within(dialog).queryByRole("tab", { name: "Channels" })).toBeNull();
+    expect(
+      within(dialog).queryByRole("button", { name: "Channels" }),
+    ).toBeNull();
     // The author picker offers only people already known, and says the
     // people search that needs the relay waits for the connection.
     for (const text of ["from:al", "in:@al", "in:beta from:al"]) {
@@ -1215,5 +1255,514 @@ it("finds and opens saved conversations while the community is unreachable or st
     owner.dispose();
     bindings.dispose();
     await root.fiber.dispose();
+  }
+});
+
+/** Cmd+K on `ask: …` with an agent New chat would tag, and a New chat draft. */
+async function askSearch(existingDraft?: {
+  text: string;
+  recipients: readonly never[];
+}) {
+  const root = new Context();
+  root.provide("pluginStatus", {
+    isActive: () => true,
+    subscribe: () => () => {},
+  });
+  const bindings = createShortcutBindings(window);
+  const shortcuts = new ShortcutsService(root, window, bindings);
+  const relay = keypair(),
+    viewer = keypair(),
+    agent = keypair();
+  const owner = createRelaySession({
+    ...scriptedTransport(viewer.pubkey, relay.pubkey).transport,
+    query: async () => [],
+  });
+  const source = owner.session.agentChoices;
+  const picked = { pubkey: agent.pubkey, name: "Aria", managed: true };
+  const choices = {
+    ...source.snapshot(),
+    complete: true,
+    identities: [picked],
+    selectable: [picked],
+    archives: { status: "unavailable", archived: [] },
+  } as ReturnType<typeof source.snapshot>;
+  const session = {
+    ...owner.session,
+    agentChoices: {
+      ...source,
+      snapshot: () => choices,
+      subscribe: () => () => {},
+      retain: () => () => {},
+      ensure: () => {},
+    },
+  } as typeof owner.session;
+  const scope = `wss://relay.example:${viewer.pubkey}`;
+  const connection = { status: "ready", generation: 1, session, scope };
+  let community = { selected: "wss://relay.example", viewer: viewer.pubkey };
+  const open = vi.fn(async () => {});
+  const services = {
+    shortcuts,
+    shortcutBindings: bindings,
+    navigation: {
+      subscribe: () => () => {},
+      snapshot: () => ({ entry: { target: null } }),
+      open,
+    },
+    communities: {
+      subscribe: () => () => {},
+      snapshot: () => community,
+      relay: { subscribe: () => () => {}, snapshot: () => connection },
+    },
+  } as unknown as SearchServices;
+  if (existingDraft) writeView(scope, "solo:new-draft", existingDraft);
+  const user = userEvent.setup();
+  render(
+    <ToastProvider>
+      <PageSearch
+        pages={[
+          {
+            key: "buzz.channels/channels",
+            pluginId: "buzz.channels",
+            id: "channels",
+            title: "Channels",
+            revision: "bundled",
+            component: () => null,
+          },
+        ]}
+        onSelect={vi.fn()}
+        services={services}
+      />
+    </ToastProvider>,
+  );
+  await user.click(screen.getByRole("button", { name: "Search Buzz" }));
+  const input = await screen.findByRole("combobox", { name: "Search Buzz" });
+  await user.type(input, "ask: summarize the release");
+  // The Ask row appears once the default agent is read.
+  await screen.findByRole("option", { name: /Aria/ });
+  return {
+    agent,
+    scope,
+    open,
+    user,
+    switchCommunity() {
+      community = { ...community, selected: "wss://other.example" };
+    },
+    draft: () => readView<unknown>(scope, "solo:new-draft", null),
+    async dispose() {
+      cleanup();
+      owner.dispose();
+      bindings.dispose();
+      await root.fiber.dispose();
+    },
+  };
+}
+
+it("asks in New chat by writing the question draft and opening it for the agent", async () => {
+  const f = await askSearch();
+  try {
+    expect(f.draft()).toBeNull();
+    await f.user.keyboard("{Enter}");
+    await vi.waitFor(() =>
+      expect(f.open).toHaveBeenCalledExactlyOnceWith(
+        soloDraftTarget(f.scope, { agent: f.agent.pubkey }),
+      ),
+    );
+    expect(f.draft()).toEqual({
+      text: "@Aria Search Buzz to answer: summarize the release",
+      recipients: [
+        { pubkey: f.agent.pubkey, name: "Aria", start: 0, end: "@Aria".length },
+      ],
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+it("keeps an unsent New chat draft when asking, and opens New chat with the question only on Replace", async () => {
+  const unsent = { text: "my half-written note", recipients: [] };
+  const f = await askSearch(unsent);
+  const question = {
+    text: "@Aria Search Buzz to answer: summarize the release",
+    recipients: [
+      {
+        pubkey: f.agent.pubkey,
+        name: "Aria",
+        start: 0,
+        end: "@Aria".length,
+      },
+    ],
+  };
+  // New chat's composer reads its draft as it opens, so it must open only
+  // once the question is written.
+  const opened: unknown[] = [];
+  f.open.mockImplementation(async () => {
+    opened.push(f.draft());
+  });
+  try {
+    await f.user.keyboard("{Enter}");
+    const notice = await screen.findByRole("dialog", {
+      name: "New chat already has an unsent draft",
+    });
+    expect(f.draft()).toEqual(unsent);
+    expect(f.open).not.toHaveBeenCalled();
+    fireEvent.click(within(notice).getByRole("button", { name: "Replace it" }));
+    await vi.waitFor(() =>
+      expect(f.open).toHaveBeenCalledExactlyOnceWith(
+        soloDraftTarget(f.scope, { agent: f.agent.pubkey }),
+      ),
+    );
+    expect(opened).toEqual([question]);
+    expect(f.draft()).toEqual(question);
+  } finally {
+    await f.dispose();
+  }
+});
+
+it("does nothing on Replace once the person has switched community", async () => {
+  const unsent = { text: "my half-written note", recipients: [] };
+  const f = await askSearch(unsent);
+  try {
+    await f.user.keyboard("{Enter}");
+    const notice = await screen.findByRole("dialog", {
+      name: "New chat already has an unsent draft",
+    });
+    f.switchCommunity();
+    fireEvent.click(within(notice).getByRole("button", { name: "Replace it" }));
+    await vi.waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", {
+          name: "New chat already has an unsent draft",
+        }),
+      ).toBeNull(),
+    );
+    expect(f.draft()).toEqual(unsent);
+    expect(f.open).not.toHaveBeenCalled();
+  } finally {
+    await f.dispose();
+  }
+});
+
+/** A connected search whose viewer has joined `design`, `design-crit` and
+ * `release-notes`, for the place search keeps between openings. */
+function memorySearch() {
+  const root = new Context();
+  root.provide("pluginStatus", {
+    isActive: () => true,
+    subscribe: () => () => {},
+  });
+  const bindings = createShortcutBindings(window);
+  const shortcuts = new ShortcutsService(root, window, bindings);
+  const viewer = keypair(),
+    relay = keypair();
+  const channels = [
+    ["design", "design"],
+    ["crit", "design-crit"],
+    ["release", "release-notes"],
+  ] as const;
+  const owner = createRelaySession({
+    ...scriptedTransport(viewer.pubkey, relay.pubkey).transport,
+    query: async (filters) =>
+      filters.flatMap((filter) =>
+        filter.kinds?.includes(39000)
+          ? channels.map(([id, name]) =>
+              metadata(relay, id, name, 1_700_000_000, [["t", "stream"]]),
+            )
+          : filter.kinds?.includes(39002)
+            ? channels.map(([id]) => roster(relay, id, [viewer.pubkey]))
+            : [],
+      ),
+  });
+  const navigate = vi.fn(async () => {});
+  const connection = {
+    status: "ready",
+    generation: 1,
+    session: owner.session,
+    scope: "s",
+  };
+  const community = { selected: "wss://relay.example", viewer: viewer.pubkey };
+  const services = {
+    shortcuts,
+    shortcutBindings: bindings,
+    navigation: {
+      subscribe: () => () => {},
+      snapshot: () => ({ entry: { target: null } }),
+      open: navigate,
+    },
+    communities: {
+      subscribe: () => () => {},
+      snapshot: () => community,
+      relay: { subscribe: () => () => {}, snapshot: () => connection },
+    },
+  } as unknown as SearchServices;
+  render(
+    <PageSearch
+      pages={[
+        {
+          key: "buzz.channels/channels",
+          pluginId: "buzz.channels",
+          id: "channels",
+          title: "Channels",
+          revision: "bundled",
+          component: () => null,
+        },
+      ]}
+      onSelect={vi.fn()}
+      services={services}
+    />,
+  );
+  const field = () => screen.getByRole("combobox", { name: "Search Buzz" });
+  const closed = () =>
+    waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Search Buzz" })).toBeNull(),
+    );
+  return {
+    bindings,
+    shortcuts,
+    navigate,
+    field,
+    closed,
+    async open() {
+      await userEvent.click(
+        screen.getByRole("button", { name: "Search Buzz" }),
+      );
+      await screen.findByRole("dialog", { name: "Search Buzz" });
+    },
+    /** The empty view's rows, once the joined channels have loaded. */
+    async recentRows() {
+      const recent = await screen.findByRole("group", {
+        name: "Recents",
+      });
+      await waitFor(() =>
+        expect(within(recent).getAllByRole("option")).not.toHaveLength(0),
+      );
+      return within(recent).getAllByRole("option");
+    },
+    /** Types `text` and opens the matching channel, closing search. */
+    async openMatch(text: string, name: RegExp) {
+      await userEvent.type(field(), text);
+      await userEvent.click(await screen.findByRole("option", { name }));
+      await closed();
+    },
+    async dispose() {
+      cleanup();
+      owner.dispose();
+      bindings.dispose();
+      await root.fiber.dispose();
+    },
+  };
+}
+
+it("reopens with the text it was left on after opening a channel, and fresh after Escape", async () => {
+  const t = memorySearch();
+  try {
+    await t.open();
+    await t.openMatch("crit", /design-crit/);
+    // Back within a few minutes: same text, same rows.
+    await t.open();
+    expect(t.field()).toHaveValue("crit");
+    expect(
+      await screen.findByRole("option", { name: /design-crit/ }),
+    ).toBeVisible();
+    expect(screen.queryByRole("option", { name: /release-notes/ })).toBeNull();
+    // The kept text is selected, so new typing replaces it.
+    await waitFor(() => expect(t.field()).toHaveFocus());
+    expect(t.field()).toHaveProperty("selectionStart", 0);
+    expect(t.field()).toHaveProperty("selectionEnd", 4);
+    await userEvent.keyboard("release");
+    expect(t.field()).toHaveValue("release");
+    // Escape means done: the next opening starts fresh.
+    await userEvent.keyboard("{Escape}");
+    await t.closed();
+    await t.open();
+    expect(t.field()).toHaveValue("");
+  } finally {
+    await t.dispose();
+  }
+});
+
+it("keeps its place for under five minutes away, and starts fresh from five", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const t = memorySearch();
+  try {
+    await t.open();
+    await t.openMatch("crit", /design-crit/);
+    // One tick inside the memory: still kept, and this opening is the new
+    // one the time away is counted from.
+    vi.setSystemTime(Date.now() + 5 * 60_000 - 1);
+    await t.open();
+    expect(t.field()).toHaveValue("crit");
+    await userEvent.click(
+      await screen.findByRole("option", { name: /design-crit/ }),
+    );
+    await t.closed();
+    // Exactly five minutes away: the kept place has expired.
+    vi.setSystemTime(Date.now() + 5 * 60_000);
+    await t.open();
+    expect(t.field()).toHaveValue("");
+  } finally {
+    vi.useRealTimers();
+    await t.dispose();
+  }
+});
+
+it("moves through results with the person's own keys, saved, alongside the arrows", async () => {
+  Object.defineProperty(navigator, "platform", {
+    configurable: true,
+    value: "MacIntel",
+  });
+  const t = memorySearch();
+  try {
+    await t.open();
+    const rows = await t.recentRows();
+    const hints = () =>
+      [...document.querySelectorAll(".search-peek-keys kbd")]
+        .slice(0, 2)
+        .map((key) => key.textContent);
+    expect(hints()).toEqual(["↑", "↓"]);
+    act(() => {
+      t.bindings.set("search-previous-result", { key: "k", ctrl: true });
+      t.bindings.set("search-next-result", { key: "j", ctrl: true });
+    });
+    expect(hints()).toEqual(["⌃K", "⌃J"]);
+    expect(
+      JSON.parse(localStorage.getItem(SHORTCUT_BINDINGS_KEY) ?? "null"),
+    ).toEqual({
+      "search-previous-result": { key: "k", ctrl: true },
+      "search-next-result": { key: "j", ctrl: true },
+    });
+    const restored = createShortcutBindings(window);
+    expect(restored.resolve("search-next-result")).toEqual([
+      { key: "j", ctrl: true },
+    ]);
+    restored.dispose();
+    await userEvent.keyboard("{Control>}j{/Control}");
+    expect(t.field()).toHaveAttribute("aria-activedescendant", rows[0]?.id);
+    await userEvent.keyboard("{Control>}j{/Control}");
+    expect(t.field()).toHaveAttribute("aria-activedescendant", rows[1]?.id);
+    await userEvent.keyboard("{Control>}k{/Control}");
+    expect(t.field()).toHaveAttribute("aria-activedescendant", rows[0]?.id);
+    // Up and Down still move, as a combobox's arrows do.
+    expect(fireEvent.keyDown(t.field(), { key: "ArrowDown" })).toBe(false);
+    expect(t.field()).toHaveAttribute("aria-activedescendant", rows[1]?.id);
+    expect(fireEvent.keyDown(t.field(), { key: "ArrowUp" })).toBe(false);
+    expect(t.field()).toHaveAttribute("aria-activedescendant", rows[0]?.id);
+    await userEvent.keyboard("j");
+    expect(t.field()).toHaveValue("j");
+  } finally {
+    localStorage.removeItem(SHORTCUT_BINDINGS_KEY);
+    Reflect.deleteProperty(navigator, "platform");
+    await t.dispose();
+  }
+});
+
+it("lets an app shortcut that runs inside search keep a chord the field's Control keys use", async () => {
+  // Not a Mac, so Mod is Control and a rebind can land on Control+P.
+  Object.defineProperty(navigator, "platform", {
+    configurable: true,
+    value: "Linux x86_64",
+  });
+  const t = memorySearch();
+  const find = vi.fn();
+  const remove = t.shortcuts.registerHost({
+    id: "test-find",
+    title: "Find on screen",
+    binding: { key: "f", mod: true, shift: true },
+    allowInEditable: true,
+    allowInModal: true,
+    run: find,
+  });
+  try {
+    await t.open();
+    const rows = await t.recentRows();
+    // Control+N and Control+P step while no shortcut claims them.
+    await userEvent.keyboard("{Control>}n{/Control}{Control>}n{/Control}");
+    expect(t.field()).toHaveAttribute("aria-activedescendant", rows[1]?.id);
+    await userEvent.keyboard("{Control>}p{/Control}");
+    expect(t.field()).toHaveAttribute("aria-activedescendant", rows[0]?.id);
+    // From a row that could step back, the rebound Control+P only finds.
+    await userEvent.keyboard("{Control>}n{/Control}");
+    expect(t.field()).toHaveAttribute("aria-activedescendant", rows[1]?.id);
+    act(() => t.bindings.set("test-find", { key: "p", mod: true }));
+    expect(fireEvent.keyDown(t.field(), { key: "p", ctrlKey: true })).toBe(
+      false,
+    );
+    expect(find).toHaveBeenCalledOnce();
+    expect(t.field()).toHaveAttribute("aria-activedescendant", rows[1]?.id);
+    // Search Buzz's own Control+K runs nothing inside search, so it steps.
+    await userEvent.keyboard("{Control>}k{/Control}");
+    expect(t.field()).toHaveAttribute("aria-activedescendant", rows[0]?.id);
+    expect(find).toHaveBeenCalledOnce();
+  } finally {
+    remove();
+    localStorage.removeItem(SHORTCUT_BINDINGS_KEY);
+    Reflect.deleteProperty(navigator, "platform");
+    await t.dispose();
+  }
+});
+
+it("reopens an empty search fresh while unread leads, so it shows what is unread now", async () => {
+  const t = memorySearch();
+  try {
+    setUnreadFirstPreference(true);
+    await t.open();
+    await t.recentRows();
+    await userEvent.keyboard("{ArrowDown}");
+    expect(t.field()).toHaveAttribute("aria-activedescendant");
+    await userEvent.keyboard("{Enter}");
+    await t.closed();
+    await t.open();
+    await t.recentRows();
+    expect(t.field()).not.toHaveAttribute("aria-activedescendant");
+  } finally {
+    setUnreadFirstPreference(true);
+    await t.dispose();
+  }
+});
+
+it("keeps an empty search's place only while unread does not lead it", async () => {
+  const t = memorySearch();
+  try {
+    setUnreadFirstPreference(false);
+    await t.open();
+    await t.recentRows();
+    await userEvent.keyboard("{ArrowDown}");
+    await userEvent.keyboard("{Enter}");
+    await t.closed();
+    // Off, an empty search reopens where it was left.
+    await t.open();
+    const kept = (await t.recentRows())[0];
+    expect(t.field()).toHaveAttribute("aria-activedescendant", kept?.id);
+    await userEvent.keyboard("{Enter}");
+    await t.closed();
+    // Turned back on, that place is not restored over what is unread now.
+    setUnreadFirstPreference(true);
+    await t.open();
+    await t.recentRows();
+    expect(t.field()).not.toHaveAttribute("aria-activedescendant");
+  } finally {
+    setUnreadFirstPreference(true);
+    await t.dispose();
+  }
+});
+
+it("goes back to Top results on Escape from a clicked group filter, and closes on the next", async () => {
+  const t = memorySearch();
+  try {
+    await t.open();
+    await userEvent.type(t.field(), "design");
+    const shown = () => screen.getByRole("button", { pressed: true });
+    await userEvent.click(
+      await screen.findByRole("button", { name: /^Channels/ }),
+    );
+    expect(shown()).toHaveAccessibleName(/^Channels/);
+    expect(shown()).toHaveFocus();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.getByRole("dialog", { name: "Search Buzz" })).toBeVisible();
+    expect(shown()).toHaveAccessibleName(/^Top results/);
+    expect(t.field()).toHaveFocus();
+    await userEvent.keyboard("{Escape}");
+    await t.closed();
+  } finally {
+    await t.dispose();
   }
 });

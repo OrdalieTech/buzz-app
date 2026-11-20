@@ -6,7 +6,6 @@ import {
   useContext,
   useMemo,
   useState,
-  useSyncExternalStore,
   type ComponentPropsWithoutRef,
   type ReactElement,
   type ReactNode,
@@ -15,49 +14,44 @@ import type { RelaySession } from "../relay/session";
 import type { ComposerSession } from "./composer-session";
 import { MessageLink } from "../conversation/MessageLink";
 import { parseBuzzLink } from "../navigation/buzz-links";
-import { messageLinkParts } from "./message-link-parts";
+import { bareHostParts, messageLinkParts } from "./message-link-parts";
 import { labelText } from "./label-text";
 import {
   ReferenceText,
   channelForLink,
   channelLinkLabel,
   emptyReferenceDirectory,
-  MentionLabel,
+  ProfileMention,
 } from "./ReferenceText";
-import { CopyIcon } from "../../shared/design-system/icons/index";
-import { IconButton } from "../../shared/design-system/ui/IconButton";
-import { useToastNotification } from "../../shared/design-system/ui/Toast";
 import { profileKey } from "../profiles/target";
-import referenceStyles from "../../shared/InlineReference.module.css";
 import Markdown, { type Components, type ExtraProps } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { remarkSpoilers } from "./remark-spoilers";
-import type {
-  CodeBlockRenderer,
-  ContributionReader,
-  ConversationExtensions,
-} from "../conversation/contracts";
-import {
-  ContributionBoundary,
-  contributionKey,
-} from "../conversation/ContributionBoundary";
-import { resolveMatch } from "../../plugins/contributions";
+import type { ConversationExtensions } from "../conversation/contracts";
+import { CodeFence, observeTableOverflow } from "../markdown/code-blocks";
 import { InlineText } from "../conversation/InlineText";
 import type { ChannelMessage, Profile } from "../relay/contracts";
-import { emojiMatches, linkPart, messageParts } from "../relay/emoji";
+import {
+  emojiMatches,
+  isNumericTimeShortcode,
+  linkPart,
+  messageParts,
+} from "../relay/emoji";
 import { safeLinkUrl, visibleHtmlSource } from "../relay/message-content";
 import styles from "./Messages.module.css";
-import { profileMentionNames, profileMentionParts } from "./profile-mentions";
+import {
+  profileMentionNames,
+  renderedProfileMentionParts,
+} from "./profile-mentions";
 import {
   isLiteralMarkdownContext,
   isPlainProse,
   plainProseTree,
-  prepareMarkdown,
-  type LiteralRange,
+  preparedMarkdown,
+  recentResults,
   type PreparedMarkdown,
 } from "./markdown-preparation";
-import { writeClipboardText } from "../../shared/clipboard";
 
 type MarkdownNode = {
   type: string;
@@ -80,14 +74,14 @@ type InlinePart = {
   target?: string | undefined;
   literal?: boolean;
 };
-type ProtectedContent = {
+export type ProtectedContent = {
   content: string;
   prefix: string;
   parts: InlinePart[];
 };
 /** Bind exact names on the FULL signed body, before Markdown decodes escapes or
  * divides emphasis. Reference labels must also survive unchanged for resolution. */
-function protectInlineContent(
+export function protectInlineContent(
   row: Pick<
     ChannelMessage,
     | "content"
@@ -95,13 +89,15 @@ function protectInlineContent(
     | "attachmentSeams"
     | "mentions"
     | "mentionReferences"
+    | "mentionLabels"
     | "emoji"
   >,
   profiles: ReadonlyMap<string, Profile> | undefined,
-  literalRanges: readonly LiteralRange[],
+  prepared: Extract<ReturnType<typeof preparedMarkdown>, { kind: "markdown" }>,
   agents: typeof emptyReferenceDirectory.agents,
   spoilerDelimiters: readonly number[],
 ): ProtectedContent {
+  const { literalRanges } = prepared;
   let rangeIndex = 0;
   const isLiteral = (start: number, end: number) => {
     while (
@@ -114,7 +110,7 @@ function protectInlineContent(
 
   // Numeric entities can manufacture private-use characters during parsing too.
   // Choose an unused prefix in that decoded source; never trust a fixed marker.
-  const decoded = row.content.replace(
+  const decoded = prepared.content.replace(
     /&#(x[a-f\d]{1,6}|\d{1,7});/gi,
     (entity, number: string) => {
       const code =
@@ -149,11 +145,11 @@ function protectInlineContent(
     return `${start}${parts.length - 1}${end}`;
   };
   let offset = 0;
-  const content = profileMentionParts(row, profiles, agents)
+  const content = renderedProfileMentionParts(row, profiles, agents, prepared)
     .map((segment) => {
       const start = offset;
       offset += segment.text.length;
-      if (segment.target && !isLiteral(start, offset)) return token(segment);
+      if (segment.target) return token(segment);
       let partOffset = start;
       return messageParts(segment.text)
         .map((part) => {
@@ -180,7 +176,15 @@ function protectInlineContent(
               ? []
               : Array.from(emojiMatches(part, row.emoji ?? []), (match) => ({
                   ...match,
-                  literal: undefined,
+                  // Preserve the full-source boundary after mention segmentation,
+                  // including during the inline plugin's later text scan.
+                  literal: isNumericTimeShortcode(
+                    prepared.content,
+                    partStart + match.start,
+                    match.emoji.shortcode,
+                  )
+                    ? part.slice(match.start, match.end)
+                    : undefined,
                 }))),
             ...(urlPart ? [] : encoded),
             ...spoilerDelimiters
@@ -223,7 +227,7 @@ function protectInlineContent(
   return { content, prefix, parts };
 }
 
-const placeholderPattern = (protectedContent: ProtectedContent) =>
+export const placeholderPattern = (protectedContent: ProtectedContent) =>
   new RegExp(
     `[\uE000\uFFFC]${protectedContent.prefix.slice(1)}(\\d+)[\uE002\uFFFC]`,
     "g",
@@ -246,6 +250,7 @@ function inlineProtectionKey(
   const emoji = row.emoji?.map(({ shortcode, url }) => [shortcode, url]);
   return JSON.stringify([
     row.edited === true,
+    row.mentionLabels,
     row.attachmentSeams,
     mentions,
     agentNames,
@@ -469,6 +474,10 @@ type MessageComponents = {
     props: ComponentPropsWithoutRef<Tag> & ExtraProps,
   ) => ReactNode;
 };
+const MESSAGE_CODE_CLASSES = {
+  frame: styles.codeBlock,
+  actions: styles.codeActions,
+};
 const MessageComponentsContext = createContext<MessageComponents | null>(null);
 function useMessageComponents() {
   const components = useContext(MessageComponentsContext);
@@ -487,34 +496,6 @@ const markdownComponents: Components = {
     <table ref={observeTableOverflow} {...props} />
   ),
 };
-
-/** WebKit adds an `overflow-x: auto` scrollbar after flex and grid ancestors
- * have taken their heights, then lays out only the table again. A scrollbar
- * that takes space then overlaps the next row, or leaves a gap when removed.
- * CSS chooses the scrollbar from measured overflow so it is laid out with
- * the ancestors. Observe content too: edits can change scrollWidth without
- * resizing a table at its width cap. Measure on mount because the resize
- * observer's first report arrives after the row's. */
-function observeTableOverflow(table: HTMLTableElement | null) {
-  if (!table || typeof ResizeObserver === "undefined") return;
-  const update = () => {
-    const overflow = String(table.scrollWidth > table.clientWidth);
-    if (table.dataset.overflow !== overflow) table.dataset.overflow = overflow;
-  };
-  update();
-  const observer = new ResizeObserver(update);
-  observer.observe(table);
-  const contentObserver = new MutationObserver(update);
-  contentObserver.observe(table, {
-    childList: true,
-    characterData: true,
-    subtree: true,
-  });
-  return () => {
-    observer.disconnect();
-    contentObserver.disconnect();
-  };
-}
 
 export function MessageMarkdown({
   row,
@@ -545,10 +526,7 @@ export function MessageMarkdown({
   edited?: boolean | undefined;
 }) {
   const resolveName = useChannelIdentityNames(session, row.channelId);
-  const prepared = useMemo(
-    () => preparedBodies(row.content, () => prepareMarkdown(row.content)),
-    [row.content],
-  );
+  const prepared = useMemo(() => preparedMarkdown(row.content), [row.content]);
   if (prepared.kind === "plain")
     return (
       <div className={styles.plainText}>
@@ -597,7 +575,7 @@ function PreparedMessageMarkdown({
   interactive = true,
   edited = false,
 }: Parameters<typeof MessageMarkdown>[0] & {
-  prepared: Extract<ReturnType<typeof prepareMarkdown>, { kind: "markdown" }>;
+  prepared: Extract<PreparedMarkdown, { kind: "markdown" }>;
   resolveName: (pubkey: string, fallback: string) => string;
 }) {
   const row =
@@ -618,6 +596,7 @@ function PreparedMessageMarkdown({
         scope={scope}
         interactive={interactive}
         channelPrivate={!!channel?.private}
+        channelSolo={channel?.channelType === "solo"}
       >
         {children}
       </MessageLink>
@@ -635,29 +614,31 @@ function PreparedMessageMarkdown({
     );
   const renderText = (text: string) => {
     let offset = 0;
-    return messageLinkParts(text).map((part) => {
-      // A trailing bare link yields two empty text parts at the same offset.
-      if (!part.url && !part.text) return null;
-      const key = `${offset}:${part.text}`;
-      offset += part.text.length;
-      return part.url ? (
-        <span key={key}>{renderLink(part.url, part.label)}</span>
-      ) : (
-        <ReferenceText
-          channelId={row.channelId}
-          key={key}
-          text={part.text}
-          mentions={[]}
-          directory={directory}
-          renderText={renderInline}
-          onOpenLink={onOpenLink}
-          extensions={extensions}
-          session={session}
-          scope={scope}
-          interactive={interactive}
-        />
-      );
-    });
+    return messageLinkParts(text)
+      .flatMap((part) => (part.url ? [part] : bareHostParts(part.text)))
+      .map((part) => {
+        // A trailing bare link yields two empty text parts at the same offset.
+        if (!part.url && !part.text) return null;
+        const key = `${offset}:${part.text}`;
+        offset += part.text.length;
+        return part.url ? (
+          <span key={key}>{renderLink(part.url, part.label)}</span>
+        ) : (
+          <ReferenceText
+            channelId={row.channelId}
+            key={key}
+            text={part.text}
+            mentions={[]}
+            directory={directory}
+            renderText={renderInline}
+            onOpenLink={onOpenLink}
+            extensions={extensions}
+            session={session}
+            scope={scope}
+            interactive={interactive}
+          />
+        );
+      });
   };
 
   const profiles = participantProfiles ?? directory.profiles;
@@ -672,22 +653,9 @@ function PreparedMessageMarkdown({
   const protectedContent = useMemo(
     () =>
       protectInlineContent(
-        {
-          content: prepared.content,
-          // Seams index the folded body. Leave link-repaired prose unbound, as edits are.
-          ...(sourceRow.edited ||
-          (sourceRow.attachmentSeams && prepared.content !== sourceRow.content)
-            ? { edited: true as const }
-            : {}),
-          ...(sourceRow.attachmentSeams
-            ? { attachmentSeams: sourceRow.attachmentSeams }
-            : {}),
-          mentions: sourceRow.mentions,
-          mentionReferences: sourceRow.mentionReferences ?? [],
-          ...(sourceRow.emoji ? { emoji: sourceRow.emoji } : {}),
-        },
+        sourceRow,
         profiles,
-        prepared.literalRanges,
+        prepared,
         directory.agents,
         prepared.spoilerDelimiters,
       ),
@@ -701,40 +669,20 @@ function PreparedMessageMarkdown({
   // Explicit profile links are identity locators, not signed notification intent.
   // Reuse the same control and availability gate as bound prose mentions.
   const renderProfile = (text: unknown, target: unknown) => {
-    const key = typeof target === "string" ? profileKey(target) : undefined;
-    const agent =
-      !!key &&
-      (directory.agents.some((agent) => agent.pubkey === key) ||
-        (participantProfiles ?? directory.profiles).get(key)?.isAgent);
-    const clickable =
-      interactive && typeof target === "string" && !!canOpenLink?.(target);
-    if (typeof text === "string" && typeof target === "string") {
-      const label = key ? resolveName(key, text.slice(1)) : text.slice(1);
-      const Mention = clickable ? "button" : "span";
-      // Selection copy reads the identity and the whole label (selection-copy.ts).
-      return (
-        <Mention
-          type={clickable ? "button" : undefined}
-          className={referenceStyles.link}
-          data-mention-kind={agent ? "agent" : "person"}
-          data-mention-self={key && key === session?.viewer ? "" : undefined}
-          data-profile-target={target}
-          data-mention-name={label}
-          aria-label={clickable ? `View ${label} profile` : undefined}
-          onClick={
-            clickable
-              ? (event) => {
-                  event.currentTarget.focus();
-                  onOpenLink(target);
-                }
-              : undefined
-          }
-        >
-          <MentionLabel agent={!!agent} label={label} />
-        </Mention>
-      );
-    }
-    return undefined;
+    if (typeof text !== "string" || typeof target !== "string")
+      return undefined;
+    const clickable = interactive && !!canOpenLink?.(target);
+    return (
+      <ProfileMention
+        text={text}
+        target={target}
+        profiles={profiles}
+        agents={directory.agents}
+        viewer={session?.viewer}
+        resolveName={resolveName}
+        onOpen={clickable ? onOpenLink : undefined}
+      />
+    );
   };
   const components: MessageComponents = {
     p: ({ node: _node, ...props }) => (
@@ -799,27 +747,16 @@ function PreparedMessageMarkdown({
         <span {...props}>{children}</span>
       );
     },
-    pre: ({ node, children, ...props }) => {
-      const code = labelText(children).replace(/\n$/, "");
-      const plain = (
-        <pre {...props}>
-          {children}
-          {interactive && <CodeActions code={code} />}
-        </pre>
-      );
-      const language = codeLanguage(node);
-      // Previews are not interactive, so they keep the plain code.
-      return interactive && language && extensions?.codeBlocks ? (
-        <CodeBlock
-          registry={extensions.codeBlocks}
-          language={language}
-          code={code}
-          fallback={plain}
-        />
-      ) : (
-        plain
-      );
-    },
+    // Previews are not interactive, so they keep the plain code.
+    pre: (props) => (
+      <CodeFence
+        {...props}
+        copy={interactive}
+        focusable={interactive}
+        registry={interactive ? extensions?.codeBlocks : undefined}
+        classes={MESSAGE_CODE_CLASSES}
+      />
+    ),
   };
 
   const markdown = (
@@ -830,33 +767,6 @@ function PreparedMessageMarkdown({
   return largeEmoji ? markdown : <div className={styles.text}>{markdown}</div>;
 }
 
-/** Switching channels remounts every row. Keep recent results so a revisit
- * does not prepare and parse unchanged bodies again. */
-function recentResults<T>(
-  budget: number,
-  weigh: (key: string, value: T) => number,
-) {
-  const results = new Map<string, Readonly<{ value: T; weight: number }>>();
-  let total = 0;
-  return (key: string, make: () => T) => {
-    let entry = results.get(key);
-    if (entry) results.delete(key);
-    else {
-      const value = make();
-      entry = { value, weight: weigh(key, value) };
-      // Keeping a result heavier than the budget would evict all the others.
-      if (entry.weight > budget) return value;
-      total += entry.weight;
-    }
-    results.set(key, entry);
-    for (const [oldest, { weight }] of results) {
-      if (total <= budget) break;
-      results.delete(oldest);
-      total -= weight;
-    }
-    return entry.value;
-  };
-}
 function elementCount(node: ReactNode): number {
   if (Array.isArray(node))
     return node.reduce<number>((sum, child) => sum + elementCount(child), 0);
@@ -864,11 +774,6 @@ function elementCount(node: ReactNode): number {
     ? 1 + elementCount(node.props.children)
     : 0;
 }
-// A prepared body keeps its content and literal ranges: ~200k characters.
-const preparedBodies = recentResults<PreparedMarkdown>(
-  200_000,
-  (content) => 100 + content.length,
-);
 // A parsed body keeps ~2 KB, ~1 KB per element and ~2 bytes per character of
 // its key and text. Dense markup has an element every few characters, so weigh
 // both: ~4 MB in all. The elements depend only on the protected content; their
@@ -951,95 +856,6 @@ function MessageSpoiler({
       >
         {children}
       </span>
-    </span>
-  );
-}
-
-/** The fence's info-string language, as remark records it on the inner `code`. */
-function codeLanguage(pre: ExtraProps["node"]) {
-  const code = pre?.children[0];
-  if (code?.type !== "element" || code.tagName !== "code") return undefined;
-  const classes = code.properties.className;
-  return Array.isArray(classes)
-    ? classes
-        .map(String)
-        .find((name) => name.startsWith("language-"))
-        ?.slice("language-".length)
-    : undefined;
-}
-
-/** A plugin presents the block and may add an action; the host keeps the frame,
- * action placement and copy, and restores the plain code when the plugin fails
- * or is removed. */
-function CodeBlock({
-  registry,
-  language,
-  code,
-  fallback,
-}: {
-  registry: ContributionReader<CodeBlockRenderer>;
-  language: string;
-  code: string;
-  fallback: ReactNode;
-}) {
-  const renderers = useSyncExternalStore(
-    registry.subscribe,
-    registry.snapshot,
-    registry.snapshot,
-  );
-  const renderer = resolveMatch(renderers, language);
-  if (!renderer) return fallback;
-  const { component: Renderer, action: Action } = renderer;
-  return (
-    <ContributionBoundary
-      key={`${contributionKey(renderer)}:${language}:${code}`}
-      fallback={fallback}
-    >
-      {/* Selection copy reads the source here (selection-copy.ts). */}
-      <div
-        className={styles.codeBlock}
-        data-copy-code={code}
-        data-copy-language={language}
-      >
-        <Renderer code={code} language={language} />
-        <CodeActions code={code}>
-          {Action && <Action code={code} language={language} />}
-        </CodeActions>
-      </div>
-    </ContributionBoundary>
-  );
-}
-
-function CodeActions({
-  code,
-  children,
-}: {
-  code: string;
-  children?: ReactNode;
-}) {
-  const notify = useToastNotification();
-  const [copying, setCopying] = useState(false);
-  return (
-    <span className={styles.codeActions}>
-      {children}
-      <IconButton
-        hint="familiar"
-        aria-label="Copy code block"
-        title="Copy code block"
-        disabled={copying}
-        focusableWhenDisabled
-        icon={<CopyIcon />}
-        onClick={() => {
-          setCopying(true);
-          void Promise.resolve()
-            .then(() => writeClipboardText(code))
-            .then(
-              () => notify("Copied code to clipboard", "success"),
-              () => notify("Failed to copy code", "error"),
-            )
-            .finally(() => setCopying(false));
-        }}
-      />
     </span>
   );
 }

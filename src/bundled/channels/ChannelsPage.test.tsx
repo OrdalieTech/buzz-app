@@ -260,7 +260,7 @@ it("animates Connecting only while a connection is actually under way", async ()
   const page = (snapshot: Partial<RelaySnapshot>) => {
     const relay = {
       snapshot: () => ({ scope: "s", generation: 0, ...snapshot }),
-      retry,
+      tryAgain: retry,
     } as unknown as RelayData;
     return (
       <ChannelsPage

@@ -9,10 +9,10 @@ filing is private client-side organization, independent of access; see
 - A Solo chat is a channel with the `buzz.solo` label.
 - Channel visibility and signed membership control access. Direct invitations
   add members; sharing from Chat access to a channel opens community reading.
-- A shared chat link is an ordinary message containing
-  `[Chat: name](buzz://channel/<id>)`. It renders as a chat card when the target
-  is a Solo chat; the `Chat:` label lets a viewer without access see it as one.
-  Links carry no other share marker, and older `Session:` labels still render.
+- A shared chat link is an ordinary Markdown link,
+  `[name](buzz://channel/<id>)`. A known Solo chat uses the round chat bubble.
+  An unavailable destination shows a lock. Older `Chat:` and `Session:` labels
+  remain part of the authored message.
 
 The access dialog has two ways to share:
 
@@ -39,14 +39,23 @@ people, agents and channels** for an owner who can add agents) filters current
 access and lists people under **Not in this chat**, each with an **Add** button;
 Enter adds the highlighted person. Adding is immediate and uses the Solo share rule
 (`canShareSoloChat`), with per-person **Adding…**, error and **Retry** states. The
-owner's selectable agents are offered too and join as Bot, even with a Guest
-admission default, without starting a run. Composer mentions use the same grant.
+owner's selectable agents are offered too. Agents whose signed profiles verify
+that the chat owner owns them join as Admin; other agents join as Bot, even with
+a Guest admission default, without starting a run. Composer mentions use the
+same rule; other participants' composer additions use Bot.
+Existing members keep their roles, and retries finish the original saved grant.
 Where the viewer cannot add agents, a note says to mention an agent in the chat
 instead.
 Current access uses the channel groups (**People**, **Agents**) with Owner and
 Admin tags, and each row has the channel members' actions menu, so the chat owner
-can remove someone. The verified roster shows loading or failure, never treating a
-failed read as an empty audience.
+can remove someone. In a Private chat on a relay that supports Solo role updates,
+the owner can confirm a lower role for any current non-owner, including people
+and agents.
+**Viewing only** gives read-only access
+to the chat. A verified agent can move from **Viewing only** to **Participating**,
+and the chat owner can grant **Admin** to their own verified agents. The
+verified roster shows loading or failure, never treating a failed read as an
+empty audience.
 
 Invitations use the same groups and controls as channels: **Your agents** first,
 then **People**, **Other agents** and **Your other agents**, omitting empty groups.
@@ -66,7 +75,7 @@ Private to View only and its link will be posted in that channel, then discloses
 community reading of the full history and Canvas. **Share** saves that
 access and posts the link in one step. A chat already set to View only gets a
 similar confirmation explaining link delivery; Share posts the link without an
-access write. Public (existing) chats keep their access and post directly.
+access write. Public chats keep their access and post directly.
 Cancel returns focus to the same Share result and preserves the search.
 The toast says **Chat changed to View only. Shared in #channel** when Share
 changed access, or **Shared in #channel** when access was already open. Both
@@ -119,19 +128,20 @@ members keep their individual roles when the general policy changes.
 
 View only makes the chat's full history and Canvas readable by the community.
 The confirmation names this disclosure, including workspace folder paths and
-agent instructions stored in Canvas. Moving from Public (existing) also
+agent instructions stored in Canvas. Moving from Public also
 explains that people already in the chat keep their access. Moving from View only
 to Private warns that joined viewers remain members unless a verified role
 snapshot establishes that no Guests exist; loading or failed verification keeps
-the warning. Public (existing) → Private also warns that joined members retain
+the warning. Public → Private also warns that joined members retain
 their access until removed in People. One signed kind-9002 edit sets
 `visibility=open` and `join_role=guest` together, through the existing
 `channelDetails` save, conflict checks and exact readback.
 
 Omitting Public here is a UI restriction, not a relay or harness safeguard.
 CLI/MCP or another client can still set a Solo chat to Public with Member
-admission. The dialog shows **Public (existing)** for that policy and lets the
-owner change it to View only or Private. Public members can still post and
+admission. The dialog shows **Public** for that policy and lets the
+owner change it to View only or Private. The confirmation warns that the picker
+cannot switch it back to Public. Public members can still post and
 address the owner's agents, and can replace the shared Canvas. Agent wake and
 owner-Canvas hardening are separate follow-up work; this picker does not fix
 those risks. Changing to View only restricts new people, not existing members.
@@ -158,8 +168,8 @@ automatically resending.
 
 ## Sending a chat link in a channel
 
-Pasting a recognized Solo chat link into a composer stages it as a chat card.
-Sending the card into a channel, thread or DM uses the same policy as Share.
+Pasting a recognized Solo chat link keeps it editable inline in the composer.
+Sending it into a channel, thread or DM uses the same policy as Share.
 For a Private chat you own, **Share** confirms community access to
 its full history and Canvas, opens reading, then sends your original message.
 **Cancel** leaves access and the draft unchanged.
@@ -185,9 +195,9 @@ synchronized into the chat.
 ## Explicit conversion, separate from Share
 
 The product owner approved this distinction on 2026-10-14: **Share** keeps the
-Solo label and project filing; **Convert to channel** removes the Solo label and
-the initiating viewer's project filing, so the same conversation becomes an
-ordinary Team channel, with Private, View only or Public access. It changes
+Solo label and project filing; **Convert to channel** removes the Solo label,
+so the same conversation becomes an ordinary Team channel (still in its
+workspace, if filed), with Private, View only or Public access. It changes
 organization and conversation behavior for every member, never creates a new
 conversation or copies history.
 
@@ -212,11 +222,8 @@ The sequence is explicit, not atomic:
    altered-signature rejection and exact readback remain unchanged. The edit
    removes `buzz.solo` from the channel's labels and applies the chosen
    visibility and admission policy; name, lifetime and other labels are preserved.
-2. Refresh Solo projects and, if this viewer filed the chat in one, clear only
-   that assignment through `soloPreferences.assign(id, undefined)`. Its encrypted
-   account/community record, serialization and Outbox own persistence. Other
-   projects, conversations, defaults, memberships and other people's filing are
-   untouched.
+2. Keep the chat's workspace assignment: workspaces hold channels as well as
+   chats, so no sidebar write occurs.
 3. Announce **Converted to channel.** and open the same channel ID in Team. No
    new grant, notification, agent wake or transcript write occurs.
 
@@ -234,18 +241,11 @@ details** recovers failed reads without losing that intent. If another details
 surface confirmed the publication, fresh matching metadata can advance the retained
 conversion receipt without another kind-9002 command.
 
-`conversion.ts` retains only chat-local orchestration intent and the confirmed
-metadata phase, with a shared running guard. It is not permission evidence or a
-persistent transaction. After the label edit succeeds but project unfiling fails,
-the dialog says **Channel converted. Finish removing it from its Solo project.**
-**Finish conversion** re-reads details, confirms the label is gone and the
-settings are unchanged, and retries only the preference write. Failed reads keep
-the recovery entry. A verified superseding settings edit retires an unconfirmed
-conversion receipt, including after Reload or reopening the dialog; it does not
-rewrite those settings or remove project filing. Restart loses the
-orchestration receipt, not access or the channel: the conversation is already an
-ordinary Team channel, and a leftover project assignment for a channel without the
-label is ignored by Solo.
+**Finish conversion** re-reads details when the publication needs confirmation.
+Failed reads keep the recovery entry. A verified newer settings edit retires
+an unconfirmed conversion receipt after Reload or reopening the dialog.
+Conversion keeps the workspace assignment. An unfiled chat appears in Team
+once its Solo label is removed.
 
 ### Ordinary behavior after conversion
 

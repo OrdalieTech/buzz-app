@@ -11,7 +11,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useContext, useEffect, useState, type ReactNode } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { createRelaySession } from "../../features/relay/session";
 import type { RelayData } from "../../features/relay/service";
@@ -23,6 +23,7 @@ import {
   profileHistoryTarget,
 } from "../../features/profiles/target";
 import { ProfilePanel } from "./ProfilePanel";
+import { TranscriptFocus } from "../../features/agents/ActivityTranscript";
 import { createAgentMemories } from "../../features/agents/memory";
 import { resolveMatch } from "../../plugins/contributions";
 import { parseEntityLink } from "../../features/repos/routes";
@@ -35,6 +36,7 @@ import type { Navigation } from "../../features/navigation/controller";
 import type {
   Agent,
   Agents,
+  ConfigHistory,
   RegisteredAgentType,
   TranscriptRequest,
 } from "../../features/agents/service";
@@ -92,6 +94,7 @@ it("updates a mounted profile from the shared name view without replacing its id
     snapshot: () => snapshot,
     subscribe: () => () => {},
     retry() {},
+    tryAgain() {},
     disconnect() {},
     clearCache: async () => {},
   };
@@ -108,7 +111,7 @@ it("updates a mounted profile from the shared name view without replacing its id
     );
     expect(await screen.findByRole("heading", { name })).toBeTruthy();
     expect(screen.queryByRole("img", { name: /^Presence:/ })).toBeNull();
-    expect(screen.getByText("Active", { exact: true })).toBeVisible();
+    expect(screen.getByText("Online", { exact: true })).toBeVisible();
     expect(
       screen.getAllByRole("img", { name: `${name} avatar, online` }),
     ).toHaveLength(1);
@@ -121,11 +124,11 @@ it("updates a mounted profile from the shared name view without replacing its id
     expect(
       screen.getByRole("img", { name: `${name} avatar, online` }),
     ).toBeTruthy();
-    expect(screen.queryByRole("img", { name: "Presence: Active" })).toBeNull();
-    expect(screen.getByText("Active", { exact: true })).toBeVisible();
+    expect(screen.queryByRole("img", { name: /^Presence:/ })).toBeNull();
+    expect(screen.getByText("Online", { exact: true })).toBeVisible();
     await user.click(screen.getByRole("tab", { name: "Info" }));
     expect(screen.queryByRole("img", { name: /^Presence:/ })).toBeNull();
-    expect(screen.getByText("Active", { exact: true })).toBeVisible();
+    expect(screen.getByText("Online", { exact: true })).toBeVisible();
     expect(
       screen.getAllByRole("img", { name: `${name} avatar, online` }),
     ).toHaveLength(1);
@@ -147,7 +150,7 @@ it("updates a mounted profile from the shared name view without replacing its id
       expect(
         screen.getByRole("img", { name: `${name} avatar, ${status}` }),
       ).toBeTruthy();
-      expect(screen.queryByText("Active", { exact: true })).toBeNull();
+      expect(screen.queryByText("Online", { exact: true })).toBeNull();
     }
     presenceStatus.mockReturnValue("unknown");
     act(() => {
@@ -155,11 +158,11 @@ it("updates a mounted profile from the shared name view without replacing its id
       notify();
     });
     expect(screen.getByRole("img", { name: `${name} avatar` })).toBeTruthy();
-    expect(screen.queryByRole("img", { name: "Presence: Active" })).toBeNull();
+    expect(screen.queryByRole("img", { name: /^Presence:/ })).toBeNull();
     expect(document.querySelector(".buzz-avatar-status")).not.toHaveAttribute(
       "data-status",
     );
-    expect(screen.queryByText(/^(Active|Away|Offline)$/)).toBeNull();
+    expect(screen.queryByText(/^(Online|Away|Offline)$/)).toBeNull();
     expect(owner.session.profiles.snapshot().size).toBe(0);
   } finally {
     vi.useRealTimers();
@@ -219,6 +222,7 @@ it("recovers provider-owned names in the same live session and releases demand w
     snapshot: () => snapshot,
     subscribe: () => () => {},
     retry() {},
+    tryAgain() {},
     disconnect() {},
     clearCache: async () => {},
   };
@@ -316,6 +320,7 @@ it("exposes thinking through the named profile avatar across tabs", async () => 
     snapshot: () => snapshot,
     subscribe: () => () => {},
     retry() {},
+    tryAgain() {},
     disconnect() {},
     clearCache: async () => {},
   };
@@ -354,7 +359,7 @@ it("exposes thinking through the named profile avatar across tabs", async () => 
     expect(
       screen.getByRole("img", { name: "Thinking agent avatar, thinking" }),
     ).toBeVisible();
-    expect(screen.getByText("Active", { exact: true })).toBeVisible();
+    expect(screen.getByText("Online", { exact: true })).toBeVisible();
     await userEvent
       .setup()
       .click(screen.getByRole("tab", { name: "Channels" }));
@@ -364,7 +369,7 @@ it("exposes thinking through the named profile avatar across tabs", async () => 
     expect(
       screen.getByRole("img", { name: "Thinking agent avatar, thinking" }),
     ).toBeVisible();
-    expect(screen.getByText("Active", { exact: true })).toBeVisible();
+    expect(screen.getByText("Online", { exact: true })).toBeVisible();
     act(() => {
       activity = { ...activity, turns: [] };
       for (const listener of listeners) listener();
@@ -392,6 +397,7 @@ function renderAgentActivity(
     dirty: boolean;
     saving: boolean;
   },
+  history?: ConfigHistory,
 ) {
   const owner = createRelaySession(null);
   const memories =
@@ -429,6 +435,7 @@ function renderAgentActivity(
     snapshot: () => snapshot,
     subscribe: () => () => {},
     retry() {},
+    tryAgain() {},
     disconnect() {},
     clearCache: async () => {},
   };
@@ -450,13 +457,17 @@ function renderAgentActivity(
         conversation,
         initialTranscript,
         openConversation,
+        settingsContent,
       }: {
         conversation?: { channelId: string; rootId?: string };
         initialTranscript?: TranscriptRequest;
         openConversation?: (channelId: string, threadRootId?: string) => void;
+        settingsContent?: ReactNode;
       }) {
         // Like a type's Activity tab: it acts on the request as it shows.
         const [first] = useState(!!initialTranscript);
+        // Like its transcript: it shows the opening's message.
+        const focus = useContext(TranscriptFocus);
         // Like a settings section, it can hold an unsaved change.
         const [dirty, setDirty] = useState(false);
         useAgentSaveState(dirty, false, role === "settings");
@@ -469,12 +480,18 @@ function renderAgentActivity(
         return (
           <>
             <p>Echo {title.toLowerCase()}</p>
+            {history && settingsContent}
             {role === "settings" && (
               <button type="button" onClick={() => setDirty(true)}>
                 Make a change
               </button>
             )}
             {first && <p>Transcript first</p>}
+            {focus && (
+              <button type="button" onClick={focus.done}>
+                Show {focus.events.join(" and ")}
+              </button>
+            )}
             {conversation && (
               <p>
                 Opened from {conversation.channelId}/
@@ -504,6 +521,7 @@ function renderAgentActivity(
     pubkey: key,
     ...(memory && { owner: viewer }),
     name: "Echo",
+    ...(history && { owner: viewer, configProblem: "Unsupported settings" }),
     type: type.key,
     place: "here",
     config: {},
@@ -517,7 +535,7 @@ function renderAgentActivity(
     types: () => types,
     find: (pubkey: string) => (pubkey === key ? agent : undefined),
     memberships: () => [],
-    configHistory: () => undefined,
+    configHistory: () => history,
     addedTabs: () =>
       linkTab
         ? [
@@ -578,6 +596,63 @@ function renderAgentActivity(
     },
   );
 }
+
+it("focuses Previous versions when opening recovery from profile Activity", async () => {
+  const channel = "c";
+  const head = signed(keypair(), {
+    kind: 45010,
+    created_at: 1,
+    content: JSON.stringify({
+      version: 1,
+      agentType: "other",
+      settings: {},
+    }),
+    tags: [
+      ["ar", "1"],
+      ["h", channel],
+      ["d", "settings"],
+      ["type", "buzz.agent.settings"],
+      ["op", "create"],
+    ],
+  });
+  const history: ConfigHistory = {
+    read: async () => [head],
+    revise: async () => ({ status: "accepted" }),
+    sides: [
+      {
+        side: "settings",
+        expected: { channel, d: "settings", type: "buzz.agent.settings" },
+        head,
+        version: 0,
+      },
+    ],
+    settings: { agentType: "test/echo", schema: {} },
+  };
+  const dispose = renderAgentActivity(
+    [
+      { title: "Settings", role: "settings" },
+      { title: "Activity", role: "activity" },
+    ],
+    undefined,
+    false,
+    undefined,
+    undefined,
+    false,
+    undefined,
+    history,
+  );
+  try {
+    const user = userEvent.setup();
+    const recovery = screen.getByRole("button", { name: "Previous Versions" });
+    recovery.focus();
+    await user.keyboard("{Enter}");
+    expect(
+      screen.getByRole("button", { name: "Previous versions" }),
+    ).toHaveFocus();
+  } finally {
+    dispose();
+  }
+});
 
 it.each([false, "opened"] as const)(
   "keeps an Activity profile mounted across version addresses (transcript %s)",
@@ -778,6 +853,30 @@ it("keeps a new opening for a profile on another section to itself, so a remount
     await user.click(screen.getByRole("tab", { name: "Identity" }));
     await user.click(screen.getByRole("tab", { name: "Activity" }));
     expect(screen.queryByText("Transcript first")).toBeNull();
+  } finally {
+    dispose();
+  }
+});
+
+it("gives each opening's message to its transcript until it is shown", async () => {
+  const dispose = renderAgentActivity(
+    [{ title: "Activity", role: "activity" }],
+    "thread-root",
+  );
+  const user = userEvent.setup();
+  try {
+    act(
+      () => void openProfileTranscript(dispose.target, () => true, ["reply"]),
+    );
+    await user.click(screen.getByRole("button", { name: "Show reply" }));
+    expect(screen.queryByRole("button", { name: /^Show / })).toBeNull();
+    act(
+      () => void openProfileTranscript(dispose.target, () => true, ["prompt"]),
+    );
+    expect(screen.getByRole("button", { name: "Show prompt" })).toBeVisible();
+    // An opening without a message replaces the one not yet shown.
+    act(() => void openProfileTranscript(dispose.target, () => true));
+    expect(screen.queryByRole("button", { name: /^Show / })).toBeNull();
   } finally {
     dispose();
   }
@@ -1112,6 +1211,7 @@ it("shows historical verification time and issuer, discloses cache, and hides di
     snapshot: () => snapshot,
     subscribe: () => () => {},
     retry() {},
+    tryAgain() {},
     disconnect() {},
     clearCache: async () => {},
   };
@@ -1200,6 +1300,132 @@ it("shows historical verification time and issuer, discloses cache, and hides di
   } finally {
     for (const read of profileReads) read.resolve();
     cleanup();
+    owner.dispose();
+  }
+});
+
+it("composes Info in place while preserving the native header, focus region and Channels", async () => {
+  const owner = createRelaySession(null);
+  const snapshot = {
+    status: "ready" as const,
+    generation: 1,
+    session: owner.session,
+  };
+  const relay: RelayData = {
+    snapshot: () => snapshot,
+    subscribe: () => () => {},
+    retry() {},
+    tryAgain() {},
+    disconnect() {},
+    clearCache: async () => {},
+  };
+  try {
+    render(
+      <ProfilePanel
+        relay={relay}
+        target={profileTarget(key) ?? ""}
+        close={() => {}}
+        renderPersonInfo={(content) => (
+          <section aria-label="Extended Info">
+            <button type="button">Extra profile action</button>
+            {content}
+          </section>
+        )}
+      />,
+    );
+    const region = screen.getByRole("region", { name: "Profile details" });
+    region.focus();
+    expect(region).toHaveFocus();
+    expect(
+      within(screen.getByRole("region", { name: "Extended Info" })).getByRole(
+        "button",
+        { name: "Copy npub" },
+      ),
+    ).toBeTruthy();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("tab", { name: "Channels" }));
+    expect(screen.queryByRole("region", { name: "Extended Info" })).toBeNull();
+    expect(screen.getByRole("region", { name: "Profile details" })).toBe(
+      region,
+    );
+    await user.click(screen.getByRole("tab", { name: "Info" }));
+    expect(
+      screen.getByRole("button", { name: "Extra profile action" }),
+    ).toBeTruthy();
+  } finally {
+    owner.dispose();
+  }
+});
+
+it("leaves an agent-hinted profile outside person Info composition", () => {
+  const owner = createRelaySession(null);
+  const snapshot = {
+    status: "ready" as const,
+    generation: 1,
+    session: owner.session,
+  };
+  const relay: RelayData = {
+    snapshot: () => snapshot,
+    subscribe: () => () => {},
+    retry() {},
+    tryAgain() {},
+    disconnect() {},
+    clearCache: async () => {},
+  };
+  const renderPersonInfo = vi.fn((content: ReactNode) => content);
+  try {
+    render(
+      <ProfilePanel
+        relay={relay}
+        target={`buzz:agent-profile:${key}`}
+        close={() => {}}
+        renderPersonInfo={renderPersonInfo}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Copy npub" })).toBeTruthy();
+    expect(renderPersonInfo).not.toHaveBeenCalled();
+  } finally {
+    owner.dispose();
+  }
+});
+
+it("marks an agent's name with the robot icon, and not a person's", () => {
+  const owner = createRelaySession(null);
+  const snapshot = {
+    status: "ready" as const,
+    generation: 1,
+    session: owner.session,
+  };
+  const relay: RelayData = {
+    snapshot: () => snapshot,
+    subscribe: () => () => {},
+    retry() {},
+    tryAgain() {},
+    disconnect() {},
+    clearCache: async () => {},
+  };
+  try {
+    const { rerender } = render(
+      <ProfilePanel
+        relay={relay}
+        target={`buzz:agent-profile:${key}`}
+        close={() => {}}
+      />,
+    );
+    expect(
+      screen.getByRole("heading", { level: 2 }).querySelector("svg"),
+    ).not.toBeNull();
+    rerender(
+      <ProfilePanel
+        relay={relay}
+        target={profileTarget(key) ?? ""}
+        close={() => {}}
+      />,
+    );
+    expect(
+      screen.getByRole("heading", { level: 2 }).querySelector("svg"),
+    ).toBeNull();
+  } finally {
     owner.dispose();
   }
 });

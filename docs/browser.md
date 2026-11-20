@@ -49,6 +49,11 @@ account-isolated guest opens through browser login. Other errors stay closed.
 A 401 from the exchange also asks the sign-in adapter's session route once, as
 other granted calls do. Only when the adapter confirms the session ended does the
 shared NIP-FI session move to reauthentication required, so Settings matches.
+While the session stands, or when the exchange returns a viewer credential that
+has already expired or outlasts the eight-hour limit, the panel shows
+**Sign in again to open this app** with **Try again** and **Open settings**,
+which opens Identity in an FI build and the Builderlab card in live
+development, where you sign out and back in.
 When the exchange refuses the viewer (403), the panel shows **You can’t open this
 app** with **Try again** in place of the website instead of the error bar. It
 gives no reason for the refusal. When the exchange cannot be reached, fails on
@@ -73,7 +78,7 @@ This distinction is required by the locked Tauri implementation: its built-in ch
 
 The generated app-command manifest makes native permissions explicit. Only the main webview receives attachment, positioning, navigation, action, status and detachment commands. Capabilities target its webview label, not the containing window; Tauri combines window and webview matches with OR. A sibling guest must not inherit the main webview's commands.
 
-URLs submitted through the API/address field and navigation requests surfaced by the native engine pass the URL policy. Back/Forward use native history. Popups and downloads are unsupported. Camera/microphone requests are denied natively; permission behavior requires native acceptance checks on each supported platform. This is not a claim that websites cannot make network requests or that trusted plugin JavaScript is sandboxed.
+URLs submitted through the API/address field and navigation requests surfaced by the native engine pass the URL policy. Back/Forward use native history. Popups and downloads are unsupported. A Builderlab app's navigation to its own portal approval or connections page is cancelled, and the page, rebuilt with only its known parameters, opens in the system browser instead. The first after a user action in the toolbar (Reload, Back, Forward or a typed address) opens at once. A later approval waits for Reload, and a later connections page waits for **Open in browser**, which opens it; loading another page drops it. When the main window is focused again after a handoff, the guest returns once to the page that started it; this is not a user action. Camera/microphone requests are denied natively; permission behavior requires native acceptance checks on each supported platform. This is not a claim that websites cannot make network requests or that trusted plugin JavaScript is sandboxed.
 
 Changes to the locked Tauri/Wry versions require native navigation, resize, teardown and permission checks on supported desktop platforms. Browser tests in Chromium/WebKit do not establish those native guarantees.
 

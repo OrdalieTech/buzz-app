@@ -2,17 +2,20 @@ import { useState } from "react";
 import type { Config } from "./runtime";
 
 const groups = {
-  model: ["model", "effort"],
+  // Automatic (Recommended) is a model choice too.
+  model: ["model", "effort", "preset"],
   instructions: ["instructions"],
   workspace: ["workspace"],
   scope: ["scope"],
+  compactAt: ["compactAt"],
 } as const;
 export type SettingGroup = keyof typeof groups;
 export const settingLabels: Record<SettingGroup, string> = {
   model: "Model and thinking",
   instructions: "Instructions",
   workspace: "Workspace",
-  scope: "Sessions",
+  scope: "Session scope",
+  compactAt: "Auto-compact at",
 };
 const names = Object.keys(groups) as SettingGroup[];
 const same = (a: Config, b: Config, group: SettingGroup) =>

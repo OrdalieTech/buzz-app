@@ -18,9 +18,11 @@ import {
 import { PreviewCard } from "../../shared/design-system/ui/PreviewCard";
 import { AgentAvatar } from "../agents/AgentAvatar";
 import { usePresenceStatus } from "../presence/react";
+import { useMessageDensity } from "../../shared/theme/message-density";
 import type { RelaySession } from "../relay/session";
 import { UserStatusDisplay } from "../user-status/StatusDisplay";
 import { ProfileBackdrop } from "./ProfileBackdrop";
+import { ProfileLocalTime } from "./ProfileLocalTime";
 import styles from "./ProfilePeek.module.css";
 import {
   otherVerifiedName,
@@ -64,6 +66,26 @@ function OtherName({
   ) : null;
 }
 
+/** Their shared local time, read only while the preview is open. */
+function LocalTime({
+  session,
+  pubkey,
+}: {
+  session: RelaySession;
+  pubkey: string;
+}) {
+  const timeZone = useSyncExternalStore(
+    session.profiles.subscribe,
+    () => session.profiles.snapshot().get(pubkey)?.tz,
+  );
+  return (
+    <ProfileLocalTime
+      timeZone={timeZone}
+      className="text-caption text-secondary"
+    />
+  );
+}
+
 /** A lightweight look at the same identity the avatar opens in the profile panel. */
 export function ProfilePeek({
   trigger,
@@ -79,6 +101,7 @@ export function ProfilePeek({
   onFocusChange,
 }: ProfilePeekProps) {
   const [open, setOpen] = useState(false);
+  const compact = useMessageDensity() === "compact";
   const [hoveredAction, setHoveredAction] = useState<"profile" | "message">();
   const profileButton = useRef<HTMLButtonElement>(null);
   const returningFromProfile = useRef<"pending" | "returned" | null>(null);
@@ -137,8 +160,8 @@ export function ProfilePeek({
     viewer,
     agent,
     enabled: open,
-    onOpened(channelId) {
-      if (!onOpen(`buzz://channel/${encodeURIComponent(channelId)}`))
+    onOpened(link) {
+      if (!onOpen(link))
         throw new Error("Could not open the conversation. Try again.");
       setOpen(false);
     },
@@ -179,10 +202,13 @@ export function ProfilePeek({
       open={open}
       onOpenChange={(next, details) => {
         // Crossing an avatar on the active toolbar's safe pointer route must
-        // not put a new preview between the message and its actions.
+        // not put a new preview between the message and its actions. A compact
+        // row reveals its actions anywhere in the row, avatar included, so
+        // there they do not mark a route.
         const avatar = document.getElementById(triggerId);
         if (
           next &&
+          !compact &&
           details.reason === "trigger-hover" &&
           document.activeElement !== avatar &&
           avatar?.closest("[data-actions-revealed]")
@@ -242,6 +268,7 @@ export function ProfilePeek({
               {name}
             </div>
             {session && <OtherName session={session} pubkey={pubkey} />}
+            {session && <LocalTime session={session} pubkey={pubkey} />}
             {session && (
               <UserStatusDisplay
                 session={session}

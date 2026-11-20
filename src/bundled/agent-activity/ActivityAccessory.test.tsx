@@ -3,6 +3,8 @@ import { ActivityGroupPreview } from "../../features/messages/ActivityGroupPrevi
 import {
   activityPresentation,
   useActivityPresentation,
+  type ActivityPresentation,
+  type ActivityRowPresentation,
 } from "../../features/messages/activity-presentation";
 import { MessageRow } from "../../features/messages/MessageRow";
 import { createRelaySession } from "../../features/relay/session";
@@ -38,6 +40,7 @@ import { createAgentActivity } from "../../features/agents/activity";
 import { requestWork } from "../../features/agents/request-work";
 import { createAgentLibrary } from "../../features/agents/library";
 import type { RelaySession } from "../../features/relay/session";
+import type { ChannelMessage } from "../../features/relay/contracts";
 
 // Stop's results are host toasts; the shared Toast owns how they show.
 const notify = vi.hoisted(() => vi.fn());
@@ -850,6 +853,118 @@ function hosted(running: boolean | Promise<boolean> = true) {
     interrupt: vi.fn(async () => running),
   };
 }
+
+it("notes a finished local request that ran without its gateway, and nothing for one that didn't", () => {
+  const local = createLocalAgentActivity();
+  const f = fixture(local);
+  const view = render(<ActivityAccessory {...f.props} />);
+  const begin = () =>
+    local.begin({
+      scope: "test",
+      channelId: "c",
+      threadRootId: root,
+      messageId: root,
+      agent: A,
+    });
+  try {
+    act(() => {
+      const work = begin();
+      work.started();
+      work.finish({ ok: true });
+    });
+    expect(screen.queryByText(/Ran without/)).not.toBeInTheDocument();
+    act(() => {
+      const work = begin();
+      work.notice(
+        "Ran without the agent gateway: Buzz couldn't reach the gateway.",
+      );
+      work.started();
+      work.finish({ ok: true });
+    });
+    expect(
+      screen.getByText(
+        "Ran without the agent gateway: Buzz couldn't reach the gateway.",
+      ),
+    ).toBeInTheDocument();
+  } finally {
+    view.unmount();
+    f.dispose();
+  }
+});
+
+it("keeps a fallback turn's notice when a later message supersedes it, without calling it stopped", () => {
+  const local = createLocalAgentActivity();
+  const f = fixture(local);
+  const view = render(<ActivityAccessory {...f.props} />);
+  const NOTICE =
+    "Ran without the agent gateway: Buzz couldn't reach the gateway.";
+  try {
+    act(() => {
+      const work = local.begin({
+        scope: "test",
+        channelId: "c",
+        threadRootId: root,
+        messageId: root,
+        agent: A,
+      });
+      work.notice(NOTICE);
+      work.started();
+      work.supersede();
+    });
+    expect(screen.getByText(NOTICE)).toBeInTheDocument();
+    expect(screen.queryByText(/stopped/i)).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: /activity history: Blossom, Continued on a later message/,
+      }),
+    ).toBeInTheDocument();
+  } finally {
+    view.unmount();
+    f.dispose();
+  }
+});
+
+it("keeps a fallback turn's outcome beside its notice when it is stopped or fails", () => {
+  const local = createLocalAgentActivity();
+  const f = fixture(local);
+  const view = render(<ActivityAccessory {...f.props} />);
+  const begin = () =>
+    local.begin({
+      scope: "test",
+      channelId: "c",
+      threadRootId: root,
+      messageId: root,
+      agent: A,
+    });
+  const NOTICE =
+    "Ran without the agent gateway: Buzz couldn't reach the gateway.";
+  try {
+    act(() => {
+      const work = begin();
+      work.notice(NOTICE);
+      work.started();
+      work.finish({ ok: true, stopped: true });
+    });
+    expect(screen.getByText("Stopped")).toBeInTheDocument();
+    expect(screen.getByText(`· ${NOTICE}`)).toBeInTheDocument();
+    act(() => {
+      const work = begin();
+      work.notice(NOTICE);
+      work.started();
+      work.finish({ ok: false, error: "Provider refused the model" });
+    });
+    expect(screen.getByText("Couldn’t finish")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: /activity history: Blossom/ }),
+    );
+    expect(
+      screen.getByText(`Provider refused the model · ${NOTICE}`),
+    ).toBeInTheDocument();
+  } finally {
+    view.unmount();
+    f.dispose();
+  }
+});
 
 it.each(["waiting", "working"])(
   "stops a local request that is %s through its harness, then notes it stopped",
@@ -1995,11 +2110,106 @@ it("lets a thread root's live bubble replace that thread's indicator", () => {
   }
 });
 
-it("shows thinking once across the live bubble, recorded history and conversation indicator", () => {
-  const local = createLocalAgentActivity();
-  const f = fixture(local);
+/** What a thread mounts for agent work, sharing one session. */
+function threadParts(f: ReturnType<typeof fixture>) {
   const owner = createRelaySession(null);
   const session = { ...owner.session, ...f.props.session };
+  const row = (
+    entry: ChannelMessage,
+    activity: ActivityRowPresentation | undefined,
+  ) => (
+    <MessageRow
+      key={entry.id}
+      row={entry}
+      session={session}
+      profile={f.profiles.get(A)}
+      media={() => undefined}
+      onOpenLink={f.props.open}
+      day={false}
+      retry={undefined}
+      recordedActivity={activity}
+    />
+  );
+  return {
+    session,
+    // An agent's update and the viewer's follow-up, each replying to the root.
+    update: {
+      ...f.props.message,
+      authorId: A,
+      threadRootId: root,
+      replyParentId: root,
+      audience: "agents" as const,
+    },
+    followUp: {
+      ...f.props.message,
+      id: next,
+      threadRootId: root,
+      replyParentId: root,
+      content: "Follow-up",
+    },
+    row,
+    accessory: (message = f.props.message) => (
+      <ActivityAccessory
+        {...f.props}
+        session={session}
+        message={message}
+        messageLayout="thread"
+      />
+    ),
+    // Given its rows' presentations, a group also renders its history rows.
+    group: (
+      group: ActivityPresentation,
+      expanded: boolean,
+      byRow?: ReadonlyMap<string, ActivityRowPresentation>,
+    ) => (
+      <ActivityGroupPreview
+        key={group.ids[0]}
+        session={session}
+        group={group}
+        profiles={f.profiles}
+        media={() => undefined}
+        expanded={expanded}
+        onToggle={() => {}}
+        openActivity={f.props.open}
+        canOpenActivity={f.props.canOpen}
+        {...(byRow && {
+          renderHistory: (entry: ChannelMessage) => {
+            const activity = byRow.get(entry.id);
+            if (!activity) throw new Error("Missing recorded activity");
+            return row(entry, { ...activity, container: "history" });
+          },
+        })}
+      />
+    ),
+    tail: (
+      <TypingIndicator
+        session={session}
+        channelId="c"
+        threadRootId={root}
+        inFlow
+      />
+    ),
+    dispose: () => {
+      owner.dispose();
+      f.dispose();
+    },
+  };
+}
+const workingDots = () => [
+  ...document.querySelectorAll('[data-state="working"]'),
+];
+const dotsOn = (id: string) =>
+  workingDots().filter(
+    (dot) =>
+      dot.closest("[data-message-id]")?.getAttribute("data-message-id") === id,
+  );
+const workingCue = () =>
+  screen.queryByRole("button", { name: /Activity: .*working/ });
+
+it("shows thinking and its dots once, moving from the live bubble into recorded history", () => {
+  const local = createLocalAgentActivity();
+  const f = fixture(local);
+  const t = threadParts(f);
   const work = local.begin({
     scope: "test",
     agent: A,
@@ -2009,111 +2219,98 @@ it("shows thinking once across the live bubble, recorded history and conversatio
     thread: true,
   });
   work.step("Thinking");
-  const row = {
-    ...f.props.message,
-    id: "thinking-step",
-    authorId: A,
-    threadRootId: root,
-    replyParentId: root,
-    audience: "agents" as const,
-    content: "Thinking",
+  const row = { ...t.update, id: "thinking-step", content: "Thinking" };
+  // A failure the run reported before it was retried, absorbed into history.
+  const { audience: _audience, ...reply } = row;
+  const failure = {
+    ...reply,
+    id: "failure",
+    notice: "execution-failure" as const,
+    content: "Provider unavailable",
   };
   const rows = [row];
+  const failed = [row, failure];
   const empty: typeof rows = [];
   const agents = new Set([A]);
   function Flow({
     recorded,
     expanded,
+    retried,
   }: {
     recorded: boolean;
     expanded: boolean;
+    retried: boolean;
   }) {
     const presentation = useActivityPresentation(
-      recorded ? rows : empty,
-      session.agentActivity,
+      recorded ? (retried ? failed : rows) : empty,
+      t.session.agentActivity,
       agents,
       root,
     );
     const group = presentation.groups[0];
     return (
       <>
-        <ActivityAccessory
-          {...f.props}
-          session={session}
-          messageLayout="thread"
-        />
-        {group && (
-          <ActivityGroupPreview
-            session={session}
-            group={group}
-            profiles={f.profiles}
-            media={() => undefined}
-            expanded={expanded}
-            onToggle={() => {}}
-            renderHistory={(entry) => {
-              const activity = presentation.byRow.get(entry.id);
-              if (!activity) throw new Error("Missing recorded activity");
-              return (
-                <MessageRow
-                  row={entry}
-                  session={session}
-                  profile={f.profiles.get(A)}
-                  media={() => undefined}
-                  onOpenLink={f.props.open}
-                  day={false}
-                  retry={undefined}
-                  recordedActivity={{
-                    ...activity,
-                    container: "history",
-                  }}
-                />
-              );
-            }}
-          />
-        )}
-        <TypingIndicator
-          session={session}
-          channelId="c"
-          threadRootId={root}
-          inFlow
-        />
+        {t.accessory()}
+        {group && t.group(group, expanded, presentation.byRow)}
+        {t.tail}
       </>
     );
   }
-  const ui = (recorded: boolean, expanded = false) => (
+  const ui = (recorded: boolean, expanded = false, retried = false) => (
     <ActivityIndicatorPresentation>
-      <Flow recorded={recorded} expanded={expanded} />
+      <Flow recorded={recorded} expanded={expanded} retried={retried} />
     </ActivityIndicatorPresentation>
   );
   const view = render(ui(false));
   try {
     expect(screen.getAllByText("Thinking")).toHaveLength(1);
     // Until history owns the work, the message bubble is its one indicator.
-    expect(
-      screen.queryByRole("button", { name: /Activity: .*working/ }),
-    ).toBeNull();
+    expect(workingCue()).toBeNull();
+    // History then owns the work: one working row, its dots included.
     view.rerender(ui(true));
     expect(
       screen.queryByLabelText("Agent activity on this message"),
     ).toBeNull();
     expect(screen.getAllByText("Thinking")).toHaveLength(1);
+    expect(workingCue()).toBeNull();
+    expect(workingDots()).toHaveLength(1);
     expect(
-      screen.getByRole("button", { name: "Activity: Blossom working" }),
-    ).toBeVisible();
+      screen.getByRole("button", { name: /Show activity history/ }),
+    ).toContainElement(workingDots()[0] as HTMLElement);
     view.rerender(ui(true, true));
     expect(screen.getAllByText("Thinking")).toHaveLength(1);
+    expect(workingCue()).toBeNull();
+    const step = () =>
+      screen.getByRole("button", { name: /Blossom: Thinking/ });
+    expect(workingDots()).toHaveLength(1);
+    expect(step()).toContainElement(workingDots()[0] as HTMLElement);
+    // Opening the working step keeps its one set of dots on the step.
+    for (const state of ["open", "closed"]) {
+      fireEvent.click(step());
+      expect(step()).toHaveAttribute("aria-expanded", `${state === "open"}`);
+      expect(workingCue()).toBeNull();
+      expect(workingDots()).toHaveLength(1);
+      expect(step()).toContainElement(workingDots()[0] as HTMLElement);
+    }
+    // Expanded, a failure row carries no dots, so the conversation keeps
+    // the one cue; collapsed, the summary's dots are that cue again.
+    view.rerender(ui(true, true, true));
+    expect(workingDots()).toHaveLength(1);
+    expect(workingCue()).toContainElement(workingDots()[0] as HTMLElement);
+    view.rerender(ui(true, false, true));
+    expect(workingCue()).toBeNull();
+    expect(workingDots()).toHaveLength(1);
     expect(
-      screen.getByRole("button", { name: "Activity: Blossom working" }),
-    ).toBeVisible();
+      screen.getByRole("button", { name: /Show activity history/ }),
+    ).toContainElement(workingDots()[0] as HTMLElement);
+    view.rerender(ui(true, true));
     act(() => work.finish({ ok: true }));
     expect(screen.getByText("Thinking")).not.toHaveAttribute("data-active");
-    expect(
-      screen.queryByRole("button", { name: "Activity: Blossom working" }),
-    ).toBeNull();
+    expect(workingCue()).toBeNull();
+    expect(workingDots()).toHaveLength(0);
   } finally {
     view.unmount();
-    owner.dispose();
-    f.dispose();
+    t.dispose();
   }
 });
 
@@ -2202,6 +2399,315 @@ it("hands live work to only the latest history for each agent and keeps Stop and
     f.dispose();
   }
 });
+
+it("hands a follow-up's live work to the update its run published to the thread root, never to older root updates", () => {
+  const local = createLocalAgentActivity();
+  const f = fixture(local);
+  const t = threadParts(f);
+  const first = local.begin({
+    scope: "test",
+    agent: A,
+    channelId: "c",
+    messageId: root,
+    threadRootId: root,
+    thread: true,
+  });
+  first.reply("old");
+  act(() => first.finish({ ok: false, error: "Root failed" }));
+  const work = local.begin({
+    scope: "test",
+    agent: A,
+    channelId: "c",
+    messageId: next,
+    threadRootId: root,
+    thread: true,
+  });
+  work.interruptible(vi.fn(async () => {}));
+  work.step("Search", "edit history");
+  // Normal sends flatten every thread reply to the root; only the publishing
+  // run knows which request each update belongs to.
+  work.reply("step");
+  const presentation = activityPresentation(
+    [
+      { ...t.update, id: "old", content: "Checking the root" },
+      t.followUp,
+      { ...t.update, id: "stray", content: "Unattributed root update" },
+      { ...t.update, id: "step", content: "Checking the follow-up" },
+    ],
+    f.props.session.agentActivity.snapshot(),
+    new Set([A]),
+    root,
+  );
+  expect(presentation.byRow.get("old")?.requestId).toBe(root);
+  expect(presentation.byRow.get("stray")).toMatchObject({
+    requestId: root,
+    active: false,
+  });
+  expect(presentation.byRow.get("step")).toMatchObject({
+    requestId: next,
+    active: true,
+  });
+  const ui = (expanded: boolean) => (
+    <ActivityIndicatorPresentation>
+      {t.accessory(t.followUp)}
+      {presentation.groups.map((group) => t.group(group, expanded))}
+    </ActivityIndicatorPresentation>
+  );
+  const view = render(ui(false));
+  try {
+    expect(
+      screen.queryByLabelText("Agent activity on this message"),
+    ).toBeNull();
+    expect(screen.getByText("Checking the follow-up")).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    expect(screen.getByText("Checking the root")).not.toHaveAttribute(
+      "data-active",
+    );
+    view.rerender(ui(true));
+    expect(
+      screen.queryByLabelText("Agent activity on this message"),
+    ).toBeNull();
+    expect(
+      screen.getAllByRole("button", { name: "Stop Blossom" }),
+    ).toHaveLength(1);
+    // The root's failure stays with the root's latest history.
+    expect(screen.getAllByText("Root failed")).toHaveLength(1);
+  } finally {
+    view.unmount();
+    t.dispose();
+  }
+});
+
+it("hands a remote follow-up's live work to the update that claims it, leaving older root updates as history", () => {
+  const f = fixture();
+  const t = threadParts(f);
+  f.send(A, "t0", 1, "turn_started", { triggeringEventIds: [root] });
+  f.send(A, "t0", 2, "turn_completed");
+  f.send(A, "t1", 1, "turn_started", {
+    triggeringEventIds: [next],
+    threadRootEventId: root,
+  });
+  const rows = [
+    f.props.message,
+    { ...t.update, id: "old", content: "Checking the root" },
+    t.followUp,
+    {
+      ...t.update,
+      id: "step",
+      request: next,
+      content: "Checking the follow-up",
+    },
+  ];
+  const agents = new Set([A]);
+  function Thread() {
+    const presentation = useActivityPresentation(
+      rows,
+      f.props.session.agentActivity,
+      agents,
+      root,
+    );
+    return (
+      <ActivityIndicatorPresentation>
+        {t.accessory(t.followUp)}
+        {presentation.groups.map((group) => t.group(group, false))}
+        {t.tail}
+      </ActivityIndicatorPresentation>
+    );
+  }
+  const view = render(<Thread />);
+  try {
+    expect(
+      screen.queryByLabelText("Agent activity on this message"),
+    ).toBeNull();
+    expect(screen.getByText("Checking the follow-up")).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    // One working presentation: the history row, its dots included.
+    expect(workingCue()).toBeNull();
+    expect(workingDots()).toHaveLength(1);
+    expect(screen.getByText("Checking the root")).not.toHaveAttribute(
+      "data-active",
+    );
+    f.send(A, "t1", 2, "turn_completed");
+    expect(screen.getByText("Checking the follow-up")).not.toHaveAttribute(
+      "data-active",
+    );
+    expect(
+      screen.queryByLabelText("Agent activity on this message"),
+    ).toBeNull();
+  } finally {
+    view.unmount();
+    t.dispose();
+  }
+});
+
+it("keeps a failed request's update from borrowing a nested follow-up's remote work", () => {
+  const f = fixture();
+  const t = threadParts(f);
+  f.send(A, "t0", 1, "turn_started", { triggeringEventIds: [root] });
+  f.send(A, "t0", 2, "turn_error");
+  f.send(A, "t1", 1, "turn_started", {
+    triggeringEventIds: [next],
+    threadRootEventId: root,
+  });
+  const old = { ...t.update, id: "old", content: "Earlier root progress" };
+  // The follow-up and its signed update both reply under the older update,
+  // which is then the thread's only top-level reply.
+  const followUp = { ...t.followUp, replyParentId: old.id };
+  const step = {
+    ...t.update,
+    id: "step",
+    replyParentId: old.id,
+    request: next,
+    content: "Checking current follow-up",
+  };
+  const agents = new Set([A]);
+  let outcomes: string[] = [];
+  // As in a thread, each reply level is projected on its own.
+  function Thread({ branch }: { branch: boolean }) {
+    const top = useActivityPresentation(
+      [old],
+      f.props.session.agentActivity,
+      agents,
+      root,
+    );
+    const nested = useActivityPresentation(
+      [followUp, step],
+      f.props.session.agentActivity,
+      agents,
+      old.id,
+    );
+    outcomes = top.groups.flatMap((group) =>
+      group.outcomes.map((entry) => entry.state),
+    );
+    const current = nested.groups.find((group) => group.ids.includes(step.id));
+    if (!current) throw new Error("Missing follow-up activity");
+    return (
+      <ActivityIndicatorPresentation>
+        {/* The root's live bubble shows only the failed request's outcome. */}
+        {t.accessory()}
+        {t.row(old, top.byRow.get(old.id))}
+        {branch && t.group(current, true, nested.byRow)}
+        {t.tail}
+      </ActivityIndicatorPresentation>
+    );
+  }
+  const check = (branch: boolean, working = true) => {
+    expect(
+      screen.getByLabelText("Agent activity on this message"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Earlier root progress")).not.toHaveAttribute(
+      "data-active",
+    );
+    expect(dotsOn(old.id)).toHaveLength(0);
+    // The failed request keeps its own outcome.
+    expect(outcomes).toEqual(["error"]);
+    // Exactly one working cue: the follow-up's update, or the tail when hidden.
+    if (!working) {
+      expect(workingCue()).toBeNull();
+      expect(workingDots()).toHaveLength(0);
+    } else if (branch) {
+      expect(workingCue()).toBeNull();
+      expect(workingDots()).toHaveLength(1);
+      expect(dotsOn(step.id)).toHaveLength(1);
+    } else {
+      expect(workingDots()).toHaveLength(1);
+      expect(workingCue()).toContainElement(workingDots()[0] as HTMLElement);
+    }
+  };
+  let view = render(<Thread branch />);
+  try {
+    check(true);
+    view.rerender(<Thread branch={false} />);
+    check(false);
+    // Closing and reopening the conversation keeps that one cue.
+    view.unmount();
+    view = render(<Thread branch={false} />);
+    check(false);
+    view.rerender(<Thread branch />);
+    check(true);
+    f.send(A, "t1", 2, "turn_completed");
+    check(true, false);
+  } finally {
+    view.unmount();
+    t.dispose();
+  }
+});
+
+// A row with replies shows in a thread as a standalone row, not a group.
+it.each(["grouped", "standalone"])(
+  "keeps a failed follow-up's update, replying to the root, from borrowing the root request's remote work: %s",
+  (layout) => {
+    const f = fixture();
+    const t = threadParts(f);
+    f.send(A, "t0", 1, "turn_started", {
+      triggeringEventIds: [root],
+      threadRootEventId: root,
+    });
+    f.send(A, "t1", 1, "turn_started", {
+      triggeringEventIds: [next],
+      threadRootEventId: root,
+    });
+    f.send(A, "t1", 2, "turn_error");
+    const old = { ...t.update, id: "old", content: "Checking the root" };
+    // Signed for the follow-up, though its reply is flattened to the root.
+    const step = {
+      ...t.update,
+      id: "step",
+      request: next,
+      content: "Checking the follow-up",
+    };
+    const rows = [old, t.followUp, step];
+    const agents = new Set([A]);
+    function Thread() {
+      const presentation = useActivityPresentation(
+        rows,
+        f.props.session.agentActivity,
+        agents,
+        root,
+      );
+      return (
+        <ActivityIndicatorPresentation>
+          {layout === "standalone" &&
+            [old, step].map((entry) =>
+              t.row(entry, presentation.byRow.get(entry.id)),
+            )}
+          {layout === "grouped" &&
+            presentation.groups.map((group) =>
+              t.group(group, true, presentation.byRow),
+            )}
+          {t.tail}
+        </ActivityIndicatorPresentation>
+      );
+    }
+    const view = render(<Thread />);
+    try {
+      expect(screen.getByText("Checking the follow-up")).not.toHaveAttribute(
+        "data-active",
+      );
+      expect(dotsOn(step.id)).toHaveLength(0);
+      // The root request's own update is its one working cue.
+      expect(screen.getByText("Checking the root")).toHaveAttribute(
+        "data-active",
+        "true",
+      );
+      expect(dotsOn(old.id)).toHaveLength(1);
+      // The follow-up below that update keeps the conversation's cue too.
+      expect(workingCue()).toBeVisible();
+      f.send(A, "t0", 2, "turn_completed");
+      expect(screen.getByText("Checking the follow-up")).not.toHaveAttribute(
+        "data-active",
+      );
+      expect(workingDots()).toHaveLength(0);
+    } finally {
+      view.unmount();
+      t.dispose();
+    }
+  },
+);
 
 it.each([
   {

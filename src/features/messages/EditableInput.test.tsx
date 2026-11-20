@@ -1312,7 +1312,13 @@ describe("Mod+Shift+V pastes plain text verbatim", () => {
       fireEvent.keyDown(h.input, chord);
       fireEvent.paste(h.input, {
         clipboardData: {
-          items: [{ kind: "file" }],
+          items: [
+            {
+              kind: "file",
+              getAsFile: () =>
+                new File(["png"], "name.png", { type: "image/png" }),
+            },
+          ],
           getData: (type: string) => (type === "text/plain" ? "name.png" : ""),
         },
       });
@@ -1379,6 +1385,23 @@ describe("Mod+Shift+V pastes plain text verbatim", () => {
     paste(h.input, url);
     expect(h.markdown()).toBe(`Check the [release notes](${url})`);
   });
+});
+
+it("does not spellcheck a mention, as a chip or opened as text", () => {
+  const h = mount();
+  const honey = { pubkey: "a".repeat(64), name: "Honey" };
+  act(() => h.input.insertText("", honey));
+  expect(h.input.querySelector('[data-source="@Honey"]')).toHaveAttribute(
+    "spellcheck",
+    "false",
+  );
+  act(() => h.input.setSelectionRange(2, 2));
+  expect(h.input.querySelector('[data-source="@Honey"]')).toBeNull();
+  const text = [...h.input.querySelectorAll("span")].find(
+    (span) => span.textContent === "@Honey",
+  );
+  expect(text).toHaveAttribute("spellcheck", "false");
+  expect(h.draft().recipients).toEqual([{ ...honey, start: 0, end: 6 }]);
 });
 
 it("bolds a mention typed between delimiters and keeps its chip and recipient", async () => {
@@ -4914,5 +4937,91 @@ describe("oversized paste feedback", () => {
     paste(h.input, "Docs", '<a href="https://example.com/docs">Docs</a>');
     expect(h.markdown()).toBe("");
     expect(onPasteTooLong).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("quoting timeline content", () => {
+  it("adds attribution above the quote and leaves a blank reply line in the same undo step", async () => {
+    const h = mount("Draft");
+    const link = `buzz://message?channel=general&id=${"a".repeat(64)}`;
+    act(() =>
+      expect(
+        h.input.insertQuote(timelineHtml("Hello <strong>world</strong>"), [
+          link,
+        ]),
+      ).toBe(true),
+    );
+    expect(h.markdown()).toBe(
+      `Draft\n\nFrom ${link}:\n\n> Hello **world**\n\n\n`,
+    );
+    await h.user.keyboard("reply");
+    expect(h.markdown()).toBe(
+      `Draft\n\nFrom ${link}:\n\n> Hello **world**\n\n\nreply`,
+    );
+    act(() => h.input.undo(false));
+    expect(h.markdown()).toBe(
+      `Draft\n\nFrom ${link}:\n\n> Hello **world**\n\n\n`,
+    );
+    act(() => h.input.undo(false));
+    expect(h.markdown()).toBe("Draft");
+  });
+
+  it("counts source links toward the limit without changing the existing draft", () => {
+    const onPasteTooLong = vi.fn();
+    const h = mount("keep", { maxLength: 20, onPasteTooLong });
+    const link = `buzz://message?channel=general&id=${"a".repeat(64)}`;
+    act(() =>
+      expect(h.input.insertQuote(timelineHtml("short"), [link])).toBe(false),
+    );
+    expect(h.markdown()).toBe("keep");
+    expect(onPasteTooLong).toHaveBeenCalledOnce();
+  });
+
+  it("replaces an empty draft's line and continues below the quote", async () => {
+    const h = mount();
+    act(() =>
+      expect(
+        h.input.insertQuote(timelineHtml("Hello <strong>world</strong>")),
+      ).toBe(true),
+    );
+    await h.user.keyboard("reply");
+    expect(h.markdown()).toBe("> Hello **world**\n\nreply");
+  });
+
+  it("appends after the draft wherever its caret is", async () => {
+    const h = mount("Draft");
+    act(() => h.input.setSelectionRange(0, 0));
+    act(() => expect(h.input.insertQuote(timelineHtml("quoted"))).toBe(true));
+    await h.user.keyboard("reply");
+    expect(h.markdown()).toBe("Draft\n\n> quoted\n\nreply");
+    // The reply typed straight after quoting is its own undo step.
+    act(() => h.input.undo(false));
+    expect(h.markdown()).toBe("Draft\n\n> quoted\n\n");
+    act(() => h.input.undo(false));
+    expect(h.markdown()).toBe("Draft");
+  });
+
+  it("keeps quoted mentions as references without notifying them", () => {
+    const h = mount();
+    act(() =>
+      h.input.insertQuote(
+        timelineHtml(
+          `<a href="${profileTarget(honey.pubkey)}">@Honey</a> said hi`,
+        ),
+      ),
+    );
+    expect(h.markdown()).toBe(`> ${honeyLink} said hi\n\n`);
+    expect(h.draft().recipients).toEqual([]);
+  });
+
+  it("refuses blank content and quotes over the length limit", () => {
+    const onPasteTooLong = vi.fn();
+    const h = mount("keep", { maxLength: 12, onPasteTooLong });
+    act(() => {
+      expect(h.input.insertQuote(timelineHtml("  "))).toBe(false);
+      expect(h.input.insertQuote(timelineHtml("far too long"))).toBe(false);
+    });
+    expect(onPasteTooLong).toHaveBeenCalledOnce();
+    expect(h.markdown()).toBe("keep");
   });
 });

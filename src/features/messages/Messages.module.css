@@ -1,5 +1,18 @@
 @reference "../../shared/styles/globals.css";
 
+/* Match native selection while a message menu owns keyboard focus. Gate the
+   rule to its visible lifetime, as Find on screen does for its highlights. */
+:root[data-message-highlight] ::highlight(buzz-message-highlight) {
+  background-color: var(--selection-fill, var(--surface-text-selection));
+  color: var(--selection-text, var(--text-on-selection));
+}
+@media (forced-colors: active) {
+  :root[data-message-highlight] ::highlight(buzz-message-highlight) {
+    background-color: Highlight;
+    color: HighlightText;
+  }
+}
+
 /* Reusable conversation components; plugins own placement and surrounding layout. */
 .thread {
   position: relative;
@@ -31,7 +44,7 @@
   /* Keep fractional last rows reachable despite integer scroll extents. */
   --history-bottom-inset: var(--space-half);
   padding-bottom: var(--history-bottom-inset);
-  /* The vendored Virtua patch (interruptMomentum in patches/virtua@0.53.5.patch)
+  /* The vendored Virtua patch (interruptMomentum in patches/virtua@0.54.2.patch)
      flips this scroller to overflow-y: hidden !important on every nonzero size
      correction on Mac WebKit. With classic, space-taking scrollbars that frame
      removes the scrollbar, widens the content box, re-wraps rows above the
@@ -102,6 +115,10 @@
   letter-spacing: var(--text-caption--letter-spacing);
   color: var(--text-subtle);
   gap: var(--space-2);
+}
+.edge[data-intro] {
+  flex-direction: column;
+  align-items: stretch;
 }
 .edge[data-history-space] {
   min-height: calc(var(--size-control) + var(--space-4));
@@ -212,6 +229,12 @@
     calc(100% - 2 * var(--message-side-space) + var(--space-1) - var(--space-8))
   );
 }
+.message[data-full-width] {
+  width: 100%;
+}
+.message:where([data-full-width]):has(> .messageGutter) > .messageBody {
+  max-width: none;
+}
 .message[data-viewer-message] > .messageBody {
   flex: 0 1 auto;
   width: fit-content;
@@ -276,7 +299,17 @@ html[data-keyboard-navigation] .authorLink:focus-visible {
   overflow-wrap: anywhere;
 }
 .text {
+  composes: document message from "../markdown/Markdown.module.css";
   white-space: pre-wrap;
+}
+.codeBlock {
+  composes: codeFrame from "../markdown/Markdown.module.css";
+}
+.codeActions {
+  composes: codeActions from "../markdown/Markdown.module.css";
+}
+.imageAlt {
+  composes: imageAlt from "../markdown/Markdown.module.css";
 }
 .text[data-single-emoji] {
   --inline-emoji-size: var(--size-emoji-display);
@@ -294,6 +327,9 @@ html[data-keyboard-navigation] .authorLink:focus-visible {
   align-items: center;
   gap: var(--space-1);
   margin: var(--space-1h) 0 0;
+  /* Reactions and reply summaries are controls, not conversation text;
+     a copy states reaction counts from the group's data-copy-text. */
+  user-select: none;
 }
 .reactions[data-populated],
 .reactionFallback {
@@ -414,25 +450,22 @@ html[data-keyboard-navigation] .authorLink:focus-visible {
 .reactionGlyph .reactionNativeEmoji {
   padding: var(--space-half);
 }
-.reactionFallbackEmoji {
-  display: inline-block;
-  min-width: 0;
-  max-width: var(--compact-control-size, var(--size-control-sm));
-  font-size: var(--text-caption);
-  line-height: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .reactionCustomEmoji {
   display: block;
   width: 0.75rem;
   height: 0.75rem;
   object-fit: contain;
 }
+/* A shortcode without usable artwork shows this neutral glyph, never its text. */
+.reactionPlaceholder {
+  display: block;
+  width: 0.75rem;
+  height: 0.75rem;
+}
 /* Paint 12px artwork at 14px (10.5pt), keeping the capsule's layout box. */
 .reactionGlyph [data-reaction-artwork],
-.reactionGlyph .reactionCustomEmoji {
+.reactionGlyph .reactionCustomEmoji,
+.reactionGlyph .reactionPlaceholder {
   scale: calc(7 / 6);
 }
 .visuallyHidden {
@@ -473,7 +506,8 @@ html[data-keyboard-navigation] .authorLink:focus-visible {
   /* Color glyph ink extends beyond its em square, especially on macOS. */
   line-height: 1.25;
 }
-.reactionPreviewEmoji .reactionCustomEmoji {
+.reactionPreviewEmoji .reactionCustomEmoji,
+.reactionPreviewEmoji .reactionPlaceholder {
   width: calc(var(--space-6) * 2);
   height: calc(var(--space-6) * 2);
 }
@@ -788,6 +822,7 @@ html[data-keyboard-navigation] .attachmentImage:focus-visible {
   padding-inline-start: var(--space-1);
 }
 .composerInput {
+  @apply text-message;
   box-sizing: border-box;
   position: relative;
   min-width: 0;
@@ -908,6 +943,7 @@ html[data-keyboard-navigation] .attachmentImage:focus-visible {
   flex: none;
   width: var(--space-5);
   height: var(--space-5);
+  -webkit-user-select: none;
   user-select: none;
 }
 .dayCalendar > * {
@@ -965,6 +1001,7 @@ html[data-keyboard-navigation] .attachmentImage:focus-visible {
   font-weight: var(--type-weight-regular);
   padding: var(--space-1);
   padding-right: var(--space-1h);
+  user-select: none;
 }
 /* Compact summaries keep their 24px participants but drop the control's
    spare block padding. */
@@ -1218,9 +1255,6 @@ html[data-keyboard-navigation] .fileAttachment:focus-visible {
   gap: var(--space-2);
   margin-top: var(--space-2);
 }
-.fileGroup .fileAttachment {
-  margin-top: 0;
-}
 .fileAttachmentBody {
   flex: 1;
   min-width: 0;
@@ -1245,6 +1279,35 @@ html[data-keyboard-navigation] .fileAttachment:focus-visible {
   font-size: var(--text-caption);
   line-height: var(--text-caption--line-height);
   letter-spacing: var(--text-caption--letter-spacing);
+}
+.filePreviewAttachment {
+  display: flex;
+  align-items: center;
+  width: 21rem;
+  max-width: 100%;
+  min-width: 0;
+  margin-top: var(--space-2);
+  border: 1px solid var(--border-standard);
+  border-radius: var(--radius-row);
+  background: var(--surface-inset);
+  color: var(--text-standard);
+  font-size: var(--text-body-sm);
+  line-height: var(--text-body-sm--line-height);
+  letter-spacing: var(--text-body-sm--letter-spacing);
+  font-weight: var(--text-body-sm--font-weight);
+}
+.filePreviewMain {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+.fileDownloadAction {
+  display: flex;
+  align-self: stretch;
+}
+.fileGroup .fileAttachment,
+.fileGroup .filePreviewAttachment {
+  margin-top: 0;
 }
 .audioAttachment {
   flex-wrap: wrap;
@@ -1722,215 +1785,6 @@ button.mediaPreview {
 .plainText {
   text-wrap-style: pretty;
 }
-.text p {
-  line-height: inherit;
-}
-.text > :first-child:not([data-single-emoji]) {
-  margin-top: 0;
-}
-.text > :last-child {
-  margin-bottom: 0;
-}
-.text :where(p, ul, ol, blockquote, pre, .codeBlock, table, hr) {
-  margin: var(--space-4) 0;
-}
-.text > p:has(+ :is(ul, ol)) {
-  margin-bottom: var(--space-2);
-}
-.text > p + :where(ul, ol) {
-  margin-top: var(--space-2);
-}
-.text :where(h1, h2, h3, h4, h5, h6) {
-  margin: var(--space-4) 0 var(--space-1h);
-  color: var(--text-standard);
-  font-size: var(--text-body);
-  line-height: var(--text-body--line-height);
-  letter-spacing: var(--text-body--letter-spacing);
-}
-.text h1 {
-  font-size: var(--text-heading);
-  line-height: var(--text-heading--line-height);
-  letter-spacing: var(--text-heading--letter-spacing);
-}
-.text h2 {
-  font-size: var(--text-body-lg);
-  line-height: var(--text-body-lg--line-height);
-  letter-spacing: var(--text-body-lg--letter-spacing);
-}
-.text h3 {
-  font-size: var(--text-label);
-  line-height: var(--text-label--line-height);
-  letter-spacing: var(--text-label--letter-spacing);
-}
-.text :where(h1, h2, h3) {
-  font-weight: var(--type-weight-medium);
-}
-.text :where(h4, h5, h6) {
-  font-weight: var(--type-weight-medium);
-}
-.text.text :where(ul, ol) {
-  padding-left: var(--space-6);
-}
-.text ol {
-  list-style: decimal;
-}
-.text ul {
-  list-style: disc;
-}
-.text li + li {
-  margin-top: var(--space-1);
-}
-.text li > :where(p, ul, ol) {
-  margin-top: var(--space-1);
-  margin-bottom: var(--space-1);
-}
-.text blockquote {
-  position: relative;
-  padding: var(--space-half) 0 var(--space-half) var(--space-3);
-  border-left: 3px solid transparent;
-}
-.text blockquote::before {
-  content: "";
-  position: absolute;
-  inset-block: 0;
-  left: -3px;
-  width: 3px;
-  border-radius: var(--radius-pill);
-  background: color-mix(
-    in srgb,
-    var(--border-prominent),
-    var(--border-standard)
-  );
-}
-@media (forced-colors: active) {
-  .text blockquote::before {
-    background: CanvasText;
-  }
-}
-.text blockquote > :first-child {
-  margin-top: 0;
-}
-.text blockquote > :last-child {
-  margin-bottom: 0;
-}
-.text code {
-  border-radius: var(--radius-chip);
-  background: var(--affordance-subtle);
-  padding: var(--space-half) var(--space-1h);
-  font-family: var(--font-system-mono);
-  font-size: var(--text-mono-sm);
-  line-height: var(--text-mono-sm--line-height);
-  letter-spacing: var(--text-mono-sm--letter-spacing);
-}
-/* The code scrolls inside its frame so the copy action stays in the corner.
-   A plugin-presented block keeps the same frame and action. */
-.text :is(pre, .codeBlock) {
-  position: relative;
-  max-width: 100%;
-  overflow: hidden;
-  border: 1px solid var(--border-standard);
-  border-radius: var(--radius-row);
-  background: var(--surface-panel);
-}
-.text pre code {
-  display: block;
-  overflow-x: auto;
-  border-radius: 0;
-  background: transparent;
-  padding: var(--space-3) var(--space-3);
-  scrollbar-width: thin;
-  white-space: pre;
-  overflow-wrap: normal;
-}
-/* Keep every line end reachable beside the pinned action. */
-.text pre:has(> .codeActions) code {
-  padding-inline-end: calc(var(--size-control-sm) + var(--space-3));
-}
-/* `pre` clips, so a focusable scroller draws its ring inside. */
-html[data-keyboard-navigation] .text pre code:focus-visible {
-  outline-offset: -2px;
-}
-.codeActions {
-  position: absolute;
-  display: flex;
-  gap: var(--space-half);
-  top: var(--space-1);
-  inset-inline-end: var(--space-1);
-  border-radius: var(--radius-icon-button);
-  background: var(--surface-panel);
-  user-select: none;
-}
-@media (hover: hover) and (pointer: fine) {
-  .text :is(pre, .codeBlock):not(:hover, :focus-within) .codeActions {
-    opacity: 0;
-  }
-}
-.text table {
-  display: block;
-  width: max-content;
-  max-width: 100%;
-  overflow-x: auto;
-  border: 1px solid var(--border-standard);
-  border-radius: var(--radius-control);
-  border-collapse: separate;
-  border-spacing: 0;
-  font-size: var(--text-body-sm);
-  line-height: var(--text-body-sm--line-height);
-  letter-spacing: var(--text-body-sm--letter-spacing);
-  overflow-wrap: normal;
-  scrollbar-width: thin;
-  /* Columns don't wrap; authored spaces stay, as in the rest of the body. */
-  white-space: pre;
-}
-/* Measured overflow chooses the scrollbar in style; see MessageMarkdown. */
-.text table[data-overflow="true"] {
-  overflow-x: scroll;
-}
-.text table[data-overflow="false"] {
-  overflow-x: hidden;
-}
-.text :where(th, td) {
-  border: 0;
-  border-right: 1px solid var(--border-standard);
-  border-bottom: 1px solid var(--border-standard);
-  padding: var(--space-1) var(--space-2);
-  text-align: left;
-  vertical-align: top;
-}
-.text :where(th, td):last-child {
-  border-right: 0;
-}
-.text tbody tr:last-child td {
-  border-bottom: 0;
-}
-.text th {
-  background: var(--affordance-subtle);
-  font-weight: var(--type-weight-medium);
-}
-.text hr {
-  border: 0;
-  border-top: 1px solid var(--border-standard);
-}
-.text input[type="checkbox"] {
-  width: 1em;
-  height: 1em;
-  margin: 0 var(--space-1h) var(--space-half) 0;
-  vertical-align: middle;
-  accent-color: var(--affordance-prominent);
-}
-.text a:not([data-solo-link]) {
-  color: var(--text-link);
-  text-decoration: underline;
-  text-decoration-thickness: 1px;
-  text-underline-offset: 2px;
-}
-.text a:not([data-solo-link]):hover {
-  text-decoration-thickness: 2px;
-}
-.imageAlt {
-  color: var(--text-subtle);
-  font-style: italic;
-}
 
 /* Metadata after the body's last line; on its own line after a closing block
    or plugin card, or after attachments when no body is drawn. A large-emoji
@@ -2141,6 +1995,7 @@ html[data-keyboard-navigation] .membership .membershipName:focus-visible {
   scroll-margin-inline-end: var(--space-3);
   /* Controls are not conversation text: a selection that spans rows passes
      through this bar, and engines copy button labels the user never saw. */
+  -webkit-user-select: none;
   user-select: none;
   @apply popover-surface;
   --floating-radius: var(--radius-control);
@@ -2196,9 +2051,14 @@ html[data-keyboard-navigation] .membership .membershipName:focus-visible {
 @media (hover: hover) and (pointer: fine) and (
     prefers-reduced-motion: no-preference
   ) {
-  html:not([data-keyboard-navigation]) .messageActions[popover]:popover-open {
+  .messageActions[popover]:popover-open {
     animation: message-actions-in calc(var(--duration-state) / 2)
       var(--easing-enter);
+  }
+  /* Keyboard reveal is immediate. Only the duration differs, so a pointer
+     press that ends keyboard navigation cannot restart an open bar's entry. */
+  html[data-keyboard-navigation] .messageActions[popover]:popover-open {
+    animation-duration: 0s;
   }
 }
 @keyframes message-actions-in {
@@ -2998,6 +2858,7 @@ html[data-keyboard-navigation] .rawDiff:focus-visible {
 
 .jumpToLatest {
   align-items: flex-end;
+  user-select: none;
   position: sticky;
   z-index: 2;
   /* Anchor the bottom edge, leaving space-3 for the shadow at any text size. */
@@ -3070,6 +2931,9 @@ html[data-keyboard-navigation] .rawDiff:focus-visible {
 /* Content hugs short messages while rich content can use the available width. */
 .messageBubble {
   position: relative;
+  /* Like the Markdown boxes inside it: no WebKit selection fill in the
+     bubble's padding or beside short lines, only behind selected text. */
+  translate: 0 0;
   --message-link: var(--text-message-link);
   --message-inset: var(--space-2);
   --message-radius: calc(
@@ -3103,44 +2967,56 @@ html[data-keyboard-navigation] .rawDiff:focus-visible {
   padding: 0;
   border-radius: 0;
 }
+/* The compact hover and open-thread marker share geometry and paint. A pseudo
+   element is generated only by the state selectors below. */
+:where(html[data-message-density="compact"])
+.message:not(.messageHighlight)::before {
+  position: absolute;
+  inset-block: 0;
+  inset-inline: calc(-1 * var(--message-hover-inset, 0px));
+  inset-inline-start: calc(
+    -1 *
+    var(--message-hover-start-inset, var(--message-hover-inset, 0px))
+  );
+  z-index: -1;
+  pointer-events: none;
+  background: var(--affordance-subtle-hover);
+  opacity: 0.5;
+}
+
+:where(html[data-message-density="compact"])
+  .message:not(.messageHighlight):is(
+    [data-actions-revealed],
+    [data-thread-open]
+  )::before {
+  content: "";
+}
 @media (hover: hover) and (pointer: fine) {
   :where(html[data-message-density="compact"])
-    .message:not(.messageHighlight):is(
-      :hover,
-      [data-actions-revealed]
-    )::before {
+    .message:not(.messageHighlight):hover::before {
     content: "";
-    position: absolute;
-    inset-block: 0;
-    inset-inline: calc(-1 * var(--message-hover-inset, 0px));
-    inset-inline-start: calc(
-      -1 *
-      var(--message-hover-start-inset, var(--message-hover-inset, 0px))
-    );
-    z-index: -1;
-    pointer-events: none;
-    background: var(--affordance-subtle-hover);
-    opacity: 0.5;
   }
-  /* An arrival cue replaces hover on its bubble rather than stacking on it. */
-  .message[data-actions-revealed]:not(.messageHighlight)
-    > .messageBody
-    > .messageContent
-    .messageBubble:not([data-emoji-only], [data-diff-only]):not(
-      :has(> .text > table:only-child),
-      :has(> .text > table:first-child + .edited:last-child)
-    ) {
-    background: var(--surface-message-hover);
-  }
-  .message[data-own][data-actions-revealed]:not(.messageHighlight)
-    > .messageBody
-    > .messageContent
-    .messageBubble:not([data-emoji-only], [data-diff-only]):not(
-      :has(> .text > table:only-child),
-      :has(> .text > table:first-child + .edited:last-child)
-    ) {
-    background: var(--surface-message-own-hover);
-  }
+}
+/* An arrival cue replaces hover on its bubble rather than stacking on it. */
+.message:is([data-actions-revealed], [data-thread-open]):not(.messageHighlight)
+  > .messageBody
+  > .messageContent
+  .messageBubble:not([data-emoji-only], [data-diff-only]):not(
+    :has(> .text > table:only-child),
+    :has(> .text > table:first-child + .edited:last-child)
+  ) {
+  background: var(--surface-message-hover);
+}
+.message[data-own]:is([data-actions-revealed], [data-thread-open]):not(
+    .messageHighlight
+  )
+  > .messageBody
+  > .messageContent
+  .messageBubble:not([data-emoji-only], [data-diff-only]):not(
+    :has(> .text > table:only-child),
+    :has(> .text > table:first-child + .edited:last-child)
+  ) {
+  background: var(--surface-message-own-hover);
 }
 .message[data-layout="continuation"] .messageBubble {
   margin-top: 0;
@@ -3168,6 +3044,7 @@ html[data-keyboard-navigation] .rawDiff:focus-visible {
 
 /* Keep sent and received avatars close to their message in every layout. */
 .messageAvatar {
+  -webkit-user-select: none;
   user-select: none;
   position: absolute;
   bottom: 0;
@@ -3197,6 +3074,7 @@ html[data-keyboard-navigation] .rawDiff:focus-visible {
   width: max-content;
   color: var(--text-subtle);
   font-variant-numeric: tabular-nums;
+  -webkit-user-select: none;
   user-select: none;
 }
 .message[data-viewer-message] .messageAvatar {
@@ -3207,7 +3085,7 @@ html[data-keyboard-navigation] .rawDiff:focus-visible {
   margin: 0;
 }
 /* Links take the bubble's paired link ink; mentions keep their own tint. */
-.messageBubble .text a:not([data-solo-link]) {
+.messageBubble .text a {
   --link-text: var(--message-link);
   --link-hover: transparent;
   --link-focus: currentColor;
@@ -3255,9 +3133,6 @@ html[data-keyboard-navigation] .rawDiff:focus-visible {
 .messageAttachments > * {
   max-width: 100%;
   margin-block: 0;
-}
-.messageAttachments[data-solo-cards] + .messageBubble {
-  margin-top: var(--space-half);
 }
 .messageAttachments .imageUnavailable {
   border-radius: calc(var(--radius-panel) - var(--space-2));
@@ -3352,6 +3227,14 @@ html[data-keyboard-navigation] .rawDiff:focus-visible {
 .message[data-stack-previous] {
   padding-top: var(--space-half);
 }
+/* A flat list keeps 8px between stacked rows, such as one author's run, so
+   each reads as its own message rather than a wrapped line of the last. */
+:where(html[data-message-density="compact"]) .message[data-stack-next] {
+  padding-bottom: var(--space-1);
+}
+:where(html[data-message-density="compact"]) .message[data-stack-previous] {
+  padding-top: var(--space-1);
+}
 .message .byline {
   padding-inline-start: var(--space-4);
   font-size: var(--text-caption);
@@ -3417,8 +3300,13 @@ html[data-keyboard-navigation] .rawDiff:focus-visible {
   opacity: 0;
   pointer-events: none;
 }
+/* Standalone :focus-within: compounded with :is() or :not(), WebKit
+   restyles the whole document on every focus change. */
 :where(html[data-message-density="compact"])
-  .message:is(:hover, :focus-within, [data-actions-revealed])
+  .message:is(:hover, [data-actions-revealed])
+  .continuationTime,
+:where(html[data-message-density="compact"])
+  .message:focus-within
   .continuationTime {
   opacity: 1;
   pointer-events: auto;
@@ -3737,7 +3625,9 @@ html[data-keyboard-navigation] .audienceEntry:has(.audienceLine:focus-visible) {
 .audienceRow:has(.audienceBody) .audiencePreviewText {
   display: none;
 }
-.audienceLine:hover {
+.audienceLine:hover,
+.audienceEntry:where([data-thread-open]):not(.messageHighlight)
+  > .audienceLine {
   background: var(--affordance-subtle-hover);
 }
 
@@ -3894,6 +3784,7 @@ html[data-keyboard-navigation] .message:focus-visible::after {
 /* Keyboard users can read a grouped message's time without opening a popup. */
 .keyboardMessageTime {
   display: none;
+  -webkit-user-select: none;
   user-select: none;
 }
 html[data-keyboard-navigation]
@@ -3939,25 +3830,6 @@ html[data-keyboard-navigation]
   gap: var(--space-1);
   min-width: 0;
 }
-.composerSoloCards {
-  container-type: inline-size;
-  container-name: message-row;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  min-width: 0;
-}
-.composerSoloCard {
-  display: flex;
-  align-items: center;
-  gap: var(--space-1);
-  min-width: 0;
-}
-.composerSoloCardContent {
-  min-width: 0;
-  max-width: calc(100% - var(--size-control));
-}
-
 html[data-keyboard-navigation] .activityExpansion {
   transition: none;
 }
@@ -4224,4 +4096,11 @@ html[data-keyboard-navigation] .activityExpansion {
 }
 .activityGroupHeader[data-expanded] > div:last-child {
   flex-shrink: 0;
+}
+.agentNote {
+  margin: var(--space-1h) 0 0;
+  color: var(--text-secondary);
+  font-size: var(--text-caption);
+  line-height: var(--text-caption--line-height);
+  letter-spacing: var(--text-caption--letter-spacing);
 }

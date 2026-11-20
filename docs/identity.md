@@ -167,7 +167,9 @@ where the backup step can run (see
 `404` wherever backups are not configured. Not sent, a `404` or any failure
 leaves the lookup unavailable rather than empty, and never fails setup: it only
 decides whether Welcome back offers a restore and whether an import needs
-automatic backup.
+automatic backup. A lookup that fails, unlike one that isn't configured, still
+lets Welcome back offer the restore: a backup may hold the key, and the restore
+page says when none does and offers **Enter my private key**.
 
 **Not linked** pauses on **Get started with Buzz**, which says the account will
 manage the Buzz identity. **Set me up** creates and links a key; **Use an
@@ -206,9 +208,12 @@ device's key in place. When this device has confirmed a stored backup of the key
 (`nsec_backup_confirmed`: a backup record here, under any account, that the
 service receipted or a restore wrote), the question says the key is backed up
 in Builderlab and that signing in to its account again restores it; otherwise
-it says the key may not be backed up. A local receipt is not consent, and the
-backup may since have been deleted, so it only changes the wording. Creating or
-importing a key still refuses while one is on the device.
+it says the key may not be backed up and shows the same private-key controls
+as Settings' **Remove from device**, with its gate: **Replace** stays disabled
+until the key was revealed or copied and **I have my key** is checked. Each new
+question starts unchecked. A local receipt is not consent, and the backup may since
+have been deleted, so a confirmed backup only changes the wording and drops that
+wait. Creating or importing a key still refuses while one is on the device.
 
 An account with no key takes this device's key, else old Buzz's, else a new
 one, without asking. When the account holds no key, the account check can't
@@ -243,8 +248,12 @@ no other sign-in brings up the OS prompt for old Buzz's storage.
 **Linked** pauses on **Welcome back**: the account is already linked to a Buzz
 identity — the key on the user's other device — shown as the full npub under
 *Linked public key (npub)* with **Copy**, with the same *Signed in as {email}.*
-line under the body. A linked key does not mean a
-backed-up one, so only when the lookup lists the linked key does the page also
+line under the body. When the linked key isn't the one on this device, the page
+says so: *Your account’s key isn’t on this device*, then to try a restore from a
+backup or enter its private key or, with no restore offered, to enter its private key.
+With a restore offered, an **Enter your private key** row under the key row
+opens the import page without waiting on the restore. A linked key does not mean a
+backed-up one, so only when the lookup lists the linked key, or failed, does the page also
 offer **Restore from backup** (primary), with **Enter your private key** as a
 smaller choice; otherwise **Enter your private key** is primary. It opens the
 same import page, which here accepts only the linked key: any other valid nsec
@@ -268,6 +277,11 @@ throughout recovery, with a browser sign-in hint while waiting. Failure shows **
 with **Enter my private key**, **I lost my key**, optional **Try again**, then Back.
 Retry is available for transient errors and partially retrieved backups, but not
 for unavailable/refused recovery, a complete empty result or complete mismatch.
+The error names its cause where native knows it: a browser sign-in the user
+declined (`error=access_denied`) is **Restore was canceled**, a browser step that
+timed out says so, and no answer from Builderlab (network, DNS, TLS) is
+**Couldn't reach Builderlab**. Other failures keep **Could not restore your
+identity**.
 Leaving or retrying cancels the native attempt first. Nothing claims the key is
 saved before installation succeeds.
 
@@ -305,7 +319,11 @@ the device, the page also says what is undone: *Your key is saved on this
 device, but it isn’t linked to your account or backed up yet.* when
 the unlink or link failed (a key that isn't linked can't be backed up),
 otherwise *Your key is saved on this device.* **Try again** repeats the failed step and the rest of the
-lane without creating another key. An expired backup session prompts sign-in
+lane without creating another key. It is offered only where another attempt
+can help: an ended Builderlab sign-in (HTTP 401, `retryable: false`), where
+signing in again helps instead, or a backup failure the failure table marks not
+retryable, leaves only the way out. Other refusals keep Try again: after Start
+over it is the only way past a failed unlink. An expired backup session prompts sign-in
 again and verifies the original account subject before uploading. Canceled or
 wrong-account sign-in leaves setup and the key intact. When backup is explicitly unavailable in the build or not offered by the
 account, **Continue without backup** skips only that backup step and runs the
@@ -341,8 +359,9 @@ card reports what the uploader's last pass found. Below it, a **Backed-up key ·
 row appears only when the account's linked key differs from this device's and
 `nsec-backups/status` (read with the bundled Builderlab session as first run reads
 it) lists it. The same-key summary and community activity lookup are omitted.
-Account lookup failures share the card's **Backup status unknown** caption and
-**Retry backup** action; retry refreshes the account lookup as well as starting
+For a key without a confirmed backup, account lookup failures share the card's
+**Backup status unknown** caption and **Retry backup** action; a confirmed key
+stays **Backed up**. Retry refreshes the account lookup as well as starting
 the native backup attempt. Backups of other keys are left out and the row is
 read-only: making another key the account's would unlink the current one, and
 kgoose never links a key again once it is unlinked.
@@ -526,7 +545,15 @@ intact. **Go back** returns to community selection without completing the join.
 A trimmed nonempty name is required; the avatar is optional. Settings → Profile
 remains the editor. Denied/unavailable/corrupt storage is not first run: like the page
 shown while the saved identity opens, it is titled **Your Buzz identity**, and
-it keeps the **Retry secure storage access** path.
+it keeps the **Retry secure storage access** path. A saved key native can't
+parse (`MALFORMED`) gets the same bytes on every read, so that page offers
+**Remove from device** instead of a retry. It confirms first, then signs out as
+**Sign out of Buzz** does without erase: the next launch deletes the key and
+opens first run, which restores the account's backup or imports a key. A
+refused sign-out stays in the dialog with its reason. On Windows and Linux,
+several keyring items matching one entry (`Ambiguous`) refuse deletes as well
+as reads, so native answers `AMBIGUOUS` instead, and the page keeps **Retry**:
+the user removes the extra items with their keyring app.
 
 The key setup screen (`IdentitySetup`) is no longer shown on first launch; the
 fixture below still renders it. It offers **Create a new identity** or **Use an
@@ -759,8 +786,21 @@ Identity details are separate under **Buzz → Identity**, so they remain availa
 if the community profile cannot load. The full npub and hex public key can be
 copied. The nsec is absent from the rendered field until Reveal; Copy can fetch it without revealing it. Hide, leaving Identity,
 window blur and document hiding retire pending reveals and clear the displayed
-secret. Failed private-key actions report fixed errors. Copy deliberately leaves
-the key on the OS clipboard; the UI warns about that. The one exception is the
+secret. Failed private-key actions report fixed errors. Copy puts the key on the
+OS clipboard through the host (`clipboard_write_text` with `clearAfterSecs`) on
+every platform. The host marks the copy as sensitive, so clipboard managers that honor the hint
+(macOS, KDE and other Linux managers) skip it and Windows keeps it out of
+clipboard history and cloud sync. Buzz can't make every manager honor it. 60 seconds after the latest successful key
+copy it tries to clear the clipboard, if it still holds that key. A copy of the
+same key restarts the wait, and a failed copy leaves the earlier wait in place.
+Failures are ignored, quitting cancels the wait, and another app can still write
+between the read and the clear. On Linux the check reads the clipboard off the
+main thread, because the owner may be Buzz's own GTK loop; a clipboard that
+doesn't answer within 10 seconds is left alone. A read can't be stopped, so it
+compares a SHA-256 fingerprint of the key, never the key, and while one read is
+still waiting later checks leave the clipboard alone. The UI says Buzz tries to clear it. A key the user
+selects and copies from the revealed field is not cleared, unless a Copy
+button wait is still running. The one exception is the
 first-run **Enter your private key** page: the typed, pasted or file-read nsec
 lives only in that page's state, masked until **Reveal private key**, and
 crosses IPC once, on **Continue with this key**, through `identity_import`; leaving the page
@@ -782,24 +822,38 @@ command permission is not proof of a human gesture.
 
 The Identity page checks key management when it opens. Builds with a backup
 service show a front pill once the key's state is known: **Backed up**, with a
-destination tooltip, **Check backup** for a failed attempt (including a confirmed
-backup's latest attempt), or a spinner only while an attempt runs.
+destination tooltip, **Check backup** for an unconfirmed key's failed attempt, or a
+spinner only while an attempt runs. Native seeds confirmation from this device's
+persisted backup receipt for the key, so a launch offline or signed out shows a
+backed-up key as **Backed up**. A later attempt that can't reach Builderlab, an
+ended sign-in, or a failed account lookup does not unconfirm it; only the
+signed-in account answering that it links no key, or another key, clears it, and
+the next account handoff starts again from the receipt. Settings also withholds
+**Backed up** while its own account read shows another key linked and backed
+up there, even when native's pass stopped before it asked the account (for
+example, waiting for consent). The receipt counts for any account, so the
+tooltip and key details say the backup is with *your* account only after a pass
+for the signed-in account completes or its read shows this key backed up; until
+then they say *a* Builderlab account.
 **Check backup** flips to the explanation and retry.
 The pill sits inside the artwork, so loading cannot move the card or its controls.
 Builds without a service reserve no pill space. The back uses the same concise
 storage and recovery explanation for self-managed and organization-managed keys.
 The local-storage explanation appears immediately and consistently calls local
-secure storage **this device**. When a backup is confirmed and the current account
-lookup has not failed, the same paragraph names the configured account destination,
-matching the front tooltip. A failed account lookup hides that sentence until the
-lookup recovers; the device-storage explanation stays visible. Native confirmation
+secure storage **this device**. When a backup is confirmed, the same paragraph
+names the configured account destination, matching the front tooltip. Native confirmation
 metadata is retained, so a failed later upload alone does not erase a known backup.
 The private-key menu’s save-a-copy guidance follows it.
 Backup attention and retry feedback sit in the bottom action stack, with the
 full **Retry backup** CTA directly above **Remove from device**. The CTA stays
 disabled with a loading spinner while an attempt runs. Failure hints use centered
 caption text and omit redundant retry instructions; the inline backup retry row
-is removed.
+is removed. **Retry backup** appears only where another attempt can change the
+answer. A missing sign-in has none: signing in on this page hands native a
+session, which starts its own attempt. An ended sign-in keeps it, since its
+session can still be live with no sign-in control on the page. Nor does a refusal
+(`not_offered`, `refused`, `invalid_service`). After the fix on Builderlab's page
+(key not linked, another key linked) it stays.
 The **Backed up** pill appears only on the front.
 Unknown backup state shows no backup claim; a failed check offers a quiet
 **Backup status unknown** caption and **Retry backup** in that same bottom action
@@ -1045,7 +1099,9 @@ Membership in any community this build's Builderlab hosts, by the welcome
 screen's `builderlab-hosted.ts` list matched on the saved relay host alone (no
 relay is read for its `self`), saves automatic backup with no prompt, unless
 a choice was saved since it was read: the save checks under the choice lock.
-Otherwise **Back up your key?** asks: **Back up key** and **I will manage my own
+Otherwise **Back up your key?** asks; it says that a self-managed key needs a
+kept copy of its private key to use the account on another device or after
+losing access to this one. **Back up key** and **I will manage my own
 key** save the answer, which a hosted
 membership arriving while it is saved does not override; closing it saves
 nothing, and it asks again on the next launch or Builderlab sign-in. A build
@@ -1115,6 +1171,17 @@ Sign-out also asks the server to end the session, best effort: one `POST` to
 and ignores the result, so sign-out never waits for it and works offline. It
 ends only the session this copy held, never one read back from the secure
 store. Sign out of Buzz, expiry and refusals end nothing at the server.
+An explicit sign-out of a server (Settings' **Sign out**, **Switch account**,
+first run's **Use a different account**) also marks that server: its next
+sign-in sends `prompt=login` whatever the caller asks: it asks the sign-in
+provider to authenticate again instead of finishing on the browser's session as
+the account just signed out. The provider decides what the browser shows, and
+the browser's session there is not ended. The mark is a file beside the server's
+FI records (`<account>.signed-out`), so it survives a restart, and only a
+completed browser sign-in or renewal removes it. A session restored from another
+copy takes the mark as the file has it: that session may have been checked
+before another copy's sign-out, so it never erases the mark. Expiry, refusals
+and close never set it, so renewing the same account stays one click. Sign out of Buzz leaves an existing mark in place.
 
 The browser callback shows that sign-in was received and attempts to close after
 three seconds. After verified session installation, macOS can return focus to
@@ -1197,12 +1264,14 @@ issuance cannot silently start another enrollment. A new sign-in revision or
 explicit agent deletion permits a reset; ordinary restore of the same session does
 not. Failure to persist the reservation prevents dispatch. A known transient
 outcome releases it only if that storage write succeeds.
+An issuer still answering 429 when retries or the deadline run out is reported
+to the owner as a limit rather than an unreachable service; it stays transient.
 
-The `/v1/nip-fi/agent-grant` and `/v1/nip-fi/agent-assertion` routes and
-`Nostr-Agent-Proof` header are this configured adapter's wire contract, not
-standard endpoints defined by NIP-FI/NIP-FA. NIP-FI defines the
-`nip-fi-agent+jwt` assertion class and owner checks; that does not establish
-interoperability with another adapter's enrollment endpoints.
+The `/v1/nip-fi/agent-grant` and `/v1/nip-fi/agent-assertion` routes follow
+NIP-FA's agent-route contract, including its neutral token types and
+`Nostr-Authorization` proof header. The issuer must accept these NIP-FA token
+types and the `Nostr-Authorization` header before clients send them. NIP-FI defines the
+`nip-fi-agent+jwt` assertion class and owner checks.
 
 ### Local credential service
 
@@ -1278,14 +1347,31 @@ open. It shows cards for each configured server, its name and origin, account,
 and saved communities that require its sign-in. Static community artwork exposes
 names and tooltips. **Sign out** confirms before ending that server’s session only.
 Within seven days of expiry, **Renew sign-in** and the expiry date appear, with
-**Sign out** in the renewal caret menu. The Builderlab connection row observes
+**Sign out** in the renewal caret menu. While the renewal's browser step runs,
+the card says "Finish in your browser" with **Cancel**; the current session stays
+signed in, and Cancel ends only that step. The native snapshot's `renewing`
+keeps that state when the page is left and opened again. The Builderlab connection row observes
 the existing plugin session and opens its settings; it starts no account read.
 A sign-out native could not finish (for example, secure storage refused) stays below the list, naming the
 server, with **Try again**; so does an ended session whose saved record native
 could not remove. A saved session native could not check, for example offline,
-is kept and offers no **Try again**. Communities no server covers are not listed.
+is kept and offers no **Try again** and no sign-in: **Check again** retries the
+restore (`federated_identity_snapshot`). It keeps the stored record while the
+check stays inconclusive; a record the server denies, or one already refused on
+this device, is cleaned up as on any restore. Communities no server covers are not listed.
 While the build’s Builderlab isn’t signed in, its row to sign in from stays listed alongside the other configured servers, with its recovery
 message when applicable.
+
+NIP-FA issuer refusals (`refused()` in `assertion.rs`, including
+`authorization-denied`) are cached for the session revision, viewer and
+community, so automatic retries (reconnects, focus, network changes) repeat them
+without asking the issuer. A user's own retry asks again: the relay service's
+`tryAgain()` (every community-connection retry button, including the live
+socket's sign-in error in the sidebar; Settings' **Check again** uses
+`recheck` instead) and each
+join-dialog **Continue** call `federated_identity_ask_again`, which forgets
+that community's cached refusals, before retrying. Automatic paths call
+`retry()` and never ask. A restart or a new session revision also asks again.
 
 When a community refuses a signed-in account (`authorization-denied` or
 `binding-mismatch`), its prompt names the community's server and account, and

@@ -1,6 +1,12 @@
 import { Service, type Context } from "@deepseek-ai/cordis";
 import type { PluginManager } from "./manager";
 import { providePluginReviewHold } from "./review-access";
+import {
+  createPluginUpdateCapabilityBridge,
+  type PluginUpdateCapability,
+} from "./updates";
+import { samePluginRelease } from "./same-release";
+import type { PluginInfo } from "./types";
 
 export type GitPluginInstallSource = Readonly<{
   repository: string;
@@ -27,6 +33,22 @@ export type PluginInstallOutcome =
   | "cancelled"
   | "unavailable";
 type PluginInstallationStatus = "installed" | "absent" | "unavailable";
+type PluginInstallationSourceKind =
+  | "git"
+  | "url"
+  | "folder"
+  | "bundled"
+  | "absent"
+  | "unavailable";
+export type PluginReleaseCandidate = Readonly<{
+  source: PluginInstallSource;
+  release: Readonly<{ revision: string; publisher?: string | null }>;
+}>;
+export type PluginReleaseComparison =
+  | "current"
+  | "different"
+  | "review"
+  | "unknown";
 export type PluginInstaller = Readonly<{
   /** The source kinds `requestInstall` accepts. Missing on hosts that accept only Git. */
   sources?: readonly ("git" | "url")[];
@@ -37,11 +59,28 @@ export type PluginInstaller = Readonly<{
    * enabled state or install source. Returns unavailable until the catalog is ready.
    */
   getInstallationStatus(id: string): PluginInstallationStatus;
-  /** Listen for status changes; call getInstallationStatus after subscribing for the current status. */
+  /**
+   * Returns only the saved source kind. Returns unavailable before catalog
+   * readiness, for duplicate IDs, or for unknown source metadata; absent means
+   * the ready catalog does not contain the manifest ID.
+   */
+  getInstallationSource?(id: string): PluginInstallationSourceKind;
+  /** Compares one supplied release without raw installed metadata; "different" does not prove it is newer. */
+  compareInstallationRelease?(
+    id: string,
+    candidate: PluginReleaseCandidate,
+  ): PluginReleaseComparison;
+  /**
+   * Subscribe before reading current status. The callback is an invalidation
+   * signal for membership or release/source identity changes and may repeat the
+   * same status; re-read the capabilities after it fires.
+   */
   subscribeInstallationStatus(
     id: string,
     listener: (status: PluginInstallationStatus) => void,
   ): () => void;
+  /** Optional on older hosts; the current host always exposes an unavailable-capable bridge. */
+  updates?: PluginUpdateCapability;
 }>;
 
 declare module "@deepseek-ai/cordis" {
@@ -123,6 +162,31 @@ function relativePath(value: unknown) {
   )
     ? value
     : null;
+}
+
+function relativeFolderPath(value: unknown, root: string) {
+  if (value === ".") return value;
+  if (typeof value !== "string" || !value || value.includes("\0")) return null;
+
+  const windowsRoot =
+    /^[A-Za-z]:[\\/]/.test(root) || /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(root);
+  if (windowsRoot ? /^[\\/]|^[A-Za-z]:/.test(value) : value.startsWith("/"))
+    return null;
+
+  const segments = value.split(windowsRoot ? /[\\/]+/ : /\/+/);
+  return segments.some((segment) => segment === "..") ||
+    !segments.some((segment) => segment !== "" && segment !== ".")
+    ? null
+    : value;
+}
+
+function isAbsoluteFolderRoot(value: string) {
+  return (
+    !value.includes("\0") &&
+    (value.startsWith("/") ||
+      /^[A-Za-z]:[\\/]/.test(value) ||
+      /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(value))
+  );
 }
 
 const pluginId = /^[a-z][a-z0-9.-]{0,127}$/;
@@ -229,9 +293,27 @@ export function createPluginInstallRequests({
     | undefined;
   let nextId = 0;
   let reviews = 0;
+  let reviewRevision = 0;
+  const updateBridge = createPluginUpdateCapabilityBridge();
   const listeners = new Set<() => void>();
+  const reviewListeners = new Set<() => void>();
   const emit = () => {
     for (const listener of listeners) listener();
+  };
+  const emitReview = () => {
+    reviewRevision++;
+    for (const listener of reviewListeners) listener();
+  };
+  const holdReview = () => {
+    reviews++;
+    emitReview();
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      reviews--;
+      emitReview();
+    };
   };
   const settle = (id: number, outcome: PluginInstallOutcome) => {
     if (current?.request.id !== id) return;
@@ -240,9 +322,22 @@ export function createPluginInstallRequests({
     current = undefined;
     resolve(outcome);
     emit();
+    emitReview();
   };
   return {
+    updates: updateBridge.capability,
+    updatesFor: updateBridge.forCaller,
+    registerUpdates: updateBridge.register,
     snapshot: () => current?.request,
+    reviewRevision: () => reviewRevision,
+    subscribeReview(listener: () => void) {
+      reviewListeners.add(listener);
+      return () => reviewListeners.delete(listener);
+    },
+    /** Acquires the shared review slot only when no request or review is active. */
+    tryHoldReview() {
+      return current !== undefined || reviews > 0 ? undefined : holdReview();
+    },
     subscribe(listener: () => void) {
       listeners.add(listener);
       return () => {
@@ -305,15 +400,7 @@ export function createPluginInstallRequests({
       else settle(id, "cancelled");
     },
     /** Marks a plugin review dialog as open until the returned function runs. */
-    holdReview() {
-      reviews++;
-      let held = true;
-      return () => {
-        if (!held) return;
-        held = false;
-        reviews--;
-      };
-    },
+    holdReview,
     settle,
   };
 }
@@ -334,6 +421,150 @@ type InstallHost = Readonly<{
 const invalidSource =
   "A plugin install request needs either an HTTPS, SSH or scp-style Git repository, a branch or tag, and optionally a relative folder and a commit; or a plugin id, an HTTPS artifact url and its sha256";
 
+function savedGitRepository(value: string) {
+  // Native imports save normalized URLs with broader SSH usernames than requests allow.
+  // Keep legacy scp metadata readable without changing request admission.
+  if (!value.includes("://")) return gitRepository(value) !== null;
+  if (/[\s\p{Cc}]/u.test(value) || value.includes("?") || value.includes("#"))
+    return false;
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === "https:" || url.protocol === "ssh:") &&
+      !!url.hostname &&
+      !url.hostname.startsWith("-") &&
+      !url.username.startsWith("-") &&
+      !url.password &&
+      (url.protocol !== "https:" || !url.username) &&
+      url.pathname.replaceAll("/", "") !== "" &&
+      !githubTree(url.hostname, url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function savedInstallationSourceKind(
+  plugin: PluginInfo,
+): PluginInstallationSourceKind {
+  if (plugin.source === "bundled") return "bundled";
+  if (plugin.source !== "external") return "unavailable";
+
+  const savedSource: unknown = plugin.updateSource;
+  if (
+    !savedSource ||
+    typeof savedSource !== "object" ||
+    Array.isArray(savedSource)
+  )
+    return "unavailable";
+  const source = savedSource as Record<string, unknown>;
+  const keys = Object.keys(source);
+  const hasOnlyKeys = (...allowed: string[]) =>
+    keys.every((key) => allowed.includes(key));
+  if (
+    hasOnlyKeys("repository", "reference", "path", "commit") &&
+    typeof source.repository === "string" &&
+    savedGitRepository(source.repository) &&
+    typeof source.reference === "string" &&
+    (source.reference === "" || gitReference(source.reference) !== null) &&
+    typeof source.path === "string" &&
+    // Native Git discovery records UTF-8 folders with POSIX separators.
+    relativeFolderPath(source.path, "/") !== null &&
+    (source.commit === undefined ||
+      (typeof source.commit === "string" &&
+        commit.test(source.commit.toLowerCase())))
+  )
+    return "git";
+  if (
+    hasOnlyKeys("url", "sha256") &&
+    typeof source.url === "string" &&
+    pluginArtifactUrl(source.url) !== null &&
+    typeof source.sha256 === "string" &&
+    sha256.test(source.sha256.toLowerCase())
+  )
+    return "url";
+  if (
+    hasOnlyKeys("root", "path") &&
+    typeof source.root === "string" &&
+    isAbsoluteFolderRoot(source.root) &&
+    typeof source.path === "string" &&
+    relativeFolderPath(source.path, source.root) !== null
+  )
+    return "folder";
+  return "unavailable";
+}
+
+function listedReleaseSource(
+  id: string,
+  source: PluginInstallSource,
+): PluginInstallSource | null {
+  const parsed = parsePluginInstallSource(source);
+  if (!parsed) return null;
+  if (isUrlInstallSource(parsed)) return parsed.id === id ? parsed : null;
+  return parsed.commit && parsed.path !== undefined ? parsed : null;
+}
+
+// Native imports persist URL-normalized provenance, including scp-style SSH remotes.
+function comparableSourceUrl(value: string) {
+  return new URL(
+    scpRepository.test(value) ? `ssh://${value.replace(":", "/")}` : value,
+  ).href;
+}
+
+function compareReleaseSource(
+  installed: PluginInfo,
+  candidate: PluginInstallSource,
+): "same" | "different-pin" | "unrelated" | "unknown" {
+  if (installed.source !== "external" || installed.error !== null)
+    return "unknown";
+  const source: unknown = installed.updateSource;
+  const sourceKind = savedInstallationSourceKind(installed);
+  if (!source || (sourceKind !== "git" && sourceKind !== "url"))
+    return "unknown";
+
+  if (sourceKind === "url") {
+    if (!isUrlInstallSource(candidate)) return "unrelated";
+    const saved = source as { url: string; sha256: string };
+    if (comparableSourceUrl(saved.url) !== comparableSourceUrl(candidate.url))
+      return "unrelated";
+    return saved.sha256.toLowerCase() === candidate.sha256
+      ? "same"
+      : "different-pin";
+  }
+
+  const saved = source as {
+    repository: string;
+    reference: string;
+    path: string;
+    commit?: string;
+  };
+  if (!saved.commit) return "unknown";
+  if (isUrlInstallSource(candidate)) return "unrelated";
+  if (!candidate.commit) return "unknown";
+  if (
+    comparableSourceUrl(saved.repository) !==
+      comparableSourceUrl(candidate.repository) ||
+    saved.reference !== candidate.reference ||
+    saved.path !== candidate.path
+  )
+    return "unrelated";
+  return saved.commit.toLowerCase() === candidate.commit
+    ? "same"
+    : "different-pin";
+}
+
+function installationIdentityKey(plugin: PluginInfo | undefined) {
+  return plugin
+    ? JSON.stringify([
+        plugin.source,
+        plugin.error,
+        plugin.revision,
+        plugin.publisher ?? null,
+        plugin.updateSource ?? null,
+      ])
+    : undefined;
+}
+
 export function createPluginInstallCore({
   plugins,
   requests,
@@ -348,20 +579,97 @@ export function createPluginInstallCore({
       ? "installed"
       : "absent";
   };
+  const getInstallationSource = (id: string): PluginInstallationSourceKind => {
+    const { configuration } = plugins.snapshot();
+    if (configuration.status !== "ready") return "unavailable";
+    let plugin: PluginInfo | undefined;
+    for (const candidate of configuration.catalog.plugins) {
+      if (candidate.manifest.id !== id) continue;
+      if (plugin) return "unavailable";
+      plugin = candidate;
+    }
+    if (!plugin) return "absent";
+    return savedInstallationSourceKind(plugin);
+  };
+  const getInstallationIdentity = (id: string) => {
+    const { configuration } = plugins.snapshot();
+    if (configuration.status !== "ready")
+      return { status: "unavailable" as const, plugin: undefined };
+    const matches = configuration.catalog.plugins.filter(
+      (plugin) => plugin.manifest.id === id,
+    );
+    return {
+      status: matches.length > 0 ? ("installed" as const) : ("absent" as const),
+      plugin: matches.length === 1 ? matches[0] : undefined,
+    };
+  };
+  const compareInstallationRelease = (
+    id: string,
+    candidate: PluginReleaseCandidate,
+  ): PluginReleaseComparison => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate))
+      return "unknown";
+    const installed = getInstallationIdentity(id);
+    if (installed.status !== "installed" || !installed.plugin) return "unknown";
+
+    const listedSource = listedReleaseSource(id, candidate.source);
+    const release = candidate.release;
+    if (
+      !listedSource ||
+      typeof release?.revision !== "string" ||
+      release.revision.trim().length === 0 ||
+      release.revision.length > 128 ||
+      typeof release.publisher !== "string" ||
+      release.publisher.trim().length === 0 ||
+      release.publisher.length > 256
+    )
+      return "unknown";
+
+    const sourceComparison = compareReleaseSource(
+      installed.plugin,
+      listedSource,
+    );
+    if (sourceComparison === "unknown") return "unknown";
+    if (
+      typeof installed.plugin.publisher !== "string" ||
+      installed.plugin.publisher.trim().length === 0
+    )
+      return "unknown";
+    if (installed.plugin.publisher !== release.publisher) return "review";
+    if (sourceComparison === "unrelated") return "review";
+    if (sourceComparison === "same")
+      return samePluginRelease(installed.plugin, release)
+        ? "current"
+        : "review";
+    return samePluginRelease(installed.plugin, release)
+      ? "review"
+      : "different";
+  };
 
   return {
     holdReview: requests.holdReview,
+    updates: requests.updates,
+    updatesFor: requests.updatesFor,
+    registerUpdates: requests.registerUpdates,
     getInstallationStatus,
+    getInstallationSource,
+    compareInstallationRelease,
     subscribeInstallationStatus(
       id: string,
       listener: (status: PluginInstallationStatus) => void,
     ) {
-      let current = getInstallationStatus(id);
+      let current = getInstallationIdentity(id);
+      let currentKey = installationIdentityKey(current.plugin);
       return plugins.subscribe(() => {
-        const next = getInstallationStatus(id);
-        if (next === current) return;
+        const next = getInstallationIdentity(id);
+        if (
+          next.status === current.status &&
+          installationIdentityKey(next.plugin) === currentKey
+        )
+          return;
         current = next;
-        listener(next);
+        currentKey = installationIdentityKey(next.plugin);
+        listener(next.status);
       });
     },
     async submit(
@@ -423,8 +731,43 @@ export function createPluginInstallerService(
   ctx: Context,
   host: Readonly<{ core: PluginInstallCore }>,
 ): PluginInstaller {
+  const callerUpdates = new WeakMap<Context, PluginUpdateCapability>();
   class PluginInstallerService extends Service implements PluginInstaller {
     readonly sources = Object.freeze(["git", "url"] as const);
+
+    get updates() {
+      const caller = this.ctx;
+      let capability = callerUpdates.get(caller);
+      if (capability) return capability;
+      const updates = caller.pluginOwner
+        ? host.core.updatesFor(caller.pluginOwner.id)
+        : host.core.updates;
+      capability = {
+        get ownerId() {
+          return updates.ownerId;
+        },
+        getSnapshot: updates.getSnapshot,
+        refresh: updates.refresh,
+        queueUpdates: updates.queueUpdates,
+        getQueueRequest: updates.getQueueRequest,
+        getQueue: updates.getQueue,
+        cancelQueue: updates.cancelQueue,
+        getOwnerStatus: (ownerId) =>
+          updates.getOwnerStatus?.(ownerId) ?? "unknown",
+        subscribe(listener) {
+          const stop = caller.effect(() => updates.subscribe(listener));
+          return () => void stop();
+        },
+        subscribeQueue(id, listener) {
+          const stop = caller.effect(() =>
+            updates.subscribeQueue(id, listener),
+          );
+          return () => void stop();
+        },
+      };
+      callerUpdates.set(caller, capability);
+      return capability;
+    }
 
     constructor() {
       super(ctx, "pluginInstaller");
@@ -449,6 +792,17 @@ export function createPluginInstallerService(
 
     getInstallationStatus(id: string): PluginInstallationStatus {
       return host.core.getInstallationStatus(id);
+    }
+
+    getInstallationSource(id: string): PluginInstallationSourceKind {
+      return host.core.getInstallationSource(id);
+    }
+
+    compareInstallationRelease(
+      id: string,
+      candidate: PluginReleaseCandidate,
+    ): PluginReleaseComparison {
+      return host.core.compareInstallationRelease(id, candidate);
     }
 
     subscribeInstallationStatus(

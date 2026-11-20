@@ -418,6 +418,363 @@ test("atomically indexes preference changes and preserves newer values during mi
   ]);
 });
 
+test("reuses unchanged stored state and indexes after repeat delivery", async ({
+  page,
+  storageUrl,
+}) => {
+  await open(page, storageUrl);
+  const result = await page.evaluate(async () => {
+    let projections = 0;
+    const c = window.artifactTest.open("viewer", "relay", "test", {
+      project: ({ record, preference }) => {
+        projections++;
+        return [
+          {
+            index: "state",
+            value: JSON.stringify([
+              record.local,
+              preference,
+              record.availability,
+            ]),
+            order: record.id,
+          },
+        ];
+      },
+    });
+    const record = {
+      id: "task",
+      channelId: "channel",
+      type: "test.task",
+      revision: { id: "A", content: "{}" },
+    };
+    const refresh = await c.beginRefresh("all");
+    const batch = {
+      source: "all",
+      refresh,
+      records: [record],
+      availability: [
+        {
+          id: "task",
+          expectedRevision: "A",
+          value: { state: "available" },
+        },
+      ],
+    };
+    await c.applyBatch(batch);
+    await c.importBatch({
+      records: [
+        { id: "task", local: { title: "device", labels: ["one", "two"] } },
+      ],
+      preferences: [{ id: "task", value: { pinned: false, rank: 0 } }],
+    });
+    const before = await c.get("task");
+    projections = 0;
+    const writes = [];
+    const put = IDBObjectStore.prototype.put;
+    const remove = IDBObjectStore.prototype.delete;
+    IDBObjectStore.prototype.put = function (...args) {
+      if (["records", "preferences", "entries"].includes(this.name))
+        writes.push(this.name);
+      return put.apply(this, args);
+    };
+    IDBObjectStore.prototype.delete = function (...args) {
+      if (this.name === "entries") writes.push(this.name);
+      return remove.apply(this, args);
+    };
+    try {
+      await c.applyBatch(structuredClone(batch));
+      await c.preferences.update("task", () => ({ rank: 0, pinned: false }));
+      await c.importBatch({
+        records: [{ id: "task", local: { title: "discarded retry" } }],
+        preferences: [{ id: "task", value: true }],
+        marker: "retry",
+      });
+      return {
+        writes,
+        projections,
+        before,
+        after: await c.get("task"),
+        indexed: await c.page({
+          index: "state",
+          value: JSON.stringify([
+            { title: "device", labels: ["one", "two"] },
+            { pinned: false, rank: 0 },
+            { state: "available" },
+          ]),
+        }),
+        imported: await c.imported("retry"),
+      };
+    } finally {
+      IDBObjectStore.prototype.put = put;
+      IDBObjectStore.prototype.delete = remove;
+    }
+  });
+  expect(result.writes).toEqual([]);
+  expect(result.projections).toBe(0);
+  expect(result.after).toEqual(result.before);
+  expect(result.indexed.entries).toEqual([result.before]);
+  expect(result.imported).toBe(true);
+});
+
+test("saves changing preferences without rewriting unchanged search indexes", async ({
+  page,
+  storageUrl,
+}) => {
+  await open(page, storageUrl);
+  const result = await page.evaluate(async () => {
+    const c = window.artifactTest.open("viewer", "relay", "test", {
+      project: ({ record, preference }) => {
+        const indexes = Array.from({ length: 400 }, (_, i) => ({
+          index: "search",
+          value: `term-${i}`,
+          order: record.id,
+        }));
+        return preference?.reverse ? indexes.reverse() : indexes;
+      },
+    });
+    await c.importBatch({ records: [{ id: "task", local: {} }] });
+    const writes = [];
+    const put = IDBObjectStore.prototype.put;
+    const remove = IDBObjectStore.prototype.delete;
+    IDBObjectStore.prototype.put = function (...args) {
+      if (this.name === "entries") writes.push("put");
+      return put.apply(this, args);
+    };
+    IDBObjectStore.prototype.delete = function (...args) {
+      if (this.name === "entries") writes.push("delete");
+      return remove.apply(this, args);
+    };
+    try {
+      const notices = [];
+      c.subscribe(() => notices.push("saved"));
+      for (let activity = 0; activity < 10; activity++)
+        await c.preferences.update("task", () => ({
+          activity,
+          reverse: activity % 2 === 1,
+        }));
+      return {
+        writes,
+        notices: notices.length,
+        saved: await c.preferences.get("task"),
+        indexed: await c.page({ index: "search", value: "term-200" }),
+      };
+    } finally {
+      IDBObjectStore.prototype.put = put;
+      IDBObjectStore.prototype.delete = remove;
+    }
+  });
+  expect(result.writes).toEqual([]);
+  expect(result.notices).toBe(10);
+  expect(result.saved).toEqual({ activity: 9, reverse: true });
+  expect(result.indexed.entries).toHaveLength(1);
+  expect(result.indexed.entries[0].preference).toEqual(result.saved);
+});
+
+test("changes only affected index keys and rolls back an invalid projection", async ({
+  page,
+  storageUrl,
+}) => {
+  await open(page, storageUrl);
+  const result = await page.evaluate(async () => {
+    const stable = { index: "all", value: "", order: "same" };
+    const c = window.artifactTest.open("viewer", "relay", "test", {
+      project: ({ preference }) => preference.indexes,
+    });
+    await c.importBatch({
+      preferences: [
+        {
+          id: "task",
+          value: {
+            indexes: [stable, { index: "old", value: "old", order: "a" }],
+          },
+        },
+      ],
+    });
+    const writes = [];
+    const put = IDBObjectStore.prototype.put;
+    const remove = IDBObjectStore.prototype.delete;
+    IDBObjectStore.prototype.put = function (value, ...args) {
+      if (this.name === "entries") writes.push(["put", value.index]);
+      return put.call(this, value, ...args);
+    };
+    IDBObjectStore.prototype.delete = function (key, ...args) {
+      if (this.name === "entries") writes.push(["delete", key[2]]);
+      return remove.call(this, key, ...args);
+    };
+    try {
+      await c.preferences.update("task", () => ({
+        indexes: [{ index: "next", value: "new", order: "z" }, stable, stable],
+      }));
+      const changed = {
+        writes: [...writes],
+        old: await c.page({ index: "old", value: "old" }),
+        next: await c.page({ index: "next", value: "new" }),
+        stable: await c.page({ index: "all", value: "" }),
+      };
+      const failure = await c.preferences
+        .update("task", () => ({
+          indexes: [{ index: "invalid", value: "", order: 5 }],
+        }))
+        .then(
+          () => "unexpected",
+          (error) => error.message,
+        );
+      const afterFailure = await c.page({ index: "next", value: "new" });
+      writes.length = 0;
+      await c.preferences.update("task", () => ({ indexes: [] }));
+      return {
+        changed,
+        failure,
+        afterFailure,
+        removed: {
+          writes,
+          next: await c.page({ index: "next", value: "new" }),
+          stable: await c.page({ index: "all", value: "" }),
+        },
+      };
+    } finally {
+      IDBObjectStore.prototype.put = put;
+      IDBObjectStore.prototype.delete = remove;
+    }
+  });
+  expect(result.changed.writes).toEqual([
+    ["delete", "old"],
+    ["put", "next"],
+  ]);
+  expect(result.changed.old.entries).toEqual([]);
+  expect(result.changed.next.entries).toHaveLength(1);
+  expect(result.changed.stable.entries).toEqual(result.changed.next.entries);
+  expect(result.failure).toBe("Invalid artifact index entry");
+  expect(result.afterFailure).toEqual(result.changed.next);
+  expect(result.removed.writes).toEqual([
+    ["delete", "all"],
+    ["delete", "next"],
+  ]);
+  expect(result.removed.next.entries).toEqual([]);
+  expect(result.removed.stable.entries).toEqual([]);
+});
+
+test("commits changed local data, preferences, revisions and availability", async ({
+  page,
+  storageUrl,
+}) => {
+  await open(page, storageUrl);
+  const result = await page.evaluate(async () => {
+    const c = window.artifactTest.open("viewer", "relay", "test", {
+      project: ({ record, preference }) => [
+        {
+          index: "state",
+          value: JSON.stringify([
+            record.local,
+            preference,
+            record.channelId,
+            record.current,
+            record.availability,
+          ]),
+          order: record.id,
+        },
+      ],
+    });
+    const refresh = await c.beginRefresh("all");
+    const record = {
+      id: "task",
+      channelId: "channel",
+      type: "test.task",
+      revision: { id: "A", content: "{}" },
+    };
+    const states = [];
+    async function capture() {
+      const entry = await c.get("task");
+      const r = entry.record;
+      const page = await c.page({
+        index: "state",
+        value: JSON.stringify([
+          r.local,
+          entry.preference,
+          r.channelId,
+          r.current,
+          r.availability,
+        ]),
+      });
+      states.push({ entry, indexed: page.entries });
+    }
+    await c.applyBatch({ source: "all", refresh, records: [record] });
+    await c.importBatch({
+      records: [{ id: "task", local: { title: "device" } }],
+    });
+    await capture();
+    await c.preferences.update("task", () => ({ pinned: false }));
+    await c.preferences.update("task", (current) => {
+      current.pinned = true;
+      return current;
+    });
+    await capture();
+    for (const revision of [
+      { id: "A", content: '{"title":"updated"}' },
+      {
+        id: "A",
+        content: '{"title":"updated"}',
+        event: { tags: [["x", "one"]] },
+      },
+      {
+        id: "A",
+        content: '{"title":"updated"}',
+        event: { tags: [["x", "two"]] },
+      },
+    ]) {
+      await c.applyBatch({
+        source: "all",
+        refresh,
+        records: [{ ...record, revision }],
+      });
+      await capture();
+    }
+    await c.applyBatch({
+      source: "all",
+      refresh,
+      records: [{ ...record, channelId: "moved" }],
+    });
+    await capture();
+    for (const value of [
+      { state: "unavailable", reason: "access" },
+      { state: "unavailable", reason: "removed" },
+      { state: "available" },
+    ]) {
+      await c.applyBatch({
+        source: "all",
+        refresh,
+        availability: [{ id: "task", expectedRevision: "A", value }],
+      });
+      await capture();
+    }
+    return states;
+  });
+  for (const { entry, indexed } of result) expect(indexed).toEqual([entry]);
+  expect(result[0].entry.record.local).toEqual({ title: "device" });
+  expect(result[1].entry.preference).toEqual({ pinned: true });
+  expect(result.slice(2, 5).map(({ entry }) => entry.record.current)).toEqual([
+    { id: "A", content: '{"title":"updated"}' },
+    {
+      id: "A",
+      content: '{"title":"updated"}',
+      event: { tags: [["x", "one"]] },
+    },
+    {
+      id: "A",
+      content: '{"title":"updated"}',
+      event: { tags: [["x", "two"]] },
+    },
+  ]);
+  expect(result[5].entry.record.channelId).toBe("moved");
+  expect(result.slice(6).map(({ entry }) => entry.record.availability)).toEqual(
+    [
+      { state: "unavailable", reason: "access" },
+      { state: "unavailable", reason: "removed" },
+      { state: "available" },
+    ],
+  );
+});
+
 test("commits delta progress without inferring absence and preserves device data", async ({
   page,
   storageUrl,
@@ -791,7 +1148,7 @@ test("accepts authoritative heads without ancestry and rejects retired captures"
       .applyBatch({
         source: "all",
         refresh: old,
-        records: [record("A", "old-home")],
+        records: [record("C", "new-home")],
       })
       .then(
         () => "unexpected",
@@ -802,7 +1159,7 @@ test("accepts authoritative heads without ancestry and rejects retired captures"
         source: "all",
         refresh: newer,
         availability: [
-          { id: "task", expectedRevision: "A", value: { state: "deleted" } },
+          { id: "task", expectedRevision: "A", value: { state: "available" } },
         ],
       })
       .then(
@@ -1313,4 +1670,407 @@ test("direct reads do not wait for an index-only transaction", async ({
   expect(result.ids.ids).toEqual(["task"]);
   expect(result.error).toBeNull();
   expect(result.checkpoint).toBeNull();
+});
+
+// Real transaction completion and BroadcastChannel ordering own this contract.
+test("emits only changed IDs after commit and keeps metadata notifications", async ({
+  page,
+  storageUrl,
+}) => {
+  await open(page, storageUrl);
+  const result = await page.evaluate(async () => {
+    const c = window.artifactTest.open();
+    await c.get("a");
+    const changes = [];
+    const committedReads = [];
+    let legacy = 0;
+    c.subscribe(() => legacy++);
+    const stop = c.subscribeChanges((hint) => {
+      changes.push(hint);
+      if (hint.ids) for (const id of hint.ids) committedReads.push(c.get(id));
+    });
+    await c.importBatch({
+      records: [
+        { id: "a", local: {} },
+        { id: "b", local: {} },
+      ],
+      preferences: [{ id: "a", value: { pinned: false } }],
+    });
+    await c.importBatch({
+      records: [{ id: "a", local: { ignored: true } }],
+      preferences: [{ id: "a", value: { pinned: true } }],
+      marker: "done",
+    });
+    await c.preferences.update("a", (current) => current);
+    await c.preferences.update("a", (current) => {
+      current.pinned = true;
+      return current;
+    });
+    const refresh = await c.beginRefresh("all");
+    const batch = {
+      source: "all",
+      refresh,
+      records: [
+        {
+          id: "a",
+          channelId: "home",
+          type: "test.task",
+          revision: { id: "A", content: "{}" },
+        },
+      ],
+      availability: [
+        { id: "a", expectedRevision: "A", value: { state: "available" } },
+      ],
+    };
+    await c.applyBatch(batch);
+    await c.applyBatch(batch);
+    await c.applyBatch({ source: "all", refresh });
+    await c.setRefreshError(refresh, "offline");
+    await c.completeRefresh(refresh, { expected: null, next: "one" });
+    const next = await c.beginRefresh("all");
+    await c.applyBatch({
+      source: "all",
+      refresh: next,
+      availability: [
+        { id: "a", expectedRevision: "A", value: { state: "unavailable" } },
+      ],
+    });
+    const rollback = await c
+      .applyBatch({
+        source: "all",
+        refresh: next,
+        records: [
+          {
+            id: "aborted",
+            channelId: "home",
+            type: "test.task",
+            revision: { id: "B", content: "{}" },
+          },
+        ],
+        availability: [
+          { id: "a", expectedRevision: "stale", value: { state: "deleted" } },
+        ],
+      })
+      .then(
+        () => "unexpected",
+        (error) => error.message,
+      );
+    const rolledBack = await c.get("aborted");
+    const current = await c.get("a");
+    const rows = await Promise.all(committedReads);
+    stop();
+    await c.preferences.update("a", () => false);
+    return {
+      changes,
+      legacy,
+      rollback,
+      rolledBack,
+      current,
+      rowsPresent: rows.every(Boolean),
+    };
+  });
+  expect(result.changes).toEqual([
+    { ids: ["a", "b"] },
+    { ids: ["a"] },
+    { ids: ["a"] },
+    { ids: ["a"] },
+  ]);
+  expect(result.legacy).toBe(11);
+  expect(result.rollback).toBe("Artifact revision changed");
+  expect(result.rolledBack).toBeUndefined();
+  expect(result.current.record.availability.state).toBe("unavailable");
+  expect(result.rowsPresent).toBe(true);
+});
+
+test("delivers hints to same-collection handles and windows with isolated scopes", async ({
+  page,
+  context,
+  storageUrl,
+}) => {
+  await open(page, storageUrl);
+  const other = await context.newPage();
+  await open(other, storageUrl);
+  await other.evaluate(async () => {
+    window.collection = window.artifactTest.open();
+    await window.collection.get("a");
+    window.hints = [];
+    window.collection.subscribeChanges((hint) => window.hints.push(hint));
+    window.change = new Promise((resolve) => {
+      window.collection.subscribeChanges(async (hint) => {
+        if (hint.ids?.includes("barrier"))
+          resolve(await window.collection.get("a"));
+      });
+    });
+  });
+  const local = await page.evaluate(async () => {
+    const { createArtifactStore } = await import(
+      "/src/features/artifact-storage/store.ts"
+    );
+    const store = createArtifactStore("viewer", "relay");
+    const definition = {
+      name: "tasks",
+      type: "test.task",
+      version: 1,
+      project: () => [],
+    };
+    const c = store.collection("test", definition);
+    const peer = store.collection("test", definition);
+    const scopes = [
+      window.artifactTest.open("other"),
+      window.artifactTest.open("viewer", "other"),
+      window.artifactTest.open("viewer", "relay", "other"),
+      store.collection("test", { ...definition, name: "other" }),
+    ];
+    const leaks = [];
+    await Promise.all(scopes.map((scope) => scope.get("a")));
+    const barriers = scopes.map((scope) => {
+      scope.subscribeChanges((hint) => leaks.push(hint));
+      // Each scope's legacy callback is a delivery barrier on that channel.
+      return new Promise((resolve) => scope.subscribe(resolve));
+    });
+    const settled = Promise.all(barriers);
+    await Promise.all(scopes.map((scope) => scope.get("a")));
+    const hints = [];
+    const delivered = new Promise((resolve) =>
+      peer.subscribeChanges((hint) => {
+        hints.push(hint);
+        if (hint.ids?.includes("barrier")) resolve();
+      }),
+    );
+    await peer.get("a");
+    await c.importBatch({ records: [{ id: "a", local: { saved: true } }] });
+    await c.importBatch({ records: [{ id: "barrier", local: {} }] });
+    await delivered;
+    // Send metadata-only commits after the target writes to establish completion
+    // on every isolated scope without creating any changed-entry hints there.
+    for (const scope of scopes) await scope.importBatch({ marker: "barrier" });
+    await settled;
+    store.close();
+    return { hints, leaks };
+  });
+  expect((await other.evaluate(() => window.change)).record.local).toEqual({
+    saved: true,
+  });
+  expect(await other.evaluate(() => window.hints)).toEqual([
+    { ids: ["a"] },
+    { ids: ["barrier"] },
+  ]);
+  expect(local).toEqual({
+    hints: [{ ids: ["a"] }, { ids: ["barrier"] }],
+    leaks: [],
+  });
+});
+
+test("resets for legacy delivery, lifecycle gaps, upgrades and removals", async ({
+  page,
+  storageUrl,
+}) => {
+  await open(page, storageUrl);
+  const result = await page.evaluate(async () => {
+    const { purgeArtifactStorage } = await import(
+      "/src/features/artifact-storage/store.ts"
+    );
+    const c = window.artifactTest.open();
+    await c.importBatch({ records: [{ id: "a", local: {} }] });
+    const hints = [];
+    let next;
+    c.subscribeChanges((hint) => {
+      hints.push(hint);
+      next?.();
+    });
+    const notification = () =>
+      new Promise((resolve) => {
+        next = resolve;
+      });
+    const channel = new BroadcastChannel(
+      `buzz-artifacts-v1:${JSON.stringify([c.scope.partition, JSON.stringify(["test", "tasks"])])}`,
+    );
+    for (const data of [
+      null,
+      { version: 42 },
+      { version: 1, change: { ids: [1] } },
+    ]) {
+      const received = notification();
+      channel.postMessage(data);
+      await received;
+    }
+    let received = notification();
+    window.dispatchEvent(
+      new PageTransitionEvent("pageshow", { persisted: true }),
+    );
+    await received;
+    received = notification();
+    const upgraded = window.artifactTest.open("viewer", "relay", "test", {
+      version: 2,
+    });
+    await upgraded.get("a");
+    await received;
+    const stale = await c.get("a").then(
+      () => "unexpected",
+      (error) => error.message,
+    );
+    c.close();
+    received = new Promise((resolve) => upgraded.subscribeChanges(resolve));
+    await purgeArtifactStorage("viewer", "relay");
+    const removal = await received;
+    upgraded.close();
+    const reopened = window.artifactTest.open("viewer", "relay", "test", {
+      version: 2,
+    });
+    const removed = await reopened.get("a");
+    channel.close();
+    return { hints, stale, removal, removed };
+  });
+  expect(result.hints).toEqual(
+    Array.from({ length: 5 }, () => ({ reset: true })),
+  );
+  expect(result.stale).toBe("Artifact collection version changed");
+  expect(result.removal).toEqual({ reset: true });
+  expect(result.removed).toBeUndefined();
+});
+
+test("bounds a 5000-record hint and updates one entry without rescanning", async ({
+  page,
+  storageUrl,
+}) => {
+  await open(page, storageUrl);
+  const result = await page.evaluate(async () => {
+    const c = window.artifactTest.open();
+    await c.get("task-0");
+    const hints = [];
+    c.subscribeChanges((hint) => hints.push(hint));
+    const seeded = new Promise((resolve) => {
+      const stop = c.subscribeChanges(() => {
+        stop();
+        resolve();
+      });
+    });
+    await c.importBatch({
+      records: Array.from({ length: 5000 }, (_, i) => ({
+        id: `task-${i}`,
+        local: {},
+      })),
+    });
+    await seeded;
+    const initial = hints.splice(0);
+    let gets = 0;
+    let cursors = 0;
+    const get = IDBObjectStore.prototype.get;
+    const cursor = IDBObjectStore.prototype.openCursor;
+    IDBObjectStore.prototype.get = function (...args) {
+      gets++;
+      return get.apply(this, args);
+    };
+    IDBObjectStore.prototype.openCursor = function (...args) {
+      cursors++;
+      return cursor.apply(this, args);
+    };
+    const started = performance.now();
+    try {
+      const read = new Promise((resolve) =>
+        c.subscribeChanges(async (hint) => {
+          resolve(await Promise.all(hint.ids.map((id) => c.get(id))));
+        }),
+      );
+      await c.preferences.update("task-2500", () => ({ pinned: true }));
+      const rows = await read;
+      return {
+        initial,
+        hints,
+        gets,
+        cursors,
+        elapsedMs: performance.now() - started,
+        rows: rows.length,
+        preference: rows[0].preference,
+      };
+    } finally {
+      IDBObjectStore.prototype.get = get;
+      IDBObjectStore.prototype.openCursor = cursor;
+    }
+  });
+  expect(result.initial).toEqual([{ reset: true }]);
+  expect(result.hints).toEqual([{ ids: ["task-2500"] }]);
+  expect(result.rows).toBe(1);
+  expect(result.preference).toEqual({ pinned: true });
+  expect(result.gets).toBe(6);
+  expect(result.cursors).toBe(0);
+  console.log(
+    JSON.stringify({
+      engine: test.info().project.name,
+      updateMs: result.elapsedMs,
+      gets: result.gets,
+      cursors: result.cursors,
+    }),
+  );
+});
+
+test("buffers commits during a paged bootstrap and retires closed listeners", async ({
+  page,
+  storageUrl,
+}) => {
+  await open(page, storageUrl);
+  const result = await page.evaluate(async () => {
+    const c = window.artifactTest.open();
+    await c.importBatch({
+      records: [
+        { id: "a", local: {} },
+        { id: "c", local: {} },
+      ],
+    });
+    const pending = new Set();
+    const hints = [];
+    const stop = c.subscribeChanges((hint) => {
+      hints.push(hint);
+      for (const id of hint.ids) pending.add(id);
+    });
+    const first = await c.page({ index: "archive", value: "false", limit: 1 });
+    // The first page is held here while writes move behind its cursor.
+    await c.preferences.update("a", () => ({ pinned: true }));
+    const received = new Promise((resolve) => {
+      const unsubscribe = c.subscribeChanges((hint) => {
+        if (hint.ids?.includes("0")) {
+          unsubscribe();
+          resolve();
+        }
+      });
+    });
+    await c.importBatch({ records: [{ id: "0", local: {} }] });
+    await received;
+    const second = await c.page({
+      index: "archive",
+      value: "false",
+      after: first.next,
+    });
+    const index = new Map(
+      [...first.entries, ...second.entries].map((entry) => [
+        entry.record.id,
+        entry,
+      ]),
+    );
+    for (const id of pending) index.set(id, await c.get(id));
+    stop();
+    const beforeClose = hints.length;
+    let closedCalls = 0;
+    c.subscribeChanges(() => closedCalls++);
+    // Close inside the legacy callback, before the changed-entry callback runs.
+    c.subscribe(() => c.close());
+    await c.preferences.update("a", () => false);
+    const rejected = await c.get("a").then(
+      () => "unexpected",
+      (error) => error.message,
+    );
+    return {
+      ids: [...index.keys()].sort(),
+      preference: index.get("a").preference,
+      beforeClose,
+      closedCalls,
+      afterClose: hints.length,
+      rejected,
+    };
+  });
+  expect(result.ids).toEqual(["0", "a", "c"]);
+  expect(result.preference).toEqual({ pinned: true });
+  expect(result.afterClose).toBe(result.beforeClose);
+  expect(result.closedCalls).toBe(0);
+  expect(result.rejected).toBe("Artifact collection closed");
 });

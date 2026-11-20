@@ -11,6 +11,7 @@ import {
   settingsDialog,
   settingsSections,
   settleDialogMotion,
+  settlePanelMotion,
   settleShellToggle,
 } from "./navigation.mjs";
 import { test, expect } from "./fixture.mjs";
@@ -55,11 +56,14 @@ const button = (page, name) => page.getByRole("button", { name, exact: true });
 const companionLauncher = (page, name) =>
   button(page, name).and(page.locator("button[aria-expanded]"));
 // Global destinations live in the dock independently of the Messages sidebar.
-const destinationTitles = ["Bestie", "Workflows"];
+const destinationTitles = ["Create an agent", "Workflows"];
 const dockDestinations = (page, options = {}) =>
   page
     .getByRole("navigation", { name: "Apps dock", ...options })
-    .getByRole("tab", { name: /^(Bestie|Workflows)$/, ...options });
+    .getByRole("tab", {
+      name: /^(Create an agent|Bestie|Workflows)$/,
+      ...options,
+    });
 const companionReadingTest = readingTest.extend({ companionFixture: true });
 const box = async (locator) => {
   const bounds = await locator.boundingBox();
@@ -137,7 +141,7 @@ async function link(page, app, target) {
     );
   });
 }
-async function shellFits(page, width) {
+async function shellFits(page, width, bestieLabel = "Create an agent") {
   // The Workflows page renders no toggle at wide widths, so settle only when
   // the drawer is in play.
   if (width <= 650) await settleShellToggle(page);
@@ -147,7 +151,7 @@ async function shellFits(page, width) {
   // Settings is a modal with its own navigation; the shell is measured with
   // Settings closed.
   const destinations = dockDestinations(page);
-  await expect(destinations).toHaveText(destinationTitles);
+  await expect(destinations).toHaveText([bestieLabel, "Workflows"]);
   const dock = await box(page.getByRole("navigation", { name: "Apps dock" }));
   for (const destination of [destinations.first(), destinations.last()]) {
     await destination.scrollIntoViewIfNeeded();
@@ -349,7 +353,17 @@ test("joined sidebar and workspace surface, real link panel and compact communit
   near(dock.y, main.y);
   near(dock.height, main.height);
   near(dock.x - main.x - main.width, 1);
-  near(dock.x + dock.width, page.viewportSize().width - gap - 1);
+  const halfSpace = await page.locator(".shell-content").evaluate((element) => {
+    const rootSize = Number.parseFloat(
+      getComputedStyle(document.documentElement).fontSize,
+    );
+    return (
+      Number.parseFloat(
+        getComputedStyle(element).getPropertyValue("--space-half"),
+      ) * rootSize
+    );
+  });
+  near(dock.x + dock.width, page.viewportSize().width - (gap - halfSpace) - 1);
   await expect(composer).toHaveJSProperty("value", "Layout draft");
   await expect(composer).toBeInViewport();
   await page.screenshot({ path: testInfo.outputPath("joined-one-panel.png") });
@@ -973,7 +987,7 @@ companionTest(
       [390, 400],
     ]) {
       await page.setViewportSize({ width, height });
-      await shellFits(page, width);
+      await shellFits(page, width, "Bestie");
       await expect(
         button(page, "Close Companion fixture panel"),
       ).toBeInViewport();
@@ -1048,26 +1062,26 @@ companionTest(
   },
 );
 
-const todosOverlapTest = companionTest.extend({
+const sidePanelOverlapTest = companionTest.extend({
   threadUnread: true,
   readState: true,
   historyCounts: { alpha: 3, beta: 1 },
 });
-todosOverlapTest(
-  "Todos stacks beside threads and linked panels in either opening order",
+sidePanelOverlapTest(
+  "a side panel stacks beside threads and linked panels in either opening order",
   async ({ page, app }) => {
     await page.setViewportSize({ width: 1440, height: 950 });
     await open(page, app);
     await openSettings(page);
     await selectSettingsSection(page, "Manage plugins");
-    await pluginAction(page, "Todos").click();
+    await pluginAction(page, "Side panel fixture").click();
     await closeSettings(page);
     await openPage(page, "Messages");
-    const todos = page.getByRole("region", {
-      name: "Todos panel",
+    const sidePanel = page.getByRole("region", {
+      name: "Side fixture panel",
       exact: true,
     });
-    const toggle = button(page, "Toggle channel todos");
+    const toggle = button(page, "Toggle side panel fixture");
     const thread = page.getByRole("complementary", {
       name: "Thread",
       exact: true,
@@ -1083,10 +1097,10 @@ todosOverlapTest(
     });
     const stacked = async (primary) => {
       await expect(primary).toBeVisible();
-      await expect(todos).toBeVisible();
-      near((await box(todos.locator("header.panel-header"))).height, 40);
+      await expect(sidePanel).toBeVisible();
+      await settlePanelMotion(page);
       const top = await box(primary);
-      const bottom = await box(todos);
+      const bottom = await box(sidePanel);
       near(top.x, bottom.x);
       near(top.width, bottom.width);
       near(bottom.y - top.y - top.height, 1);
@@ -1130,7 +1144,7 @@ todosOverlapTest(
         '.buzz-tabs-item:has([data-tab-value^="thread:"][aria-selected="true"]) > button[aria-label^="Close "]',
       )
       .click();
-    await button(page, "Hide todos").click();
+    await button(page, "Hide side panel fixture").click();
     await openThread();
     await toggle.click();
     await stacked(thread);
@@ -1147,13 +1161,13 @@ todosOverlapTest(
         '.buzz-tabs-item:not(:has([data-tab-value^="thread:"])) > button[aria-label^="Close "]',
       )
       .click();
-    await button(page, "Hide todos").click();
+    await button(page, "Hide side panel fixture").click();
     await link(page, app, "https://github.com/block/buzz/pull/7");
     await toggle.click();
     await stacked(linked);
     await openChannelDetails(page);
     await expect(settings).toBeVisible();
-    await expect(todos).toHaveCount(0); // Settings intentionally retires the drawer.
+    await expect(sidePanel).toHaveCount(0); // Settings intentionally retires the drawer.
     await button(page, "Close Channel settings tab").click();
     await expect(linked).toBeVisible();
     await companionLauncher(page, "Companion fixture").click();

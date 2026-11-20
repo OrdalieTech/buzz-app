@@ -103,7 +103,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
-function setup() {
+function setup({ archived = [] as string[] } = {}) {
   const empty: never[] = [];
   const emoji = { status: "ready", entries: empty };
   const profiles = new Map();
@@ -214,40 +214,70 @@ function setup() {
     },
     refresh: async () => {},
   };
+  // Archive evidence, read once, as the relay keeps it.
+  let archiveSnapshot = Object.freeze({
+    status: "ready" as const,
+    archived: Object.freeze([...archived]),
+  });
+  const archiveListeners = new Set<() => void>();
+  const archives = {
+    snapshot: () => archiveSnapshot,
+    subscribe: (listener: () => void) => {
+      archiveListeners.add(listener);
+      return () => archiveListeners.delete(listener);
+    },
+    state: (key: string) =>
+      archiveSnapshot.archived.includes(key)
+        ? ("archived" as const)
+        : ("not-archived" as const),
+    ensure: async () => {},
+    refresh: async () => {},
+  };
   Object.assign(session, {
+    archives,
     agentChoices: createAgentChoices({
       scope,
       library: session.agentLibrary,
       native: control,
+      archives,
       signal: new AbortController().signal,
     }),
   });
-  const mount = (visit?: PageNavigation) =>
-    render(
-      <NewMessage
-        channels={channels.channels}
-        host={
-          {
-            panels: {
-              snapshot: () => emptyPanels,
-              subscribe: () => () => {},
-              resolve: () => undefined,
-            },
-            relay: {
-              snapshot: () => ({ status: "ready", session: session, scope }),
-            },
-            navigation: { open: vi.fn() },
-          } as unknown as ConversationHostServices
-        }
-        session={session}
-        scope={scope}
-        visit={visit}
-        onOpenThread={onOpenThread}
-        onStarted={onStarted}
-      />,
-    );
+  const page = (visit?: PageNavigation, to?: string, at = Date.now()) => (
+    <NewMessage
+      intent={to ? { to, at } : undefined}
+      channels={channels.channels}
+      host={
+        {
+          panels: {
+            snapshot: () => emptyPanels,
+            subscribe: () => () => {},
+            resolve: () => undefined,
+          },
+          relay: {
+            snapshot: () => ({ status: "ready", session: session, scope }),
+          },
+          navigation: { open: vi.fn() },
+        } as unknown as ConversationHostServices
+      }
+      session={session}
+      scope={scope}
+      visit={visit}
+      onOpenThread={onOpenThread}
+      onStarted={onStarted}
+    />
+  );
+  const mount = (visit?: PageNavigation, to?: string, at?: number) => {
+    const view = render(page(visit, to, at));
+    return {
+      ...view,
+      readdress: (next: string, nextAt: number) =>
+        view.rerender(page(visit, next, nextAt)),
+    };
+  };
   return {
     session,
+    profiles,
     channels,
     directMessages,
     messages,
@@ -256,6 +286,15 @@ function setup() {
     onStarted,
     mount,
     control,
+    setArchived(keys: readonly string[]) {
+      archiveSnapshot = Object.freeze({
+        status: "ready" as const,
+        archived: Object.freeze([...keys]),
+      });
+      act(() => {
+        for (const listener of archiveListeners) listener();
+      });
+    },
     updateControl(next: LocalAgentsSnapshot) {
       controlState = next;
       act(() => {
@@ -288,6 +327,7 @@ it("finds a hosted agent by its owned name and sends without local custody", asy
   expect(t.directMessages.open).toHaveBeenCalledWith(
     [hosted.pubkey],
     expect.any(AbortSignal),
+    true,
   );
   expect(t.messages.send).toHaveBeenCalledOnce();
 });
@@ -308,6 +348,73 @@ it("revalidates a hosted recipient when its owned evidence disappears", async ()
   );
   expect(t.directMessages.open).not.toHaveBeenCalled();
   expect(t.messages.send).not.toHaveBeenCalled();
+});
+
+it("neither offers nor sends to an agent whose Delete started", async () => {
+  const t = setup();
+  const [owned] = t.control.snapshot().agents;
+  assert(owned);
+  t.mount();
+  await t.user.click(
+    await screen.findByRole("option", { name: "Person 2, Agent" }),
+  );
+  await t.user.type(screen.getByRole("textbox"), "Private draft");
+  // Chosen before its Delete started; Send checks again.
+  t.updateControl({
+    status: "ready",
+    agents: [{ ...owned, deleting: true }],
+  });
+  await t.user.click(send());
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "no longer available",
+  );
+  expect(t.directMessages.open).not.toHaveBeenCalled();
+  await t.user.type(recipient(), owned.name);
+  expect(
+    screen.queryByRole("option", { name: "Person 2, Agent" }),
+  ).not.toBeInTheDocument();
+});
+
+it("neither offers nor sends to an archived agent", async () => {
+  const pubkey = people[1]?.pubkey ?? "";
+  const t = setup({ archived: [pubkey] });
+  t.mount();
+  await t.user.type(recipient(), people[1]?.name ?? "");
+  expect(
+    screen.queryByRole("option", { name: "Person 2, Agent" }),
+  ).not.toBeInTheDocument();
+});
+
+it("holds the archive rule by key, without agent flags, for a selected and a restored recipient", async () => {
+  // Person 1's profile carries neither auth nor is_agent.
+  const pubkey = people[0]?.pubkey ?? "";
+  const t = setup();
+  const view = t.mount();
+  await t.user.click(await screen.findByRole("option", { name: "Person 1" }));
+  await t.user.type(screen.getByRole("textbox"), "Private draft");
+  t.setArchived([pubkey]);
+  expect(screen.getByText("Unavailable")).toBeVisible();
+  await t.user.click(send());
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "no longer available",
+  );
+  expect(t.directMessages.open).not.toHaveBeenCalled();
+  view.unmount();
+  // Restored with the draft: still refused.
+  t.mount();
+  expect(screen.getByRole("button", { name: "Remove Person 1" })).toBeVisible();
+  expect(screen.getByText("Unavailable")).toBeVisible();
+  await waitFor(() => expect(send()).toBeEnabled());
+  await t.user.click(send());
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "no longer available",
+  );
+  expect(t.directMessages.open).not.toHaveBeenCalled();
+  expect(t.messages.send).not.toHaveBeenCalled();
+  await t.user.type(recipient(), "Person 1");
+  expect(
+    screen.queryByRole("option", { name: "Person 1" }),
+  ).not.toBeInTheDocument();
 });
 
 it("offers only local agents in this community, including cached searches after their list changes", async () => {
@@ -920,6 +1027,131 @@ it("shows selected recipient artwork without opening or sending, and updates it 
   expect(t.onOpenThread).not.toHaveBeenCalled();
 });
 
+it("addresses the draft to the person it was opened from, creating the DM only on send", async () => {
+  const t = setup();
+  const [person] = people;
+  if (!person) throw new Error("No person");
+  t.profiles.set(person.pubkey, { name: person.name });
+  t.mount(undefined, person.pubkey);
+  expect(
+    await screen.findByRole("button", { name: "Remove Person 1" }),
+  ).toBeVisible();
+  expect(t.directMessages.open).not.toHaveBeenCalled();
+  await t.user.type(screen.getByRole("textbox"), "Hello");
+  await t.user.click(send());
+  await waitFor(() => expect(t.onStarted).toHaveBeenCalledOnce());
+  expect(t.directMessages.open).toHaveBeenCalledExactlyOnceWith(
+    [person.pubkey],
+    expect.any(AbortSignal),
+    true,
+  );
+  expect(t.messages.send).toHaveBeenCalledOnce();
+});
+
+it("takes each choice of a person once, so returning keeps later recipients", async () => {
+  const t = setup();
+  const [first] = people;
+  if (!first) throw new Error("No people");
+  t.profiles.set(first.pubkey, { name: first.name });
+  const now = Date.now();
+  const view = t.mount(undefined, first.pubkey, now + 2);
+  await t.user.click(
+    await screen.findByRole("button", { name: "Remove Person 1" }),
+  );
+  await t.user.click(await screen.findByRole("option", { name: "Person 3" }));
+  view.unmount();
+  // Back, a reload or closing Settings returns to the same choice, and Back
+  // to an earlier one is older still.
+  for (const at of [now + 2, now + 1]) {
+    const again = t.mount(undefined, first.pubkey, at);
+    expect(
+      await screen.findByRole("button", { name: "Remove Person 3" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Remove Person 1" }),
+    ).not.toBeInTheDocument();
+    again.unmount();
+  }
+  // Choosing that person again addresses the draft anew.
+  t.mount(undefined, first.pubkey, now + 3);
+  expect(
+    await screen.findByRole("button", { name: "Remove Person 1" }),
+  ).toBeVisible();
+});
+
+it("keeps a held message's recipients when opened from another person", async () => {
+  const t = setup();
+  t.directMessages.delivery.mockReturnValue("unknown");
+  t.directMessages.delivered.mockRejectedValueOnce(
+    new Error("Delivery uncertain"),
+  );
+  const view = t.mount();
+  await t.user.click(await screen.findByRole("option", { name: "Person 1" }));
+  await t.user.type(screen.getByRole("textbox"), "Held");
+  await t.user.click(send());
+  await screen.findByRole("alert");
+  view.unmount();
+  t.mount(undefined, people[2]?.pubkey);
+  expect(
+    await screen.findByRole("button", { name: "Remove Person 1" }),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Remove Person 3" }),
+  ).not.toBeInTheDocument();
+});
+
+it("keeps a failed message's recipients when opened from another person", async () => {
+  const t = setup();
+  t.directMessages.delivered.mockRejectedValueOnce(new Error("Send failed"));
+  const view = t.mount();
+  await t.user.click(await screen.findByRole("option", { name: "Person 1" }));
+  await t.user.type(screen.getByRole("textbox"), "Failed");
+  await t.user.click(send());
+  await screen.findByRole("alert");
+  view.unmount();
+  t.mount(undefined, people[2]?.pubkey);
+  expect(
+    await screen.findByRole("button", { name: "Remove Person 1" }),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Remove Person 3" }),
+  ).not.toBeInTheDocument();
+});
+
+it("holds a choice made during a send until the send settles, keeping the send's recipients", async () => {
+  const t = setup();
+  let fail: (reason: Error) => void = () => {};
+  t.directMessages.open.mockImplementationOnce(
+    () =>
+      new Promise((_, reject) => {
+        fail = reject;
+      }),
+  );
+  const view = t.mount();
+  await t.user.click(await screen.findByRole("option", { name: "Person 1" }));
+  await t.user.type(screen.getByRole("textbox"), "Mid-send");
+  await t.user.click(send());
+  const third = people[2];
+  if (!third) throw new Error("No people");
+  t.profiles.set(third.pubkey, { name: third.name });
+  view.readdress(third.pubkey, Date.now() + 1);
+  expect(
+    screen.getByRole("button", { name: "Remove Person 1" }),
+  ).toBeInTheDocument();
+  expect(t.directMessages.open).toHaveBeenCalledExactlyOnceWith(
+    [people[0]?.pubkey],
+    expect.any(AbortSignal),
+    true,
+  );
+  await act(async () => fail(new Error("Could not open")));
+  expect(
+    await screen.findByRole("button", { name: "Remove Person 3" }),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Remove Person 1" }),
+  ).not.toBeInTheDocument();
+});
+
 it("requires an arrow key before Enter selects a recipient", async () => {
   const t = setup();
   t.mount();
@@ -1114,8 +1346,8 @@ it("keeps a failed draft editable and resolves changed recipients again", async 
     expect(t.onStarted).toHaveBeenCalledWith(channel, "d".repeat(64)),
   );
   expect(t.directMessages.open.mock.calls).toEqual([
-    [[people[0]?.pubkey], expect.any(AbortSignal)],
-    [[people[0]?.pubkey, people[1]?.pubkey], expect.any(AbortSignal)],
+    [[people[0]?.pubkey], expect.any(AbortSignal), true],
+    [[people[0]?.pubkey, people[1]?.pubkey], expect.any(AbortSignal), true],
   ]);
   expect(t.outbox.dismiss).toHaveBeenCalledOnce();
 });
@@ -1161,6 +1393,7 @@ it("holds Send while the To field has text that is not a recipient", async () =>
   expect(t.directMessages.open).toHaveBeenCalledWith(
     [people[0]?.pubkey],
     expect.any(AbortSignal),
+    true,
   );
 });
 
@@ -1656,6 +1889,10 @@ it("checks local agents again after opening and leaves queued retries alone", as
   await screen.findByRole("alert");
   expect(t.messages.send).not.toHaveBeenCalled();
   t.updateControl(previous);
+  // Someone joined the DM the first attempt was given, so the relay now
+  // gives these recipients another, and the message goes there.
+  const moved = "22222222-2222-4222-8222-222222222222";
+  t.directMessages.open.mockResolvedValueOnce(moved);
   t.directMessages.delivery.mockReturnValue("unknown");
   t.directMessages.delivered.mockRejectedValueOnce(new Error("Uncertain"));
   await t.user.click(send());
@@ -1664,6 +1901,10 @@ it("checks local agents again after opening and leaves queued retries alone", as
   await t.user.click(screen.getByRole("button", { name: "Retry send" }));
   await waitFor(() => expect(t.onStarted).toHaveBeenCalledOnce());
   expect(t.messages.send).toHaveBeenCalledOnce();
+  expect(t.messages.send.mock.calls[0]?.[0]).toBe(moved);
+  // The queued message keeps its exact event: Retry send opened nothing.
+  expect(t.directMessages.open).toHaveBeenCalledTimes(2);
+  expect(t.onStarted).toHaveBeenCalledWith(moved, expect.any(String));
 });
 
 it("distinguishes namesake options and chips without pictures", async () => {
@@ -1982,6 +2223,7 @@ it("labels people by verified identity, never an editable handle, and opens the 
   expect(t.directMessages.open).toHaveBeenCalledWith(
     [aleksandr.pubkey],
     expect.any(AbortSignal),
+    true,
   );
 });
 

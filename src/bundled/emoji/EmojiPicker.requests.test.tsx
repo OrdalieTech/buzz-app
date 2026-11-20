@@ -10,9 +10,11 @@ import {
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { createRelaySession } from "../../features/relay/session";
+import type { EmojiSnapshot } from "../../features/relay/emoji-directory";
 import { relayGifRequests } from "../../features/relay/gifs";
 import { createGifShortcut } from "./gif-shortcut";
 import { EmojiPicker } from "./EmojiPicker";
+import { createAddEmoji, PREVIEW_ACTION_SLOT } from "./add-emoji";
 
 afterEach(() => {
   cleanup();
@@ -88,6 +90,109 @@ it("uses the supplied window owner for GIF discovery, search, retry and selectio
     expect(direct).not.toHaveBeenCalled();
     expect(directSearch).not.toHaveBeenCalled();
   } finally {
+    owner.dispose();
+  }
+});
+
+it("shows a recovering catalog as loading and keeps Retry for deterministic failures", async () => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  const owner = createRelaySession(null);
+  const listeners = new Set<() => void>();
+  let snapshot: EmojiSnapshot = Object.freeze({
+    status: "error",
+    entries: [],
+    mine: [],
+    error: "ReadError: Relay read timed out",
+    transient: true,
+  });
+  const publish = (next: EmojiSnapshot) => {
+    snapshot = next;
+    for (const listener of listeners) listener();
+  };
+  const refresh = vi.fn(async () => {});
+  const session = {
+    ...owner.session,
+    emoji: {
+      ...owner.session.emoji,
+      snapshot: () => snapshot,
+      subscribe(listener: () => void) {
+        listeners.add(listener);
+        return () => void listeners.delete(listener);
+      },
+      ensure: vi.fn(async () => {}),
+      refresh,
+    },
+  };
+  try {
+    render(
+      <EmojiPicker
+        session={session}
+        scope="a"
+        disabled={false}
+        insert={vi.fn()}
+        reaction
+      />,
+    );
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    fireEvent.click(screen.getByRole("button", { name: "Add reaction" }));
+    // Loading feedback stays silent for a fast read, then announces.
+    await act(() => vi.advanceTimersByTimeAsync(999));
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByText("Loading community emoji…")).toBeNull();
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    vi.useRealTimers();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Loading community emoji…",
+    );
+    expect(screen.queryByText(/timed out/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry emoji" })).toBeNull();
+    // A recovery attempt in flight keeps the same loading state.
+    act(() =>
+      publish({
+        ...snapshot,
+        status: "loading",
+        error: undefined,
+        transient: undefined,
+      }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Loading community emoji…",
+    );
+    act(() => publish({ ...snapshot, status: "ready", entries: [], mine: [] }));
+    expect(screen.queryByText("Loading community emoji…")).toBeNull();
+    // A loaded catalog that recovers a failed refresh stays quiet and usable.
+    act(() =>
+      publish({
+        ...snapshot,
+        error: "ReadError: Relay read timed out",
+        transient: true,
+      }),
+    );
+    expect(screen.queryByText("Loading community emoji…")).toBeNull();
+    expect(screen.queryByText(/timed out/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry emoji" })).toBeNull();
+    act(() => publish({ ...snapshot, error: undefined, transient: undefined }));
+    act(() =>
+      publish({
+        ...snapshot,
+        status: "error",
+        error: "Community emoji exceeds the catalog budget.",
+      }),
+    );
+    expect(screen.queryByText("Loading community emoji…")).toBeNull();
+    expect(
+      screen.getByText("Community emoji exceeds the catalog budget."),
+    ).toHaveAttribute("role", "alert");
+    fireEvent.click(screen.getByRole("button", { name: "Retry emoji" }));
+    expect(refresh).toHaveBeenCalledOnce();
+  } finally {
+    vi.useRealTimers();
     owner.dispose();
   }
 });
@@ -401,6 +506,67 @@ it("keeps the newest composer shortcut target when older discovery completes", a
     act(() => shortcut.run());
     await screen.findByRole("searchbox", { name: "Search GIFs" });
     expect(newerSupports).toHaveBeenCalledOnce();
+  } finally {
+    owner.dispose();
+  }
+});
+
+it("offers Add emoji in the preview only while the Settings card can open", async () => {
+  for (const name of ["ResizeObserver", "IntersectionObserver"])
+    vi.stubGlobal(
+      name,
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+  const owner = createRelaySession(null);
+  const addEmoji = createAddEmoji();
+  const open = vi.fn();
+  const insert = vi.fn();
+  try {
+    render(
+      <EmojiPicker
+        session={owner.session}
+        scope="a"
+        disabled={false}
+        insert={insert}
+        addEmoji={addEmoji}
+        reaction
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Add reaction" }));
+    const picker = await vi.waitFor(() => {
+      const element = document.querySelector("em-emoji-picker");
+      if (!element?.shadowRoot?.querySelector("#preview"))
+        throw new Error("Preview has not rendered");
+      return element;
+    });
+    expect(screen.queryByRole("button", { name: "Add emoji" })).toBeNull();
+    let withdraw = () => {};
+    act(() => {
+      withdraw = addEmoji.provide(open);
+    });
+    const add = await screen.findByRole("button", { name: "Add emoji" });
+    // The light-DOM action is projected through the slot in Mart's preview row.
+    expect(add.closest("[slot]")?.parentElement).toBe(picker);
+    expect(
+      picker.shadowRoot?.querySelector(
+        `#preview slot[name="${PREVIEW_ACTION_SLOT}"]`,
+      ),
+    ).not.toBeNull();
+    act(() => withdraw());
+    expect(screen.queryByRole("button", { name: "Add emoji" })).toBeNull();
+    act(() => {
+      addEmoji.provide(open);
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Add emoji" }));
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(insert).not.toHaveBeenCalled();
+    await vi.waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Emoji picker" })).toBeNull(),
+    );
   } finally {
     owner.dispose();
   }

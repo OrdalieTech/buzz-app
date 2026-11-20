@@ -739,7 +739,11 @@ fn isolated_agent_ipc_probe() {
     assert_eq!(resolved["relayUrl"], "wss://relay.test");
     #[cfg(unix)]
     {
-        let library = invoke("relay_agent_library", serde_json::json!({})).unwrap();
+        let library = invoke(
+            "relay_agent_library",
+            serde_json::json!({"community":"https://relay.test"}),
+        )
+        .unwrap();
         assert_eq!(
             library,
             serde_json::json!({"definitions": [], "identities": []})
@@ -750,20 +754,47 @@ fn isolated_agent_ipc_probe() {
             .unwrap()
             .join("agents/identities.json");
         assert!(path.starts_with(std::env::var("HOME").unwrap()));
-        let saved = serde_json::json!([{
-            "pubkey": "a".repeat(64), "relay": "wss://relay.test", "owner": public,
-            "auth": "private attestation", "type": "plugin/agent", "name": "Current agent",
-            "picture": "https://images.example/current.png"
-        }])
+        let saved = serde_json::json!([
+            {
+                "pubkey": "a".repeat(64), "relay": "wss://elsewhere.test", "owner": public,
+                "auth": "private attestation", "type": "plugin/agent", "name": "Elsewhere"
+            },
+            {
+                "pubkey": "b".repeat(64), "relay": "wss://relay.test", "owner": "c".repeat(64),
+                "auth": "private attestation", "type": "plugin/agent", "name": "Other account"
+            },
+            {
+                "pubkey": "a".repeat(64), "relay": "wss://relay.test", "owner": public,
+                "auth": "private attestation", "type": "plugin/agent", "name": "Current agent",
+                "picture": "https://images.example/current.png"
+            }
+        ])
         .to_string();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &saved).unwrap();
         assert_eq!(
-            invoke("relay_agent_library", serde_json::json!({})).unwrap(),
+            invoke(
+                "relay_agent_library",
+                serde_json::json!({"community":"https://relay.test"})
+            )
+            .unwrap(),
             serde_json::json!({"definitions": [], "identities": [{
                 "pubkey": "a".repeat(64), "name": "Current agent", "avatar": "https://images.example/current.png"
             }]})
         );
+        assert_eq!(
+            invoke(
+                "relay_agent_library",
+                serde_json::json!({"community":"https://new.test"})
+            )
+            .unwrap(),
+            serde_json::json!({"definitions": [], "identities": []})
+        );
+        assert!(invoke(
+            "relay_agent_library",
+            serde_json::json!({"community":"https://relay.test/path"})
+        )
+        .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
         std::fs::remove_file(&path).unwrap();
         assert!(app
@@ -1091,6 +1122,47 @@ fn shared_kind_five_signer_accepts_message_and_reaction_deletion_only_in_broker_
     assert!(validate_event("https://relay.test", &event).is_err());
     event.tags[1][1] = id;
     event.tags.push(vec!["a".into(), "30620:other:id".into()]);
+    assert!(validate_event("https://relay.test", &event).is_err());
+}
+
+#[test]
+fn shared_kind_five_signer_accepts_one_reaction_deletion_without_a_channel() {
+    let id = "a".repeat(64);
+    let mut event = EventTemplate {
+        kind: 5,
+        created_at: 123,
+        content: String::new(),
+        tags: vec![
+            vec!["e".into(), id.clone()],
+            vec!["k".into(), "7".into()],
+            vec!["client-id".into(), "intent".into()],
+        ],
+    };
+    assert!(validate_event("https://relay.test", &event).is_ok());
+    event.tags.pop();
+    assert!(validate_event("https://relay.test", &event).is_ok());
+    // Only reactions, and only one target, as the relay accepts.
+    event.tags[1][1] = "9".into();
+    assert!(validate_event("https://relay.test", &event).is_err());
+    event.tags[1][1] = "7".into();
+    event.tags.push(vec!["e".into(), "b".repeat(64)]);
+    assert!(validate_event("https://relay.test", &event).is_err());
+    event.tags.pop();
+    event.tags[0][1] = "A".repeat(64);
+    assert!(validate_event("https://relay.test", &event).is_err());
+    event.tags[0][1] = id.clone();
+    event.tags.push(vec!["k".into(), "9".into()]);
+    assert!(validate_event("https://relay.test", &event).is_err());
+    event.tags.pop();
+    event
+        .tags
+        .push(vec!["a".into(), format!("30175:{}:pm", "c".repeat(64))]);
+    assert!(validate_event("https://relay.test", &event).is_err());
+    event.tags.pop();
+    event.content = "reason".into();
+    assert!(validate_event("https://relay.test", &event).is_err());
+    event.content.clear();
+    event.created_at = 9_007_199_254_740_992;
     assert!(validate_event("https://relay.test", &event).is_err());
 }
 
@@ -1523,6 +1595,85 @@ async fn sidebar_signer_matches_projection_lengths_and_preserves_unknown_sort_en
 }
 
 #[tokio::test]
+async fn workspace_signer_round_trips_full_compact_filings() {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    let host = IdentityHost::fixture();
+    let coordinate = "channel-workspaces";
+    let mut sections = Vec::new();
+    let mut filings = serde_json::Map::new();
+    for workspace in 0..200_u16 {
+        let id = format!("00000000-0000-4000-8000-{workspace:012}");
+        sections.push(serde_json::json!({
+            "id":id, "name":format!("Workspace {workspace}"), "order":workspace
+        }));
+        let rows: Vec<String> = (0..10_u16)
+            .map(|offset| {
+                let mut bytes = [0_u8; 32];
+                bytes[..2].copy_from_slice(&(workspace * 10 + offset).to_be_bytes());
+                format!("~{}", STANDARD_NO_PAD.encode(bytes))
+            })
+            .collect();
+        filings.insert(id, serde_json::json!(rows));
+    }
+    let payload = serde_json::json!({
+        "version":1, "sections":sections, "filings":filings, "sectionOrder":[],
+        "packedUnfiled": [format!("~{}", STANDARD_NO_PAD.encode([200_u8; 32]))],
+        "unifiedOnly": STANDARD_NO_PAD.encode([1_u8; 275]),
+    });
+    let event = host
+        .sign_sidebar(coordinate.into(), payload.clone(), 1)
+        .await
+        .unwrap();
+    host.admit_sidebar(event.clone()).await.unwrap();
+    assert_eq!(
+        host.decode_sidebar(vec![event]).await.unwrap()[coordinate],
+        payload
+    );
+
+    let mut closed = payload.clone();
+    let closed_fields = closed.as_object_mut().unwrap();
+    closed_fields.remove("packedUnfiled");
+    closed_fields.remove("unifiedOnly");
+    closed_fields.insert("legacyImportClosed".into(), true.into());
+    let event = host
+        .sign_sidebar(coordinate.into(), closed.clone(), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        host.decode_sidebar(vec![event]).await.unwrap()[coordinate],
+        closed
+    );
+    let mut invalid = payload.clone();
+    invalid["legacyImportClosed"] = true.into();
+    assert!(host
+        .sign_sidebar(coordinate.into(), invalid, 2)
+        .await
+        .is_err());
+
+    let mut invalid = payload.clone();
+    invalid["unifiedOnly"] = serde_json::json!("AQ");
+    assert!(host
+        .sign_sidebar(coordinate.into(), invalid, 2)
+        .await
+        .is_err());
+    let mut invalid = payload.clone();
+    invalid["unfiled"] = serde_json::json!(["elsewhere"]);
+    assert!(host
+        .sign_sidebar(coordinate.into(), invalid, 2)
+        .await
+        .is_err());
+    let mut invalid = payload;
+    let rows = invalid["filings"]["00000000-0000-4000-8000-000000000000"]
+        .as_array_mut()
+        .unwrap();
+    rows.push(rows[0].clone());
+    assert!(host
+        .sign_sidebar(coordinate.into(), invalid, 2)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn sidebar_signer_supports_large_records_without_expanding_general_signing() {
     let host = IdentityHost::fixture();
     let channels: serde_json::Map<String, serde_json::Value> = (0..500)
@@ -1849,7 +2000,7 @@ async fn webp_thumbnails_fall_back_to_jpeg_only_when_missing() {
     let webp = format!("/media/{hash}.thumb.webp");
     let jpeg = format!("/media/{hash}.thumb.jpg");
     let (base, paths) = thumbnail_server("404 Not Found");
-    let response = serve_media(
+    let (served, response) = serve_media(
         &IdentityHost::fixture(),
         None,
         base.join(&webp).unwrap(),
@@ -1858,7 +2009,8 @@ async fn webp_thumbnails_fall_back_to_jpeg_only_when_missing() {
     .await
     .unwrap();
     assert_eq!(response.body(), b"jpeg");
-    assert_eq!(*paths.lock().unwrap(), [webp.clone(), jpeg]);
+    assert_eq!(served, base.join(&jpeg).unwrap());
+    assert_eq!(*paths.lock().unwrap(), [webp.clone(), jpeg.clone()]);
 
     let (base, paths) = thumbnail_server("401 Unauthorized");
     let status = serve_media(
@@ -1874,6 +2026,25 @@ async fn webp_thumbnails_fall_back_to_jpeg_only_when_missing() {
 
     let png = Url::parse(&format!("https://relay.test/media/{hash}.png")).unwrap();
     assert_eq!(jpeg_thumb(&png), None);
+}
+
+#[tokio::test]
+async fn saved_webp_thumbnails_fall_back_to_jpeg_under_its_name() {
+    let hash = "a".repeat(64);
+    let (base, _) = thumbnail_server("404 Not Found");
+    let dir = tempfile::tempdir().unwrap();
+    let url = base.join(&format!("/media/{hash}.thumb.webp")).unwrap();
+    let saved = save_media(
+        &IdentityHost::fixture(),
+        None,
+        url,
+        dir.path().to_owned(),
+        "",
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved, dir.path().join(format!("{hash}.thumb.jpg")));
+    assert_eq!(std::fs::read(&saved).unwrap(), b"jpeg");
 }
 
 #[test]
@@ -2444,7 +2615,7 @@ async fn failed_media_blocks_are_fetched_again() {
 }
 
 /// Answers each connection with the next canned response, ignoring the request.
-fn scripted_media_server(
+pub(super) fn scripted_media_server(
     responses: Vec<Vec<u8>>,
 ) -> (Url, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3371,6 +3542,217 @@ async fn read_state_codec_round_trips_and_rejects_foreign_intent() {
     ]);
     assert!(host.decode_read_state(vec![duplicate]).await.is_err());
     assert!(host.decode_read_state(vec![signed; 17]).await.is_err());
+}
+
+#[tokio::test]
+async fn read_state_unread_v2_codec_is_its_own_paired_shape() {
+    let host = IdentityHost::fixture();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let blob = serde_json::json!({"v":2,"client_id":"fixture",
+        "contexts":{"room":0,"ov_s:room":now,"ov_c:room":0,"ov_b:room":0}});
+    let signed = host
+        .sign_read_state("c".repeat(32), now, blob.clone())
+        .await
+        .unwrap();
+    verify(&signed);
+    assert_eq!(
+        signed["tags"],
+        serde_json::json!([
+            ["d", format!("read-state-unread-v2:{}", "c".repeat(32))],
+            ["t", "read-state-unread-v2"]
+        ])
+    );
+    let decoded = host.decode_read_state(vec![signed.clone()]).await.unwrap();
+    assert_eq!(decoded[0]["blob"], blob);
+    // Only 32 lowercase hex slots, and only versions 1 and 2.
+    assert!(host
+        .sign_read_state("C".repeat(32), now, blob.clone())
+        .await
+        .is_err());
+    assert!(host
+        .sign_read_state(
+            "c".repeat(32),
+            now,
+            serde_json::json!({"v":3,"client_id":"f","contexts":{}})
+        )
+        .await
+        .is_err());
+    // Each crossed pairing is validly re-signed with the fixture key, so only
+    // the coordinate, tag and version gate can reject it.
+    let resign = |event: &serde_json::Value, tags: serde_json::Value| {
+        let mut event = event.clone();
+        event["tags"] = tags;
+        let hash = Sha256::digest(
+            serde_json::to_vec(&serde_json::json!([
+                0,
+                event["pubkey"],
+                event["created_at"],
+                event["kind"],
+                event["tags"],
+                event["content"]
+            ]))
+            .unwrap(),
+        );
+        let secp = secp256k1::Secp256k1::new();
+        let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [1; 32]).unwrap();
+        event["id"] = format!("{hash:x}").into();
+        event["sig"] = secp
+            .sign_schnorr_no_aux_rand(&hash, &keypair)
+            .to_string()
+            .into();
+        verify(&event);
+        event
+    };
+    let pair = |prefix: &str, tag: &str| {
+        serde_json::json!([["d", format!("{prefix}:{}", "c".repeat(32))], ["t", tag]])
+    };
+    let v1 = host
+        .sign_read_state(
+            "c".repeat(32),
+            now,
+            serde_json::json!({"v":1,"client_id":"fixture","contexts":{"room":1}}),
+        )
+        .await
+        .unwrap();
+    // The re-signer itself yields events that decode under their own pair.
+    for (event, prefix) in [(&signed, "read-state-unread-v2"), (&v1, "read-state")] {
+        let same = resign(event, pair(prefix, prefix));
+        assert!(host.decode_read_state(vec![same]).await.is_ok());
+    }
+    for (event, prefix, tag) in [
+        // A version-2 blob under a crossed pair, or the version-1 pair.
+        (&signed, "read-state-unread-v2", "read-state"),
+        (&signed, "read-state", "read-state-unread-v2"),
+        (&signed, "read-state", "read-state"),
+        // A version-1 blob under a crossed pair, or the version-2 pair.
+        (&v1, "read-state", "read-state-unread-v2"),
+        (&v1, "read-state-unread-v2", "read-state"),
+        (&v1, "read-state-unread-v2", "read-state-unread-v2"),
+    ] {
+        let crossed = resign(event, pair(prefix, tag));
+        assert!(host.decode_read_state(vec![crossed]).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn thread_follows_codec_is_a_separate_exact_shape() {
+    let host = IdentityHost::fixture();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let key = format!("room:{}", "1".repeat(64));
+    let payload = serde_json::json!({"v":1,"client_id":"fixture","later":true,
+        "threads":{key.clone():{"follow":true,"at":now,"x":1}}});
+    let signed = host
+        .sign_thread_follows("b".repeat(32), now, payload.clone())
+        .await
+        .unwrap();
+    verify(&signed);
+    assert_eq!(
+        signed["tags"],
+        serde_json::json!([
+            ["d", format!("thread-follows:{}", "b".repeat(32))],
+            ["t", "thread-follows"]
+        ])
+    );
+    let decoded = host
+        .decode_thread_follows(vec![signed.clone()])
+        .await
+        .unwrap();
+    assert_eq!(decoded[0]["payload"], payload);
+    // The shapes never cross.
+    assert!(host.decode_read_state(vec![signed.clone()]).await.is_err());
+    let read = host
+        .sign_read_state(
+            "a".repeat(32),
+            now,
+            serde_json::json!({"v":1,"client_id":"f","contexts":{}}),
+        )
+        .await
+        .unwrap();
+    assert!(host.decode_thread_follows(vec![read]).await.is_err());
+    assert!(host
+        .sign_read_state("a".repeat(32), now, payload.clone())
+        .await
+        .is_err());
+    // Strict intent: slot, window and payload.
+    assert!(host
+        .sign_thread_follows("B".repeat(32), now, payload.clone())
+        .await
+        .is_err());
+    assert!(host
+        .sign_thread_follows("b".repeat(32), now + 61, payload.clone())
+        .await
+        .is_err());
+    assert!(host
+        .sign_thread_follows("b".repeat(32), now - 120, payload.clone())
+        .await
+        .is_err());
+    let bad = serde_json::json!({"v":1,"client_id":"f","threads":{"bad":{"follow":true,"at":1}}});
+    assert!(host
+        .sign_thread_follows("b".repeat(32), now, bad)
+        .await
+        .is_err());
+    let mut tampered = signed.clone();
+    tampered["tags"] = serde_json::json!([["d", "channel-sort"], ["t", "thread-follows"]]);
+    assert!(host.decode_thread_follows(vec![tampered]).await.is_err());
+    assert!(host
+        .decode_thread_follows(vec![signed.clone(); 17])
+        .await
+        .is_err());
+    // An own event whose payload can't be read decodes to null, and is never
+    // published; a readable one is forwarded byte-for-byte.
+    let mut unreadable = signed.clone();
+    unreadable["content"] = "not-ciphertext".into();
+    let hash = Sha256::digest(
+        serde_json::to_vec(&serde_json::json!([
+            0,
+            unreadable["pubkey"],
+            unreadable["created_at"],
+            unreadable["kind"],
+            unreadable["tags"],
+            unreadable["content"]
+        ]))
+        .unwrap(),
+    );
+    let secp = secp256k1::Secp256k1::new();
+    let keypair = secp256k1::Keypair::from_seckey_byte_array(&secp, [1; 32]).unwrap();
+    unreadable["id"] = format!("{hash:x}").into();
+    unreadable["sig"] = secp
+        .sign_schnorr_no_aux_rand(&hash, &keypair)
+        .to_string()
+        .into();
+    let decoded = host
+        .decode_thread_follows(vec![unreadable.clone()])
+        .await
+        .unwrap();
+    assert!(decoded[0]["payload"].is_null());
+    assert!(super::readable_own_follows(&host, unreadable)
+        .await
+        .is_err());
+    assert_eq!(
+        super::readable_own_follows(&host, signed.clone())
+            .await
+            .unwrap(),
+        serde_json::to_string(&signed).unwrap()
+    );
+    // Follow client ids are 1-64 characters, like read state's.
+    for client_id in ["".to_string(), "é".repeat(65)] {
+        let payload = serde_json::json!({"v":1,"client_id":client_id,"threads":{}});
+        assert!(host
+            .sign_thread_follows("b".repeat(32), now, payload)
+            .await
+            .is_err());
+    }
+    let payload = serde_json::json!({"v":1,"client_id":"é".repeat(64),"threads":{}});
+    assert!(host
+        .sign_thread_follows("b".repeat(32), now, payload)
+        .await
+        .is_ok());
 }
 
 #[test]
@@ -4578,5 +4960,35 @@ async fn a_plugin_request_refused_without_the_users_sign_in_is_not_their_refusal
         if refusal.community == "https://plugin-refusal-marker.test" {
             break;
         }
+    }
+}
+
+#[test]
+fn huddle_end_requires_one_parent_and_a_distinct_room() {
+    let parent = "00000000-0000-4000-8000-000000000001";
+    let room = "00000000-0000-4000-8000-000000000002";
+    let mut event = EventTemplate {
+        kind: 48103,
+        created_at: 1,
+        content: serde_json::json!({"ephemeral_channel_id": room}).to_string(),
+        tags: vec![vec!["h".into(), parent.into()]],
+    };
+    assert!(validate_event("https://relay.test", &event).is_ok());
+    event
+        .tags
+        .push(vec!["client-id".into(), uuid::Uuid::new_v4().to_string()]);
+    event.tags.push(vec!["ms".into(), "999".into()]);
+    assert!(validate_event("https://relay.test", &event).is_ok());
+    event.tags.push(vec!["h".into(), room.into()]);
+    assert!(validate_event("https://relay.test", &event).is_err());
+    event.tags.pop();
+    for content in [
+        "{}".to_string(),
+        "bad".into(),
+        serde_json::json!({"ephemeral_channel_id":parent}).to_string(),
+        serde_json::json!({"ephemeral_channel_id":"bad"}).to_string(),
+    ] {
+        event.content = content;
+        assert!(validate_event("https://relay.test", &event).is_err());
     }
 }

@@ -12,7 +12,7 @@ import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { SidebarSection } from "./SidebarSection";
-
+import { MenuItem } from "../../shared/design-system/ui/Menu";
 afterEach(cleanup);
 
 it("chooses a filter with the keyboard and appends hidden channels below its options", async () => {
@@ -45,9 +45,7 @@ it("chooses a filter with the keyboard and appends hidden channels below its opt
   expect(
     await screen.findByRole("menuitemradio", { name: "Unreads" }),
   ).toHaveAttribute("aria-checked", "true");
-  await user.click(
-    screen.getByRole("menuitemradio", { name: /Active in the last/ }),
-  );
+  await user.click(screen.getByRole("menuitemradio", { name: "Active" }));
   expect(change).not.toHaveBeenCalled();
   await user.click(await screen.findByRole("button", { name: "Apply" }));
   expect(change).toHaveBeenCalledExactlyOnceWith("active", 30 * 86400);
@@ -66,7 +64,7 @@ it("chooses a filter with the keyboard and appends hidden channels below its opt
   expect(popup?.querySelector('[role="separator"]')).toBeInTheDocument();
   expect(
     screen
-      .getByRole("menuitemradio", { name: /Active in the last/ })
+      .getByRole("menuitemradio", { name: "Active" })
       .compareDocumentPosition(quiet) & Node.DOCUMENT_POSITION_FOLLOWING,
   ).toBeTruthy();
   // jsdom has no submenu geometry; browser checks own pointer travel/focus.
@@ -239,11 +237,11 @@ it("offers confirmed removal for custom sections", async () => {
     screen.getByRole("button", { name: "More actions for Work" }),
   );
   await user.click(
-    await screen.findByRole("menuitem", { name: "Remove section" }),
+    await screen.findByRole("menuitem", { name: "Remove workspace" }),
   );
   const confirmation = screen.getByRole("dialog", { name: "Remove Work?" });
   expect(confirmation).toHaveAccessibleDescription(
-    "1 channel will move back to Channels. This does not delete any channels.",
+    "1 conversation will return to their default sections.",
   );
   expect(remove).not.toHaveBeenCalled();
   await user.click(
@@ -254,12 +252,12 @@ it("offers confirmed removal for custom sections", async () => {
     screen.getByRole("button", { name: "More actions for Work" }),
   );
   await user.click(
-    await screen.findByRole("menuitem", { name: "Remove section" }),
+    await screen.findByRole("menuitem", { name: "Remove workspace" }),
   );
   await user.click(
     within(screen.getByRole("dialog", { name: "Remove Work?" })).getByRole(
       "button",
-      { name: "Remove section" },
+      { name: "Remove workspace" },
     ),
   );
   expect(remove).toHaveBeenCalledOnce();
@@ -290,12 +288,12 @@ it("holds confirmation while removing, shows failure, and permits explicit retry
     screen.getByRole("button", { name: "More actions for Work" }),
   );
   await user.click(
-    await screen.findByRole("menuitem", { name: "Remove section" }),
+    await screen.findByRole("menuitem", { name: "Remove workspace" }),
   );
   const dialog = screen.getByRole("dialog", { name: "Remove Work?" });
   try {
     await user.click(
-      within(dialog).getByRole("button", { name: "Remove section" }),
+      within(dialog).getByRole("button", { name: "Remove workspace" }),
     );
     await waitFor(() => expect(remove).toHaveBeenCalledOnce());
     expect(
@@ -316,7 +314,7 @@ it("holds confirmation while removing, shows failure, and permits explicit retry
   expect(screen.getByText("General", { exact: true })).toBeVisible();
   expect(within(dialog).getByRole("button", { name: "Cancel" })).toBeEnabled();
   await user.click(
-    within(dialog).getByRole("button", { name: "Remove section" }),
+    within(dialog).getByRole("button", { name: "Remove workspace" }),
   );
   await waitFor(() =>
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
@@ -346,11 +344,11 @@ it.each(["Cancel", "Escape"])(
     });
     await user.click(trigger);
     await user.click(
-      await screen.findByRole("menuitem", { name: "Remove section" }),
+      await screen.findByRole("menuitem", { name: "Remove workspace" }),
     );
     const dialog = screen.getByRole("dialog", { name: "Remove Work?" });
     await user.click(
-      within(dialog).getByRole("button", { name: "Remove section" }),
+      within(dialog).getByRole("button", { name: "Remove workspace" }),
     );
     expect(await within(dialog).findByRole("alert")).toHaveTextContent(
       "Publication not confirmed",
@@ -381,7 +379,9 @@ it("never offers removal for built-in sections even when a callback is supplied"
     screen.getByRole("button", { name: "More actions for Channels" }),
   );
   await screen.findByRole("menu", { name: "More actions for Channels" });
-  expect(screen.queryByRole("menuitem", { name: "Remove section" })).toBeNull();
+  expect(
+    screen.queryByRole("menuitem", { name: "Remove workspace" }),
+  ).toBeNull();
   expect(remove).not.toHaveBeenCalled();
 });
 
@@ -405,12 +405,12 @@ it.each([0, 2])(
       screen.getByRole("button", { name: "More actions for Work" }),
     );
     await user.click(
-      await screen.findByRole("menuitem", { name: "Remove section" }),
+      await screen.findByRole("menuitem", { name: "Remove workspace" }),
     );
     expect(
       screen.getByRole("dialog", { name: "Remove Work?" }),
     ).toHaveAccessibleDescription(
-      `${count} channels will move back to Channels. This does not delete any channels.`,
+      `${count} conversations will return to their default sections.`,
     );
   },
 );
@@ -481,60 +481,72 @@ it("keeps hidden-channel navigation available when filter choices are read-only"
   expect(change).not.toHaveBeenCalled();
 });
 
-it("renames a saved section from its menu and keeps the dialog open on failure", async () => {
+it("opens a filtered Solo chat without expanding its workspace", async () => {
   const user = userEvent.setup();
-  const rename = vi
-    .fn()
-    .mockRejectedValueOnce(new Error("offline"))
-    .mockResolvedValue(undefined);
+  function Workspace() {
+    const [open, setOpen] = useState(false);
+    const [chat, select] = useState<string>();
+    return (
+      <>
+        <SidebarSection
+          sectionKey="group:work"
+          title="Work"
+          open={open}
+          onToggle={setOpen}
+          filter={{ value: "unreads", change: () => {} }}
+          channels={{
+            rows: [{ id: "quiet", name: "Quiet chat", channelType: "solo" }],
+            select,
+          }}
+        >
+          <p>Workspace chats</p>
+        </SidebarSection>
+        <output aria-label="Open chat">{chat}</output>
+      </>
+    );
+  }
+  render(<Workspace />);
+  await user.click(
+    screen.getByRole("button", { name: "More actions for Work" }),
+  );
+  await user.click(await screen.findByRole("menuitem", { name: "Filter" }));
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Quiet chat" }));
+  expect(screen.getByLabelText("Open chat")).toHaveTextContent("quiet");
+  expect(screen.getByLabelText("Work").closest("details")).not.toHaveAttribute(
+    "open",
+  );
+});
+
+it("opens workspace settings from a saved section's menu", async () => {
+  const user = userEvent.setup();
+  const open = vi.fn();
   render(
     <SidebarSection
       sectionKey="group:work"
       title="Work"
       open
       onToggle={() => {}}
-      onRename={rename}
-    >
-      <p>Rows</p>
-    </SidebarSection>,
-  );
-  const trigger = screen.getByRole("button", { name: "More actions for Work" });
-  await user.click(trigger);
-  await user.click(
-    await screen.findByRole("menuitem", { name: "Rename section" }),
-  );
-  const dialog = await screen.findByRole("dialog", { name: "Rename section" });
-  const input = within(dialog).getByRole("textbox", { name: "Section name" });
-  expect(input).toHaveValue("Work");
-  await user.clear(input);
-  await user.type(input, " Projects ");
-  await user.click(within(dialog).getByRole("button", { name: "Rename" }));
-  expect(await within(dialog).findByRole("alert")).toHaveTextContent("offline");
-  await user.click(within(dialog).getByRole("button", { name: "Rename" }));
-  expect(rename).toHaveBeenNthCalledWith(2, "Projects");
-  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-  await waitFor(() => expect(trigger).toHaveFocus());
-});
-
-it("offers rename only for saved sections with a rename writer", async () => {
-  const user = userEvent.setup();
-  render(
-    <SidebarSection
-      sectionKey="channels"
-      title="Channels"
-      open
-      onToggle={() => {}}
-      onRename={() => {}}
-      move={{}}
+      menuActions={(dismiss) => (
+        <MenuItem
+          onClick={() => {
+            dismiss();
+            open();
+          }}
+        >
+          Workspace settings
+        </MenuItem>
+      )}
     >
       <p>Rows</p>
     </SidebarSection>,
   );
   await user.click(
-    screen.getByRole("button", { name: "More actions for Channels" }),
+    screen.getByRole("button", { name: "More actions for Work" }),
   );
-  await screen.findByRole("menuitem", { name: "Move up" });
-  expect(screen.queryByRole("menuitem", { name: "Rename section" })).toBeNull();
+  await user.click(
+    await screen.findByRole("menuitem", { name: "Workspace settings" }),
+  );
+  expect(open).toHaveBeenCalledOnce();
 });
 
 it("keeps the actions menu closed after it is hidden and shown again", async () => {

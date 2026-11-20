@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { BACKGROUND_JITTER_MS } from "../features/notifications/community-unread";
 import type { Context } from "@deepseek-ai/cordis";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { Host } from "../features/host/service";
+import type { Seen } from "../features/seen/service";
 import { createServices, type AppServices } from "./services";
 
 const plugin = vi.hoisted(() => ({
   cleanup: vi.fn<() => void | Promise<void>>(),
   host: undefined as Host | undefined,
+  seen: undefined as Seen | undefined,
 }));
 vi.mock("@tauri-apps/api/core", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@tauri-apps/api/core")>()),
@@ -27,6 +30,7 @@ vi.mock("../bundled", () => ({
         inject: ["pages", "host"],
         apply(ctx: Context) {
           plugin.host = ctx.host;
+          plugin.seen = ctx.reflect.get("seen");
           ctx.pages.register({
             id: "main",
             title: "Test",
@@ -53,6 +57,7 @@ beforeEach(() => {
   vi.stubGlobal("navigator", { platform: "MacIntel" });
   plugin.cleanup.mockReset();
   plugin.host = undefined;
+  plugin.seen = undefined;
   vi.mocked(isTauri).mockReturnValue(false);
   vi.mocked(invoke).mockReset();
   values = new Map<string, string>();
@@ -116,6 +121,15 @@ afterEach(async () => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   vi.useRealTimers();
+});
+
+it("provides Seen through optional lookup even with no selected community", async () => {
+  await vi.advanceTimersByTimeAsync(0);
+  expect(services.communities.snapshot().selected).toBeNull();
+  const key = "test.page/welcome";
+  expect(plugin.seen?.has(key)).toBe(false);
+  plugin.seen?.mark(key);
+  expect(services.seen.has(key)).toBe(true);
 });
 
 async function openCommunities() {
@@ -190,7 +204,12 @@ it.each([
     ).toEqual(["buzz.emoji/picker", "buzz.mentions/picker"]);
     expect(
       services.conversation.completions.snapshot().map(({ key }) => key),
-    ).toEqual(["buzz.emoji/typeahead", "buzz.mentions/typeahead"]);
+    ).toEqual([
+      "buzz.emoji/typeahead",
+      "buzz.mentions/typeahead",
+      "buzz.mentions/folders",
+      "buzz.mentions/skills",
+    ]);
     expect(
       services.conversation.inline.snapshot().map(({ key }) => key),
     ).toEqual(["buzz.emoji/custom"]);
@@ -451,7 +470,12 @@ it("restores the selected native community and recovers discovery failure withou
     viewer,
     scope: `${community}:${viewer}`,
   });
-  expect(new Set(destinations)).toEqual(new Set([community]));
+  // The other saved community connects in the background for switcher unread,
+  // once its start delay ends.
+  await vi.advanceTimersByTimeAsync(BACKGROUND_JITTER_MS);
+  expect(new Set(destinations)).toEqual(
+    new Set([community, "https://unopened.test"]),
+  );
   expect(fetch).not.toHaveBeenCalled();
 });
 
@@ -526,7 +550,8 @@ it("seeds a packaged native community after onboarding and preserves the user's 
   await vi.advanceTimersByTimeAsync(0);
   expect(services.communities.snapshot().selected).toBe(membership.id);
   expect(services.relay.snapshot().status).toBe("ready");
-  // Choosing Personal space also survives restart, without a new relay connection.
+  // Choosing Personal space also survives restart; the saved community still
+  // connects in the background for switcher unread.
   services.communities.select(null);
   await services.dispose();
   destinations.length = 0;
@@ -536,7 +561,8 @@ it("seeds a packaged native community after onboarding and preserves the user's 
     selected: null,
     memberships: [membership],
   });
-  expect(destinations).toEqual([]);
+  await vi.advanceTimersByTimeAsync(BACKGROUND_JITTER_MS);
+  expect(new Set(destinations)).toEqual(new Set([membership.id]));
   expect(fetch).not.toHaveBeenCalled();
 });
 

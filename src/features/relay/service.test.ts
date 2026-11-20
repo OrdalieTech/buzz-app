@@ -54,6 +54,32 @@ it("shares a session above plugin lifetimes, rather than one store per consumer"
   expect(connect).toHaveBeenCalledTimes(1);
   expect(source.query).toHaveBeenCalledTimes(1);
 });
+it("publishes the community ID its transport read, and reads it again for a new session", async () => {
+  const ctx = root();
+  const reads = (communityId?: string): ReadTransport => ({
+    ...transport("viewer"),
+    readState: {
+      ...(communityId ? { communityId } : {}),
+      decode: async () => [],
+    },
+  });
+  const connect = vi
+    .fn()
+    .mockResolvedValueOnce(reads("22222222-2222-4222-8222-222222222222"))
+    .mockResolvedValueOnce(reads());
+  const data = provideRelay(ctx, connect);
+  await flush();
+  expect(data.snapshot()).toMatchObject({
+    status: "ready",
+    communityId: "22222222-2222-4222-8222-222222222222",
+  });
+  const first = data.snapshot().session;
+  data.retry();
+  await flush();
+  await vi.waitFor(() => expect(data.snapshot().session).not.toBe(first));
+  expect(data.snapshot().status).toBe("ready");
+  expect(data.snapshot().communityId).toBeUndefined();
+});
 it("keeps app startup demand-driven while retaining hover preparation and cached opening", async () => {
   const viewer = keypair();
   const relay = keypair();
@@ -139,6 +165,84 @@ it("reconnects a connection the federated session refused once it is signed in",
   await flush();
   expect(connect).toHaveBeenCalledTimes(2);
   expect(data.snapshot().status).toBe("ready");
+});
+it("makes Try again ask the issuer again for a refused connection before reconnecting", async () => {
+  const ctx = root();
+  const order: string[] = [];
+  const listeners = new Set<(kind: "sign-in" | "access") => void>();
+  const connect = vi.fn(async (): Promise<ReadTransport> => {
+    order.push("connect");
+    return {
+      ...transport("viewer"),
+      scope: "https://relay.example",
+      observeRefusal(listener) {
+        listeners.add(listener);
+        return () => void listeners.delete(listener);
+      },
+    };
+  });
+  const askAgain = vi.fn(async (relay: string) => {
+    order.push(`ask again ${relay}`);
+  });
+  const data = provideRelay(
+    ctx,
+    connect,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    askAgain,
+  );
+  await flush();
+  for (const listener of [...listeners]) listener("access");
+  await flush();
+  expect(data.snapshot()).toMatchObject({ status: "error", denied: true });
+  // An automatic reconnect does not ask.
+  data.retry();
+  await flush();
+  expect(askAgain).not.toHaveBeenCalled();
+  for (const listener of [...listeners]) listener("access");
+  await flush();
+  data.tryAgain();
+  // The attempt starts at once, so a route retried next sees it under way.
+  expect(data.snapshot().status).toBe("connecting");
+  // A second press while it runs joins it, but still asks, so an attempt
+  // already past its own ask can't repeat a cached refusal.
+  data.tryAgain();
+  await flush();
+  const ask = `ask again ${data.snapshot().origin}`;
+  expect(order).toEqual(["connect", "connect", ask, ask, "connect"]);
+  expect(data.snapshot().origin).toMatch(/relay\.example/);
+  expect(data.snapshot().status).toBe("ready");
+});
+it("makes Try again on a ready connection retry what failed, without reconnecting", async () => {
+  const ctx = root();
+  const connect = vi.fn(async () => transport("viewer"));
+  const askAgain = vi.fn(async () => {
+    throw new Error("unavailable");
+  });
+  const data = provideRelay(
+    ctx,
+    connect,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    askAgain,
+  );
+  await flush();
+  const recovery = data.snapshot().session.recovery;
+  expect(recovery?.snapshot().reauthorized ?? 0).toBe(0);
+  data.tryAgain();
+  await flush();
+  // A failed ask still retries: every failed read and the live socket.
+  expect(askAgain).toHaveBeenCalledOnce();
+  expect(recovery?.snapshot().reauthorized).toBe(1);
+  expect(connect).toHaveBeenCalledTimes(1);
 });
 it("asks a live socket that may have died during sleep to answer", async () => {
   vi.useFakeTimers();

@@ -261,6 +261,61 @@ it("notifies once per replay, then once per live change", async () => {
   }
 });
 
+it.each(["empty", "checked", "pending", "revoked"] as const)(
+  "publishes only evidence revisions after a refused %s sync",
+  async (state) => {
+    const { createProfileDirectory } = await import("./profile-directory");
+    let sink: VerifiedProfileSink | undefined;
+    const directory = createProfileDirectory(
+      { read: async () => [] },
+      undefined,
+      undefined,
+      {
+        authority,
+        subscribe(_filter, next) {
+          sink = next;
+          return () => {};
+        },
+      },
+    );
+    try {
+      await directory.ensure([alice.pubkey]);
+      assert(sink);
+      if (state !== "empty")
+        sink.event(state === "revoked" ? retract(11) : projection(11));
+      if (state === "checked") {
+        sink.eose();
+        await tick();
+      }
+      const before = directory.queries.verifiedRevision?.() ?? 0;
+      const changed = vi.fn();
+      directory.queries.subscribe(changed);
+      sink.closed("error: relay refused verification");
+      await tick();
+      if (state === "pending" || state === "revoked") {
+        expect(directory.queries.verifiedRevision?.()).toBeGreaterThan(before);
+        expect(directory.queries.verifiedSince?.(alice.pubkey, before)).toBe(
+          true,
+        );
+      } else expect(directory.queries.verifiedRevision?.()).toBe(before);
+      if (state === "empty") expect(changed).not.toHaveBeenCalled();
+      else expect(changed).toHaveBeenCalledTimes(1);
+      if (state === "checked" || state === "pending")
+        expect(
+          directory.queries.snapshot().get(alice.pubkey)?.verified?.status,
+        ).toBe("cached");
+      if (state === "revoked") {
+        expect(directory.queries.verifiedHeld?.(alice.pubkey)).toBe(true);
+        expect(
+          directory.queries.snapshot().get(alice.pubkey)?.verified,
+        ).toBeUndefined();
+      }
+    } finally {
+      directory.dispose();
+    }
+  },
+);
+
 it("a newer malformed projection invalidates an older valid name", async () => {
   const h = harness();
   try {
@@ -478,6 +533,172 @@ it("qualifies verified namesakes and shared usernames, but not a unique verified
     await tick(); // Verified changes publish on the next macrotask.
     expect(name(alice)).toBe("Sam");
     expect(name(carol)).toBe("Carol");
+  } finally {
+    directory.dispose();
+  }
+});
+
+it("does not count an archived identity as a namesake of an active one", async () => {
+  const { createProfileDirectory } = await import("./profile-directory");
+  const carol = keypair();
+  const verifiedAs = (subject: string, displayName: string, username: string) =>
+    eventDto(
+      signed(relay, {
+        kind: 30382,
+        content: "",
+        created_at: 10,
+        tags: [
+          ["d", subject],
+          ["p", subject],
+          ["active", "true"],
+          ["display_name", displayName],
+          ["username", username],
+          ["issuer_label", "Example"],
+          ["verified_at", "10"],
+        ],
+      }),
+    );
+  let archived: readonly string[] = [];
+  let status: "idle" | "ready" = "idle";
+  const listeners = new Set<() => void>();
+  const setArchived = (ids: readonly string[]) => {
+    status = "ready";
+    archived = ids;
+    for (const listener of listeners) listener();
+  };
+  const ensure = vi.fn(async () => {
+    await tick(); // A real archive read answers asynchronously.
+    setArchived([bob.pubkey, carol.pubkey]);
+  });
+  const archives = {
+    snapshot: () => ({ status, archived }),
+    ensure,
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+  let sink: VerifiedProfileSink | undefined;
+  const directory = createProfileDirectory(
+    { read: async () => [] },
+    undefined,
+    undefined,
+    {
+      authority: { ...authority, multipleIssuers: false },
+      subscribe(_filter, next) {
+        sink = next;
+        return () => {};
+      },
+    },
+    archives,
+  );
+  try {
+    const people = [alice, bob, carol];
+    directory.accept(
+      people.map((key) =>
+        eventDto(signed(key, { kind: 0, tags: [], content: "{}" })),
+      ),
+    );
+    await directory.ensure(people.map((key) => key.pubkey));
+    assert(sink);
+    sink.event(verifiedAs(alice.pubkey, "Sam", "sam"));
+    sink.event(verifiedAs(bob.pubkey, "Sam", "sam"));
+    sink.event(verifiedAs(carol.pubkey, "Sam", "sam"));
+    sink.eose();
+    await tick(); // Verified changes publish on the next macrotask.
+    const name = (key: { pubkey: string }) =>
+      directory.queries.snapshot().get(key.pubkey)?.name;
+    const suffixed = (key: { pubkey: string }) =>
+      `Sam (${key.pubkey.slice(0, 10)})`;
+    // The collision reads archives, and their arrival refolds the labels.
+    expect(ensure).toHaveBeenCalledOnce();
+    await tick();
+    expect(name(alice)).toBe("Sam");
+    expect(name(bob)).toBe(suffixed(bob));
+    expect(name(carol)).toBe(suffixed(carol));
+    setArchived([carol.pubkey]);
+    expect(name(alice)).toBe(suffixed(alice));
+    expect(name(bob)).toBe(suffixed(bob));
+    expect(name(carol)).toBe(suffixed(carol));
+  } finally {
+    directory.dispose();
+  }
+});
+
+it("keeps a self-declared name suffixed beside an archived verified namesake", async () => {
+  const { createProfileDirectory } = await import("./profile-directory");
+  let sink: VerifiedProfileSink | undefined;
+  const directory = createProfileDirectory(
+    { read: async () => [] },
+    undefined,
+    undefined,
+    {
+      authority: { ...authority, multipleIssuers: false },
+      subscribe(_filter, next) {
+        sink = next;
+        return () => {};
+      },
+    },
+    {
+      snapshot: () => ({ status: "ready", archived: [alice.pubkey] }),
+      subscribe: () => () => {},
+      ensure: async () => {},
+    },
+  );
+  try {
+    directory.accept([
+      eventDto(signed(alice, { kind: 0, tags: [], content: "{}" })),
+      eventDto(signed(bob, { kind: 0, tags: [], content: '{"name":"Sam"}' })),
+    ]);
+    await directory.ensure([alice.pubkey, bob.pubkey]);
+    assert(sink);
+    sink.event(projection(10, alice.pubkey, [], "Sam"));
+    sink.eose();
+    await tick(); // Verified changes publish on the next macrotask.
+    expect(directory.queries.snapshot().get(bob.pubkey)?.name).toBe(
+      `Sam (${bob.pubkey.slice(0, 10)})`,
+    );
+  } finally {
+    directory.dispose();
+  }
+});
+
+it("reads no archives for a directory without verified namesakes", async () => {
+  const { createProfileDirectory } = await import("./profile-directory");
+  const ensure = vi.fn(async () => {});
+  let sink: VerifiedProfileSink | undefined;
+  const directory = createProfileDirectory(
+    { read: async () => [] },
+    undefined,
+    undefined,
+    {
+      authority: { ...authority, multipleIssuers: false },
+      subscribe(_filter, next) {
+        sink = next;
+        return () => {};
+      },
+    },
+    {
+      snapshot: () => ({ status: "idle", archived: [] }),
+      subscribe: () => () => {},
+      ensure,
+    },
+  );
+  try {
+    directory.accept(
+      [alice, bob].map((key) =>
+        eventDto(signed(key, { kind: 0, tags: [], content: "{}" })),
+      ),
+    );
+    await directory.ensure([alice.pubkey, bob.pubkey]);
+    assert(sink);
+    sink.event(projection());
+    sink.eose();
+    await tick(); // Verified changes publish on the next macrotask.
+    expect(
+      directory.queries.snapshot().get(alice.pubkey)?.verified,
+    ).toBeTruthy();
+    expect(ensure).not.toHaveBeenCalled();
   } finally {
     directory.dispose();
   }
@@ -1298,5 +1519,243 @@ it("replays in full a batch that had not reached EOSE or was rebuilt", async () 
     expect(rebuilt.since).toBeUndefined();
   } finally {
     h.directory.dispose();
+  }
+});
+
+it("restores saved heads as cached until a sync answers, never over a sync's answer", async () => {
+  const h = harness();
+  try {
+    h.directory.ensure([bob.pubkey]);
+    await Promise.resolve();
+    const first = h.subscriptions[0];
+    assert(first);
+    first.sink.eose(); // Bob has no head.
+    const carol = keypair();
+    const {
+      id: _id,
+      sig: _sig,
+      pubkey: _pubkey,
+      ...template
+    } = projection(10, carol.pubkey);
+    const foreign = eventDto(signed(keypair(), template));
+    // Right id and bytes, but no proof: a record must be checked to restore.
+    const unchecked = JSON.parse(JSON.stringify(projection(10, carol.pubkey)));
+    h.changed.mockClear();
+    const saved = projection(10);
+    h.directory.restore([
+      saved,
+      projection(10, bob.pubkey, [], "Bob"),
+      foreign,
+      unchecked,
+    ]);
+    expect(h.changed).toHaveBeenCalledTimes(1);
+    expect([...h.directory.snapshot()]).toEqual([
+      [alice.pubkey, expect.objectContaining({ status: "cached" })],
+    ]);
+    expect(h.directory.heads(10)).toEqual([saved]);
+    await Promise.resolve();
+    const second = h.subscriptions[1];
+    assert(second);
+    // Alice joins the open batch, so a sync rechecks her.
+    expect(second.subjects).toEqual([bob.pubkey, alice.pubkey]);
+    second.sink.eose(); // The relay no longer holds Alice's head.
+    expect(h.directory.snapshot().size).toBe(0);
+    h.directory.restore([saved]);
+    expect(h.directory.snapshot().size).toBe(0);
+  } finally {
+    h.directory.dispose();
+  }
+});
+
+it("keeps a sync's removal over a restored head after a disconnect", async () => {
+  const h = harness();
+  try {
+    h.directory.ensure([alice.pubkey]);
+    await Promise.resolve();
+    const sink = h.subscriptions[0]?.sink;
+    assert(sink);
+    sink.eose(); // The relay no longer holds Alice's head.
+    h.directory.connected(false);
+    // The disk copy is read after the disconnect cleared checked status.
+    h.directory.restore([projection(10)]);
+    expect(h.directory.snapshot().size).toBe(0);
+    expect(h.directory.heads(10)).toEqual([]);
+  } finally {
+    h.directory.dispose();
+  }
+});
+
+it("restores nothing while discovery has no authority", async () => {
+  const subscribe = vi.fn(() => () => {});
+  const changed = vi.fn();
+  const directory = createVerifiedProfileDirectory(
+    undefined,
+    subscribe,
+    changed,
+  );
+  try {
+    directory.restore([projection(10)]);
+    await Promise.resolve();
+    expect(directory.snapshot().size).toBe(0);
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(changed).not.toHaveBeenCalled();
+  } finally {
+    directory.dispose();
+  }
+});
+
+it("restores only into room the limit leaves, never over a checked head", async () => {
+  const h = harness();
+  try {
+    h.directory.resize(3);
+    h.directory.ensure([alice.pubkey, bob.pubkey]);
+    await Promise.resolve();
+    const sink = h.subscriptions[0]?.sink;
+    assert(sink);
+    sink.event(projection(10));
+    sink.event(projection(10, bob.pubkey, [], "Bob"));
+    sink.eose();
+    const [carol, dave] = [keypair(), keypair()];
+    h.directory.restore([
+      projection(10, carol.pubkey, [], "Carol"),
+      projection(10, dave.pubkey, [], "Dave"),
+    ]);
+    const shown = h.directory.snapshot();
+    expect(shown.get(alice.pubkey)?.status).toBe("checked");
+    expect(shown.get(bob.pubkey)?.status).toBe("checked");
+    expect(shown.size).toBe(3);
+  } finally {
+    h.directory.dispose();
+  }
+});
+
+async function archivedNamesakes(archiveRead: () => Promise<unknown[]>) {
+  const { createProfileDirectory } = await import("./profile-directory");
+  const { createIdentityArchives } = await import("./identity-archives");
+  const read = vi.fn(archiveRead);
+  const archives = createIdentityArchives({ read } as never, relay.pubkey);
+  let sink: VerifiedProfileSink | undefined;
+  const directory = createProfileDirectory(
+    { read: async () => [] },
+    undefined,
+    undefined,
+    {
+      authority: { ...authority, multipleIssuers: false },
+      subscribe(_filter, next) {
+        sink = next;
+        return () => {};
+      },
+    },
+    archives.queries,
+  );
+  const verifyAsSam = async () => {
+    const people = [alice, bob];
+    directory.accept(
+      people.map((key) =>
+        eventDto(signed(key, { kind: 0, tags: [], content: "{}" })),
+      ),
+    );
+    await directory.ensure(people.map((key) => key.pubkey));
+    assert(sink);
+    for (const key of people)
+      sink.event(
+        eventDto(
+          signed(relay, {
+            kind: 30382,
+            content: "",
+            created_at: 10,
+            tags: [
+              ["d", key.pubkey],
+              ["p", key.pubkey],
+              ["active", "true"],
+              ["display_name", "Sam"],
+              ["username", "sam"],
+              ["issuer_label", "Example"],
+              ["verified_at", "10"],
+            ],
+          }),
+        ),
+      );
+    sink.eose();
+    await tick(); // Verified changes publish on the next macrotask.
+  };
+  return { archives, directory, read, verifyAsSam };
+}
+const bobArchived = () =>
+  signed(relay, {
+    kind: 13535,
+    created_at: 1,
+    content: "",
+    tags: [["-"], ["p", bob.pubkey]],
+  });
+
+it("skips the archive read while offline and runs it once on reconnect", async () => {
+  const h = await archivedNamesakes(async () => [bobArchived()]);
+  try {
+    await h.verifyAsSam();
+    await vi.waitFor(() =>
+      expect(h.archives.queries.snapshot().status).toBe("ready"),
+    );
+    expect(h.read).toHaveBeenCalledOnce();
+    // The session's disconnect order: the directory, then the archives.
+    h.directory.connected(false);
+    h.archives.stale();
+    await tick(); // The queued verified flush lands offline.
+    expect(h.read).toHaveBeenCalledOnce();
+    expect(h.archives.queries.snapshot().status).toBe("idle");
+    h.directory.connected(true);
+    await tick();
+    expect(h.read).toHaveBeenCalledTimes(2);
+    await h.archives.queries.ensure(); // A picker opens.
+    expect(h.read).toHaveBeenCalledTimes(2);
+  } finally {
+    h.directory.dispose();
+    h.archives.dispose();
+  }
+});
+
+it("starts the archive read after publishing, so a reentrant clear stands", async () => {
+  const h = await archivedNamesakes(async () => [bobArchived()]);
+  let cleared = false;
+  const afterClear: number[] = [];
+  const stopArchives = h.archives.queries.subscribe(() => {
+    if (cleared || h.archives.queries.snapshot().status !== "loading") return;
+    cleared = true;
+    h.directory.clear();
+  });
+  const stopDirectory = h.directory.queries.subscribe(() => {
+    if (cleared) afterClear.push(h.directory.queries.snapshot().size);
+  });
+  try {
+    await h.verifyAsSam();
+    expect(cleared).toBe(true);
+    // No publish after the clear may restore the profiles it dropped.
+    expect(afterClear).not.toHaveLength(0);
+    expect(afterClear.every((size) => size === 0)).toBe(true);
+  } finally {
+    stopArchives();
+    stopDirectory();
+    h.directory.dispose();
+    h.archives.dispose();
+  }
+});
+
+it("reads archives once when reconnecting before the queued flush lands", async () => {
+  const h = await archivedNamesakes(async () => [bobArchived()]);
+  try {
+    await h.verifyAsSam();
+    await vi.waitFor(() =>
+      expect(h.archives.queries.snapshot().status).toBe("ready"),
+    );
+    h.directory.connected(false);
+    h.archives.stale();
+    h.directory.connected(true);
+    await tick(); // The queued verified flush lands online.
+    expect(h.read).toHaveBeenCalledTimes(2);
+    await h.archives.queries.ensure(); // A picker opens.
+    expect(h.read).toHaveBeenCalledTimes(2);
+  } finally {
+    h.directory.dispose();
+    h.archives.dispose();
   }
 });

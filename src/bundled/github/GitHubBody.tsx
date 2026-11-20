@@ -1,12 +1,23 @@
 import {
   Children,
+  createContext,
+  Fragment,
   isValidElement,
   memo,
+  useContext,
+  useEffect,
   useMemo,
+  useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
 } from "react";
-import Markdown, { type ExtraProps } from "react-markdown";
+import type { Components, ExtraProps } from "react-markdown";
+import {
+  MarkdownDocument,
+  sharedComponents,
+} from "../../features/markdown/MarkdownDocument";
+import type { MarkdownProfile } from "../../features/markdown/profiles";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import type { PhrasingContent, Root, RootContent } from "mdast";
@@ -22,15 +33,17 @@ import {
   attachmentMetadata,
   bodyUrl,
   inertHtml,
+  knownSize,
+  rememberSize,
+  signedUrl,
+  type Size,
 } from "./attachments";
 import styles from "./GitHub.module.css";
 
-function containsImage(node: NonNullable<ExtraProps["node"]>): boolean {
-  return (
-    node.tagName === "img" ||
-    node.children.some(
-      (child) => child.type === "element" && containsImage(child),
-    )
+function images(node: NonNullable<ExtraProps["node"]>): unknown[] {
+  if (node.tagName === "img") return [node.properties.src];
+  return node.children.flatMap((child) =>
+    child.type === "element" ? images(child) : [],
   );
 }
 
@@ -54,14 +67,18 @@ function htmlContent(html: string): PhrasingContent[] {
     if (!(node instanceof Element)) return [];
     if (depth > MAX_MARKDOWN_DEPTH)
       return [{ type: "text", value: node.outerHTML }];
-    if (node.localName === "img")
+    if (node.localName === "img") {
+      const width = Number(node.getAttribute("width"));
       return [
         {
           type: "image",
           url: node.getAttribute("src") ?? "",
           alt: node.getAttribute("alt") ?? "",
+          ...(Number.isInteger(width) &&
+            width > 0 && { data: { hProperties: { width } } }),
         },
       ];
+    }
 
     const children = [...node.childNodes].flatMap((child) =>
       convert(child, depth + 1),
@@ -173,36 +190,192 @@ function githubHtml() {
 }
 
 function EmbeddedAttachment({
+  source,
+  signed,
+  image = false,
   children,
   fallback,
   caption,
+  width,
+  onMedia,
 }: {
-  children: ReactNode;
+  source: string;
+  /** The latest signed link for `source` in the rendered HTML. */
+  signed?: string | undefined;
+  image?: boolean;
+  children(src: string, size: Size | undefined): ReactNode;
   fallback: ReactNode;
   caption: ReactNode;
+  /** The authored width, which bounds the frame before the media loads. */
+  width?: number | undefined;
+  /** The signed link `src` loaded, or failed. */
+  onMedia?: ((loaded: boolean, src: string) => void) | undefined;
 }) {
   const [loaded, setLoaded] = useState(false);
+  // Media loads its own link first. When that fails it takes the signed link,
+  // and when that fails the next one read; a working link stays, so media
+  // does not reload or restart when the body is read again.
+  const [shown, setShown] = useState(source);
+  const [failed, setFailed] = useState(false);
+  if (failed && signed && signed !== shown) {
+    setShown(signed);
+    setFailed(false);
+  }
+  const [size, setSize] = useState(() => knownSize(source));
+  // GitHub gives no image height, so an image loads at once, off screen, and
+  // its frame takes the image's size before it scrolls into view. Like the
+  // shown link, the probe keeps its link until that link fails.
+  const [probe, setProbe] = useState(() =>
+    image && !size ? (signed ?? source) : undefined,
+  );
+  const [probeFailed, setProbeFailed] = useState(false);
+  if (probeFailed && signed && signed !== probe) {
+    setProbe(signed);
+    setProbeFailed(false);
+  }
+  useEffect(() => {
+    if (!probe) return;
+    const element = new Image();
+    element.onload = () => {
+      const { naturalWidth: width, naturalHeight: height } = element;
+      rememberSize(source, { width, height });
+      if (width > 0 && height > 0) setSize({ width, height });
+    };
+    element.onerror = () => setProbeFailed(true);
+    element.src = probe;
+    return () => {
+      element.onload = null;
+      element.onerror = null;
+    };
+  }, [probe, source]);
+  const show = (next: boolean) => {
+    setLoaded(next);
+    setFailed(!next);
+    if (shown !== source) onMedia?.(next, shown);
+  };
   return (
     <div
       className={styles.attachment}
-      onLoadCapture={() => setLoaded(true)}
-      onLoadedDataCapture={() => setLoaded(true)}
-      onErrorCapture={() => setLoaded(false)}
+      style={
+        width
+          ? ({ "--attachment-width": `${width}px` } as CSSProperties)
+          : undefined
+      }
+      onLoadCapture={(event) => {
+        show(true);
+        if (!image || !(event.target instanceof HTMLImageElement)) return;
+        const { naturalWidth: width, naturalHeight: height } = event.target;
+        rememberSize(source, { width, height });
+        // A remembered size can be stale when the image changed since.
+        if (width > 0 && height > 0)
+          setSize((current) =>
+            current?.width === width && current.height === height
+              ? current
+              : { width, height },
+          );
+      }}
+      onLoadedDataCapture={() => show(true)}
+      // A video player reloads after a network failure (code 2) on its own,
+      // so that keeps its link and only shows the original link until the
+      // video loads again. An expired or missing link fails as unsupported
+      // (code 4) in Chromium and WebKit, and takes another link. Audio has no
+      // quiet reload, so any audio failure does.
+      onLoadedMetadataCapture={(event) => {
+        setLoaded(true);
+        if (event.target instanceof HTMLVideoElement)
+          rememberSize(source, {
+            width: event.target.videoWidth,
+            height: event.target.videoHeight,
+          });
+      }}
+      onErrorCapture={(event) => {
+        const target = event.target;
+        if (target instanceof HTMLVideoElement && target.error?.code === 2) {
+          setLoaded(false);
+          return;
+        }
+        show(false);
+      }}
     >
-      {children}
-      {loaded ? caption : fallback}
+      {/* Media keeps a failure until remounted with a new source. */}
+      <Fragment key={shown}>{children(shown, size)}</Fragment>
+      {/* An image's frame holds its place, so its link shows only if it fails. */}
+      {loaded ? caption : image && !failed ? null : fallback}
     </div>
   );
 }
 
+type Media = (
+  source: string,
+  label: ReactNode,
+  image?: boolean,
+  description?: string,
+  width?: number,
+) => ReactNode;
+const MediaContext = createContext<Media>((source) => source);
+
+const PROFILE: MarkdownProfile = {
+  syntax: [remarkGfm],
+  transforms: [remarkBreaks, githubHtml],
+  html: "convert",
+};
+
+// Stable across renders, so a body read again keeps its media elements.
+const components: Components = {
+  ...sharedComponents,
+  // Players are block elements, including when embedded in prose.
+  p: ({ children }) => <div className={styles.paragraph}>{children}</div>,
+  a: function MarkdownLink({ href, children, node }) {
+    const media = useContext(MediaContext);
+    if (!href) return <>{children}</>;
+    const linked = node ? images(node) : [];
+    if (linked.length)
+      return (
+        <div>
+          {children}
+          {/* GitHub links an uploaded image to itself; the preview opens it. */}
+          {!linked.every((src) => src === href) && (
+            <a href={href} target="_blank" rel="noreferrer">
+              {href}
+            </a>
+          )}
+        </div>
+      );
+    return media(href, children, false, plainText(children) || undefined);
+  },
+  img: function MarkdownImage({ src, alt, width }) {
+    const media = useContext(MediaContext);
+    return typeof src === "string" && src
+      ? media(src, alt, true, alt, Number(width) || undefined)
+      : alt;
+  },
+  table: ({ children }) => (
+    <div className={styles.tableScroll}>
+      <table>{children}</table>
+    </div>
+  ),
+};
+
+const RETRY_DELAY = 30_000;
+const MAX_RETRIES = 3;
+
+/** A private repository's media links need a GitHub sign-in; `bodyHtml` has
+ * signed links for them that expire within minutes and change on every read.
+ * Media whose own link fails takes its signed link, and when that fails reads
+ * GitHub again with `refresh` and takes the link read. Each source reads at
+ * once only on its first failure; when a read leaves media failed with no
+ * newer link to try, it reads again after 30 seconds, at most three times.
+ * So a mount reads at most once per signed source plus three times. */
 export const GitHubBody = memo(function GitHubBody({
   body,
   bodyHtml,
   url,
+  refresh,
 }: {
   body: string;
   bodyHtml?: string | undefined;
   url: string;
+  refresh?: (() => Promise<unknown>) | undefined;
 }) {
   const bounded = useMemo(
     () => body.length <= MAX_MARKDOWN_LENGTH && !scanMarkdown(body).tooDeep,
@@ -212,15 +385,85 @@ export const GitHubBody = memo(function GitHubBody({
     () => (bounded ? attachmentMetadata(bodyHtml) : new Map()),
     [bounded, bodyHtml],
   );
+  // One read at a time, and at most once per signed source plus three
+  // retries per mount: a source that already read at once (`tried`, kept
+  // through loads) waits for a retry. `failed` keeps each source's failed
+  // signed link until a signed link for it loads.
+  const failed = useRef(new Map<string, string>());
+  const tried = useRef(new Set<string>());
+  const reading = useRef(false);
+  const retry = useRef<{
+    timer?: ReturnType<typeof setTimeout> | undefined;
+    count: number;
+    stopped?: boolean;
+  }>({ count: 0 });
+  // A retry reads with the latest body's links and refresh.
+  const latest = useRef({ metadata, refresh });
+  useEffect(() => {
+    latest.current = { metadata, refresh };
+  }, [metadata, refresh]);
+  useEffect(() => {
+    const state = retry.current;
+    state.stopped = false;
+    return () => {
+      state.stopped = true;
+      clearTimeout(state.timer);
+      state.timer = undefined;
+    };
+  }, []);
   if (!bounded) return <div className={styles.plainBody}>{body}</div>;
 
-  const media = (
-    source: string,
-    label: ReactNode,
-    image = false,
-    description?: string,
-  ) => {
+  // Failed media whose latest signed link is the one that failed.
+  const stuck = () =>
+    [...failed.current].some(
+      ([source, link]) => signedUrl(source, latest.current.metadata) === link,
+    );
+  const read = () => {
+    const current = latest.current.refresh;
+    if (!current) return;
+    reading.current = true;
+    const done = () => {
+      reading.current = false;
+      later();
+    };
+    current().then(done, done);
+  };
+  const later = () => {
+    const state = retry.current;
+    if (
+      state.stopped ||
+      state.timer ||
+      reading.current ||
+      state.count >= MAX_RETRIES ||
+      !stuck()
+    )
+      return;
+    state.timer = setTimeout(() => {
+      state.timer = undefined;
+      // A read in flight retries when it settles; links read meanwhile are
+      // tried first.
+      if (reading.current || !stuck()) return;
+      state.count += 1;
+      read();
+    }, RETRY_DELAY);
+  };
+  const renew = (source: string, loaded: boolean, link: string) => {
+    if (!refresh) return;
+    if (loaded) {
+      failed.current.delete(source);
+      return;
+    }
+    failed.current.set(source, link);
+    if (tried.current.has(source) || reading.current) later();
+    else {
+      tried.current.add(source);
+      read();
+    }
+  };
+
+  const media: Media = (source, label, image = false, description, width) => {
     const attachment = attachmentFor(source, metadata, image);
+    const signed = signedUrl(source, metadata);
     const link = (
       <a href={source} target="_blank" rel="noreferrer">
         {label || attachment?.name || "Open attachment"}
@@ -230,6 +473,14 @@ export const GitHubBody = memo(function GitHubBody({
     return (
       <EmbeddedAttachment
         key={source}
+        source={source}
+        {...(signed && {
+          signed,
+          onMedia: (loaded: boolean, link: string) =>
+            renew(source, loaded, link),
+        })}
+        image={attachment.kind === "image"}
+        width={width}
         fallback={link}
         caption={
           !image && Children.toArray(label).some((part) => part !== source)
@@ -237,61 +488,37 @@ export const GitHubBody = memo(function GitHubBody({
             : null
         }
       >
-        {attachment.kind === "audio" ? (
-          <AudioAttachment attachment={attachment} source={source} />
-        ) : (
-          <MediaAttachment
-            attachment={attachment}
-            media={(value) => value}
-            {...(description !== undefined
-              ? { imageDescription: description }
-              : {})}
-            preload="metadata"
-          />
-        )}
+        {(src, size) =>
+          attachment.kind === "audio" ? (
+            <AudioAttachment attachment={attachment} source={src} />
+          ) : (
+            <MediaAttachment
+              attachment={
+                size ? { ...attachment, dimensions: size } : attachment
+              }
+              media={() => src}
+              {...(description !== undefined
+                ? { imageDescription: description }
+                : {})}
+              preload="metadata"
+            />
+          )
+        }
       </EmbeddedAttachment>
     );
   };
 
   return (
-    <div className={styles.body}>
-      <Markdown
-        remarkPlugins={[remarkGfm, remarkBreaks, githubHtml]}
+    <MediaContext value={media}>
+      <MarkdownDocument
+        content={body}
+        profile={PROFILE}
+        // Relative links resolve against the current item.
         urlTransform={(value) => bodyUrl(value, url) ?? ""}
-        components={{
-          // Players are block elements, including when embedded in prose.
-          p: ({ children }) => (
-            <div className={styles.paragraph}>{children}</div>
-          ),
-          a: ({ href, children, node }) => {
-            if (!href) return <>{children}</>;
-            if (node && containsImage(node))
-              return (
-                <div>
-                  {children}
-                  <a href={href} target="_blank" rel="noreferrer">
-                    {href}
-                  </a>
-                </div>
-              );
-            return media(
-              href,
-              children,
-              false,
-              plainText(children) || undefined,
-            );
-          },
-          img: ({ src, alt }) =>
-            typeof src === "string" && src ? media(src, alt, true, alt) : alt,
-          table: ({ children }) => (
-            <div className={styles.tableScroll}>
-              <table>{children}</table>
-            </div>
-          ),
-        }}
-      >
-        {body}
-      </Markdown>
-    </div>
+        components={components}
+        scale="document"
+        className={styles.body}
+      />
+    </MediaContext>
   );
 });

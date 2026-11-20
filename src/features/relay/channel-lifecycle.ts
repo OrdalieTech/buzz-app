@@ -8,6 +8,7 @@ import { retryRead } from "./read-retry";
 import { yieldToHost } from "./yield";
 import { hasTag, newer, type RelayEvent } from "./events";
 import { openMetadata } from "./discovery";
+import { FRESH_FOR } from "./store";
 import {
   channelTypeTag,
   DM_VISIBILITY_KIND,
@@ -54,7 +55,15 @@ export interface ChannelLifecycleCapability {
   ): Promise<void>;
   snapshot(): DmVisibility;
   subscribe(listener: () => void): () => void;
-  refreshVisibility(signal?: AbortSignal): Promise<void>;
+  /** `ifStale` lets a read that succeeded within `FRESH_FOR` answer, for
+   * triggers that only suggest visibility may have changed. `trailing` needs
+   * a read that starts after this call: repeated calls during a pending read
+   * share one more read after it. `strong` reads from the relay's writer, for
+   * a trigger that follows a relay write the read must see. */
+  refreshVisibility(
+    signal?: AbortSignal,
+    options?: { ifStale?: boolean; trailing?: boolean; strong?: boolean },
+  ): Promise<void>;
   observeRemoval(listener: (channelId: string) => void): () => void;
 }
 
@@ -66,6 +75,7 @@ export function createChannelLifecycle({
   canAccess,
   acceptDiscovery,
   removed,
+  deleted,
 }: {
   reader?: RelayReader | undefined;
   writer?: RelayWriter | undefined;
@@ -74,6 +84,7 @@ export function createChannelLifecycle({
   canAccess(id: string): boolean;
   acceptDiscovery(events: readonly RelayEvent[]): void;
   removed(id: string): void;
+  deleted?: (id: string) => void;
 }) {
   let closed = false;
   let busy = false;
@@ -94,6 +105,11 @@ export function createChannelLifecycle({
   let refresh: Promise<void> | undefined;
   let refreshSignal: AbortSignal | undefined;
   let refreshController: AbortController | undefined;
+  // The one read `trailing` refreshes queue behind a pending read.
+  let trailing: Promise<void> | undefined;
+  let trailingStrong = false;
+  // When this epoch's last visibility refresh succeeded.
+  let refreshedAt: number | undefined;
   const available = !!reader && !!writer;
   const emit = (next: DmVisibility) => {
     snapshot = Object.freeze(next);
@@ -313,9 +329,39 @@ export function createChannelLifecycle({
         listeners.delete(listener);
       };
     },
-    refreshVisibility(caller?: AbortSignal) {
+    refreshVisibility(
+      caller?: AbortSignal,
+      options?: { ifStale?: boolean; trailing?: boolean; strong?: boolean },
+    ) {
       if (!reader || closed || caller?.aborted) return Promise.resolve();
-      if (refresh && !refreshSignal?.aborted) return refresh;
+      if (refresh && !refreshSignal?.aborted) {
+        if (!options?.trailing) return refresh;
+        // The pending read may predate this call.
+        if (options.strong) trailingStrong = true;
+        if (!trailing) {
+          const started = epoch;
+          const next: Promise<void> = refresh.then(() => {
+            // A clear retired this read; its shared state is a newer one's.
+            if (trailing !== next || started !== epoch) return;
+            trailing = undefined;
+            const strong = trailingStrong;
+            trailingStrong = false;
+            return capability.refreshVisibility(
+              caller,
+              strong ? { strong } : undefined,
+            );
+          });
+          trailing = next;
+        }
+        return trailing;
+      }
+      if (
+        options?.ifStale &&
+        snapshot.status === "ready" &&
+        refreshedAt !== undefined &&
+        Date.now() - refreshedAt < FRESH_FOR
+      )
+        return Promise.resolve();
       const started = epoch;
       const controller = new AbortController();
       refreshController = controller;
@@ -330,7 +376,10 @@ export function createChannelLifecycle({
       // retries within the same budget.
       const operation = retryRead(
         async () => {
-          await owned({ caller: signal }, readVisibility);
+          await owned({ caller: signal }, (read) =>
+            readVisibility(read, options?.strong),
+          );
+          if (started === epoch) refreshedAt = Date.now();
         },
         signal,
         isTransientFailure,
@@ -546,6 +595,7 @@ export function createChannelLifecycle({
                 }
               } else if (!record) {
                 removed(id);
+                if (action === "delete") deleted?.(id);
                 for (const listener of removalListeners) listener(id);
                 return;
               }
@@ -581,6 +631,9 @@ export function createChannelLifecycle({
       refreshController?.abort();
       for (const controller of controllers.keys()) controller.abort();
       refresh = undefined;
+      trailing = undefined;
+      trailingStrong = false;
+      refreshedAt = undefined;
       visibility = undefined;
       emit({ status: "idle", hidden: Object.freeze([]) });
     },

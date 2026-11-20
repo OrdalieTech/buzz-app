@@ -1,3 +1,5 @@
+import type { IdentityAttest } from "../relay/identity-archives";
+import type { OwnerProof } from "./relay-removal";
 // The agents service's relay, communities and native fakes, shared by its
 // tests. `steps` records the order of cleanup steps the fakes take.
 import { vi } from "vitest";
@@ -72,7 +74,7 @@ export function fakeRelay(origin = "https://relay.example.test") {
     archived,
     /** The last read did not finish, as when its session closed. */
     unknown: false,
-    /** The community has no archives at all. */
+    /** The community advertises no archive authority. */
     unavailable: false,
     snapshot() {
       return { status: this.unavailable ? "unavailable" : "ready" };
@@ -91,15 +93,26 @@ export function fakeRelay(origin = "https://relay.example.test") {
       return archived.has(pubkey) ? "archived" : "not-archived";
     },
     writable: true,
-    request: vi.fn(async (action: string, pubkey: string) => {
-      steps.push(action);
-      if (action === "archive") archived.add(pubkey);
-      else archived.delete(pubkey);
-    }),
+    request: vi.fn(
+      async (
+        action: string,
+        pubkey: string,
+        _signal?: AbortSignal,
+        _issue?: OwnerProof,
+        _attest?: IdentityAttest,
+      ) => {
+        steps.push(action);
+        if (action === "archive") archived.add(pubkey);
+        else archived.delete(pubkey);
+      },
+    ),
   };
   let status = "connected";
   /** Channels the session does not know yet, attended or not. */
   const pending = new Set<string>();
+  /** Not an event of a channel the session does not know yet. */
+  const known = ({ tags }: RelayEvent) =>
+    !tags.some(([key, value]) => key === "h" && pending.has(value ?? ""));
   /** Channels of the list live does not route. */
   const unrouted = new Set<string>();
   /** Channels it knows only from agents' lookups. */
@@ -131,21 +144,25 @@ export function fakeRelay(origin = "https://relay.example.test") {
         filters.some((filter) => !filter.kinds?.length && !filter.ids?.length)
       )
         throw new Error("Relay reads need valid kinds or event IDs");
-      // A catch-up read is bounded on both sides; it may ask for any kinds.
       // The session drops a channel's events until it knows the channel.
-      return filters[0]?.kinds?.includes(9) ||
-        (filters[0]?.since !== undefined && filters[0]?.until !== undefined)
-        ? page(history, filters[0]).filter(
-            ({ tags }) =>
-              !tags.some(
-                ([key, value]) => key === "h" && pending.has(value ?? ""),
-              ),
-          )
+      return filters[0]?.kinds?.includes(9)
+        ? page(history, filters[0]).filter(known)
         : [...listed];
     }),
+    // Catch-up pages only through this: the relay's own page.
     readRemote: vi.fn(async (filters: readonly ReadFilter[]) => {
-      const ids = filters[0]?.ids ?? [];
-      return history.filter((event) => ids.includes(event.id));
+      const [filter] = filters;
+      if (filter?.ids)
+        return history.filter((event) => filter.ids?.includes(event.id));
+      // As the session's reader refuses it.
+      if (!filter?.kinds?.length)
+        throw new Error("Relay reads need valid kinds or event IDs");
+      // A catch-up read is bounded on both sides; it may ask for any kinds.
+      // The session drops a channel's events until it knows the channel.
+      return filter.kinds.includes(9) ||
+        (filter.since !== undefined && filter.until !== undefined)
+        ? page(history, filter).filter(known)
+        : [];
     }),
     channelWrites: {
       starting: (_id: string): Promise<void> | undefined => undefined,
@@ -227,6 +244,7 @@ export function fakeRelay(origin = "https://relay.example.test") {
     session,
   };
   const connected_ = snapshot;
+  let communityId: string | undefined;
   return {
     relay: {
       snapshot: () => snapshot,
@@ -239,7 +257,11 @@ export function fakeRelay(origin = "https://relay.example.test") {
     /** Drops the connection, or restores it with a new session. */
     connect(connected: boolean) {
       snapshot = connected
-        ? { ...connected_, session: { ...session } as RelaySession }
+        ? {
+            ...connected_,
+            session: { ...session } as RelaySession,
+            ...(communityId ? { communityId } : {}),
+          }
         : { status: "disconnected", generation: 2, session };
       for (const listener of changes) listener();
     },
@@ -258,10 +280,29 @@ export function fakeRelay(origin = "https://relay.example.test") {
       snapshot = { status: "error", generation: 4, session, error: "down" };
       for (const listener of changes) listener();
     },
+    /** Reloads in place, as Cmd+R does: connecting, then failing if asked
+     * (for good unless `retrying`), still reloading until `connect`. */
+    reload(failure?: { denied?: true; retrying?: true }) {
+      snapshot = failure
+        ? {
+            status: "error",
+            generation: 5,
+            session,
+            error: "down",
+            reloading: true,
+            ...failure,
+          }
+        : { status: "connecting", generation: 5, session, reloading: true };
+      for (const listener of changes) listener();
+    },
     /** Replaces the session, as after the transport was lost. */
     reconnecting() {
       snapshot = { status: "connecting", generation: 3, session };
       for (const listener of changes) listener();
+    },
+    /** The NIP-11 community ID the next connected session's transport reads. */
+    readsCommunity(id: string | undefined) {
+      communityId = id;
     },
     /** Drops and restores the socket inside the same session, as live.ts does. */
     recover() {
@@ -311,6 +352,10 @@ export function page(events: readonly RelayEvent[], filter: ReadFilter) {
         (!filter["#h"] ||
           event.tags.some(
             ([key, value]) => key === "h" && value === filter["#h"]?.[0],
+          )) &&
+        (!filter["#p"] ||
+          event.tags.some(
+            ([key, value]) => key === "p" && value === filter["#p"]?.[0],
           )),
     )
     .sort((a, b) => b.created_at - a.created_at || (a.id < b.id ? -1 : 1))
@@ -538,7 +583,7 @@ export function fakeNative(identities: AgentIdentity[] = []) {
           tags: (template.tags ?? []).map((tag) => [...tag]),
         }),
     ),
-    publishProfile: vi.fn(async (_: Membership) => {}),
+    publishProfile: vi.fn(async (_: Membership, _force?: boolean) => {}),
     query: vi.fn<AgentsNative["query"]>(async () => []),
     effectiveEdit: vi.fn<AgentsNative["effectiveEdit"]>(async () => {
       throw new Error("No effective edit fixture");

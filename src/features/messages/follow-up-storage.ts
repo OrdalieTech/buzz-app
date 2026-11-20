@@ -1,19 +1,28 @@
+import { forwardReference, type ForwardReference } from "./forward-clipboard";
 import {
   clearView,
   readView,
   viewRevision,
   writeView,
 } from "../../shared/view-state";
-import type { UploadedAttachment } from "../relay/attachments";
+import {
+  isUploadedAttachment,
+  type UploadedAttachment,
+} from "../relay/attachments";
 import type { MentionPicks } from "../relay/messages";
+import type { ComposerToken } from "./composer-token";
+import { messageTokenTags } from "./message-tokens";
 
 export type FollowUpMessage = {
   channelId: string;
+  forward?: ForwardReference;
   text: string;
   recipients: readonly string[];
   attachments: readonly UploadedAttachment[];
   references: readonly string[];
   picks: MentionPicks;
+  /** The message's chips; publication signs them. */
+  tokens?: readonly ComposerToken[];
 };
 export type SavedFollowUp = FollowUpMessage & {
   id: string;
@@ -185,29 +194,26 @@ function strings(value: unknown): value is string[] {
 function valid(value: unknown): value is SavedFollowUp {
   if (!value || typeof value !== "object") return false;
   const v = value as SavedFollowUp;
+  // Malformed chips stay in storage; this build cannot send them.
+  try {
+    if (v.tokens !== undefined) {
+      if (!Array.isArray(v.tokens)) return false;
+      messageTokenTags(v.tokens);
+    }
+  } catch {
+    return false;
+  }
   return (
     typeof v.id === "string" &&
     typeof v.channelId === "string" &&
     typeof v.text === "string" &&
+    (v.forward === undefined || !!forwardReference(v.forward)) &&
     (v.sending === undefined || v.sending === true) &&
     Number.isFinite(v.createdAt) &&
     strings(v.recipients) &&
     strings(v.references) &&
     Array.isArray(v.attachments) &&
-    v.attachments.every(
-      (a) =>
-        a &&
-        typeof a.name === "string" &&
-        typeof a.url === "string" &&
-        typeof a.type === "string" &&
-        typeof a.sha256 === "string" &&
-        Number.isFinite(a.size) &&
-        (a.voice === undefined ||
-          (a.voice &&
-            Number.isFinite(a.voice.duration) &&
-            Array.isArray(a.voice.waveform) &&
-            a.voice.waveform.every(Number.isFinite))),
-    ) &&
+    v.attachments.every(isUploadedAttachment) &&
     !!v.picks &&
     typeof v.picks === "object" &&
     !Array.isArray(v.picks) &&

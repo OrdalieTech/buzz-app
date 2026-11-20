@@ -82,7 +82,7 @@ test("keeps the upstream anchors the web build relies on", () => {
     'notifications.indicator.available ||\n    import.meta.env.VITE_BUZZ_BROWSER_HOST === "1"',
   );
   expect(read("src/features/notifications/indicator-unread.ts")).toContain(
-    'dispatchEvent(new CustomEvent("buzz-unread", { detail: unread }))',
+    'new CustomEvent("buzz-unread", { detail: state?.attention ?? 0 })',
   );
   // Phones open Inbox rows as conversation visits (web/mobile.css breakpoint).
   expect(read("src/bundled/inbox/InboxPage.tsx")).toContain(

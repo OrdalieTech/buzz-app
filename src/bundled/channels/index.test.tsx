@@ -11,10 +11,12 @@ afterEach(() => {
 function registered() {
   const shortcuts = { register: vi.fn() };
   apply({
+    reflect: { get: () => undefined },
     shortcuts,
     conversation: {
       registerCompletion() {},
       registerTabs() {},
+      registerWorkspace() {},
       registerMessageAction() {},
     },
     settingsCards: { register() {} },
@@ -70,6 +72,20 @@ it("steps only while the sidebar renders rows, and not from a terminal", () => {
   );
   document.querySelector<HTMLElement>("#term")?.focus();
   expect(next.when()).toBe(false);
+});
+
+it("stays available in the message composer but not in other text fields", () => {
+  const next = registered().get("next-conversation");
+  sidebar("a", "*b", "c");
+  document.body.insertAdjacentHTML(
+    "beforeend",
+    `<textarea aria-label="Canvas Markdown"></textarea>
+    <form data-composer-surface=""><div role="textbox" tabindex="0"></div></form>`,
+  );
+  document.querySelector<HTMLElement>("textarea")?.focus();
+  expect(next.when()).toBe(false);
+  document.querySelector<HTMLElement>('[role="textbox"]')?.focus();
+  expect(next.when()).toBe(true);
 });
 
 it("registers a plain Escape that waits for an open conversation to mark read", () => {

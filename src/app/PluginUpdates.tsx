@@ -1,5 +1,6 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useRef,
@@ -7,10 +8,12 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
+import { samePluginRelease } from "../plugins/same-release";
 import type { PluginManager } from "../plugins/manager";
 import { pendingManaged } from "../plugins/managed";
 import { canRetryPlugin } from "../plugins/manager";
 import type { PluginInstallRequests } from "../plugins/installer";
+import type { ManagedChange } from "../plugins/types";
 import {
   createPluginUpdates,
   type PluginUpdate,
@@ -50,6 +53,7 @@ const Context = createContext<{
 const noSubscribe = () => () => {};
 const empty: readonly PluginUpdate[] = [];
 const noUpdates = () => empty;
+const noQueueRevision = () => 0;
 
 export function PluginUpdates({
   plugins,
@@ -66,11 +70,21 @@ export function PluginUpdates({
 }) {
   const [store, setStore] = useState<Updates>();
   const [action, setAction] = useState<PluginUpdate>();
+  const [actionQueueId, setActionQueueId] = useState<string>();
+  const reviewLeaseRevision = useRef<number | undefined>(undefined);
   const returnFocus = useRef<HTMLElement | null>(null);
   const state = useSyncExternalStore(plugins.subscribe, plugins.snapshot);
   const updates = useSyncExternalStore(
     store?.subscribe ?? noSubscribe,
     store?.snapshot ?? noUpdates,
+  );
+  const queueRevision = useSyncExternalStore(
+    store?.subscribe ?? noSubscribe,
+    store?.revision ?? noQueueRevision,
+  );
+  const reviewRevision = useSyncExternalStore(
+    installRequests.subscribeReview,
+    installRequests.reviewRevision,
   );
   const authorizeGit = async (repository: string) =>
     (await relay.snapshot().session.authorizeGit?.(repository)) ?? null;
@@ -81,6 +95,7 @@ export function PluginUpdates({
         (await relay.snapshot().session.authorizeGit?.(repository)) ?? null,
     );
     setStore(updates);
+    const unregisterUpdates = installRequests.registerUpdates(updates);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let disposed = false;
     // Being offline is normal, so background checks wait for a connection.
@@ -128,29 +143,132 @@ export function PluginUpdates({
       document.removeEventListener("visibilitychange", scheduled);
       window.removeEventListener("online", reconnected);
       unsubscribe();
+      unregisterUpdates();
       updates.dispose();
     };
-  }, [plugins, relay]);
+  }, [plugins, relay, installRequests]);
   const configuration = state.configuration;
   const catalog =
     configuration.status === "ready" ? configuration.catalog : undefined;
   const open = (update: PluginUpdate) => {
-    if (state.busy || action) return;
+    if (state.busy || action || !update.token) return;
     returnFocus.current = document.activeElement as HTMLElement;
-    setAction(update);
+    if (!store?.capability.queueUpdates([update.token]))
+      void store?.check(true);
   };
+  useEffect(() => {
+    if (
+      !store ||
+      action ||
+      state.busy ||
+      queueRevision !== store.revision() ||
+      reviewRevision !== installRequests.reviewRevision()
+    )
+      return;
+    const review = store.startNextReview(installRequests.tryHoldReview);
+    if (!review) return;
+    reviewLeaseRevision.current = installRequests.reviewRevision();
+    returnFocus.current = document.activeElement as HTMLElement;
+    setAction(review.update);
+    setActionQueueId(review.queueId);
+  }, [
+    store,
+    action,
+    state.busy,
+    queueRevision,
+    reviewRevision,
+    installRequests,
+  ]);
+  const activeReview = store?.getActiveReview();
+  const endReview = useCallback(
+    (review: NonNullable<typeof activeReview>, error?: string) =>
+      store?.endReview(review.queueId, review.token, error),
+    [store],
+  );
   const installed =
     action && catalog?.plugins.find((p) => p.manifest.id === action.id);
   const source = action && pluginUpdateSource(plugins, action.id);
+  // Keep stale tokens rendered so their explicit confirmation guard can explain the refusal.
   const validAction =
     action &&
     installed &&
     source &&
-    installed.revision === action.installedRevision &&
+    action.token &&
+    activeReview &&
+    actionQueueId !== undefined &&
+    activeReview.queueId === actionQueueId &&
+    activeReview.token === action.token &&
+    reviewLeaseRevision.current === installRequests.reviewRevision() &&
+    samePluginRelease(installed, {
+      revision: action.installedRevision,
+      publisher: action.installedPublisher,
+    }) &&
     updateSourceKey(source) === updateSourceKey(action.source);
+  const review = activeReview;
+  const reviewToken = action?.token;
+  const queuedUpdate =
+    reviewToken &&
+    actionQueueId !== undefined &&
+    review &&
+    review.queueId === actionQueueId &&
+    review.token === reviewToken
+      ? {
+          origin: review.callerId,
+          validate: () =>
+            reviewLeaseRevision.current === installRequests.reviewRevision()
+              ? store?.capability.getSnapshot().status === "checking"
+                ? {
+                    message:
+                      "Checking for updates. Try again when the check finishes.",
+                    transient: true as const,
+                  }
+                : store?.isCurrentToken(reviewToken)
+                  ? undefined
+                  : "The update candidate changed after it was checked. Check for updates again before reviewing it."
+              : "Another plugin review opened. Close it before confirming this update.",
+          confirmed: () => store?.beginOperation(review.queueId, reviewToken),
+          settled: (
+            outcome: "installed" | "updated" | "cancelled" | "unavailable",
+          ) => store?.finishReview(review.queueId, reviewToken, outcome),
+          ended: (error?: string) => endReview(review, error),
+        }
+      : undefined;
   useEffect(() => {
-    if (action && !validAction && !state.busy) setAction(undefined);
-  }, [action, validAction, state.busy]);
+    if (action && !validAction && !state.busy) {
+      const review = store?.getActiveReview();
+      if (
+        review &&
+        review.queueId === actionQueueId &&
+        review.token === action.token
+      )
+        endReview(
+          review,
+          reviewLeaseRevision.current === installRequests.reviewRevision()
+            ? "The installed plugin changed after this update was checked."
+            : "Another plugin review opened. Close it before confirming this update.",
+        );
+      setAction(undefined);
+      setActionQueueId(undefined);
+    }
+  }, [
+    action,
+    actionQueueId,
+    validAction,
+    state.busy,
+    store,
+    endReview,
+    installRequests,
+  ]);
+  useEffect(() => {
+    if (
+      action &&
+      (activeReview?.queueId !== actionQueueId ||
+        activeReview?.token !== action.token)
+    ) {
+      setAction(undefined);
+      setActionQueueId(undefined);
+    }
+  }, [action, actionQueueId, activeReview]);
   const needsReview = (update: PluginUpdate) => {
     const previous = catalog?.plugins.find((p) => p.manifest.id === update.id);
     return (
@@ -160,6 +278,17 @@ export function PluginUpdates({
       (update.candidate.publisher ?? null) !== (previous.publisher ?? null)
     );
   };
+  const managed =
+    configuration.status === "ready" ? configuration.managed : undefined;
+  const [seenAutomatic, setSeenAutomatic] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const automatic =
+    managed?.status === "ready"
+      ? (managed.automatic ?? []).filter(
+          (change) => !seenAutomatic.has(automaticKey(change)),
+        )
+      : [];
   const [recovering, setRecovering] = useState<readonly string[]>([]);
   const [checking, setChecking] = useState<readonly string[]>([]);
   const checkAgain = async (id: string) => {
@@ -179,12 +308,40 @@ export function PluginUpdates({
         checking,
         checkAgain,
         busy: state.busy || !!action,
-        recommended: pendingManaged(
-          configuration.status === "ready" ? configuration.managed : undefined,
-        ).map((entry) => entry.id),
+        recommended: pendingManaged(managed).map((entry) => entry.id),
       }}
     >
       {children}
+      {managed?.status === "ready" && automatic.length > 0 && (
+        <ToastNotice
+          key={automatic.map(automaticKey).join(" ")}
+          title={automaticTitle(managed.source, automatic)}
+          description={
+            automatic.length > 1
+              ? automatic.map((change) => change.name).join(", ")
+              : automatic[0]?.action === "installed"
+                ? "It’s on now. You can turn it off or remove it in Manage plugins."
+                : `It now runs the version ${managed.source} recommends.`
+          }
+          tone="info"
+          timeout={8000}
+          onDismiss={() =>
+            setSeenAutomatic(
+              (seen) => new Set([...seen, ...automatic.map(automaticKey)]),
+            )
+          }
+          closeLabel="Dismiss automatic plugin changes"
+          navigation={{
+            label: "Manage plugins",
+            open: () =>
+              void navigation.open({
+                version: 1,
+                kind: "settings",
+                section: "plugins",
+              }),
+          }}
+        />
+      )}
       {updates
         .filter(
           (update) =>
@@ -234,16 +391,24 @@ export function PluginUpdates({
         })}
       {validAction && catalog && (
         <PluginImport
-          key={`${action.id}:${updateSourceKey(action.source)}`}
+          key={`${action.id}:${updateSourceKey(action.source)}:${action.token}`}
           plugins={plugins}
           catalog={catalog}
           busy={state.busy}
           updateId={action.id}
-          updateAction={{ source: action.source, apply: !needsReview(action) }}
+          updateAction={{
+            source: action.source,
+            ...(action.candidate
+              ? {
+                  candidateRevision: action.candidate.revision,
+                  candidatePublisher: action.candidate.publisher ?? null,
+                }
+              : {}),
+          }}
           reviewRequested
           authorizeGit={authorizeGit}
-          holdReview={installRequests.holdReview}
           returnFocus={() => returnFocus.current}
+          queuedUpdate={queuedUpdate}
           onClosed={() => {
             setRecovering((ids) =>
               ids.includes(action.id) ? ids : [...ids, action.id],
@@ -289,6 +454,18 @@ export function PluginUpdates({
         })}
     </Context>
   );
+}
+
+const automaticKey = (change: ManagedChange) =>
+  `${change.id}:${change.revision}`;
+
+function automaticTitle(source: string, changes: readonly ManagedChange[]) {
+  const [change] = changes;
+  if (changes.length === 1 && change)
+    return `${source} ${change.action} ${change.name}`;
+  const actions = new Set(changes.map((item) => item.action));
+  const verb = actions.size > 1 ? "installed or updated" : change?.action;
+  return `${source} ${verb} ${changes.length} plugins`;
 }
 
 export function PluginUpdatesMenu({

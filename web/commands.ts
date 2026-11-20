@@ -90,6 +90,8 @@ export const commands: Record<string, Handler> = {
     location.reload();
   },
   sign_out_wipe_refusal: () => null,
+  // The browser has its own developer tools.
+  web_inspector: () => null,
   // Block's key backup service is not configured for this host.
   nsec_backup_available: () => false,
   nsec_backup_confirmed: () => false,
@@ -105,6 +107,9 @@ export const commands: Record<string, Handler> = {
   relay_decode_read_state: key,
   relay_sign_read_state: key,
   relay_publish_read_state: key,
+  relay_decode_thread_follows: key,
+  relay_sign_thread_follows: key,
+  relay_publish_thread_follows: key,
   relay_decode_sidebar: key,
   relay_sign_sidebar: key,
   relay_kit_prepare: key,

@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { ReactNode, Ref } from "react";
 
 type HeaderProps = {
   title: ReactNode;
@@ -9,6 +9,11 @@ type HeaderProps = {
   align?: "start" | "end";
   id?: string;
   level?: 1 | 2 | 3 | 4;
+  /** The heading element, for a caller that moves focus to it. */
+  ref?: Ref<HTMLHeadingElement>;
+  /** `-1` lets the heading take programmatic focus: a landing with no
+   * tabbable descendants, for when the controls it introduces go away. */
+  tabIndex?: -1;
 };
 
 /** Content hierarchy; panel chrome and dialog semantics remain with their owners. */
@@ -30,6 +35,8 @@ function ContentHeader({
   id,
   level = 2,
   inline = false,
+  ref,
+  tabIndex,
 }: HeaderProps & { inline?: boolean }) {
   const Heading = `h${level}` as "h1" | "h2" | "h3" | "h4";
   return (
@@ -46,7 +53,12 @@ function ContentHeader({
       )}
       <div className="buzz-content-header-copy">
         {eyebrow && <p className="buzz-content-header-eyebrow">{eyebrow}</p>}
-        <Heading id={id} className="buzz-content-header-title">
+        <Heading
+          id={id}
+          ref={ref}
+          tabIndex={tabIndex}
+          className="buzz-content-header-title"
+        >
           {title}
         </Heading>
         {subtitle && <p className="buzz-content-header-subtitle">{subtitle}</p>}

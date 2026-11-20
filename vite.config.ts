@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { defineConfig, loadEnv, type PluginOption } from "vite";
 import react from "@vitejs/plugin-react";
+import { diffHighlighterAliases } from "./scripts/diff-highlighter-aliases.mjs";
 import { worktreePort } from "./scripts/worktree-port.mjs";
 import {
   parseCommunityAliases,
@@ -11,6 +12,8 @@ import {
 } from "./src/features/communities/destination.ts";
 import { parseFirstRunAccountSeed } from "./src/features/identity/first-run-seed.ts";
 import { isBuiltInBuilderlab } from "./src/features/federated-identity/community-hosts.ts";
+import { selectGatewayDescriptor } from "./src/features/agents/gateway/descriptor.ts";
+import { parseRecommended } from "./src/features/agents/recommended.ts";
 
 /** A value native builds also read: process first, then repository-root
  * .env.local, never Vite mode files; undefined when unset. */
@@ -108,13 +111,6 @@ export default defineConfig(async ({ command, mode }) => {
     .filter(Boolean)
     .map(relayOrigin)
     .join(" ");
-  const workflowRestrictedCommunities = (
-    env.BUZZ_WORKFLOW_RESTRICTED_COMMUNITIES ?? ""
-  )
-    .split(/\s+/)
-    .filter(Boolean)
-    .map(relayOrigin)
-    .join(" ");
   // Public routing configuration only; the viewer pin and credentials stay in Node.
   const defaultRelay = env.BUZZ_RELAY_URL?.trim();
   const defaultOrigin = defaultRelay ? relayOrigin(defaultRelay) : "";
@@ -158,6 +154,9 @@ export default defineConfig(async ({ command, mode }) => {
       throw new Error(`${name} must be an https:// URL without credentials.`);
     return value;
   });
+  // Packagers may recommend agent settings: candidates in priority order.
+  const recommended = env.BUZZ_RECOMMENDED_AGENT?.trim() ?? "";
+  parseRecommended(recommended);
   // Opt-in seed: replaces first run's Builderlab account requests, key backup
   // and recovery, so the first-run screens can be walked against a real account
   // whose binding must not change. Builds never see it. The full list is in
@@ -165,6 +164,19 @@ export default defineConfig(async ({ command, mode }) => {
   const firstRunAccount =
     command === "serve" ? (env.BUZZ_DEV_FIRST_RUN_ACCOUNT ?? "") : "";
   parseFirstRunAccountSeed(firstRunAccount);
+  // The agent gateway deployment descriptor: an explicit BUZZ_AGENT_GATEWAY,
+  // else the packaged org-gateways.json entry for BUZZ_DEFAULT_COMMUNITY_URL.
+  // Both read from the process only, as native reads them for the Agents
+  // plugin's gateway grant, so the two can't disagree; neither set (the
+  // release default) leaves routing off.
+  const gateway = selectGatewayDescriptor(
+    process.env.BUZZ_AGENT_GATEWAY ?? "",
+    readFileSync(
+      fileURLToPath(new URL("src/bundled/org-gateways.json", import.meta.url)),
+      "utf8",
+    ),
+    process.env.BUZZ_DEFAULT_COMMUNITY_URL ?? "",
+  );
   const plugins: PluginOption[] = [react()];
   if (command === "serve")
     plugins.push(
@@ -202,8 +214,12 @@ export default defineConfig(async ({ command, mode }) => {
     });
   return {
     plugins,
+    resolve: { alias: diffHighlighterAliases },
     define: {
       "import.meta.env.VITE_BUZZ_LIVE": JSON.stringify(live ? "1" : "0"),
+      "import.meta.env.VITE_BUZZ_AGENT_GATEWAY": JSON.stringify(
+        gateway ? JSON.stringify(gateway) : "",
+      ),
       "import.meta.env.VITE_BUZZ_NOTIFICATIONS_PAUSED": JSON.stringify(
         command === "serve" && env.BUZZ_DEV_NOTIFICATIONS === "0" ? "1" : "0",
       ),
@@ -211,8 +227,6 @@ export default defineConfig(async ({ command, mode }) => {
       "import.meta.env.VITE_BUZZ_EXTERNAL_MCP_COMMUNITIES": JSON.stringify(
         externalMcpCommunities,
       ),
-      "import.meta.env.VITE_BUZZ_WORKFLOW_RESTRICTED_COMMUNITIES":
-        JSON.stringify(workflowRestrictedCommunities),
       "import.meta.env.VITE_BUZZ_BUILDERLAB_URL": JSON.stringify(builderlabUrl),
       "import.meta.env.VITE_BUZZ_FEDERATED_IDENTITY": JSON.stringify(
         federatedUrl === undefined ? "0" : "1",
@@ -227,6 +241,8 @@ export default defineConfig(async ({ command, mode }) => {
       "import.meta.env.VITE_BUZZ_MOBILE_APP_IOS_URL": JSON.stringify(mobileIos),
       "import.meta.env.VITE_BUZZ_MOBILE_APP_ANDROID_URL":
         JSON.stringify(mobileAndroid),
+      "import.meta.env.VITE_BUZZ_RECOMMENDED_AGENT":
+        JSON.stringify(recommended),
       "import.meta.env.VITE_BUZZ_FIRST_RUN_ACCOUNT":
         JSON.stringify(firstRunAccount),
     },

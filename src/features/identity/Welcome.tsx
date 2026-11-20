@@ -22,7 +22,7 @@ import { communityDestination } from "../communities/destination";
 import { accountConsents } from "../communities/account-consent";
 import { FindCommunity, type JoinConsent } from "../communities/FindCommunity";
 import type { FoundCommunity } from "../communities/find-community";
-import type { createInviteIntent } from "../communities/invite-intent";
+import type { JoinRequest } from "../communities/invite-intent";
 import {
   type Admission,
   admitCommunity,
@@ -37,6 +37,7 @@ import type { SignInOptions } from "../federated-identity/service";
 import { readErrorKind } from "../relay/errors";
 import { AlertDialog } from "../../shared/design-system/ui/AlertDialog";
 import { Button } from "../../shared/design-system/ui/Button";
+import { Checkbox } from "../../shared/design-system/ui/Checkbox";
 import { BackupError } from "./backup";
 import { BackupConsent } from "./BackupConsent";
 import {
@@ -71,7 +72,11 @@ import { OnboardingWordmark } from "./OnboardingWordmark";
 import { ProfileStep } from "./ProfileStep";
 import { PublicKeyPanel } from "./PublicKeyPanel";
 import type { Restored } from "./restore-communities";
-import { type Identity, nativeIdentityEnabled } from "./service";
+import {
+  type Identity,
+  MALFORMED_IDENTITY,
+  nativeIdentityEnabled,
+} from "./service";
 import {
   adoptLinkedLegacy,
   backUp,
@@ -93,6 +98,7 @@ import {
   unlinkKey,
 } from "./setup";
 import { SetupProgress } from "./SetupProgress";
+import { PrivateKey } from "./PrivateKey";
 import { signOutFailure } from "./SignOut";
 import {
   onSignInRequest,
@@ -164,7 +170,7 @@ export function Welcome({
    * The app's invite intent: a typed address the restore did not admit is
    * handed to the rail's Add-a-community dialog as the gate lifts.
    */
-  invites: Pick<ReturnType<typeof createInviteIntent>, "open">;
+  invites: { open(invite: JoinRequest, viewer: string): void };
   children: ReactNode;
   /**
    * The NIP-FI session as the bundled Builderlab plugin calls it
@@ -220,6 +226,16 @@ export function Welcome({
   const session = useSession(federatedIdentity);
   // Whether the key Replace would sign out has a confirmed backup.
   const [replacingBackedUp, setReplacingBackedUp] = useState(false);
+  // Whether that key, with no confirmed backup, was revealed or copied and the
+  // user says they have it, as Settings' Remove from device asks: until then
+  // Replace would lose it, so it waits.
+  const [replacingKeyKept, setReplacingKeyKept] = useState(false);
+  const [replacingHaveKey, setReplacingHaveKey] = useState(false);
+  // The unreadable saved key's removal: asking, then its native refusal.
+  const [removingKey, setRemovingKey] = useState<{
+    pending: boolean;
+    error?: string;
+  }>();
   const progress = useSyncExternalStore(setup.subscribe, setup.snapshot);
   // The signed-in account's reads, from sign-in until the landing is shown again.
   const reads = useRef<FirstRunAccount | undefined>(undefined);
@@ -236,6 +252,8 @@ export function Welcome({
   const known = useRef<readonly string[] | undefined>(undefined);
   // Backup status belongs to this signed-in account and is cleared on the landing.
   const [backups, setBackups] = useState<readonly string[]>();
+  // The backup lookup failed, so a backup may hold the linked key.
+  const [backupUnknown, setBackupUnknown] = useState(false);
   // The community list that lets Join a community offer Create a community
   // (`checkCreation`), and whether its page is shown; both cleared on the landing.
   const [creatable, setCreatable] = useState<CommunityList>();
@@ -464,6 +482,7 @@ export function Welcome({
   // The linked key is backed up: Welcome back offers a restore, and an
   // import of it skips another backup.
   const backedUp = !!linked && !!backups?.includes(linked);
+  const restorable = backedUp || (!!linked && backupUnknown);
   /**
    * Sign-in leads to the account check, which picks the lane: a linked key
    * pauses on Welcome back, otherwise setup goes on by itself. The backed-up-key
@@ -511,9 +530,10 @@ export function Welcome({
             },
           ]
         : []),
-      checkBackup(current, (keys) => {
+      checkBackup(current, (keys, failed) => {
         checkedBackups = keys;
         setBackups(keys);
+        setBackupUnknown(!!failed);
       }),
       {
         label: "Preparing your identity…",
@@ -605,10 +625,13 @@ export function Welcome({
   };
   /**
    * Another account's key is here, and replacing it is always the user's
-   * call. A confirmed backup only changes what the question says: that key
-   * can be restored by signing in to its account.
+   * call. With a confirmed backup, that key can be restored by signing in to
+   * its account. Without one, Replace waits until the key is revealed or
+   * copied, as Settings' Remove from device does.
    */
   const askToReplace = async (onDevice: string): Promise<Resting> => {
+    setReplacingKeyKept(false);
+    setReplacingHaveKey(false);
     setReplacingBackedUp(await identity.backedUp(onDevice).catch(() => false));
     return { status: "paused", at: "replace-key" };
   };
@@ -738,8 +761,11 @@ export function Welcome({
         try {
           await currentAccount.backUp(pubkey);
         } catch (error) {
-          if (error instanceof BackupError && error.kind === "signed_out")
+          if (error instanceof BackupError && error.kind === "signed_out") {
             expired = true;
+            // Try again signs in first, so it can help here.
+            throw new BackupError("signed_out", true);
+          }
           throw error;
         }
       },
@@ -762,6 +788,7 @@ export function Welcome({
     setLinked(undefined);
     setOwned(undefined);
     setBackups(undefined);
+    setBackupUnknown(false);
     setCreatable(undefined);
     setCreating(false);
     reads.current = undefined;
@@ -1009,7 +1036,7 @@ export function Welcome({
               description={
                 replacingBackedUp
                   ? "Replacing it removes that account from this computer to continue with the one you just signed in to. Its key was backed up in Builderlab: sign in to that account again to restore it."
-                  : "Replacing it removes that account from this computer to continue with the one you just signed in to. It may not be backed up."
+                  : "Replacing it removes that account from this computer to continue with the one you just signed in to. Its key may not be backed up: copy its private key first, or you could lose that account."
               }
               onClose={switchAccount}
               actions={
@@ -1017,13 +1044,34 @@ export function Welcome({
                   <Button onClick={switchAccount}>Cancel</Button>
                   <Button
                     variant="destructive"
+                    disabled={
+                      !replacingBackedUp &&
+                      !(replacingKeyKept && replacingHaveKey)
+                    }
                     onClick={() => void setup.start([replaceKey(linked)])}
                   >
                     Replace
                   </Button>
                 </>
               }
-            />
+            >
+              {!replacingBackedUp && (
+                <>
+                  <PrivateKey
+                    identity={identity}
+                    onInteraction={() => setReplacingKeyKept(true)}
+                  />
+                  <div className="mt-6">
+                    <Checkbox
+                      label="I have my key"
+                      checked={replacingHaveKey}
+                      disabled={!replacingKeyKept}
+                      onCheckedChange={setReplacingHaveKey}
+                    />
+                  </div>
+                </>
+              )}
+            </AlertDialog>
           </>
         );
       case "welcome-back":
@@ -1032,10 +1080,11 @@ export function Welcome({
             <WelcomeBack
               email={auth.account?.email}
               npub={npubEncode(linked)}
+              onDevice={viewer === linked}
               onRestore={
                 viewer === linked
                   ? () => void setup.start(finish())
-                  : backedUp
+                  : restorable
                     ? () => {
                         void current.recovery.beginRecovery();
                         pause("key-restore");
@@ -1088,7 +1137,9 @@ export function Welcome({
         return linked ? (
           <KeyLost
             owned={owned}
-            onBack={() => back("welcome-back", backedUp ? "restore" : "import")}
+            onBack={() =>
+              back("welcome-back", restorable ? "restore" : "import")
+            }
             onStartOver={() => {
               setLinked(undefined);
               setOwned(undefined);
@@ -1133,6 +1184,57 @@ export function Welcome({
             </h1>
             {state.status === "loading" ? (
               <p role="status">Opening your saved identity…</p>
+            ) : state.error === MALFORMED_IDENTITY ? (
+              // Reading it again gets the same bytes: only removing it, which
+              // restarts into first run's restore or import, gets past it.
+              <>
+                <p role="alert">
+                  Buzz can’t read the key saved on this computer, so it can’t
+                  open with it or copy it. Trying again won’t change that.
+                </p>
+                <Button onClick={() => setRemovingKey({ pending: false })}>
+                  Remove from device
+                </Button>
+                {removingKey && (
+                  <AlertDialog
+                    title="Remove the unreadable key?"
+                    description="This deletes it from this computer’s secure storage, signs you out of your organizations and restarts Buzz. Then sign in to restore your account’s key from its backup, or enter your private key. Without a backup or a copy, that identity can’t be recovered."
+                    pending={removingKey.pending}
+                    onClose={() => setRemovingKey(undefined)}
+                    actions={
+                      <>
+                        <Button
+                          disabled={removingKey.pending}
+                          onClick={() => setRemovingKey(undefined)}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          variant="destructive"
+                          disabled={removingKey.pending}
+                          onClick={() => {
+                            setRemovingKey({ pending: true });
+                            identity
+                              .signOut({ wipe: false, removeAgents: false })
+                              .catch((reason: unknown) =>
+                                setRemovingKey({
+                                  pending: false,
+                                  error: signOutFailure(reason),
+                                }),
+                              );
+                          }}
+                        >
+                          Remove from device
+                        </Button>
+                      </>
+                    }
+                  >
+                    {removingKey.error && (
+                      <p role="alert">{removingKey.error}</p>
+                    )}
+                  </AlertDialog>
+                )}
+              </>
             ) : (
               <>
                 <p role="alert">{state.error}</p>
@@ -1394,6 +1496,7 @@ export function Welcome({
           onBack={reads.current ? undefined : backToLanding}
           onSwitchAccount={reads.current ? leaveFailedSetup : undefined}
           onRetry={
+            !progress.retryable ||
             progress.unsupportedBackup ||
             progress.bound ||
             progress.error === WRONG_ACCOUNT
@@ -1502,8 +1605,8 @@ function npubOf(state: ReturnType<Identity["snapshot"]>) {
 /**
  * What a failed link or unlink leaves undone: the key is not the account's
  * (and, after an unlink, the old key stays bound), and with it the backup,
- * which needs a linked key. The page has no way past it but Try again, or
- * leaving through Use a different account.
+ * which needs a linked key. The page has no way past it but Try again, where
+ * another attempt can help, or leaving through Use a different account.
  */
 const UNLINKED_NOTE =
   "Your key is saved on this device, but it isn’t linked to your account or backed up yet.";

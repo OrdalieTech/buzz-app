@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import { callTool, memoryVersion, TOOLS } from "./tools";
 import { callSessionTool, sessionTools } from "./session-tools";
 import { PLUGIN_TOOLS } from "./plugins";
+import { BESTIE_TOOLS } from "./bestie";
 import { SETTINGS_TOOLS } from "./settings";
 import { SOLO_WORKER_TOOLS } from "./solo-worker";
 import { Context } from "@deepseek-ai/cordis";
@@ -156,9 +157,10 @@ it.each([false, true])(
         // The shared session gate checks these optional hooks before dispatch.
         if (property === "protect")
           return protectedSession ? protect : undefined;
-        if (property === "nativeToolGate") return undefined;
-        // The tool list checks whether settings can change here.
-        if (property === "settings") return undefined;
+        if (property === "nativeToolGate" || property === "settle")
+          return undefined;
+        // The tool list checks whether settings and the Bestie can change here.
+        if (property === "settings" || property === "bestie") return undefined;
         throw new Error(`Help must not access the host: ${String(property)}`);
       },
     });
@@ -442,6 +444,25 @@ it("replies in the current thread and notifies the members it names", async () =
   ]);
 });
 
+// As a model that fills in every optional field sends it.
+it("replies in the current thread when channel and reply are blank", async () => {
+  const { client, published } = fake(community);
+  await callTool(client, { channel: "chan", root }, "send", {
+    audience: "everyone",
+    text: "hi",
+    channel: "",
+    reply: "",
+    path: "",
+    files: [],
+    mentions: [],
+    final: true,
+  });
+  expect(published.at(-1)?.tags).toEqual([
+    ["h", "chan"],
+    ["e", root, "", "reply"],
+  ]);
+});
+
 it("tags a message for agents, and needs the audience said", async () => {
   const { client, published } = fake(community);
   const context = { channel: "chan", root };
@@ -461,6 +482,32 @@ it("tags a message for agents, and needs the audience said", async () => {
   await expect(
     callTool(client, context, "send", { text: "hi", audience: "humans" }),
   ).rejects.toThrow("audience must be everyone or agents");
+  expect(published).toHaveLength(1);
+});
+
+it("signs the turn's triggering request separately from the flattened reply", async () => {
+  const { client, published } = fake(community);
+  const context = { channel: "chan", root };
+  const request = "f".repeat(64);
+  await callTool(client, context, "send", {
+    text: "Checking",
+    audience: "agents",
+    request: request.toUpperCase(),
+  });
+  expect(published[0]?.tags).toEqual([
+    ["h", "chan"],
+    ["e", root, "", "reply"],
+    ["audience", "agents"],
+    ["buzz:request", request],
+  ]);
+  for (const bad of ["", "nope", 7])
+    await expect(
+      callTool(client, context, "send", {
+        text: "hi",
+        audience: "agents",
+        request: bad,
+      }),
+    ).rejects.toThrow("Not an event id");
   expect(published).toHaveLength(1);
 });
 
@@ -682,6 +729,49 @@ it("tags the community emoji a message or edit uses, as the composer does", asyn
   ]);
 });
 
+it("tags a community emoji reaction and refuses a shortcode outside the palette", async () => {
+  const approve = "https://relay/media/approve.png";
+  const { client, published } = fake([
+    ...community,
+    event({ id: root, pubkey: alice }),
+    event({
+      id: "e".repeat(64),
+      pubkey: bob,
+      created_at: 20,
+      kind: 30030,
+      tags: [
+        ["d", "buzz:custom-emoji"],
+        ["emoji", "approve", approve],
+      ],
+    }),
+  ]);
+  await callTool(client, {}, "react", { id: root, emoji: ":Approve:" });
+  await callTool(client, {}, "react", { id: root, emoji: "👍" });
+  expect(published).toEqual([
+    {
+      kind: 7,
+      content: ":Approve:",
+      tags: [
+        ["e", root],
+        ["p", alice],
+        ["emoji", "approve", approve],
+      ],
+    },
+    {
+      kind: 7,
+      content: "👍",
+      tags: [
+        ["e", root],
+        ["p", alice],
+      ],
+    },
+  ]);
+  await expect(
+    callTool(client, {}, "react", { id: root, emoji: ":foo:" }),
+  ).rejects.toThrow("unknown custom emoji :foo:");
+  expect(published).toHaveLength(2);
+});
+
 it("reads no emoji sets for a message without a shortcode", async () => {
   const { client } = fake(community);
   await callTool(client, { channel: "chan" }, "send", {
@@ -778,16 +868,31 @@ it("reads the current thread with each message's latest edit", async () => {
   ]);
 });
 
+// As a model that fills in every optional field sends it.
+it("reads the current thread when optional fields are blank or 0", async () => {
+  const { client } = fake(community);
+  const blank = (await callTool(client, { channel: "chan", root }, "read", {
+    channel: "",
+    thread: "",
+    message_url: "",
+    q: "",
+    author: "",
+    since: 0,
+    before: 0,
+    before_id: "",
+    limit: 5,
+  })) as string;
+  expect(blank).toBe(
+    await callTool(client, { channel: "chan", root }, "read", { limit: 5 }),
+  );
+  expect(blank).toContain(`thread ${root} in chan`);
+});
+
 it.each([
   ["channel", { channel: "chan" }],
-  ["search", { q: "hello" }],
   ["current thread", {}],
   ["explicit thread", { thread: nested }],
   ["message link", { message_url: `buzz://message?channel=chan&id=${nested}` }],
-  [
-    "message search",
-    { message_url: `buzz://message?channel=chan&id=${nested}`, q: "hello" },
-  ],
 ] as const)(
   "keeps agent ownership and nested reply context in a %s read",
   async (_, args) => {
@@ -832,8 +937,10 @@ it.each([
     const line = text.split("\n").find((line) => line.startsWith(id));
     expect(line).toContain(`from ${alice} "Alice Smith" claimed owner ${bob}`);
     expect(line).toContain(`reply_to ${nested}`);
+    // Its thread fields name its root and reply tags, so no tags repeat them.
+    expect(line).not.toContain("tags ");
     expect(line).toContain("hello, edited");
-    if ("channel" in args || "q" in args) expect(line).toContain(`re ${root}`);
+    if ("channel" in args) expect(line).toContain(`re ${root}`);
     else expect(text.split("\n")[0]).toBe(`thread ${root} in chan`);
     // Human authors and direct replies keep their compact, unambiguous form.
     expect(
@@ -848,6 +955,87 @@ it.each([
     expect(message.sig).toBe(signature);
   },
 );
+
+it("shows a message's meaningful tags in a read, but not its bookkeeping", async () => {
+  const id = "4".repeat(64);
+  const shown = [
+    // A lone root isn't a reply, so no thread field names it.
+    ["e", root, "", "root"],
+    ["p", bob],
+    ["q", nested],
+    ["t", "release"],
+    ["imeta", "url https://relay.test/media/a.png", "m image/png"],
+    ["buzz:request", nested],
+  ];
+  const auth = ["auth", bob, "kind=9", "8".repeat(128)];
+  const hidden = [
+    ["audience", "agents"],
+    ["client-id", "c1"],
+    ["ms", "5"],
+    ["model", bob, "m"],
+  ];
+  const { client } = fake([
+    ...community,
+    event({
+      id,
+      content: "tagged",
+      tags: [["h", "chan"], auth, ...shown, ...hidden],
+    }),
+  ]);
+  const line = (await read(client, { channel: "chan" }))
+    .split("\n")
+    .find((line) => line.startsWith(id));
+  expect(line).toContain(`tags ${JSON.stringify(shown)} at `);
+  expect(line).not.toContain('"h"');
+  expect(line).not.toContain(auth[3]);
+});
+
+it("reads an edited message with the files and emoji its latest edit leaves", async () => {
+  const id = "4".repeat(64);
+  const { client } = fake([
+    ...community,
+    event({
+      id,
+      content: "files :party:",
+      tags: [
+        ["h", "chan"],
+        ["imeta", "url https://relay.test/media/old.png"],
+        ["emoji", "party", "https://relay.test/party.png"],
+      ],
+    }),
+    event({
+      id: "5".repeat(64),
+      kind: 40003,
+      created_at: 110,
+      content: "files, edited",
+      tags: [
+        ["h", "chan"],
+        ["e", id],
+        ["imeta", "url https://relay.test/media/new.png"],
+      ],
+    }),
+    // Newer, with no files, so it clears them, as the relay does.
+    event({
+      id: "6".repeat(64),
+      kind: 40003,
+      created_at: 120,
+      content: "files, edited again :wave:",
+      tags: [
+        ["h", "chan"],
+        ["e", id],
+        ["emoji", "wave", "https://relay.test/wave.png"],
+      ],
+    }),
+  ]);
+  const line = (await read(client, { channel: "chan" }))
+    .split("\n")
+    .find((line) => line.startsWith(id));
+  expect(line).toContain(
+    `tags ${JSON.stringify([
+      ["emoji", "wave", "https://relay.test/wave.png"],
+    ])} at `,
+  );
+});
 
 const reply = (id: string, created_at: number) =>
   event({
@@ -866,47 +1054,7 @@ const next = (answer: string) => {
   return found ? (JSON.parse(found) as Record<string, unknown>) : undefined;
 };
 
-it("searches one author's messages since a time across channels, before the limit", async () => {
-  const { client } = fake([
-    profile(alice, "Alice Smith"),
-    event({ id: "3".repeat(64), created_at: 50, content: "too old" }),
-    event({
-      id: "4".repeat(64),
-      created_at: 200,
-      content: "rollout done",
-      tags: [["h", "other"]],
-    }),
-    // Newer messages from someone else that a limit applied first would keep.
-    ...["5", "6", "7"].map((n) =>
-      event({ id: n.repeat(64), pubkey: bob, created_at: 300 }),
-    ),
-  ]);
-  const answer = await read(client, {
-    q: "rollout",
-    author: npubEncode(alice),
-    since: 100,
-    limit: 2,
-  });
-  expect(answer).toBe(
-    `${"4".repeat(64)} from ${alice} "Alice Smith" in other at 1970-01-01T00:03Z: rollout done`,
-  );
-  // Without a channel, search still spans every channel it can read.
-  expect(client.query).toHaveBeenCalledWith([
-    {
-      kinds: [9, 40002, 45001, 45003],
-      search: "rollout",
-      limit: 2,
-      authors: [alice],
-      since: 100,
-    },
-  ]);
-  // A full page says more may match.
-  expect(await read(client, { q: "x", limit: 1 })).toMatch(
-    /\nResult limit reached; more matches may exist\. Narrow with channel, author, since or before\.$/,
-  );
-});
-
-it("tells apart people with the same name, and where each message is", async () => {
+it("names a channel read's channel once, and each reply's thread", async () => {
   const { client } = fake([
     profile(alice, "Sam"),
     profile(bob, "Sam"),
@@ -922,11 +1070,6 @@ it("tells apart people with the same name, and where each message is", async () 
       ],
     }),
   ]);
-  expect((await read(client, { q: "ship" })).split("\n")).toEqual([
-    `${"3".repeat(64)} from ${alice} "Sam" in chan at 1970-01-01T00:01Z: ship it`,
-    `${"4".repeat(64)} from ${bob} "Sam" in other re ${root} at 1970-01-01T00:02Z: ship it too`,
-  ]);
-  // A channel read names the channel once, and each reply's thread.
   expect(
     (await read(client, { channel: "other", author: bob, since: 110 })).split(
       "\n",
@@ -987,32 +1130,314 @@ it("pages a thread to its start, each reply once, through timestamp ties", async
 it("refuses read arguments it cannot apply, saying how to fix them", async () => {
   const { client } = fake(community);
   for (const [args, error] of [
-    [{ q: "x", author: "alice" }, "author must be a hex pubkey or npub"],
-    [{ q: "x", author: 7 }, "author must be a hex pubkey or npub"],
-    [{ q: "x", since: "friday" }, "since must be Unix seconds"],
-    [{ q: "x", since: -1 }, "since must be Unix seconds"],
-    [{ q: "x", since: 1.5 }, "since must be Unix seconds"],
-    [{ q: "x", since: 1_760_000_000_000 }, "since must be Unix seconds"],
-    [{ q: "x", since: 200, before: 100 }, "since must not be after before"],
+    // A session that kept an older tool list may still search through read.
+    [{ q: "x" }, "read does not search; use search with the same q."],
+    [{ q: "x", channel: "chan" }, "read does not search; use search"],
+    [
+      { channel: "chan", author: "alice" },
+      "author must be a hex pubkey or npub",
+    ],
+    [{ channel: "chan", author: 7 }, "author must be a hex pubkey or npub"],
+    [{ channel: "chan", since: "friday" }, "since must be Unix seconds"],
+    [{ channel: "chan", since: -1 }, "since must be Unix seconds"],
+    [{ channel: "chan", since: 1.5 }, "since must be Unix seconds"],
+    [
+      { channel: "chan", since: 1_760_000_000_000 },
+      "since must be Unix seconds",
+    ],
+    [
+      { channel: "chan", since: 200, before: 100 },
+      "since must not be after before",
+    ],
     [{ channel: "chan", before_id: root }, "before_id needs before"],
     [{ channel: "chan", before: 1, before_id: "x" }, "before_id must be"],
     [
-      { q: "x", before: 1, before_id: root },
-      "before_id pages thread and channel reads",
-    ],
-    [
       { author: alice },
-      "author and since filter a search (q) or a channel read",
+      "author and since filter a channel read, not a thread; add channel, or use search.",
     ],
     [
       { thread: root, since: 1 },
-      "author and since filter a search (q) or a channel read",
+      "author and since filter a channel read, not a thread",
     ],
   ] as const)
     await expect(read(client, args), JSON.stringify(args)).rejects.toThrow(
       error,
     );
   expect(client.query).not.toHaveBeenCalled();
+});
+
+const DAY = 86_400;
+const SEARCH_KINDS = [9, 40002, 45001, 45003];
+const SCOPE =
+  "Searched with your own access: channels you're in and open channels, not other people's private channels or DMs.";
+const search = (client: BuzzClient, args: Record<string, unknown>) =>
+  callTool(
+    client,
+    { channel: "chan", root },
+    "search",
+    args,
+  ) as Promise<string>;
+const metadata = (id: string, name: string, tags: string[][] = []) =>
+  event({
+    id: createHash("sha256").update(id).digest("hex"),
+    kind: 39000,
+    tags: [["d", id], ["name", name], ...tags],
+  });
+/** Answers a message search with `ranked`, as a relay ranks it; the fake
+ * only filters. */
+const ranking = (client: BuzzClient, ranked: () => BuzzEvent[]) => {
+  const query = client.query;
+  client.query = vi.fn(async (filters: readonly Filter[]) =>
+    filters[0]?.search && (filters[0].kinds as number[]).includes(9)
+      ? ranked()
+      : query(filters),
+  );
+};
+
+it("searches by name, channel and date, best match first, citing each hit", async () => {
+  const best = event({
+    id: "3".repeat(64),
+    created_at: 2 * DAY,
+    content: "relay  deploy done;\ndeploy verified",
+    tags: [
+      ["h", "other"],
+      ["auth", bob, "kind=9", "8".repeat(128)],
+    ],
+  });
+  const reply = event({
+    id: "4".repeat(64),
+    created_at: 2 * DAY + 60,
+    content: "the deploy",
+    tags: [
+      ["h", "other"],
+      ["e", root, "", "reply"],
+    ],
+  });
+  const { client } = fake([
+    profile(alice, "Alice Smith"),
+    profile(bob, "Bob"),
+    metadata("other", "ops"),
+    best,
+    reply,
+    event({
+      kind: 40003,
+      created_at: 3 * DAY,
+      content: "the deploy, edited",
+      tags: [["e", reply.id]],
+    }),
+  ]);
+  ranking(client, () => [best, reply]);
+  const answer = await search(client, {
+    q: "deploy",
+    from: "@alice smith",
+    in: "#OPS",
+    after: "1970-01-02",
+    before: "1970-01-04",
+  });
+  expect(client.query).toHaveBeenCalledWith([
+    {
+      kinds: SEARCH_KINDS,
+      limit: 30,
+      search: "deploy",
+      authors: [alice],
+      "#h": ["other"],
+      since: DAY,
+      // `before` excludes its day.
+      until: 3 * DAY - 1,
+    },
+  ]);
+  expect(answer.split("\n")).toEqual([
+    `2 results for "deploy" from ${alice} "Alice Smith" in #ops after 1970-01-02 before 1970-01-04, best match first.`,
+    SCOPE,
+    `[1] buzz://message?channel=other&id=${best.id} · #ops · from ${alice} "Alice Smith" · claimed owner ${bob} "Bob" · 1970-01-03T00:00Z`,
+    "    relay deploy done; deploy verified",
+    `[2] buzz://message?channel=other&id=${reply.id}&thread=${root} · #ops · from ${alice} "Alice Smith" · 1970-01-03T00:01Z · in a thread`,
+    "    the deploy, edited",
+    "No more matches.",
+  ]);
+  // Each link opens its message.
+  await expect(
+    read(client, {
+      message_url: `buzz://message?channel=other&id=${best.id}`,
+    }),
+  ).resolves.toContain("relay  deploy done");
+});
+
+it("reads newest history without q, in a DM named by its person, a page at a time", async () => {
+  const dm = event({
+    id: "d".repeat(64),
+    kind: 39000,
+    tags: [
+      ["d", "dm1"],
+      ["t", "dm"],
+      ["p", me],
+      ["p", bob],
+    ],
+  });
+  const { client } = fake([
+    profile(me, "Helper"),
+    profile(bob, "Bob"),
+    dm,
+    event({
+      id: "3".repeat(64),
+      pubkey: me,
+      created_at: 200,
+      content: "hi bob",
+      tags: [["h", "dm1"]],
+    }),
+    event({
+      id: "4".repeat(64),
+      pubkey: me,
+      created_at: 100,
+      content: "earlier",
+      tags: [["h", "dm1"]],
+    }),
+  ]);
+  const first = await search(client, { in: "@Bob", from: "me", limit: 1 });
+  expect(client.query).toHaveBeenCalledWith([
+    {
+      kinds: [9, 40002, 40008, 45001, 45003],
+      limit: 1,
+      authors: [me],
+      "#h": ["dm1"],
+    },
+  ]);
+  expect(first.split("\n")).toEqual([
+    `1 result for from ${me} "Helper" in DM with Bob, newest first.`,
+    SCOPE,
+    `[1] buzz://message?channel=dm1&id=${"3".repeat(64)} · DM with Bob · from ${me} "Helper" · 1970-01-01T00:03Z`,
+    "    hi bob",
+    `More may match; continue with {"from":"${me}","in":"dm1","limit":1,"page":2}`,
+  ]);
+  // The fake ignores page; the relay's bridge offsets by it.
+  const second = await search(client, next(first) as Record<string, unknown>);
+  expect(client.query).toHaveBeenCalledWith(
+    expect.arrayContaining([
+      expect.objectContaining({ page: 2, "#h": ["dm1"], authors: [me] }),
+    ]),
+  );
+  expect(second).toContain("\n[2] buzz://message?channel=dm1&id=");
+});
+
+it("asks for newest first, and says when the community ranked anyway", async () => {
+  const older = event({ id: "3".repeat(64), created_at: 100, content: "x" });
+  const newer = event({ id: "4".repeat(64), created_at: 200, content: "x" });
+  const { client } = fake([older, newer]);
+  let ranked = [older, newer];
+  ranking(client, () => ranked);
+  const header = async () =>
+    (await search(client, { q: "x", sort: "newest" })).split("\n")[0];
+  expect(await header()).toBe(
+    `2 results for "x", best match first (this community can't sort a search by newest).`,
+  );
+  expect(client.query).toHaveBeenCalledWith([
+    { kinds: SEARCH_KINDS, limit: 30, search: "x", search_sort: "newest" },
+  ]);
+  ranked = [newer, older];
+  expect(await header()).toBe(`2 results for "x", newest first.`);
+});
+
+it("keeps a span back from now fixed across pages", async () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(30 * DAY * 1000);
+    const { client } = fake([event({ created_at: 25 * DAY, content: "x" })]);
+    const first = await search(client, { q: "x", after: "7d", limit: 1 });
+    expect(client.query).toHaveBeenCalledWith([
+      expect.objectContaining({ search: "x", since: 23 * DAY }),
+    ]);
+    expect(next(first)).toEqual({
+      q: "x",
+      after: "1970-01-24T00:00:00Z",
+      limit: 1,
+      page: 2,
+    });
+    // An hour later, page 2 still starts where page 1 did.
+    vi.setSystemTime(30 * DAY * 1000 + 3_600_000);
+    await search(client, next(first) as Record<string, unknown>);
+    expect(client.query).toHaveBeenCalledWith([
+      expect.objectContaining({ page: 2, since: 23 * DAY }),
+    ]);
+    // A UTC time is read to the second; before excludes it.
+    await search(client, { q: "x", before: "1970-01-24T00:00:05Z" });
+    expect(client.query).toHaveBeenCalledWith([
+      expect.objectContaining({ until: 23 * DAY + 4 }),
+    ]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("gives every author's key, whatever name they chose, and cuts long messages around the match", async () => {
+  const long = `${"a ".repeat(300)}needle${" b".repeat(300)}`;
+  const { client } = fake([
+    profile(alice, "Sam"),
+    profile(bob, "Sam"),
+    metadata("chan", "general"),
+    event({ id: "3".repeat(64), content: long }),
+    event({ id: "4".repeat(64), pubkey: bob, created_at: 120, content: "x" }),
+  ]);
+  const lines = (await search(client, { q: "needle" })).split("\n");
+  expect(lines[2]).toContain(` · #general · from ${bob} "Sam" · `);
+  expect(lines[4]).toContain(` · #general · from ${alice} "Sam" · `);
+  const cut = lines[5] as string;
+  expect(cut).toMatch(/^ {4}…a a .*needle b b .*…$/);
+  expect(cut.length).toBeLessThanOrEqual(4 + 402);
+});
+
+it("refuses search arguments it cannot apply, saying how to fix them", async () => {
+  const { client } = fake([
+    profile(alice, "Sam"),
+    profile(bob, "Sam"),
+    profile(me, "Lau"),
+    profile("e".repeat(64), "Kim"),
+    metadata("c1", "ops"),
+    metadata("c2", "ops"),
+    metadata("c3", "general"),
+  ]);
+  for (const [args, error] of [
+    [{}, "Give q, or from, in, after or before."],
+    [{ q: " ", limit: 0, page: 0 }, "Give q, or from, in, after or before."],
+    [{ q: "x", sort: "oldest" }, "sort must be relevance or newest."],
+    [{ q: "x", page: -1 }, "page must be a whole number, 1 or more."],
+    [{ q: "x", page: 1.5 }, "page must be a whole number, 1 or more."],
+    [{ q: "x", after: "friday" }, "after must be a date (YYYY-MM-DD)"],
+    [{ q: "x", before: "2026-02-30" }, "before must be a date (YYYY-MM-DD)"],
+    [
+      { q: "x", after: "2026-01-02T25:00:00Z" },
+      "after must be a date (YYYY-MM-DD)",
+    ],
+    [
+      { q: "x", after: "2026-01-02T10:00:00+01:00" },
+      "after must be a date (YYYY-MM-DD)",
+    ],
+    [
+      { q: "x", after: "2026-01-02", before: "2026-01-02" },
+      "after must be earlier than before.",
+    ],
+    [{ from: "Sam" }, "2 people are named Sam; give their npub."],
+    [{ from: "Nobody" }, "No one is named Nobody."],
+    [{ in: "@Sam" }, "2 people are named Sam; give their npub."],
+    [{ in: "@Kim" }, "You have no DM with Kim."],
+    [{ in: "#ops" }, "2 channels are named ops; give its ID."],
+    [
+      { in: "gen" },
+      "No channel you can see is named gen.\nSimilar:\nc3 #general",
+    ],
+  ] as const)
+    await expect(search(client, args), JSON.stringify(args)).rejects.toThrow(
+      error,
+    );
+  // Nothing was searched.
+  expect(
+    vi
+      .mocked(client.query)
+      .mock.calls.flat(2)
+      .some((filter) => (filter.kinds as number[]).includes(9)),
+  ).toBe(false);
+  await expect(search(client, { q: "zebra", in: "c3" })).resolves.toBe(
+    `No messages for "zebra" in #general.\n${SCOPE}`,
+  );
 });
 
 it("takes back its own reaction", async () => {
@@ -1343,13 +1768,14 @@ it("lists its tools before it can call them", async () => {
     },
   )) as { result: { tools: unknown[] } };
   // Every app session lists the same tools: the Buzz, attention, Solo worker,
-  // plugin and settings tools.
+  // plugin, settings and Bestie tools.
   expect(list.result.tools).toHaveLength(
     TOOLS.length +
       ATTENTION_TOOLS.length +
       SOLO_WORKER_TOOLS.length +
       PLUGIN_TOOLS.length +
-      SETTINGS_TOOLS.length,
+      SETTINGS_TOOLS.length +
+      BESTIE_TOOLS.length,
   );
   await expect(
     respond(
@@ -1731,6 +2157,160 @@ it("creates a Solo chat with its members in the create, as Buzz does", async () 
   await expect(
     callTool(client, {}, "channel_get", { channel: plain }),
   ).resolves.toBe(`${plain} ops (stream, private)\nyou: owner`);
+});
+
+it("discovers local workspaces and files only after creating a Solo with explicit members", async () => {
+  const { client, published } = relay();
+  const file = vi.fn(async () => ({ status: "filed" as const }));
+  const list = vi.fn(async () => [{ id: "work", name: "Work" }]);
+  const prepare = vi.fn(async () => file);
+  client.soloWorkspaces = { list, prepare };
+  expect(await callTool(client, {}, "solo_workspace_list", {})).toBe(
+    JSON.stringify([{ id: "work", name: "Work" }]),
+  );
+  const answer = await callTool(client, {}, "channel_create", {
+    name: "triage",
+    visibility: "private",
+    solo: true,
+    members: [alice],
+    workspace: "work",
+  });
+  const id = published[0]?.tags[0]?.[1];
+  expect(prepare).toHaveBeenCalledExactlyOnceWith("work", [alice], id);
+  expect(file).toHaveBeenCalledExactlyOnceWith(id);
+  expect(answer).toBe(
+    `created ${id}\nadded ${alice} Alice Smith\nfiled in workspace work`,
+  );
+  expect(published).toHaveLength(1);
+  expect(published[0]?.kind).toBe(9007);
+});
+
+it("rejects unsupported or invalid workspace placement before publication", async () => {
+  const { client, published } = relay();
+  const args = {
+    name: "triage",
+    visibility: "private",
+    solo: true,
+    members: [alice],
+    workspace: "work",
+  };
+  await expect(callTool(client, {}, "solo_workspace_list", {})).rejects.toThrow(
+    "unavailable on this host",
+  );
+  await expect(callTool(client, {}, "channel_create", args)).rejects.toThrow(
+    "unavailable on this host",
+  );
+  const prepare = vi.fn(async () => {
+    throw new Error("No such workspace");
+  });
+  client.soloWorkspaces = { list: async () => [], prepare };
+  await expect(
+    callTool(client, {}, "channel_create", {
+      ...args,
+      solo: false,
+      members: undefined,
+    }),
+  ).rejects.toThrow("workspace is for Solo");
+  await expect(callTool(client, {}, "channel_create", args)).rejects.toThrow(
+    "No such workspace",
+  );
+  expect(published).toEqual([]);
+});
+
+it.each([
+  "deleted target",
+  "record full",
+  "revision conflict",
+  "community changed",
+])("keeps the created chat ID when filing fails: %s", async (message) => {
+  const { client, published } = relay();
+  const file = vi.fn(async () => {
+    throw new Error(message);
+  });
+  client.soloWorkspaces = { list: async () => [], prepare: async () => file };
+  const answer = await callTool(client, {}, "channel_create", {
+    name: "triage",
+    visibility: "private",
+    solo: true,
+    members: [alice],
+    workspace: "work",
+  });
+  const id = published[0]?.tags[0]?.[1];
+  expect(answer).toContain(`created ${id}`);
+  expect(answer).toContain(
+    `workspace placement unconfirmed and may have completed: ${message}`,
+  );
+  expect(answer).toContain("do not create another chat");
+  expect(published).toHaveLength(1);
+  expect(file).toHaveBeenCalledOnce();
+});
+
+it.each(["not-filed", "unconfirmed"] as const)(
+  "reports structured placement outcome without repeating create: %s",
+  async (status) => {
+    const { client, published } = relay();
+    client.soloWorkspaces = {
+      list: async () => [],
+      prepare: async () => async () => ({ status, error: "placement stopped" }),
+    };
+    const answer = await callTool(client, {}, "channel_create", {
+      name: "triage",
+      visibility: "private",
+      solo: true,
+      members: [alice],
+      workspace: "work",
+    });
+    expect(answer).toContain(`created ${published[0]?.tags[0]?.[1]}`);
+    expect(answer).toContain(
+      status === "not-filed"
+        ? "created, not filed"
+        : "placement unconfirmed and may have completed",
+    );
+    if (status === "unconfirmed")
+      expect(answer).toContain("Inspect or refresh");
+    expect(published).toHaveLength(1);
+  },
+);
+
+it("reports uncertainty after a gated durable placement loses its app lifetime", async () => {
+  const { client, published } = relay();
+  let release!: () => void;
+  const delivered = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started!: () => void;
+  const enqueued = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let durable = false;
+  client.soloWorkspaces = {
+    list: async () => [],
+    prepare: async () => async () => {
+      durable = true;
+      started();
+      await delivered;
+      throw new Error("retired after durable placement");
+    },
+  };
+  const pending = callTool(client, {}, "channel_create", {
+    name: "triage",
+    visibility: "private",
+    solo: true,
+    members: [alice],
+    workspace: "work",
+  });
+  try {
+    await enqueued;
+    expect(durable).toBe(true);
+    expect(published).toHaveLength(1);
+  } finally {
+    release();
+  }
+  const answer = await pending;
+  expect(answer).toContain(`created ${published[0]?.tags[0]?.[1]}`);
+  expect(answer).toContain("placement unconfirmed and may have completed");
+  expect(answer).toContain("Inspect or refresh");
+  expect(answer).not.toContain("not filed");
 });
 
 it("refuses Solo arguments that do not fit, before publishing", async () => {
@@ -3286,17 +3866,249 @@ it("finds users through the community's name search, in its order", async () => 
     profile(alice, "Wesley"),
   ]);
   const found = await callTool(client, {}, "users", { q: "Wes" });
-  expect(found).toBe(`${bob} Wes\n${alice} Wesley`);
+  expect(found).toBe(`${bob} "Wes"\n${alice} "Wesley"`);
   expect(client.searchProfiles).toHaveBeenCalledWith("wes", 100);
   expect(client.query).not.toHaveBeenCalled();
 });
 
+function verifiedPeople(more: readonly BuzzEvent[] = []) {
+  const relay = keypair();
+  const carol = "e".repeat(64);
+  const head = (
+    subject: string,
+    display: string,
+    username: string,
+    full: string,
+  ) =>
+    eventDto(
+      signed(relay, {
+        kind: 30382,
+        content: "",
+        created_at: 100,
+        tags: [
+          ["d", subject],
+          ["p", subject],
+          ["active", "true"],
+          ["issuer_label", "Example"],
+          ["verified_at", "100"],
+          ["display_name", display],
+          ["username", username],
+          ["full_name", full],
+        ],
+      }),
+    );
+  const heads = [
+    head(alice, "Ally", "jrivera", "Jordan Rivera"),
+    head(carol, "Cee", "cquinn", "Casey Quinn"),
+  ];
+  const { client: base } = fake([...community, ...heads, ...more]);
+  const client = {
+    ...base,
+    relayAuthor: relay.pubkey,
+    searchProfiles: vi.fn(async () => [
+      event({
+        kind: 0,
+        pubkey: alice,
+        content: JSON.stringify({
+          display_name: "Alice Smith",
+          name: "asmith",
+        }),
+      }),
+      ...heads,
+    ]),
+  };
+  return { client, carol };
+}
+
+it("finds a user by a verified full name that differs from their profile name", async () => {
+  const { client, carol } = verifiedPeople();
+  const found = await callTool(client, {}, "users", { q: "Jordan Rivera" });
+  expect(client.searchProfiles).toHaveBeenCalledWith("jordan rivera", 100);
+  expect(found).toBe(
+    [
+      `${alice} "Alice Smith" (verified: Jordan Rivera)`,
+      `${carol} (verified: Casey Quinn)`,
+    ].join("\n"),
+  );
+});
+
+it("learns the relay's key only when a people search needs it", async () => {
+  const { client: known, carol } = verifiedPeople();
+  const { relayAuthor, ...client } = known;
+  const relayAuthorLookup = vi.fn(async () => relayAuthor);
+  const lazy = { ...client, relayAuthorLookup };
+  await callTool(lazy, {}, "channel_list", {});
+  expect(relayAuthorLookup).not.toHaveBeenCalled();
+  const found = await callTool(lazy, {}, "users", { q: "Jordan Rivera" });
+  expect(found).toBe(
+    [
+      `${alice} "Alice Smith" (verified: Jordan Rivera)`,
+      `${carol} (verified: Casey Quinn)`,
+    ].join("\n"),
+  );
+});
+
+it("asks for the relay's key once per people search", async () => {
+  const { client: known } = verifiedPeople();
+  const { relayAuthor: _, ...client } = known;
+  const relayAuthorLookup = vi.fn(async () => {
+    throw new Error("offline");
+  });
+  const found = await callTool({ ...client, relayAuthorLookup }, {}, "users", {
+    q: "Jordan Rivera",
+  });
+  expect(relayAuthorLookup).toHaveBeenCalledOnce();
+  expect(found).toBe(`${alice} "Alice Smith"`);
+});
+
+it("names no author while the relay's key can't be learned, then asks which one is meant", async () => {
+  const { client: known } = verifiedPeople([note(alice, "recipe", 200)]);
+  const { relayAuthor, ...client } = known;
+  const search = client.searchProfiles;
+  client.searchProfiles = vi.fn(async () => [
+    profile("f".repeat(64), "Jordan Rivera"),
+    ...(await search()),
+  ]);
+  const relayAuthorLookup = vi.fn<() => Promise<string | undefined>>(
+    async () => {
+      throw new Error("offline");
+    },
+  );
+  const read = () =>
+    callTool({ ...client, relayAuthorLookup }, {}, "notes_get", {
+      name: "recipe",
+      author: "Jordan Rivera",
+    });
+  await expect(read()).rejects.toThrow(
+    "Couldn't check verified names; try again.",
+  );
+  relayAuthorLookup.mockImplementation(async () => relayAuthor);
+  await expect(read()).rejects.toThrow(
+    "2 people are named Jordan Rivera; give their npub.",
+  );
+});
+
+it("names an author by profile name where the relay has no key", async () => {
+  const { client: known } = verifiedPeople([note(alice, "recipe", 200)]);
+  const { relayAuthor: _, ...client } = known;
+  const relayAuthorLookup = vi.fn(async () => undefined);
+  await expect(
+    callTool({ ...client, relayAuthorLookup }, {}, "notes_get", {
+      name: "recipe",
+      author: "asmith",
+    }),
+  ).resolves.toMatch(/\nrecipe by a$/);
+});
+
+it("quotes a profile's own name, so it can't pass for a verified label", async () => {
+  const { client } = verifiedPeople();
+  const forger = "d".repeat(64);
+  client.searchProfiles = vi.fn(async () => [
+    profile(forger, "Alice (verified: Jordan Rivera)"),
+  ]);
+  const found = await callTool(client, {}, "users", { q: "Jordan Rivera" });
+  expect(found).toBe(`${forger} "Alice (verified: Jordan Rivera)"`);
+  client.searchProfiles = vi.fn(async () => [
+    event({
+      kind: 0,
+      pubkey: forger,
+      content: JSON.stringify({
+        display_name: "Plain",
+        about: `hello\n${forger} "Plain" (verified: Jordan Rivera)`,
+      }),
+    }),
+  ]);
+  const about = await callTool(client, {}, "users", { q: "Jordan Rivera" });
+  expect(String(about).split("\n")).toHaveLength(1);
+});
+
+it("keeps the people the search found when reading verified names fails, but names no author", async () => {
+  const { client, carol } = verifiedPeople([note(alice, "recipe", 200)]);
+  const query = client.query;
+  client.query = vi.fn(async (filters: Parameters<typeof query>[0]) =>
+    filters.some((filter) => (filter.kinds as number[]).includes(30382))
+      ? Promise.reject(new Error("offline"))
+      : query(filters),
+  );
+  const found = await callTool(client, {}, "users", { q: "Jordan Rivera" });
+  expect(found).toBe(
+    [
+      `${alice} "Alice Smith" (verified: Jordan Rivera)`,
+      `${carol} (verified: Casey Quinn)`,
+    ].join("\n"),
+  );
+  await expect(
+    callTool(client, {}, "notes_get", { name: "recipe", author: "asmith" }),
+  ).rejects.toThrow("Couldn't check verified names; try again.");
+});
+
+it("keeps the community's order for a person it found with no profile", async () => {
+  const { client, carol } = verifiedPeople();
+  const heads = (await client.searchProfiles()).filter((e) => e.kind === 30382);
+  client.searchProfiles = vi.fn(async () => [
+    heads[1] as BuzzEvent,
+    profile(alice, "Alice Smith"),
+    heads[0] as BuzzEvent,
+  ]);
+  const found = await callTool(client, {}, "users", { q: "q" });
+  expect(found).toBe(
+    `${carol} (verified: Casey Quinn)\n${alice} "Alice Smith" (verified: Jordan Rivera)`,
+  );
+});
+
+it("names an author by any verified name or profile name, ignoring accents and case", async () => {
+  const carol = "e".repeat(64);
+  const { client } = verifiedPeople([
+    note(alice, "recipe", 200),
+    note(carol, "recipe", 300),
+  ]);
+  const read = (author: string) =>
+    callTool(client, {}, "notes_get", { name: "recipe", author });
+  for (const author of [
+    "Jordán Rivera",
+    "Ally",
+    "jrivera",
+    "alice smith",
+    "asmith",
+  ])
+    await expect(read(author)).resolves.toMatch(/\nrecipe by a$/);
+  await expect(read("Casey Quinn")).resolves.toMatch(/\nrecipe by e$/);
+  await expect(read("Nobody")).rejects.toThrow("No one is named Nobody.");
+});
+
+it("asks which person is meant when a profile name is another's verified name", async () => {
+  const { client } = verifiedPeople([note(alice, "recipe", 200)]);
+  const namesake = "f".repeat(64);
+  const search = client.searchProfiles;
+  client.searchProfiles = vi.fn(async () => [
+    profile(namesake, "Jordan Rivera"),
+    ...(await search()),
+  ]);
+  await expect(
+    callTool(client, {}, "notes_get", {
+      name: "recipe",
+      author: "Jordan Rivera",
+    }),
+  ).rejects.toThrow("2 people are named Jordan Rivera; give their npub.");
+});
+
 it("finds users with NIP-50 search where the community has no name search", async () => {
-  const { client } = fake(community);
+  const dana = "d".repeat(64);
+  const { client } = fake([
+    ...community,
+    event({
+      kind: 0,
+      pubkey: dana,
+      content: JSON.stringify({ display_name: "Dana", name: "dfernández" }),
+    }),
+  ]);
   client.searchProfiles = vi.fn(async () => undefined);
   // The fake ignores `search`; the name filter keeps only matching names.
   expect(await callTool(client, {}, "users", { q: "alice" })).toBe(
-    `${alice} Alice Smith`,
+    `${alice} "Alice Smith"`,
+  );
+  expect(await callTool(client, {}, "users", { q: "Fernandez" })).toBe(
+    `${dana} "Dana"`,
   );
   expect(client.query).toHaveBeenCalledWith([
     { kinds: [0], search: "alice", limit: 100 },
@@ -3323,7 +4135,7 @@ it("reads users by id without the name search", async () => {
   const { client } = fake(community);
   client.searchProfiles = vi.fn(async () => []);
   expect(await callTool(client, {}, "users", { ids: [bob] })).toBe(
-    `${bob} Bob`,
+    `${bob} "Bob"`,
   );
   expect(client.searchProfiles).not.toHaveBeenCalled();
 });
@@ -4083,10 +4895,32 @@ it("hands off to the agent in another of its conversations it can see", async ()
   );
   await wake({ channel: "chan", root }, { channel: "solo" });
   await wake({}, { channel: "chan", thread: root });
+  // Where the host says the channel's threads have sessions of their own, a
+  // conversation with no thread there is apart from them and can wake one; a
+  // session marked whole still cannot, nor can one where the host says no.
+  client.threadsApart = vi.fn((channel: string) => channel === "chan");
+  await wake({ channel: "chan" }, { channel: "chan", thread: nested });
+  expect(client.threadsApart).toHaveBeenCalledWith("chan");
+  await expect(
+    wake(
+      { channel: "chan", root: "5".repeat(64), wholeChannel: true },
+      { channel: "chan", thread: nested },
+    ),
+  ).rejects.toThrow("That is this conversation.");
+  vi.mocked(client.threadsApart).mockReturnValue(false);
+  await expect(
+    wake({ channel: "chan" }, { channel: "chan", thread: nested }),
+  ).rejects.toThrow(/^That is this conversation\.$/);
+  // Where the host cannot tell yet, the refusal says why.
+  vi.mocked(client.threadsApart).mockReturnValue(undefined);
+  await expect(
+    wake({ channel: "chan" }, { channel: "chan", thread: nested }),
+  ).rejects.toThrow("this channel has not loaded here yet");
   expect(vi.mocked(client.handoff).mock.calls).toEqual([
     [{ channel: "chan", root, text: "carry on", from: { channel: "solo" } }],
     [{ channel: "solo", text: "carry on", from: { channel: "chan", root } }],
     [{ channel: "chan", root, text: "carry on", from: {} }],
+    [{ channel: "chan", root, text: "carry on", from: { channel: "chan" } }],
   ]);
 });
 it("reads agents and teams and drafts team changes without members", async () => {
@@ -4246,6 +5080,35 @@ it("nests a reply under a message inside a thread, naming the root and the paren
   expect(published[0]?.tags[4]?.[0]).toBe("imeta");
 });
 
+it.each(["send", "reply_in_subthread"])(
+  "%s refuses a self-mention instead of reporting a post as a wake",
+  async (name) => {
+    const { client, published } = fake([...community, profile(me, "Echo")]);
+    for (const mention of [
+      { text: "@Echo carry on" },
+      { text: `nostr:${npubEncode(me)} carry on` },
+      { text: "carry on", mentions: [me] },
+    ]) {
+      await expect(
+        callTool(client, { channel: "elsewhere" }, name, {
+          channel: "chan",
+          parent: root,
+          audience: "agents",
+          ...mention,
+        }),
+      ).rejects.toThrow("self_handoff");
+    }
+    expect(published).toEqual([]);
+    await callTool(client, { channel: "elsewhere" }, name, {
+      channel: "chan",
+      parent: root,
+      audience: "everyone",
+      text: "An ordinary update",
+    });
+    expect(published).toHaveLength(1);
+  },
+);
+
 it.each(["everyone", "agents"])(
   "replies under a thread's root as send does, for audience %s",
   async (audience) => {
@@ -4270,11 +5133,12 @@ it.each(["everyone", "agents"])(
   },
 );
 
-it("tags a nested reply for agents only", async () => {
+it("tags a nested reply for agents only, signing its request", async () => {
   const { client, published } = fake(community);
   await callTool(client, { channel: "chan", root }, "reply_in_subthread", {
     parent: nested,
     audience: "agents",
+    request: "f".repeat(64),
     text: "a",
   });
   expect(published[0]?.tags).toEqual([
@@ -4282,6 +5146,7 @@ it("tags a nested reply for agents only", async () => {
     ["e", root, "", "root"],
     ["e", nested, "", "reply"],
     ["audience", "agents"],
+    ["buzz:request", "f".repeat(64)],
   ]);
 });
 
@@ -4513,4 +5378,262 @@ it("addresses a new reaction to the actual message author and fails before publi
     callTool(client, {}, "react", { id: nested, emoji: "❤️" }),
   ).rejects.toThrow("No message");
   expect(published).toHaveLength(1);
+});
+
+it.each(["send", "reply_in_subthread"])(
+  "%s carries exact snapshot-matching attachment hints only out of band",
+  async (name) => {
+    const { client, published } = fake(community);
+    const hash = createHash("sha256").update(PNG).digest("hex");
+    vi.mocked(client.upload).mockResolvedValue({
+      url: "https://relay/media/x.png",
+      sha256: hash,
+      size: PNG.length,
+      type: "image/png",
+    });
+    await callTool(client, { channel: "chan", root }, name, {
+      text: "attachment",
+      audience: "everyone",
+      ...(name === "send" ? { reply: nested } : { parent: nested }),
+      files: ["shot.png", "shot.png"],
+    });
+    expect(client.publish).toHaveBeenLastCalledWith(
+      expect.objectContaining({ kind: 9 }),
+      {
+        managedAttachments: [
+          {
+            path: "shot.png",
+            sha256: hash,
+            size: PNG.length,
+            url: "https://relay/media/x.png",
+          },
+        ],
+      },
+    );
+    expect(published[0]?.tags).toContainEqual(
+      expect.arrayContaining(["imeta", `x ${hash}`, `size ${PNG.length}`]),
+    );
+  },
+);
+
+it.each(["send", "reply_in_subthread"])(
+  "%s refuses an attachment-bearing self-mention without publishing release hints",
+  async (name) => {
+    const { client } = fake(community);
+    vi.mocked(client.upload).mockResolvedValue({
+      url: "https://relay/media/x.png",
+      sha256: createHash("sha256").update(PNG).digest("hex"),
+      size: PNG.length,
+      type: "image/png",
+    });
+    await expect(
+      callTool(client, { channel: "chan", root }, name, {
+        text: "attachment",
+        audience: "agents",
+        ...(name === "send" ? { reply: nested } : { parent: nested }),
+        mentions: [me],
+        files: ["shot.png"],
+      }),
+    ).rejects.toThrow("self_handoff");
+    expect(client.upload).toHaveBeenCalledOnce();
+    expect(client.publish).not.toHaveBeenCalled();
+  },
+);
+
+it.each(["read", "upload", "body", "mentions", "emoji"])(
+  "never publishes release hints after %s fails, including a later attachment failure",
+  async (boundary) => {
+    const { client } = fake(community);
+    const hash = createHash("sha256").update(PNG).digest("hex");
+    vi.mocked(client.upload).mockResolvedValue({
+      url: "https://relay/media/x.png",
+      sha256: hash,
+      size: PNG.length,
+      type: "image/png",
+    });
+    if (boundary === "read")
+      vi.mocked(client.read)
+        .mockResolvedValueOnce(PNG)
+        .mockRejectedValueOnce(new Error("read failed"));
+    if (boundary === "upload")
+      vi.mocked(client.upload)
+        .mockResolvedValueOnce({
+          url: "https://relay/media/x.png",
+          sha256: hash,
+          size: PNG.length,
+          type: "image/png",
+        })
+        .mockRejectedValueOnce(new Error("upload failed"));
+    if (boundary === "body")
+      vi.mocked(client.read).mockImplementation(async (path) => {
+        if (path === "body.txt") throw new Error("body failed");
+        return PNG;
+      });
+    if (boundary === "mentions" || boundary === "emoji")
+      vi.mocked(client.query).mockImplementation(async () => {
+        throw new Error(`${boundary} failed`);
+      });
+    await expect(
+      callTool(client, { channel: "chan" }, "send", {
+        audience: "everyone",
+        files: ["one.png", "two.png"],
+        ...(boundary === "body"
+          ? { path: "body.txt" }
+          : { text: boundary === "emoji" ? ":sample:" : "attachment" }),
+        ...(boundary === "mentions" && { mentions: [bob] }),
+      }),
+    ).rejects.toThrow("failed");
+    expect(client.publish).not.toHaveBeenCalled();
+  },
+);
+
+it.each(["mismatch", "conflict", "overflow", "text-path"])(
+  "omits managed hints for %s without changing ordinary attachment publication",
+  async (kind) => {
+    const { client } = fake(community);
+    const hash = createHash("sha256").update(PNG).digest("hex");
+    vi.mocked(client.upload).mockResolvedValue({
+      url: "https://relay/media/x.png",
+      sha256: hash,
+      size: PNG.length,
+      type: "image/png",
+    });
+    if (kind === "mismatch")
+      vi.mocked(client.upload).mockResolvedValue({
+        url: "https://relay/media/x.png",
+        sha256: "forged",
+        size: PNG.length,
+        type: "image/png",
+      });
+    if (kind === "conflict") {
+      vi.mocked(client.read)
+        .mockResolvedValueOnce(PNG)
+        .mockResolvedValueOnce(new Uint8Array([1, 2, 3]));
+      vi.mocked(client.upload).mockImplementation(async (data, type) => ({
+        url: "https://relay/media/x.png",
+        sha256: createHash("sha256").update(data).digest("hex"),
+        size: data.length,
+        type,
+      }));
+    }
+    await callTool(client, { channel: "chan" }, "send", {
+      audience: "everyone",
+      ...(kind === "text-path"
+        ? { path: "notes.md" }
+        : {
+            text: "attachment",
+            files:
+              kind === "overflow"
+                ? Array.from({ length: 17 }, (_, i) => `${i}.png`)
+                : ["shot.png", "shot.png"],
+          }),
+    });
+    expect(client.publish).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ kind: 9 }),
+    );
+  },
+);
+
+it("holds publication until the actual attachment upload settles", async () => {
+  const { client } = fake(community);
+  const read = gate<Uint8Array>();
+  const upload = gate<Awaited<ReturnType<BuzzClient["upload"]>>>();
+  const uploaded = gate<void>();
+  vi.mocked(client.read).mockReturnValue(read.promise);
+  vi.mocked(client.upload).mockImplementation(() => {
+    uploaded.resolve();
+    return upload.promise;
+  });
+  const pending = callTool(client, { channel: "chan" }, "send", {
+    audience: "everyone",
+    text: "attachment",
+    files: ["file.png"],
+  });
+  try {
+    expect(client.upload).not.toHaveBeenCalled();
+    expect(client.publish).not.toHaveBeenCalled();
+    read.resolve(PNG);
+    await uploaded.promise;
+    expect(client.publish).not.toHaveBeenCalled();
+    upload.resolve({
+      url: "https://relay/media/x.png",
+      sha256: createHash("sha256").update(PNG).digest("hex"),
+      size: PNG.length,
+      type: "image/png",
+    });
+    expect(await pending).toContain("sent ");
+    expect(client.publish).toHaveBeenCalledOnce();
+  } finally {
+    read.resolve(PNG);
+    upload.resolve({ url: "x", sha256: "", size: 0, type: "" });
+    await pending.catch(() => undefined);
+  }
+});
+
+it("preserves ordinary attachment sends when snapshot hashing is unavailable", async () => {
+  const { client } = fake(community);
+  const hash = vi
+    .spyOn(crypto.subtle, "digest")
+    .mockRejectedValueOnce(new Error("hash unavailable"));
+  try {
+    await callTool(client, { channel: "chan" }, "send", {
+      audience: "everyone",
+      text: "attachment",
+      files: ["shot.png"],
+    });
+    expect(client.upload).toHaveBeenCalledOnce();
+    expect(client.publish).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ kind: 9 }),
+    );
+  } finally {
+    hash.mockRestore();
+  }
+});
+
+it("passes only explicit runtime settings through the owner review tool", async () => {
+  const { client } = fake([]);
+  client.updateAgent = vi.fn(async () => ({
+    requestId: "draft",
+    saved: false as const,
+  }));
+  const settings = {
+    model: "",
+    effort: "high",
+    scope: "community",
+    voice: "maple",
+    apps: false,
+    workspace: "~/example",
+    compactAt: "150000",
+  };
+  await expect(
+    callTool(client, {}, "agent_update", {
+      agent: "Self",
+      ...settings,
+      model: "  ",
+      effort: " high ",
+      voice: " maple ",
+    }),
+  ).resolves.toBe('{"requestId":"draft","saved":false}');
+  expect(client.updateAgent).toHaveBeenCalledWith({ agent: "Self", settings });
+  for (const invalid of [
+    { scope: "all" },
+    { apps: "false" },
+    { model: null },
+    { compactAt: "99000" },
+    { compactAt: "150500" },
+    { compactAt: 150000 },
+    { config: {} },
+  ])
+    await expect(
+      callTool(client, {}, "agent_update", {
+        agent: "Self",
+        ...invalid,
+      }),
+    ).rejects.toThrow();
+  expect(client.updateAgent).toHaveBeenCalledTimes(1);
+  await callTool(client, {}, "agent_update", { agent: "Self", compactAt: "" });
+  expect(client.updateAgent).toHaveBeenLastCalledWith({
+    agent: "Self",
+    settings: { compactAt: "" },
+  });
 });

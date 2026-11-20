@@ -2,6 +2,9 @@ import { Context } from "@deepseek-ai/cordis";
 import { afterEach, expect, it, vi } from "vitest";
 import { PluginRuntime } from "../../plugins/runtime";
 import { ConversationService } from "./service";
+import { ChannelMembersDialog } from "../../bundled/channels/ChannelMembersDialog";
+import { ChannelGeneralAccess } from "../../bundled/channels/ChannelGeneralAccess";
+import { DocumentEditor } from "../messages/DocumentEditor";
 import { inlineMatches } from "./InlineText";
 import type { PluginModule } from "../../plugins/api";
 import type { ChannelMessage } from "../relay/contracts";
@@ -46,6 +49,9 @@ it("registers both surfaces under the injecting plugin scope, removes and replac
     inject: ["conversation"],
     apply(ctx) {
       const conversation = ctx.conversation;
+      expect(conversation.ui.MembersDialog).toBe(ChannelMembersDialog);
+      expect(conversation.ui.GeneralAccess).toBe(ChannelGeneralAccess);
+      expect(conversation.ui.DocumentEditor).toBe(DocumentEditor);
       expect(conversation.ui.Composer).toBe(conversation.ui.Composer);
       expect(conversation.ui.Message).toBe(conversation.ui.Message);
       expect(conversation.ui.Thread).toBe(conversation.ui.Thread);
@@ -242,6 +248,79 @@ it("rejects a link renderer order that is neither a number nor a function", asyn
   expect(h.runtime.snapshot()[h.plugin.manifest.id]?.status).toBe("active");
 });
 
+it("registers link previews and withdraws them with their plugin", async () => {
+  const h = harness({
+    inject: ["conversation"],
+    apply(ctx) {
+      const base = { id: "preview", title: "Preview", matches: () => true };
+      for (const order of [null, "100", {}, true]) {
+        expect(() =>
+          ctx.conversation.registerLinkPreview({
+            ...base,
+            order,
+            component: Component,
+          } as never),
+        ).toThrow("order");
+      }
+      expect(() =>
+        ctx.conversation.registerLinkPreview({
+          ...base,
+          matches: undefined,
+          component: Component,
+        } as never),
+      ).toThrow("matcher");
+      ctx.conversation.registerLinkPreview({
+        ...base,
+        order: 100,
+        component: Component,
+      });
+    },
+  });
+  h.runtime.reconcile([h.plugin]);
+  await vi.waitFor(() =>
+    expect(h.service.linkPreviews.snapshot()).toHaveLength(1),
+  );
+  h.runtime.reconcile([]);
+  await vi.waitFor(() =>
+    expect(h.service.linkPreviews.snapshot()).toHaveLength(0),
+  );
+});
+
+it("registers identity marks and withdraws them with their plugin", async () => {
+  const h = harness({
+    inject: ["conversation"],
+    apply(ctx) {
+      expect(() =>
+        ctx.conversation.registerIdentityMark({
+          id: "Bad id",
+          title: "Check",
+          component: Component,
+        }),
+      ).toThrow("id, title and component");
+      expect(() =>
+        ctx.conversation.registerIdentityMark({
+          id: "check",
+          title: "Check",
+        } as never),
+      ).toThrow("id, title and component");
+      ctx.conversation.registerIdentityMark({
+        id: "check",
+        title: "Check",
+        component: Component,
+      });
+    },
+  });
+  h.runtime.reconcile([h.plugin]);
+  await vi.waitFor(() =>
+    expect(h.service.identityMarks.snapshot()).toHaveLength(1),
+  );
+  expect(h.runtime.snapshot()[h.plugin.manifest.id]?.status).toBe("active");
+  h.runtime.reconcile([]);
+  await vi.waitFor(() =>
+    expect(h.service.identityMarks.snapshot()).toHaveLength(0),
+  );
+});
+
 it("rejects an attachment renderer order that is neither a number nor a function", async () => {
   const h = harness({
     inject: ["conversation"],
@@ -336,17 +415,20 @@ it("owns completion registration through disable, replacement and failed activat
   );
   expect(broken.service.completions.snapshot()).toHaveLength(0);
 });
-it.each([emoji, mentions])(
-  "bundled plugin registers its own completion provider",
-  async (module) => {
+it.each([
+  [emoji, ["typeahead"]],
+  [mentions, ["typeahead", "folders", "skills"]],
+])(
+  "bundled plugin registers its own completion providers",
+  async (module, ids) => {
     const h = harness(module);
     h.runtime.reconcile([h.plugin]);
     await vi.waitFor(() =>
-      expect(h.service.completions.snapshot()).toHaveLength(1),
+      expect(h.service.completions.snapshot().map(({ id }) => id)).toEqual(ids),
     );
-    expect(h.service.completions.snapshot()[0]?.pluginId).toBe(
-      h.plugin.manifest.id,
-    );
+    expect(
+      h.service.completions.snapshot().map(({ pluginId }) => pluginId),
+    ).toEqual(ids.map(() => h.plugin.manifest.id));
   },
 );
 

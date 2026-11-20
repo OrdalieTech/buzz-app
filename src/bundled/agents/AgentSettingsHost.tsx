@@ -123,11 +123,12 @@ export function useAgentSettingsHost({
   };
 }
 
-const CARRY_LABELS: Record<keyof Carry, string> = {
+const CARRY_LABELS = {
   instructions: "Instructions",
   workspace: "Workspace",
-};
-const CARRY_KEYS = Object.keys(CARRY_LABELS) as (keyof Carry)[];
+  sessionScope: "Session scope",
+} satisfies Partial<Record<keyof Carry, string>>;
+const CARRY_KEYS = Object.keys(CARRY_LABELS) as (keyof typeof CARRY_LABELS)[];
 
 function TypeField({
   agents,
@@ -331,7 +332,6 @@ function TypeField({
             ? `Move ${agent.name} to ${migration.target.title}?`
             : "Move agent?"
         }
-        headerGap="compact"
         actions={
           <>
             <Button
@@ -495,7 +495,9 @@ export function MigrationPreview({
   const SourceIcon = source?.icon;
   const TargetIcon = target.icon;
   const carry = CARRY_KEYS.filter(
-    (key) => preview.moved.includes(key) || preview.dropped.includes(key),
+    (key) =>
+      preview.dropped.includes(key) ||
+      (key !== "sessionScope" && preview.moved.includes(key)),
   );
   const warning = source?.migrationWarning;
   return (

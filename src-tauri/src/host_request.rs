@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::sync::{Mutex, OnceLock};
 
 mod public_image;
+mod public_page;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -403,6 +404,7 @@ async fn send_byte_upload(
         bytes,
     )?;
     let client = reqwest::Client::builder()
+        .user_agent(crate::relay::user_agent())
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .timeout(DEADLINE)
@@ -478,6 +480,47 @@ pub(crate) async fn plugin_host_request_bytes(
     tokio::time::timeout_at(end, operation)
         .await
         .map_err(|_| "Host byte request timed out")?
+}
+
+/// One public page's preview fields, for a plugin whose manifest declares
+/// `host.publicPages`. Redirects come back for the plugin to check.
+#[tauri::command]
+pub(crate) async fn plugin_host_read_page(
+    manager: tauri::State<'_, PluginManager>,
+    id: String,
+    revision: String,
+    url: String,
+    timeout_ms: Option<u64>,
+) -> Result<public_page::PageReply, String> {
+    let timeout = timeout_ms.unwrap_or(10_000);
+    if !(1..=30_000).contains(&timeout) {
+        return Err("Invalid page request timeout".into());
+    }
+    let (url, _, _) = validate_request(&HostRequest {
+        url,
+        method: "GET".into(),
+        headers: BTreeMap::new(),
+        body: None,
+        timeout_ms: Some(timeout),
+    })?;
+    let end = tokio::time::Instant::now() + Duration::from_millis(timeout);
+    let operation = async {
+        let _place = crate::host_files::byte_admission(end).await?;
+        if !byte_grants(manager.clone(), &id, &revision)
+            .await?
+            .public_pages
+        {
+            return Err("Plugin may not read public pages".to_owned());
+        }
+        let reply = public_page::read(url, Duration::from_millis(timeout)).await?;
+        if !byte_grants(manager, &id, &revision).await?.public_pages {
+            return Err("Plugin may not read public pages".to_owned());
+        }
+        Ok(reply)
+    };
+    tokio::time::timeout_at(end, operation)
+        .await
+        .map_err(|_| "Host page request timed out")?
 }
 
 /// How a byte request may reach its URL: a declared origin gets any response;
@@ -804,7 +847,9 @@ pub(crate) fn client(protected: bool) -> Result<&'static reqwest::Client, String
     static PROTECTED: OnceLock<Result<reqwest::Client, reqwest::Error>> = OnceLock::new();
     let cell = if protected { &PROTECTED } else { &PLAIN };
     cell.get_or_init(|| {
-        let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        let builder = reqwest::Client::builder()
+            .user_agent(crate::relay::user_agent())
+            .redirect(reqwest::redirect::Policy::none());
         if protected {
             // No idle connections, so each one-time request opens its own
             // (reqwest is built without HTTP/2, so none are shared either).
@@ -1218,3 +1263,7 @@ mod replay_tests;
 #[cfg(test)]
 #[path = "host_request/byte_tests.rs"]
 mod byte_tests;
+
+#[cfg(test)]
+#[path = "host_request/user_agent_tests.rs"]
+mod user_agent_tests;

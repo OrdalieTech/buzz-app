@@ -150,19 +150,30 @@ test("backup pills open stable key details and long content scrolls within the b
     expect(await height(badge)).toBe(enlarged);
     await details.focus();
     await page.keyboard.press("End");
+    // WebKit animates the End scroll: wait for it to land at the bottom, or
+    // it can carry on after the focus reveal below and scroll Remove away.
     await expect
-      .poll(() => details.evaluate((el) => el.scrollTop))
-      .toBeGreaterThan(0);
+      .poll(() =>
+        details.evaluate(
+          (el) =>
+            el.scrollTop > 0 &&
+            el.scrollHeight - el.clientHeight - el.scrollTop <= 1,
+        ),
+      )
+      .toBe(true);
     await remove.focus();
-    expect(
-      await remove.evaluate((el) => {
-        const r = el.getBoundingClientRect(),
-          p = el
-            .closest('[aria-label="Identity details"]')
-            .getBoundingClientRect();
-        return r.top >= p.top && r.bottom <= p.bottom;
-      }),
-    ).toBe(true);
+    // WebKit reveals a focused element on a timer.
+    await expect
+      .poll(() =>
+        remove.evaluate((el) => {
+          const r = el.getBoundingClientRect(),
+            p = el
+              .closest('[aria-label="Identity details"]')
+              .getBoundingClientRect();
+          return r.top >= p.top && r.bottom <= p.bottom;
+        }),
+      )
+      .toBe(true);
     await page.setViewportSize({ width: 1440, height: 950 });
     await page.evaluate(
       () => (document.documentElement.style.fontSize = "16px"),

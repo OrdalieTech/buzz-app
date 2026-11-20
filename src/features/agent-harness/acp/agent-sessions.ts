@@ -130,8 +130,11 @@ export type SessionsOptions = Readonly<{
   resolveDirectory: ResolveDirectory;
   /** Answers the agent's Buzz tools. */
   tools: ToolServer;
-  /** The process its sessions open in, started when needed. */
-  process: Readonly<{ get(): Promise<AcpProcess> }>;
+  /** The process its sessions open in, started when needed. One that would
+   * replace a process `drained` says no session needs stops it first. */
+  process: Readonly<{
+    get(drained?: (process: AcpProcess) => boolean): Promise<AcpProcess>;
+  }>;
   /** The servers its sessions hold: the shared pool unless given. */
   pool?: ServerPool;
   /** The agent's current settings, for a new session. */
@@ -139,7 +142,9 @@ export type SessionsOptions = Readonly<{
   /** The agent's provider, model and thinking level now, which each new
    * turn runs on. */
   choice(): Choice;
-  /** Changes when a setting a session was opened with has changed. */
+  /** Changes when a setting only a new session runs on has changed. A
+   * changed system prompt alone is given to the session as its next turn starts, where
+   * the harness can take it. */
   fingerprint(): string;
   /** Where each conversation's last use is saved. */
   store?: SessionStore;
@@ -151,6 +156,9 @@ export type SessionsOptions = Readonly<{
     title?: string,
     conversation?: string,
   ): void;
+  /** The tags a session opens with, for the conversation it opens for:
+   * none for a one-off turn. */
+  tags?(conversation?: string): Readonly<Record<string, string>>;
   /** Called when a conversation's session opens, is sent a message, or
    * closes. */
   onChange?(): void;
@@ -160,6 +168,8 @@ type Live = {
   session: AcpSession;
   process: AcpProcess;
   fingerprint: string;
+  /** The system prompt it runs on. */
+  systemPrompt: string;
   slot: Slot;
   /** When it last took in a message or ended a turn. */
   at: number;
@@ -169,6 +179,15 @@ type Live = {
 export class AgentSessions {
   /** The latest process its sessions opened in, whose exit drops them. */
   private process: AcpProcess | undefined;
+  /** Earlier processes a newer one replaced, each stopped once no session is
+   * in it. */
+  private readonly replaced = new Set<AcpProcess>();
+  /** Processes whose exit drops their sessions. */
+  private readonly known = new WeakSet<AcpProcess>();
+  /** How many processes have been asked for, and which ask `process`
+   * answered: a start can finish after a later one. */
+  private asked = 0;
+  private promoted = 0;
   private readonly live = new Map<string, Live>();
   /** One-off turns running or starting, by label. */
   private readonly once = new Map<string, Live | undefined>();
@@ -305,6 +324,15 @@ export class AgentSessions {
       ) {
         this.drop(key, live);
         break;
+      }
+      // A harness that cannot take a new prompt in place needs a new session.
+      if (!live.session.busy && !live.process.repromptable) {
+        const { systemPrompt } = await this.options.launch();
+        if (this.live.get(key) !== live) continue;
+        if (systemPrompt !== live.systemPrompt) {
+          this.drop(key, live);
+          continue;
+        }
       }
       return this.answer(
         key,
@@ -542,7 +570,10 @@ export class AgentSessions {
   ) {
     const opening = this.start(key, title, use, named);
     this.opens.add(opening);
-    const done = () => this.opens.delete(opening);
+    const done = () => {
+      this.opens.delete(opening);
+      this.retire();
+    };
     opening.then(done, done);
     return opening;
   }
@@ -559,23 +590,23 @@ export class AgentSessions {
     const launch = await this.options.launch();
     // Removed meanwhile: a process started now would outlive it.
     if (this.disposed) throw new Error(`${this.options.label} was stopped`);
+    const asked = ++this.asked;
     const [process, cwd] = await Promise.all([
-      this.options.process.get(),
+      // Only this open is opening: no other can be in it.
+      this.options.process.get(
+        (process) => this.opens.size === 1 && !this.used(process),
+      ),
       absolute(resolveDirectory, launch.workspace),
     ]);
-    if (process !== this.process) {
-      this.process = process;
-      void process.exited.then(() => {
-        for (const [key, live] of this.live)
-          if (live.process === process) this.drop(key, live);
-      });
-    }
+    this.promote(process, asked);
     // Busy until it is adopted as a conversation's.
     const slot: Slot = { idle: () => false, evict: async () => undefined };
     const room = pool.take(slot);
     let opened: AcpSession | undefined;
+    const tags = this.options.tags?.(this.once.has(key) ? undefined : key);
     const start = () =>
       process.open({
+        ...(tags ? { tags } : {}),
         onSession: (session) => (opened = session),
         cwd,
         systemPrompt: launch.systemPrompt,
@@ -604,6 +635,7 @@ export class AgentSessions {
           session: opened,
           process,
           fingerprint,
+          systemPrompt: launch.systemPrompt,
           slot,
           at: Date.now(),
         });
@@ -612,7 +644,28 @@ export class AgentSessions {
     const released = () => pool.release(slot);
     void (session.server?.closed ?? Promise.resolve()).then(released, released);
     session.conversation = key;
-    const live = { session, process, fingerprint, slot, at: Date.now() };
+    const live: Live = {
+      session,
+      process,
+      fingerprint,
+      systemPrompt: launch.systemPrompt,
+      slot,
+      at: Date.now(),
+    };
+    // Each turn runs on the current prompt. The session runs these one at a
+    // time, so an older prompt never lands after a newer one; a failure keeps
+    // the session and is tried again at the next turn.
+    if (process.repromptable)
+      session.beforeTurn = async () => {
+        const { systemPrompt } = await this.options.launch();
+        if (systemPrompt === live.systemPrompt) return;
+        try {
+          await process.reprompt(session, systemPrompt);
+          live.systemPrompt = systemPrompt;
+        } catch (error) {
+          console.warn(`${this.options.label} kept its old prompt`, error);
+        }
+      };
     if (fingerprint !== this.options.fingerprint() && !this.disposed) {
       // Settings saved while it opened: it would work with the old ones.
       void this.close(live);
@@ -725,9 +778,43 @@ export class AgentSessions {
    * have acknowledged it. */
   private strict(live: Live) {
     this.closing.add(live);
-    return live.process
-      .close(live.session, true)
-      .then(() => void this.closing.delete(live));
+    return live.process.close(live.session, true).then(() => {
+      this.closing.delete(live);
+      this.retire();
+    });
+  }
+  /** Makes the latest ask's `process` the current one; an earlier ask's
+   * that finished late is replaced, and stops once no session is in it. */
+  private promote(process: AcpProcess, asked: number) {
+    if (asked > this.promoted) {
+      this.promoted = asked;
+      if (this.process && this.process !== process)
+        this.replaced.add(this.process);
+      this.process = process;
+    } else if (process !== this.process) this.replaced.add(process);
+    if (this.known.has(process)) return;
+    this.known.add(process);
+    void process.exited.then(() => {
+      this.replaced.delete(process);
+      if (this.process === process) this.process = undefined;
+      for (const [key, live] of this.live)
+        if (live.process === process) this.drop(key, live);
+    });
+  }
+  /** Whether a session is in `process`, or closing in it. */
+  private used(process: AcpProcess) {
+    return [...this.live.values(), ...this.once.values(), ...this.closing].some(
+      (live) => live?.process === process,
+    );
+  }
+  /** Stops each replaced process that no session is in or opening in. */
+  private retire() {
+    if (this.opens.size) return;
+    for (const process of this.replaced)
+      if (!this.used(process)) {
+        this.replaced.delete(process);
+        void process.kill().catch(() => undefined);
+      }
   }
   private close(live: Live) {
     return this.strict(live).catch(() => undefined);

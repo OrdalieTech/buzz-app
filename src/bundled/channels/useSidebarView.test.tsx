@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useLayoutEffect, useState } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { stubAvatarBrowserApis } from "../../features/agents/avatar-testing";
 import { readView } from "../../shared/view-state";
@@ -12,16 +13,104 @@ afterEach(() => {
   localStorage.clear();
   vi.restoreAllMocks();
 });
-it("re-arms only explicit current reveals using the latest location and preserves manual scrolling otherwise", () => {
-  let sidebar: ReturnType<typeof useSidebarView> | undefined;
-  function View({ location, ready }: { location?: string; ready: boolean }) {
-    sidebar = useSidebarView("fixture", ready, location);
+it("keeps the viewport when a child retries a pending reveal during a preserved open", () => {
+  function Rows({
+    retryReveal,
+    current,
+  }: {
+    retryReveal(): void;
+    current: boolean;
+  }) {
+    const [visible, setVisible] = useState(true);
+    useLayoutEffect(() => retryReveal());
     return (
       <>
-        <button type="button" onClick={sidebar.revealAgain}>
+        <button type="button" onClick={() => setVisible(!visible)}>
+          Toggle source
+        </button>
+        {current && visible && (
+          <button type="button" aria-current="page">
+            Source
+          </button>
+        )}
+      </>
+    );
+  }
+  function View({
+    location = "activity",
+  }: {
+    location?: "activity" | "source" | "other";
+  }) {
+    const sidebar = useSidebarView(
+      "fixture",
+      true,
+      location,
+      location === "source",
+    );
+    return (
+      <>
+        <button type="button" onClick={() => sidebar.revealAgain()}>
           Reveal current
         </button>
         <nav ref={sidebar.list} data-testid="viewport">
+          <Rows
+            key={location}
+            current={location !== "activity"}
+            retryReveal={sidebar.retryReveal}
+          />
+        </nav>
+      </>
+    );
+  }
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+    function (this: HTMLElement) {
+      return this.tagName === "BUTTON"
+        ? ({ top: 200, bottom: 220, height: 20 } as DOMRect)
+        : ({ top: 0, bottom: 100, height: 100 } as DOMRect);
+    },
+  );
+  const view = render(<View />);
+  const viewport = screen.getByTestId("viewport");
+  Object.defineProperty(viewport, "clientHeight", { value: 100 });
+  view.rerender(<View location="source" />);
+  expect(viewport.scrollTop).toBe(0);
+  fireEvent.click(screen.getByText("Reveal current"));
+  expect(viewport.scrollTop).toBe(160);
+  fireEvent.click(screen.getByText("Toggle source"));
+  viewport.scrollTop = 0;
+  fireEvent.scroll(viewport);
+  fireEvent.click(screen.getByText("Reveal current"));
+  expect(viewport.scrollTop).toBe(0);
+  fireEvent.click(screen.getByText("Toggle source"));
+  expect(viewport.scrollTop).toBe(160);
+
+  // A pending explicit reveal belongs to the chat whose chip requested it.
+  const reveal = screen.getByRole("button", { name: "Reveal current" });
+  fireEvent.click(screen.getByText("Toggle source"));
+  reveal.focus();
+  fireEvent.click(reveal);
+  view.rerender(<View location="other" />);
+  expect(reveal).toHaveFocus();
+});
+it("re-arms only explicit current reveals using the latest location and preserves manual scrolling otherwise", () => {
+  let sidebar: ReturnType<typeof useSidebarView> | undefined;
+  function View({
+    location,
+    ready,
+    preserve = false,
+  }: {
+    location?: string;
+    ready: boolean;
+    preserve?: boolean;
+  }) {
+    const state = useSidebarView("fixture", ready, location, preserve);
+    sidebar = state;
+    return (
+      <>
+        <button type="button" onClick={() => state.revealAgain()}>
+          Reveal current
+        </button>
+        <nav ref={state.list} data-testid="viewport">
           <button type="button" aria-current="page">
             Current
           </button>
@@ -66,4 +155,9 @@ it("re-arms only explicit current reveals using the latest location and preserve
   view.rerender(<View ready />);
   fireEvent.click(screen.getByText("Reveal current"));
   expect(viewport.scrollTop).toBe(0);
+  view.rerender(<View location="source" ready preserve />);
+  sidebar?.retryReveal();
+  expect(viewport.scrollTop).toBe(0);
+  view.rerender(<View location="source" ready />);
+  expect(viewport.scrollTop).toBe(160);
 });

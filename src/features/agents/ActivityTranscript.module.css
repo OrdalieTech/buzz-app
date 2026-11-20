@@ -62,6 +62,7 @@
 .text {
   margin: 0;
   min-width: 0;
+  border-radius: var(--radius-row);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -201,33 +202,12 @@ html[data-keyboard-navigation] .context summary:focus-visible {
 .markdown > :last-child {
   margin-block-end: 0;
 }
-.markdown :is(ul, ol) {
-  padding-left: var(--space-5);
-}
-.markdown ul {
-  list-style: disc;
-}
-.markdown ol {
-  list-style: decimal;
-}
-.markdown :is(strong, b, h1, h2, h3, h4, h5, h6) {
-  font: inherit;
-  letter-spacing: inherit;
-}
-.markdown code,
-.markdown pre,
 .pre {
   font-family: var(--font-mono);
   font-size: var(--text-mono);
   line-height: var(--text-mono--line-height);
   letter-spacing: var(--text-mono--letter-spacing);
   font-weight: var(--text-mono--font-weight);
-}
-.markdown pre {
-  overflow-x: auto;
-}
-.markdown a {
-  text-decoration: underline;
 }
 .diff {
   margin: var(--space-1) 0 0;
@@ -245,7 +225,6 @@ html[data-keyboard-navigation] .context summary:focus-visible {
   flex-shrink: 1;
   overflow-wrap: anywhere;
 }
-.markdown pre,
 .pre {
   max-height: 24rem;
   overflow: auto;
@@ -388,5 +367,25 @@ html[data-keyboard-navigation] .context summary:focus-visible {
     transition:
       transform var(--duration-fast) var(--easing-enter),
       opacity var(--duration-fast) var(--easing-enter);
+  }
+}
+
+/* Arriving at a message's turn marks its text with the message arrival
+   wash, timed like the chat message highlight: held about a second, then a
+   slow fade back to the surface's own fill. The spread pads the wash without
+   moving the text. */
+.timeline [data-arrived] {
+  animation: entry-arrived calc(var(--duration-settle) * 10) ease-out;
+}
+@keyframes entry-arrived {
+  0%,
+  45% {
+    background-color: var(--surface-message-highlight);
+    box-shadow: 0 0 0 var(--space-1) var(--surface-message-highlight);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .timeline [data-arrived] {
+    animation-timing-function: steps(1, end);
   }
 }

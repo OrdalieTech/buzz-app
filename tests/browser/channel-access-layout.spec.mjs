@@ -21,6 +21,8 @@ test("general access starts the member list and footer actions stay reachable wi
   // Read a signed View only policy without publishing a metadata change.
   await page.route("**/query", async (route) => {
     const response = await route.fetch();
+    // A refusal, such as a rate limit, carries no events to rewrite.
+    if (!response.ok()) return route.fulfill({ response });
     const events = await response.json();
     await route.fulfill({
       response,
@@ -99,6 +101,10 @@ test("general access starts the member list and footer actions stay reachable wi
       // The fixed chrome and enlarged controls cannot all fit at this width.
       // Preserve the bounded whole-body fallback and prove keyboard reachability.
       await dialog.getByRole("searchbox").focus();
+      await page.keyboard.press("Tab");
+      await expect(
+        dialog.getByRole("button", { name: /^Filter members:/ }),
+      ).toBeFocused();
       await page.keyboard.press("Tab");
       await expect(audience).toBeFocused();
       await expect(audience).toBeInViewport({ ratio: 1 });

@@ -5,7 +5,7 @@ import { nativeIdentityEnabled } from "../identity/service";
 import { nativeMediaUrl } from "../relay/native";
 import { connectCommunityTransport } from "../communities/connection";
 import { communityDestination } from "../communities/destination";
-import { avatarSource } from "../../shared/avatar-source";
+import { avatarSource, legacyEmojiPicture } from "../../shared/avatar-source";
 
 /** Shared save policy; display-only inherited artwork may still fail validation. */
 export function avatarPictureError(value: string): string | undefined {
@@ -16,6 +16,11 @@ export function avatarPictureError(value: string): string | undefined {
     return undefined;
   return "Use an HTTPS image URL without credentials (up to 2,048 characters), or remove the avatar.";
 }
+
+/** A personal profile also saves old Buzz's emoji SVG as-is: Buzz mobile still
+ * writes and reads it. Agents save HTTPS pictures only. */
+export const profilePictureError = (value: string) =>
+  legacyEmojiPicture(value.trim()) ? undefined : avatarPictureError(value);
 
 export function avatarPreview(
   value: string,
@@ -66,13 +71,15 @@ export async function uploadAvatar(
  * inscribed in a circular avatar, so clipping never crops it. */
 export const emojiAvatarScale = 0.7;
 
-/** Fit painted pixels: emoji font metrics differ between browser engines. */
+/** Fit painted pixels: emoji font metrics differ between browser engines.
+ * `offset` and `x` move the emoji down and right, in image widths. */
 export function paintEmojiAvatar(
   canvas: HTMLCanvasElement,
   emoji: string,
   color?: string,
   scale = emojiAvatarScale,
   offset = 0,
+  x = 0,
 ) {
   canvas.width = canvas.height = 512;
   const context = canvas.getContext("2d");
@@ -121,28 +128,83 @@ export function paintEmojiAvatar(
   paint(
     context,
     516 * fit,
-    256 - ((left + right + 1) / 2 - 512) * fit,
+    256 + 512 * x - ((left + right + 1) / 2 - 512) * fit,
     256 + 512 * offset - ((top + bottom + 1) / 2 - 512) * fit,
   );
 }
 
-/** Persist ordinary square artwork; Avatar owns human/agent clipping. */
+/** Persist ordinary square artwork; Avatar owns human/agent clipping. A
+ * `transparent` color leaves the background clear. */
 export async function emojiAvatar(
   emoji: string,
   color: string,
   scale = emojiAvatarScale,
   offset = 0,
+  x = 0,
 ): Promise<File> {
-  if (!emoji || emoji.length > 64 || !/^#[0-9a-f]{6}$/i.test(color))
+  if (
+    !emoji ||
+    emoji.length > 64 ||
+    (color !== "transparent" && !/^#[0-9a-f]{6}$/i.test(color))
+  )
     throw new Error("Choose an emoji and a background color.");
   const canvas = document.createElement("canvas");
-  paintEmojiAvatar(canvas, emoji, color, scale, offset);
+  paintEmojiAvatar(canvas, emoji, color, scale, offset, x);
   const blob = await new Promise<Blob>((resolve, reject) =>
     canvas.toBlob(
       (value) =>
         value
           ? resolve(value)
           : reject(new Error("Could not prepare the emoji image.")),
+      "image/png",
+    ),
+  );
+  return new File([blob], "avatar.png", { type: "image/png" });
+}
+
+/** Pan and zoom over a square frame. `x` and `y` move the image center, in
+ * frame widths; `zoom` 1 covers the frame, as an uncropped avatar does. */
+export type AvatarCrop = { zoom: number; x: number; y: number };
+
+export const uncropped: AvatarCrop = { zoom: 1, x: 0, y: 0 };
+
+/** The image's box in frame widths, keeping the frame covered. `aspect` is
+ * the image's width over its height. */
+export function avatarCropBox(aspect: number, { zoom, x, y }: AvatarCrop) {
+  const width = zoom * Math.max(1, aspect);
+  const height = zoom * Math.max(1, 1 / aspect);
+  const clamp = (value: number, size: number) =>
+    Math.min((size - 1) / 2, Math.max((1 - size) / 2, value));
+  const crop = { zoom, x: clamp(x, width), y: clamp(y, height) };
+  return {
+    crop,
+    width,
+    height,
+    left: (1 - width) / 2 + crop.x,
+    top: (1 - height) / 2 + crop.y,
+  };
+}
+
+/** Paint the framed part of an image as square PNG artwork. */
+export async function croppedAvatar(
+  image: HTMLImageElement,
+  crop: AvatarCrop,
+): Promise<File> {
+  const { width, height, left, top } = avatarCropBox(
+    image.naturalWidth / image.naturalHeight,
+    crop,
+  );
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 512;
+  const context = canvas.getContext("2d");
+  if (!context)
+    throw new Error("Image cropping is unavailable in this browser.");
+  context.imageSmoothingQuality = "high";
+  context.drawImage(image, left * 512, top * 512, width * 512, height * 512);
+  const blob = await new Promise<Blob>((resolve, reject) =>
+    canvas.toBlob(
+      (value) =>
+        value ? resolve(value) : reject(new Error("Could not crop the image.")),
       "image/png",
     ),
   );

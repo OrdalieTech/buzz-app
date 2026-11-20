@@ -43,7 +43,9 @@ test.describe("held setup", () => {
     await expect.poll(() => app.relay.hasRoute("primary", "beta")).toBe(true);
     await expect(warning).toHaveCount(0);
     const streams = () =>
-      app.report.brokerRequests.filter((r) => r.url.endsWith("/stream")).length;
+      app.report.brokerRequests.filter(
+        (r) => r.url === "/api/relay/primary/stream",
+      ).length;
     const before = streams();
     await page.getByRole("button", { name: "Beta", exact: true }).click();
     await expect(
@@ -142,9 +144,13 @@ for (const target of ["alpha", "profiles"]) {
         (r) => r.community === "primary" && r.routes.includes(target),
       );
     const streams = () =>
-      app.report.brokerRequests.filter((r) => r.url.endsWith("/stream")).length;
+      app.report.brokerRequests.filter(
+        (r) => r.url === "/api/relay/primary/stream",
+      ).length;
     const streamCount = streams();
-    const sockets = app.relay.sockets.length;
+    const sockets = app.relay.sockets.filter(
+      (s) => s.community === "primary",
+    ).length;
     for (let attempt = 0; attempt < 4; attempt++) {
       const before = requests().length;
       app.relay.failRoute("primary", target, rejected);
@@ -165,6 +171,20 @@ for (const target of ["alpha", "profiles"]) {
         await expect(notice(page)).toBeVisible();
         await expect(warning).toHaveCount(0);
       }
+    }
+    if (target === "alpha") {
+      const header = page.locator(".shell-header");
+      await header.evaluate((node) => node.classList.add("shell-header-mac"));
+      await expect
+        .poll(() =>
+          page
+            .locator(".buzz-toast")
+            .evaluate((node) => node.getBoundingClientRect().top),
+        )
+        .toBe(12);
+      await header.evaluate((node) =>
+        node.classList.remove("shell-header-mac"),
+      );
     }
     // The notice keeps showing while the retried REQ waits for EOSE, and it
     // floats above the composer without covering Send.
@@ -216,7 +236,9 @@ for (const target of ["alpha", "profiles"]) {
     ).toBeVisible();
     await expect(warning).toHaveCount(0);
     expect(streams()).toBe(streamCount);
-    expect(app.relay.sockets).toHaveLength(sockets);
+    expect(
+      app.relay.sockets.filter((s) => s.community === "primary"),
+    ).toHaveLength(sockets);
   });
 }
 
@@ -289,8 +311,13 @@ test("long recovery stays above the composer at enlarged text size", async ({
 async function openDiagnostics(page) {
   // A quick reopen can retain the outgoing settings DOM during its exit.
   const summary = page.getByText("Diagnostics", { exact: true });
-  if ((await summary.locator("..").getAttribute("open")) === null)
-    await summary.click();
+  // A recovery toast can cover the bottom of Channel settings.
+  if ((await summary.locator("..").getAttribute("open")) === null) {
+    await summary.focus();
+    await page.keyboard.press("Enter");
+    // Move the mouse off Channel actions, which a wider viewport puts over Activity's hover preview.
+    await summary.hover({ force: true });
+  }
   await expect(summary.locator("..")).toHaveAttribute("open", "");
 }
 
@@ -332,7 +359,7 @@ test.describe("public preview recovery", () => {
     const headGate = new Promise((resolve) => {
       releaseHead = resolve;
     });
-    await page.route("**/api/relay/**/query", async (route) => {
+    await page.route("**/api/relay/primary/query", async (route) => {
       const isPreviewHead = route
         .request()
         .postDataJSON()

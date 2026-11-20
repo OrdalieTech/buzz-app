@@ -1,18 +1,13 @@
-import {
-  BUZZ_PROMPT,
-  TOP_LEVEL_PROMPT,
-  CHANNEL_LEVEL_PROMPT,
-} from "../../buzz-mcp/prompt";
-import {
-  BASE_PROMPT,
-  MENTION_PROMPT,
-} from "../../features/agent-harness/base-prompt";
+import { TOP_LEVEL_PROMPT, CHANNEL_LEVEL_PROMPT } from "../../buzz-mcp/prompt";
+import { MENTION_PROMPT } from "../../features/agent-harness/base-prompt";
 import { coreMemorySection } from "../../features/agent-harness/core-memory";
 import {
   type ConversationWake,
   unframed,
   wakeSection,
 } from "../../features/agent-harness/plugin-wake";
+import { composeBase } from "../../features/agent-harness/sections/compose";
+import type { Facts } from "../../features/agent-harness/sections/index";
 import type { AgentKey } from "../../features/agents/membership";
 import type { AgentHandle } from "../../features/agents/service";
 import type { EventData } from "../../features/relay/events";
@@ -28,6 +23,7 @@ import type { Config } from "./config";
  * channel wake allows the Interest to direct a thread reply. */
 export type Conversation = {
   channelId: string;
+  community?: true;
   name: string;
   root?: string;
   topLevel?: true;
@@ -38,14 +34,25 @@ export const rootOf = (event: EventData) =>
   threadReference(event)?.rootId ?? event.id;
 export function developerInstructions(
   agent: Pick<AgentHandle, "name" | "pubkey">,
+  /** Whether each Buzz thread is a Codex thread of its own. */
+  scope: Config["scope"],
+  /** The agent's workspace, absolute, when the thread runs in a folder of
+   * the conversation's own instead. */
+  workspace?: string,
+  /** What the thread is: see `sessionPlace`. */
+  place?: Facts["place"],
 ) {
   return `You are ${agent.name} (pubkey ${agent.pubkey}), a coding agent in Buzz.
-The buzz namespace provides the shared Buzz tools, including messages, reactions, reads, uploads, canvas, and encrypted memory. Buzz access and signing are handled by the host. Do not invoke the buzz CLI or look for credentials. Use Codex's native coding tools in the workspace.
+The buzz namespace provides the shared Buzz tools, including messages, reactions, reads, uploads, canvas, and encrypted memory. Prefer these tools for Buzz operations. You may use the buzz CLI through the agent-specific BUZZ_CREDENTIAL_PROVIDER supplied by the runtime to this thread's shell commands. The host handles access and signing as this agent without exposing private keys. If that provider is unavailable or refuses an operation, use the available Buzz tools or report the blocker. Do not look for credentials, read private keys, change the provider, or pair the CLI as your owner. Use Codex's native coding tools in the workspace.
 
-${BASE_PROMPT}
-
-${BUZZ_PROMPT}`;
+${composeBase({ scope, ownFolder: workspace, place }).text}`;
 }
+/** What a conversation's Codex thread is. A conversation without a root is
+ * a whole one, as every conversation of an agent with channel scope is. */
+export const sessionPlace = (conversation: {
+  root?: string | undefined;
+}): NonNullable<Facts["place"]> =>
+  conversation.root ? "thread" : "conversation";
 
 /** Codex truncates the middle of any additional-context value over 1,000
  * tokens, which it estimates as 4 UTF-8 bytes each. */
@@ -65,11 +72,15 @@ export function turnContext(
 ) {
   const core = coreMemorySection(memory);
   const text = `You are ${agent.name} (pubkey ${agent.pubkey}).\nCurrent Buzz custom instructions replace all prior Buzz custom instructions. An empty section means no custom instructions apply.\n<agent-instructions>\n${settings.instructions}\n</agent-instructions>\n\nCurrent team sections replace all prior team sections. None means you are on no team.${team ? `\n${team}` : ""}${core ? `\n\nCurrent core memory replaces all prior core memory.\n${core}` : ""}`;
+  const community =
+    settings.scope === "community"
+      ? "\nThis is the agent's one shared community session. Each request's context replaces all earlier routing and delivery-mode instructions. Only a <realtime_delegation> turn is a spoken request; other requests follow their own posting instructions. Community scope grants no additional access."
+      : "";
   const values = [""];
   let size = 0;
   // None of it is Buzz's event or steer section.
   for (const line of unframed(
-    `${text}${repositories ? `\n\n${repositories}` : ""}`,
+    `${text}${community}${repositories ? `\n\n${repositories}` : ""}`,
   ).split(/(?<=\n)/)) {
     // A line over the limit splits by code point.
     const pieces = bytes(line) > CONTEXT_VALUE_BYTES ? [...line] : [line];
@@ -114,11 +125,17 @@ export function turnInput(
   const routing = conversation.topLevel
     ? { posting: "top-level" }
     : { session_thread: conversation.root, reply_to: rootOf(event) };
-  return `<context>\n${quoted({ agent, channel_id: conversation.channelId, channel_name: conversation.name, session_scope: conversation.root ? "thread" : "channel", ...routing })}\n</context>\n${conversation.topLevel ? `${conversation.threadReplies ? CHANNEL_LEVEL_PROMPT : TOP_LEVEL_PROMPT}\n` : ""}${wake ? "" : `${MENTION_PROMPT}\n`}${wake && !steering ? body : `<${section}>\n${body}\n</${section}>`}${note ? `\n\n${note}` : ""}`;
+  const replyGuidance = steering
+    ? wake
+      ? `When posting about this wake, pass channel "${conversation.channelId}" explicitly to send${conversation.topLevel ? " and omit reply" : ` and use reply "${rootOf(event)}"`}. Leave out the request field for the wake. You can continue working on other requests.`
+      : "When answering requests from different conversations, use Buzz send with the request ID for each reply. You can answer one request and continue working on another."
+    : "";
+  return `<context>\n${quoted({ agent, channel_id: conversation.channelId, channel_name: conversation.name, session_scope: conversation.community ? "community" : conversation.root ? "thread" : "channel", ...routing })}\n</context>\n${conversation.topLevel ? `${conversation.threadReplies ? CHANNEL_LEVEL_PROMPT : TOP_LEVEL_PROMPT}\n` : ""}${wake ? "" : `${MENTION_PROMPT}\n`}${wake && !steering ? body : `<${section}>\n${body}\n</${section}>`}${replyGuidance ? `\n\n${replyGuidance}` : ""}${note ? `\n\n${note}` : ""}`;
 }
 /** The readable part of a conversation's thread name; earlier versions used
  * it alone. */
 export function sessionTitle(agentName: string, conversation: Conversation) {
+  if (conversation.community) return `Buzz community · ${agentName}`;
   return `Buzz #${conversation.name.replace(/\s+/g, " ").slice(0, 100)}${conversation.root ? ` · thread ${conversation.root.slice(0, 8)}` : ""} · ${agentName}`;
 }
 /** Names the agent's conversation in its thread names, so its threads can be
@@ -127,14 +144,14 @@ export function sessionTitle(agentName: string, conversation: Conversation) {
  * reorder concurrent turn starts. */
 export function sessionTag(
   agent: AgentKey,
-  conversation: Pick<Conversation, "channelId" | "root">,
+  conversation: Pick<Conversation, "channelId" | "root" | "community">,
 ) {
   let hash = 0xcbf29ce484222325n;
   for (const byte of new TextEncoder().encode(
     JSON.stringify([
       agent,
-      conversation.channelId,
-      conversation.root ?? "channel",
+      conversation.community ? "@community" : conversation.channelId,
+      conversation.community ? "channel" : (conversation.root ?? "channel"),
     ]),
   ))
     hash = BigInt.asUintN(64, (hash ^ BigInt(byte)) * 0x100000001b3n);

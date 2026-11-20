@@ -12,6 +12,10 @@ export type LocalAgent = Readonly<{
   execution?: "remote" | "local";
   /** Hosted runtime identity for display; it grants no local control. */
   runtime?: string;
+  /** Its agent type on this machine, for host features a harness keys. */
+  type?: string;
+  /** Its Delete started and has not finished: never a forward choice. */
+  deleting?: true;
 }>;
 export type LocalAgentsSnapshot = Readonly<{
   status: "unavailable" | "loading" | "ready" | "error";

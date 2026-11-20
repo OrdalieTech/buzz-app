@@ -1,4 +1,5 @@
 import { assert, describe, expect, it, vi } from "vitest";
+import { huddleDescription } from "../huddle/lifecycle";
 import { ReadError } from "./errors";
 import { createRelaySession } from "./session";
 import type { LiveCallbacks } from "./live";
@@ -72,6 +73,30 @@ describe("channel store", () => {
     });
     failing.queries.ensureList();
     expect(failing.queries.list().status).toBe("loading");
+  });
+  it("does not republish the list when a channel lookup changes nothing", async () => {
+    let clock = 0;
+    const { queries, next } = setup(2, () => ++clock);
+    queries.ensureList();
+    next().respond([
+      roster(relay, "b", [viewer.pubkey]),
+      metadata(relay, "b", "Beta"),
+    ]);
+    await flush();
+    // An open channel the viewer has not joined is looked up again on every
+    // search or catch-up page that mentions it.
+    const lookUp = async () => {
+      const resolving = queries.resolve?.(["open"]);
+      next().respond([metadata(relay, "open", "Open")]);
+      await resolving;
+    };
+    await lookUp();
+    const listener = vi.fn();
+    queries.subscribeList(listener);
+    const before = queries.list();
+    await lookUp();
+    expect(listener).not.toHaveBeenCalled();
+    expect(queries.list()).toBe(before);
   });
   it("replaces a channel summary when only its private visibility changes", async () => {
     const { store, queries, next } = setup();
@@ -524,6 +549,28 @@ it("refreshes one channel's roster with an exact read and merges it without drop
     test.store.dispose();
   }
 });
+it("stamps rosterAsOf only when a complete roster read commits", async () => {
+  let clock = 1_000;
+  const test = setup(2, () => ++clock);
+  try {
+    await discovered(test);
+    const complete = test.queries.list().rosterAsOf;
+    expect(complete).toBeDefined();
+    // An exact roster read commits the list again, but proves no absence.
+    const refreshing = test.queries.refreshRoster?.("a");
+    test
+      .next()
+      .respond([
+        roster(relay, "a", [viewer.pubkey, alice.pubkey], 1_700_000_001),
+      ]);
+    await expect(refreshing).resolves.toBe(true);
+    const exact = test.queries.list();
+    expect(exact.asOf).toBeGreaterThan(complete ?? Infinity);
+    expect(exact.rosterAsOf).toBe(complete);
+  } finally {
+    test.store.dispose();
+  }
+});
 it("reports no fresh roster evidence when an exact read omits the cached channel", async () => {
   const test = setup();
   try {
@@ -718,6 +765,66 @@ it("writes one startup snapshot with the final content after a burst of discover
     owner.dispose();
   }
 });
+it("rewrites the startup snapshot only when its roster changes or ages", () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const wire = scriptedTransport(viewer.pubkey, relay.pubkey);
+  const writeStartup = vi.fn(async (_patch: SavedStartup) => {});
+  let live!: LiveCallbacks;
+  const owner = createRelaySession(
+    {
+      ...wire.transport,
+      subscribe(callbacks) {
+        live = callbacks;
+        return { update() {}, retry() {}, dispose() {} };
+      },
+    },
+    {
+      persistence: {
+        read: async () => [],
+        readStartup: async () => undefined,
+        writeStartup,
+        write: async () => {},
+        remove: async () => {},
+        retain: async () => {},
+        clear: async () => {},
+        close: () => {},
+      },
+      prepared: true,
+    },
+  );
+  const discoveryWrites = () =>
+    writeStartup.mock.calls.filter(([patch]) => patch.discovery).length;
+  try {
+    const first = roster(relay, "a", [viewer.pubkey]);
+    live.receive([first]);
+    vi.advanceTimersByTime(500);
+    expect(discoveryWrites()).toBe(1);
+    // Catch-up delivers the same version again.
+    live.receive([first]);
+    vi.advanceTimersByTime(500);
+    expect(discoveryWrites()).toBe(1);
+    live.receive([roster(relay, "b", [viewer.pubkey])]);
+    vi.advanceTimersByTime(500);
+    expect(discoveryWrites()).toBe(2);
+    // An unchanged roster is written again after ten minutes, and after the
+    // clock moves back, so restore never meets a stale or future copy.
+    vi.advanceTimersByTime(599_000);
+    live.receive([first]);
+    vi.advanceTimersByTime(500);
+    expect(discoveryWrites()).toBe(2);
+    vi.advanceTimersByTime(500);
+    live.receive([first]);
+    vi.advanceTimersByTime(500);
+    expect(discoveryWrites()).toBe(3);
+    vi.setSystemTime(Date.now() - 60_000);
+    live.receive([first]);
+    vi.advanceTimersByTime(500);
+    expect(discoveryWrites()).toBe(4);
+  } finally {
+    vi.useRealTimers();
+    owner.dispose();
+  }
+});
 it.each([
   ["saves once after", false],
   ["drops the pending save when the cache is purged during", true],
@@ -783,6 +890,88 @@ it.each([
       expect(writeProfiles).toHaveBeenCalledTimes(1);
       expect(writeProfiles.mock.calls[0]?.[0]).toHaveLength(2);
     }
+  } finally {
+    vi.useRealTimers();
+    owner.dispose();
+  }
+});
+it.each([
+  ["restores", false],
+  ["skips", true],
+] as const)(
+  "%s the saved roster when revalidate is %s",
+  async (_, revalidate) => {
+    const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+    const owner = createRelaySession(scripted.transport, {
+      persistence: {
+        read: async () => [],
+        readStartup: async () => ({
+          discovery: {
+            savedAt: Date.now(),
+            relayAuthor: relay.pubkey,
+            events: [
+              roster(relay, "alpha", [viewer.pubkey]),
+              metadata(relay, "alpha", "Alpha"),
+            ],
+          },
+        }),
+        writeStartup: async () => {},
+        readProfiles: async () => [],
+        writeProfiles: async () => {},
+        write: async () => {},
+        remove: async () => {},
+        retain: async () => {},
+        clear: async () => {},
+        close: () => {},
+      },
+      prepared: true,
+      revalidate,
+    });
+    try {
+      await owner.restore();
+      expect(!!owner.session.channels.get?.("alpha")).toBe(!revalidate);
+    } finally {
+      owner.dispose();
+    }
+  },
+);
+it("a revalidating session keeps saving profiles", async () => {
+  const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+  const readStartup = vi.fn(async () => undefined);
+  const writeProfiles = vi.fn(async (_: readonly unknown[]) => {});
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const owner = createRelaySession(scripted.transport, {
+    persistence: {
+      read: async () => [],
+      readStartup,
+      writeStartup: async () => {},
+      readProfiles: async () => [],
+      writeProfiles,
+      write: async () => {},
+      remove: async () => {},
+      retain: async () => {},
+      clear: async () => {},
+      close: () => {},
+    },
+    prepared: true,
+    revalidate: true,
+  });
+  try {
+    await owner.restore();
+    await vi.advanceTimersByTimeAsync(1000);
+    writeProfiles.mockClear();
+    const ensuring = owner.session.profiles.ensure(
+      [alice.pubkey],
+      "foreground",
+    );
+    await vi.waitFor(() => expect(scripted.pending).not.toHaveLength(0), {
+      interval: 1,
+    });
+    scripted.next().respond([profile(alice, { name: "Alice" })]);
+    await ensuring;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(writeProfiles).toHaveBeenCalledTimes(1);
+    expect(writeProfiles.mock.calls[0]?.[0]).toHaveLength(1);
   } finally {
     vi.useRealTimers();
     owner.dispose();
@@ -989,8 +1178,12 @@ it.each([
 );
 
 describe("creator proof reads", () => {
-  const stream = (channel: string, creator = alice.pubkey) =>
-    metadata(relay, channel, channel, 1_700_000_000, [
+  const stream = (
+    channel: string,
+    creator = alice.pubkey,
+    createdAt = 1_700_000_000,
+  ) =>
+    metadata(relay, channel, channel, createdAt, [
       ["t", "stream"],
       ["P", creator],
     ]);
@@ -1063,6 +1256,192 @@ describe("creator proof reads", () => {
       }
     } finally {
       store.dispose();
+    }
+  });
+
+  /** A session fed live, with the creator-proof reads it has pending. */
+  function liveSession() {
+    const wire = scriptedTransport(viewer.pubkey, relay.pubkey);
+    let live!: LiveCallbacks;
+    const owner = createRelaySession({
+      ...wire.transport,
+      subscribe(callbacks) {
+        live = callbacks;
+        return { update() {}, retry() {}, dispose() {} };
+      },
+    });
+    const reads = () =>
+      wire.pending.filter((entry) =>
+        entry.filters.some((filter) => filter.kinds?.includes(9007)),
+      );
+    return {
+      owner,
+      reads,
+      receive: async (events: RelayEvent[]) => {
+        live.receive(events);
+        await flush();
+      },
+      take() {
+        const [read] = reads();
+        assert.exists(read);
+        wire.pending.splice(wire.pending.indexOf(read), 1);
+        return read;
+      },
+    };
+  }
+  const creation = (channel: string, extra: string[][] = []) =>
+    signed(alice, {
+      kind: 9007,
+      created_at: 1_700_000_000,
+      content: "",
+      tags: [["h", channel], ...extra],
+    });
+
+  /** Holds the monotonic clock at `at` ms, with no retry jitter. */
+  function clock() {
+    let at = 1_000;
+    const now = vi.spyOn(performance, "now").mockImplementation(() => at);
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    return {
+      advance(ms: number) {
+        at += ms;
+      },
+      restore() {
+        now.mockRestore();
+        random.mockRestore();
+      },
+    };
+  }
+
+  it("reads a channel's creation once as membership changes republish its metadata", async () => {
+    // Each membership change republishes 39000 to every online member. A read
+    // per version, times members, times a run of adds, was a relay-wide burst.
+    const time = clock();
+    const { owner, reads, receive, take } = liveSession();
+    const members = [viewer.pubkey];
+    const add = () => {
+      members.push(keypair().pubkey);
+      const at = 1_700_000_000 + members.length;
+      return receive([
+        roster(relay, "a", members, at),
+        stream("a", alice.pubkey, at),
+      ]);
+    };
+    try {
+      await receive([roster(relay, "a", members), stream("a")]);
+      take().fail(new Error("offline"));
+      await flush();
+      // A failed read backs off rather than retrying on every version.
+      await add();
+      expect(reads()).toEqual([]);
+      time.advance(60_000);
+      await add();
+      const first = take();
+      expect(first.filters).toMatchObject([
+        { kinds: [9007], authors: [alice.pubkey], "#h": ["a"] },
+      ]);
+      // A version arriving while that read is in flight shares it.
+      await add();
+      expect(reads()).toEqual([]);
+      first.respond([creation("a")]);
+      await flush();
+      for (let n = 0; n < 3; n++) await add();
+      time.advance(24 * 3_600_000);
+      await add();
+      // Every version was applied, so each one was a candidate for a read.
+      expect(owner.session.channels.list().channels[0]?.members).toHaveLength(
+        members.length,
+      );
+      expect(reads()).toEqual([]);
+    } finally {
+      owner.dispose();
+      time.restore();
+    }
+  });
+
+  it("lets the next version read again after a cancelled creation read", async () => {
+    // A cancelled read learned nothing, so it must not back off: a cancelled
+    // lookup would otherwise hold off the channel's proof for a minute or more.
+    const time = clock();
+    const { owner, reads, receive, take } = liveSession();
+    try {
+      await receive([roster(relay, "a", [viewer.pubkey]), stream("a")]);
+      take().fail(new DOMException("Cancelled", "AbortError"));
+      await flush();
+      const at = 1_700_000_001;
+      await receive([
+        roster(relay, "a", [viewer.pubkey, keypair().pubkey], at),
+        stream("a", alice.pubkey, at),
+      ]);
+      expect(reads()).toHaveLength(1);
+    } finally {
+      owner.dispose();
+      time.restore();
+    }
+  });
+
+  it("retries a missing creation with backoff until it arrives", async () => {
+    // A live 39000 can precede its creation on a read replica, and a channel
+    // first seen long after creation can still meet a lagging replica. No
+    // miss is final, or a Huddle could stay classified as an ordinary channel.
+    const parent = "00000000-0000-4000-8000-000000000001";
+    const room = "00000000-0000-4000-8000-000000000002";
+    const about = huddleDescription(parent);
+    let at = 1_700_000_000;
+    const version = () => {
+      at += 1;
+      return [
+        roster(relay, room, [viewer.pubkey], at),
+        metadata(relay, room, "Huddle", at, [
+          ["P", alice.pubkey],
+          ["private"],
+          ["t", "stream"],
+          ["created_at", String(1_600_000_000)],
+          ["ttl", "3600"],
+          ["about", about],
+        ]),
+      ];
+    };
+    const summary = () =>
+      owner.session.channels.list().channels.find(({ id }) => id === room);
+    const time = clock();
+    const { owner, reads, receive, take } = liveSession();
+    try {
+      await receive(version());
+      take().respond([]);
+      await flush();
+      expect(summary()?.parentChannelId).toBeUndefined();
+      time.advance(59_999);
+      await receive(version());
+      expect(reads()).toEqual([]);
+      time.advance(1);
+      await receive(version());
+      take().respond([]);
+      await flush();
+      // The second miss doubles the backoff.
+      time.advance(119_999);
+      await receive(version());
+      expect(reads()).toEqual([]);
+      time.advance(1);
+      await receive(version());
+      take().respond([
+        creation(room, [
+          ["visibility", "private"],
+          ["channel_type", "stream"],
+          ["about", about],
+        ]),
+      ]);
+      await flush();
+      expect(summary()).toMatchObject({
+        huddle: true,
+        parentChannelId: parent,
+      });
+      time.advance(24 * 3_600_000);
+      await receive(version());
+      expect(reads()).toEqual([]);
+    } finally {
+      owner.dispose();
+      time.restore();
     }
   });
 

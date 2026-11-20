@@ -220,14 +220,16 @@ second
         "<ol><li><p>x</p></li><li><p>y</p></li></ol>" +
         "<blockquote><p>quote   here</p></blockquote>" +
         "<table><thead><tr><th>a     b</th></tr></thead><tbody><tr><td>c   d</td></tr></tbody></table>" +
-        "<p><code>a    b</code></p><pre><code>one\n  two\n</code>",
+        '<p><code>a    b</code></p><pre><code tabindex="-1">one\n  two\n</code>',
     );
   });
 
   it("renders inline and fenced code without parsing markdown inside it", () => {
     const html = render("`**literal** :party:`\n\n```ts\nconst x = 1\n```");
     expect(html).toContain("<code>**literal** :party:</code>");
-    expect(html).toContain('<code class="language-ts">const x = 1');
+    expect(html).toContain(
+      '<code class="language-ts" tabindex="-1">const x = 1',
+    );
     expect(html).not.toContain("<strong>literal</strong>");
   });
 
@@ -598,7 +600,7 @@ describe("Markdown profile mentions", () => {
     const html = render("**@Mic Smith**, _@Mic_! @Other @Missing @Microscopic");
     expect(html).toContain("<strong><button");
     expect(html).toContain('aria-label="View Mic Smith profile"');
-    expect(html).toContain("</svg>M</span>ic Smith</button></strong>");
+    expect(html).toContain("</svg></span>M</span>ic Smith</button></strong>");
     // The raw helper conservatively treats trailing underscore as a name suffix.
     expect(html.match(/<button/g)).toHaveLength(1);
     expect(html).toContain("<em>@Mic</em>");
@@ -615,7 +617,9 @@ describe("Markdown profile mentions", () => {
       extensions,
     });
     expect(html).toContain(`aria-label="View ${name} profile"`);
-    expect(html).toContain(`</svg>M</span>${name.slice(1)}</button></strong>`);
+    expect(html).toContain(
+      `</svg></span>M</span>${name.slice(1)}</button></strong>`,
+    );
     expect(html).not.toContain("<em>");
     expect(html).not.toContain("<img");
   });
@@ -761,6 +765,21 @@ describe("Markdown profile mentions", () => {
     expect(html).toContain("@Mic Smith and <button");
   });
 
+  it("renders full-key-qualified namesakes as two named controls", () => {
+    const html = render(`@Mic (${mic}) @Mic (${other})`, {
+      patch: { mentions: [mic, other] },
+      participantProfiles: new Map([
+        [mic, { name: "Mic" }],
+        [other, { name: "Mic" }],
+      ]),
+    });
+    expect(html.match(/<button/g)).toHaveLength(2);
+    expect(html).toContain(`data-profile-target="${profileTarget(mic)}"`);
+    expect(html).toContain(`data-profile-target="${profileTarget(other)}"`);
+    expect(html.match(/data-mention-name="Mic"/g)).toHaveLength(2);
+    expect(html).not.toContain(`(${mic})`);
+  });
+
   it("updates a mounted mention label without changing signed binding or profile target", () => {
     const owned = createRelaySession(null);
     const session = owned.session;
@@ -846,6 +865,20 @@ describe("Markdown profile mentions", () => {
 });
 
 describe("Markdown inline extensions", () => {
+  it.each(["Agent2", "Agent"])(
+    "keeps numeric boundaries across a mention named %s",
+    (name) => {
+      const html = render(`@${name}:25: @${name} :25: @${name}:party_parrot:`, {
+        participantProfiles: new Map([[mic, { name }]]),
+        emoji: [party, { shortcode: "25", url: party.url }],
+        extensions,
+        media: () => "https://media.test/emoji.png",
+      });
+      expect(html.match(/<button/g)).toHaveLength(3);
+      expect(html.match(/<img/g)).toHaveLength(name === "Agent2" ? 2 : 3);
+    },
+  );
+
   it("preserves custom emoji and plugin prose alongside profile mentions", () => {
     const html = render("**:party_parrot:** PLUGIN @Mic", {
       emoji: [party],
@@ -934,6 +967,27 @@ describe("Markdown inline extensions", () => {
     expect(html.replace(/<[^>]*>/g, "")).toBe(
       content.replace(/^<(.*)>$/, "$1"),
     );
+  });
+
+  it.each([
+    ["let me check example.com", "https://example.com"],
+    ["**builderlab.xyz/a.**", "https://builderlab.xyz/a"],
+    [
+      "see www.example.com and docs.rs.io",
+      "http://www.example.com/",
+      "https://docs.rs.io",
+    ],
+  ])("links a scheme-less host as authored: %s", (content, ...hrefs) => {
+    const html = render(content);
+    expect([...html.matchAll(/href="([^"]*)"/g)].map((m) => m[1])).toEqual(
+      hrefs,
+    );
+    expect(html.replace(/<[^>]*>/g, "")).toBe(content.replaceAll("**", ""));
+  });
+
+  it("leaves scheme-less hosts in code and file names as text", () => {
+    const html = render("`example.com` and main.rs");
+    expect(html).not.toContain("href=");
   });
 
   it("keeps emoji-only sizing and readable fallback when media or extensions are unavailable", () => {
@@ -1040,6 +1094,7 @@ it("renders tagged agent library names and profile names with the same agent ico
     const html = render(`@${name} can you also join`, options);
     expect(html).toContain('data-mention-kind="agent"');
     expect(html).toContain(`aria-label="View ${name} profile"`);
+    expect(html).toContain('role="img" aria-label="agent @"');
     expect(html).toContain(
       renderToStaticMarkup(<RobotIcon className={referenceStyles.icon} />),
     );
@@ -1267,6 +1322,9 @@ describe("code block copy", () => {
 
   it("omits the copy action in noninteractive previews", () => {
     expect(render(fenced, { interactive: false })).not.toContain("<button");
+    expect(render(fenced, { interactive: false })).not.toContain(
+      'tabindex="0"',
+    );
   });
 });
 
@@ -1623,4 +1681,20 @@ it("opens a plugin page link in message content through the host opener", () => 
   );
   fireEvent.click(screen.getByRole("link", { name: "the entry" }));
   expect(onOpenLink).toHaveBeenCalledWith(href);
+});
+
+it("renders frozen forwarded mention labels without source profiles or notifications", () => {
+  const content = `@A*B* (${other}) and @A*B*`;
+  const html = render(content, {
+    participantProfiles: new Map(),
+    patch: {
+      mentions: [],
+      mentionReferences: [other],
+      mentionLabels: [{ id: other, names: ["A*B*"] }],
+    },
+  });
+  expect(html).toContain("A*B*");
+  expect(html).not.toContain("<em>");
+  expect(html).not.toContain(`(${other})`);
+  expect(html).toContain("data-mention-kind");
 });

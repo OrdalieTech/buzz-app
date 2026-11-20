@@ -31,7 +31,7 @@ export function createSoloRegionFixture(viewer = "a".repeat(64)) {
         {
           manifest: { id: "example", name: "Example", apiVersion: 1 },
           source: "external",
-          enabled: false,
+          enabled: true,
           revision: "one",
           previous: null,
           reloadable: false,
@@ -126,11 +126,15 @@ export function createSoloRegionFixture(viewer = "a".repeat(64)) {
       };
     },
     retry() {},
+    tryAgain() {},
     disconnect() {},
     async clearCache() {},
   };
   const service = new SoloNavigationService(root, relay, plugins);
-  const register = async (changes: Partial<SoloRegionSource> = {}) => {
+  const register = async (
+    changes: Partial<SoloRegionSource> = {},
+    pluginId = "example",
+  ) => {
     let snapshot: SoloRegionSnapshot;
     let binding!: SoloRegionBinding;
     let signal!: AbortSignal;
@@ -156,7 +160,7 @@ export function createSoloRegionFixture(viewer = "a".repeat(64)) {
       ...changes,
     };
     const fiber = root
-      .extend({ pluginOwner: { id: "example", revision: "one" } })
+      .extend({ pluginOwner: { id: pluginId, revision: "one" } })
       .plugin((ctx) => {
         assert(ctx.soloNavigation);
         handle = ctx.soloNavigation.registerSource(source);

@@ -9,7 +9,11 @@ import type { RelaySession } from "../../features/relay/session";
 import type { ReadTransport } from "../../features/relay/transport";
 import type { FederatedIdentity } from "../../features/federated-identity/service";
 import type { RelayData, RelaySnapshot } from "../../features/relay/service";
-import type { Navigation } from "../../features/navigation/controller";
+import type {
+  Navigation,
+  NavigationOpenOptions,
+} from "../../features/navigation/controller";
+import type { ChannelList } from "../../features/relay/contracts";
 import {
   ChannelNavigationProvider,
   useChannelNavigation,
@@ -17,12 +21,17 @@ import {
 import type { OpenTarget } from "../../features/navigation/targets";
 import { NewMenu } from "./NewMenu";
 import type { Agents } from "../../features/agents/service";
-import { PrimarySidebar } from "./PrimarySidebar";
+import { PrimarySidebar } from "./sidebar-section-testing";
 import { ToastProvider } from "../../shared/design-system/ui/Toast";
-import { SoloInventory } from "../../features/channel-navigation/SoloInventory";
-import { conversationTarget } from "../../features/channel-navigation/routes";
+import { SoloInventory } from "../../bundled/channels/SoloInventory";
+import {
+  conversationTarget,
+  sidebarTarget,
+} from "../../features/channel-navigation/routes";
 import type { ContributionReader } from "../../features/conversation/contracts";
 import type { ChatIcon, ChatMenu } from "../../features/conversation/service";
+import type { SidebarRows } from "../../features/channel-navigation/sidebar-rows-service";
+import type { SidebarSections } from "../../features/channel-navigation/sidebar-sections-service";
 
 export const owners: ReturnType<typeof createRelaySession>[] = [];
 export const id = "11111111-1111-4111-8111-111111111111";
@@ -45,6 +54,8 @@ export function fixture(
     transport?: ReadTransport;
     federatedIdentity?: FederatedIdentity;
     sidebarScope?: SidebarScope;
+    sidebarRows?: SidebarRows;
+    sidebarSections?: SidebarSections;
   } = {},
 ) {
   const owner = createRelaySession(host.transport ?? null);
@@ -85,7 +96,7 @@ export function fixture(
     durability: "saved" as const,
     sync: "pending" as const,
   }));
-  let list = {
+  let list: ChannelList = {
     status: "ready" as const,
     channels: [
       {
@@ -93,6 +104,7 @@ export function fixture(
         name: "Planning",
         channelType: "solo" as const,
         creator: viewer,
+        ...(combined ? { cached: true } : {}),
       },
       {
         id: other,
@@ -137,12 +149,6 @@ export function fixture(
     },
     sidebarPreferences: {
       ...base.sidebarPreferences,
-      sectionCreationWritable: canCreate,
-      snapshot: () => preferences,
-      ensure: async () => {},
-    },
-    soloPreferences: {
-      ...base.soloPreferences,
       sectionCreationWritable: canCreate,
       snapshot: () => preferences,
       ensure: async () => {},
@@ -196,22 +202,39 @@ export function fixture(
     snapshot: () => snapshot,
     subscribe,
     retry() {},
+    tryAgain() {},
     disconnect() {},
     async clearCache() {},
   };
   let attempt = 0;
-  const open = vi.fn(async (next: OpenTarget) => {
+  let visit = new AbortController();
+  let sidebar: NavigationOpenOptions["sidebar"];
+  // Each opening ends the previous attempt's visit, as the controller does.
+  const begin = (next: OpenTarget, options?: NavigationOpenOptions) => {
+    sidebar = options?.sidebar;
     target = next;
     attempt++;
-    rendered.rerender(tree());
-    publish();
-    return { status: "opened" as const };
-  });
+    visit.abort();
+    visit = new AbortController();
+  };
+  const open = vi.fn(
+    async (next: OpenTarget, options?: NavigationOpenOptions) => {
+      begin(next, options);
+      rendered.rerender(tree());
+      publish();
+      return { status: "opened" as const };
+    },
+  );
   const navigator = {
     open,
     subscribe,
     snapshot: () => ({
-      attempt: { id: String(attempt), signal: new AbortController().signal },
+      entry: { target },
+      attempt: {
+        id: String(attempt),
+        signal: visit.signal,
+        sidebar,
+      },
     }),
   } as unknown as Navigation;
   let target: OpenTarget = conversationTarget(scope, other);
@@ -240,9 +263,11 @@ export function fixture(
                   creationAction={creationAction}
                   relay={relay}
                   navigator={navigator}
-                  target={target}
+                  target={sidebarTarget(target)}
                   chatIcons={chatIcons}
                   chatMenus={chatMenus}
+                  sidebarRows={host.sidebarRows}
+                  sidebarSections={host.sidebarSections}
                   sidebarScope={host.sidebarScope}
                   {...(host.federatedIdentity
                     ? { federatedIdentity: host.federatedIdentity }
@@ -261,6 +286,7 @@ export function fixture(
             target={target}
             chatIcons={chatIcons}
             chatMenus={chatMenus}
+            sidebarRows={host.sidebarRows}
           />
         )}
       </ChannelNavigationProvider>
@@ -291,6 +317,13 @@ export function fixture(
       });
     },
     open,
+    /** A navigation the shell does not render the sidebar for, as a thread move. */
+    navigateWithin(next: OpenTarget) {
+      act(() => {
+        begin(next);
+        publish();
+      });
+    },
     /** The sidebar's hand-off to the conversation page it opens. */
     handoff: () => handoff,
     markThrough,

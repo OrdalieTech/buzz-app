@@ -263,6 +263,34 @@ it("notifies once for a batch of verified owner attestations", async () => {
   }
 });
 
+it("reacts to time-zone-only replacements and drops unknown zones", () => {
+  const wire = scriptedTransport(user.pubkey, keypair().pubkey);
+  const reader = createRelayReader(wire.transport);
+  const directory = createProfileDirectory(reader.reader);
+  const selection = selectProfiles(directory.queries, [user.pubkey]);
+  const changed = vi.fn();
+  const unsubscribe = selection.subscribe(changed);
+  try {
+    directory.accept([profile(user, { name: "Mic", tz: "Asia/Kolkata" }, 1)]);
+    expect(selection.snapshot().get(user.pubkey)?.tz).toBe("Asia/Kolkata");
+    changed.mockClear();
+    directory.accept([
+      profile(user, { name: "Mic", tz: "America/Los_Angeles" }, 2),
+    ]);
+    expect(selection.snapshot().get(user.pubkey)?.tz).toBe(
+      "America/Los_Angeles",
+    );
+    expect(changed).toHaveBeenCalledTimes(1);
+    directory.accept([profile(user, { name: "Mic", tz: "Mars/Olympus" }, 3)]);
+    expect(selection.snapshot().get(user.pubkey)).toEqual({ name: "Mic" });
+    expect(changed).toHaveBeenCalledTimes(2);
+  } finally {
+    unsubscribe();
+    directory.dispose();
+    reader.dispose();
+  }
+});
+
 it("reacts to NIP-05-only replacements and removal without asserting verification", () => {
   const wire = scriptedTransport(user.pubkey, keypair().pubkey);
   const reader = createRelayReader(wire.transport);
@@ -697,6 +725,69 @@ it("holds an open channel's roster on top of the base and shrinks back when rele
     );
   } finally {
     unsubscribe();
+    directory.dispose();
+    vi.useRealTimers();
+  }
+});
+
+it("keeps a closed channel's roster room for a while, so switching back reads no names again", async () => {
+  vi.useFakeTimers();
+  const read = vi.fn(async () => []);
+  const directory = createProfileDirectory({ read });
+  try {
+    const people = unsignedProfiles(1524);
+    const release = directory.queries.reserve?.(500);
+    directory.accept(people);
+    release?.();
+    // A smaller channel opens; the larger one's names stay for now. Closing a
+    // smaller view does not extend the hold.
+    directory.queries.reserve?.(10);
+    await vi.advanceTimersByTimeAsync(20_000);
+    directory.queries.reserve?.(5)?.();
+    await vi.advanceTimersByTimeAsync(9_000);
+    // Reads size by the open views' room; the hold only keeps the names.
+    expect(directory.queries.limit?.()).toBe(1034);
+    expect(directory.queries.snapshot().size).toBe(1524);
+    expect(directory.queries.evictions?.()).toBe(0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(directory.queries.limit?.()).toBe(1034);
+    expect(directory.queries.snapshot().size).toBe(1034);
+  } finally {
+    directory.dispose();
+    vi.useRealTimers();
+  }
+});
+
+it("cancels a departing view's background reads after the task while its room is held", async () => {
+  vi.useFakeTimers();
+  const read = vi.fn(
+    (_filters: unknown, options?: { signal?: AbortSignal }) =>
+      new Promise<RelayEvent[]>((_resolve, reject) => {
+        options?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("Aborted", "AbortError")),
+        );
+      }),
+  );
+  const directory = createProfileDirectory({ read });
+  try {
+    const release = directory.queries.reserve?.(500);
+    directory.accept(unsignedProfiles(1524));
+    const departing = directory.ensure(["departing"], "background");
+    release?.();
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(departing).resolves.toBeUndefined();
+    expect(directory.queries.evictions?.()).toBe(1);
+    expect(directory.queries.limit?.()).toBe(1024);
+    // A read asked for while the room is held survives the shrink.
+    directory.ensure(["next"], "background").catch(() => {});
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(directory.queries.limit?.()).toBe(1024);
+    expect(directory.queries.evictions?.()).toBe(501);
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(read.mock.calls[1]?.[1]?.signal?.aborted).toBe(false);
+    directory.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
     directory.dispose();
     vi.useRealTimers();
   }

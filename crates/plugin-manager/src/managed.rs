@@ -1,6 +1,9 @@
 //! Managed plugin sources: a JSON policy that an external tool writes next to the
-//! profile folders. It only recommends sources; every install still goes through
-//! the owner's review of the Git or URL import.
+//! profile folders. Version 1 only recommends sources; every install goes through the
+//! owner's review of the Git or URL import. Version 2 entries can also ask Buzz to
+//! install or update their pinned version without that review (see `automatic`), but
+//! only when the policy is signed by the key the build names; otherwise those entries
+//! are recommendations.
 use crate::{
     err,
     imports::{plugin_url, repository_url, valid_sha256},
@@ -12,14 +15,22 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 pub const FILE_NAME: &str = "managed-plugins.json";
 pub const PATH_ENV: &str = "BUZZ_MANAGED_PLUGINS";
-const MAX_BYTES: u64 = 256 * 1024;
-const MAX_PLUGINS: usize = 64;
+/// Where the packager publishes its policy; the desktop keeps the last usable copy.
+pub const PACKAGED_URL: &str = env!("BUZZ_BUILD_MANAGED_PLUGINS_URL");
+/// The only key whose signature lets a policy install or update without review.
+pub const PACKAGED_SIGNER: &str = env!("BUZZ_BUILD_MANAGED_PLUGINS_SIGNER");
+/// A policy's detached signature sits beside it under the same name plus this suffix.
+pub const SIGNATURE_SUFFIX: &str = ".sig";
+const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
+const PACKAGED_FILE_PREFIX: &str = "packaged-managed-plugins";
+pub const MAX_BYTES: u64 = 256 * 1024;
+const MAX_PLUGINS: usize = 256;
 const MAX_PROBLEMS: usize = 16;
 const MAX_SOURCE_CHARS: usize = 80;
 
@@ -29,6 +40,31 @@ pub struct ManagedPlugin {
     pub id: String,
     #[serde(flatten)]
     pub source: ManagedSource,
+    pub install: Install,
+    pub update: Update,
+}
+
+/// How a version 2 entry reaches a profile that does not have it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Install {
+    /// Listed for the person to review and install.
+    #[default]
+    Recommend,
+    /// Installed and enabled once per profile; a removal is remembered.
+    Automatic,
+    /// Not offered; the entry only governs updates of a copy the person installed.
+    Manual,
+}
+
+/// How an installed copy that is not at the entry's pin is brought to it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Update {
+    #[default]
+    Review,
+    /// Installed without review while host access and publisher stay the same.
+    Automatic,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -51,7 +87,8 @@ pub enum ManagedState {
     Missing,
     /// Installed from this repository at the pinned commit and path, or at the pinned SHA-256.
     Current,
-    /// Installed from this repository, or from a URL, but not at the pinned version.
+    /// Installed from this repository, or from a URL, but not at the pinned version. A
+    /// URL entry also counts a Git install as outdated: its update replaces it in place.
     Outdated,
     /// Installed from a folder, an unrecorded source, another repository or with Buzz itself.
     Other,
@@ -79,12 +116,22 @@ pub enum Managed {
     Absent,
     /// The file as a whole cannot be used; nothing is recommended.
     Invalid { path: String, reason: String },
+    /// The build names a packaged policy that Buzz has not fetched yet.
+    Loading { url: String },
+    /// The packaged policy could not be fetched and there is no earlier copy.
+    Unavailable { url: String, reason: String },
     /// Usable entries, plus a report for each one that was ignored.
     Ready {
         path: String,
         source: String,
         plugins: Vec<ManagedEntry>,
         problems: Vec<String>,
+        /// The build's signer signed these exact bytes, so automatic entries apply.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        signed: bool,
+        /// What Buzz installed or updated on its own while this app has run.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        automatic: Vec<crate::automatic::Change>,
     },
 }
 impl Managed {
@@ -108,7 +155,44 @@ pub fn path(home: &Path, env: Option<OsString>) -> Result<PathBuf> {
     }
 }
 
-pub fn status(path: Result<PathBuf>, catalog: &Catalog) -> Managed {
+/// Where the detached signature of the policy at `path` is read from.
+pub fn signature_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(SIGNATURE_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Where the packager publishes the signature of the policy at `url`: the same URL
+/// with [`SIGNATURE_SUFFIX`] appended to its path.
+pub fn signature_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((path, query)) => format!("{path}{SIGNATURE_SUFFIX}?{query}"),
+        None => format!("{url}{SIGNATURE_SUFFIX}"),
+    }
+}
+
+/// Whether the signature beside `path` is `signer`'s over exactly `bytes`.
+fn signed_by(path: &Path, bytes: &[u8], signer: &str) -> bool {
+    let Ok(Some(text)) = read_file(
+        &signature_path(path),
+        "Managed plugin policy signature",
+        MAX_SIGNATURE_BYTES,
+    ) else {
+        return false;
+    };
+    crate::policy_signer(bytes, &text).is_ok_and(|key| key.eq_ignore_ascii_case(signer))
+}
+
+/// Without a valid signature, automatic entries keep only what they would ask of a
+/// person: an automatic install is a recommendation and an automatic update a review.
+fn advisory(plugin: &mut ManagedPlugin) {
+    if plugin.install == Install::Automatic {
+        plugin.install = Install::Recommend;
+    }
+    plugin.update = Update::Review;
+}
+
+pub fn status(path: Result<PathBuf>, catalog: &Catalog, signer: Option<&str>) -> Managed {
     let path = match path {
         Ok(path) => path,
         Err(reason) => {
@@ -130,24 +214,140 @@ pub fn status(path: Result<PathBuf>, catalog: &Catalog) -> Managed {
         }
     };
     match parse(&text) {
-        Ok(policy) => Managed::Ready {
-            path: shown,
-            source: policy.source,
-            plugins: policy
-                .plugins
-                .into_iter()
-                .map(|plugin| {
-                    let state = state(&plugin, catalog);
-                    ManagedEntry { plugin, state }
-                })
-                .collect(),
-            problems: policy.problems,
-        },
+        Ok(policy) => {
+            let signed = signer.is_some_and(|signer| signed_by(&path, text.as_bytes(), signer));
+            Managed::Ready {
+                path: shown,
+                source: policy.source,
+                plugins: policy
+                    .plugins
+                    .into_iter()
+                    .map(|mut plugin| {
+                        if !signed {
+                            advisory(&mut plugin);
+                        }
+                        let state = state(&plugin, catalog);
+                        ManagedEntry { plugin, state }
+                    })
+                    .collect(),
+                problems: policy.problems,
+                signed,
+                automatic: vec![],
+            }
+        }
         Err(reason) => Managed::Invalid {
             path: shown,
             reason,
         },
     }
+}
+
+/// Where the last good copy of the policy at `url` is kept, so a copy from another
+/// URL is never shown for this one.
+pub fn packaged_file_name(url: &str) -> String {
+    format!(
+        "{PACKAGED_FILE_PREFIX}-{}.json",
+        &crate::hash(url.as_bytes())[..16]
+    )
+}
+
+/// The outcome of the latest attempt to fetch the packaged policy.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PackagedFetch {
+    #[default]
+    Pending,
+    Fetched,
+    Failed(String),
+}
+
+/// The file's status, or the last fetched packaged policy when the file is absent
+/// and `BUZZ_MANAGED_PLUGINS` does not name one. `packaged` is `None` when the
+/// build has no packaged policy URL.
+pub fn effective(
+    home: &Path,
+    env: Option<OsString>,
+    packaged: Option<(&str, &PackagedFetch)>,
+    signer: Option<&str>,
+    catalog: &Catalog,
+) -> Managed {
+    let explicit = env.as_ref().is_some_and(|value| !value.is_empty());
+    match (status(path(home, env), catalog, signer), packaged) {
+        (Managed::Absent, Some((url, fetch))) if !explicit => {
+            match (
+                status(Ok(home.join(packaged_file_name(url))), catalog, signer),
+                fetch,
+            ) {
+                (Managed::Absent, PackagedFetch::Failed(reason)) => Managed::Unavailable {
+                    url: url.into(),
+                    reason: reason.clone(),
+                },
+                (Managed::Absent, _) => Managed::Loading { url: url.into() },
+                (managed, _) => managed,
+            }
+        }
+        (managed, _) => managed,
+    }
+}
+
+/// Keeps `bytes` as the packaged policy from `url` if Buzz can use it, with its
+/// signature when the packager published one; otherwise the last good copy stays. A
+/// usable policy replaces copies kept for other URLs. Returns whether the stored copy
+/// changed.
+pub fn store_packaged(
+    home: &Path,
+    url: &str,
+    bytes: &[u8],
+    signature: Option<&[u8]>,
+) -> Result<bool> {
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err("Managed plugin policy exceeds 256 KiB".into());
+    }
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "Managed plugin policy must be UTF-8".to_owned())?;
+    parse(text)?;
+    if signature.is_some_and(|signature| signature.len() as u64 > MAX_SIGNATURE_BYTES) {
+        return Err("Managed plugin policy signature exceeds 16 KiB".into());
+    }
+    let name = packaged_file_name(url);
+    let path = home.join(&name);
+    let signature_file = signature_path(&path);
+    let changed = !fs::read(&path).is_ok_and(|current| current == bytes)
+        || fs::read(&signature_file).ok().as_deref() != signature;
+    if changed {
+        fs::create_dir_all(home).map_err(err)?;
+        // The signature names the policy's digest, so a policy paired with an older
+        // signature is merely unsigned until both are in place.
+        match signature {
+            Some(signature) => write_new(home, &signature_file, signature)?,
+            None => match fs::remove_file(&signature_file) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(err(error))
+                }
+                _ => {}
+            },
+        }
+        write_new(home, &path, bytes)?;
+    }
+    for stale in fs::read_dir(home).map_err(err)?.flatten() {
+        let stale_name = stale.file_name();
+        let stale_name = stale_name.to_string_lossy();
+        let own_signature = format!("{name}{SIGNATURE_SUFFIX}");
+        if stale_name != name
+            && stale_name != own_signature
+            && stale_name.starts_with(PACKAGED_FILE_PREFIX)
+            && (stale_name.ends_with(".json") || stale_name.ends_with(".json.sig"))
+        {
+            let _ = fs::remove_file(stale.path());
+        }
+    }
+    Ok(changed)
+}
+
+fn write_new(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(err)?;
+    file.write_all(bytes).map_err(err)?;
+    file.persist(path).map_err(|e| err(e.error))?;
+    Ok(())
 }
 
 /// Reads a small policy file. `None` when it does not exist; `label` names it in errors.
@@ -192,11 +392,12 @@ pub fn parse(text: &str) -> Result<Policy> {
     let Value::Object(mut root) = value else {
         return Err("Expected a JSON object".into());
     };
-    match root.remove("version") {
-        Some(Value::Number(version)) if version.as_u64() == Some(1) => {}
-        Some(_) => return Err("Unsupported version; this Buzz reads version 1".into()),
+    let version = match root.remove("version") {
+        Some(Value::Number(version)) if matches!(version.as_u64(), Some(1 | 2)) => version.as_u64(),
+        Some(_) => return Err("Unsupported version; this Buzz reads versions 1 and 2".into()),
         None => return Err("Missing version".into()),
-    }
+    };
+    let automatic = version == Some(2);
     let source = match root.remove("source") {
         Some(Value::String(source)) => source.trim().to_owned(),
         _ => return Err("source must be a display name".into()),
@@ -231,7 +432,7 @@ pub fn parse(text: &str) -> Result<Policy> {
     let mut plugins = vec![];
     let mut seen = HashSet::new();
     for (index, entry) in entries.into_iter().take(MAX_PLUGINS).enumerate() {
-        match entry_plugin(entry) {
+        match entry_plugin(entry, automatic) {
             Ok(plugin) if seen.insert(plugin.id.clone()) => plugins.push(plugin),
             Ok(plugin) => report(format!(
                 "Plugin {}: {:?} is listed more than once; only the first entry is used",
@@ -248,7 +449,7 @@ pub fn parse(text: &str) -> Result<Policy> {
     })
 }
 
-fn entry_plugin(entry: Value) -> Result<ManagedPlugin> {
+fn entry_plugin(entry: Value, automatic: bool) -> Result<ManagedPlugin> {
     let Value::Object(mut entry) = entry else {
         return Err("expected an object".into());
     };
@@ -289,13 +490,34 @@ fn entry_plugin(entry: Value) -> Result<ManagedPlugin> {
             path,
         }
     };
+    let (mut install, mut update) = (Install::default(), Update::default());
+    if automatic {
+        install = match entry.remove("install").as_ref().map(Value::as_str) {
+            None | Some(Some("recommend")) => Install::Recommend,
+            Some(Some("automatic")) => Install::Automatic,
+            Some(Some("manual")) => Install::Manual,
+            Some(_) => {
+                return Err("install must be \"recommend\", \"automatic\" or \"manual\"".into())
+            }
+        };
+        update = match entry.remove("update").as_ref().map(Value::as_str) {
+            None | Some(Some("review")) => Update::Review,
+            Some(Some("automatic")) => Update::Automatic,
+            Some(_) => return Err("update must be \"review\" or \"automatic\"".into()),
+        };
+    }
     if let Some(unknown) = entry.keys().next() {
         return Err(format!("unknown field {unknown:?}"));
     }
-    Ok(ManagedPlugin { id, source })
+    Ok(ManagedPlugin {
+        id,
+        source,
+        install,
+        update,
+    })
 }
 
-fn canonical_path(path: &str) -> Result<()> {
+pub(crate) fn canonical_path(path: &str) -> Result<()> {
     if path != "." {
         let canonical = path.split('/').all(|segment| {
             !segment.is_empty()
@@ -389,7 +611,7 @@ fn same_repository(a: &str, b: &str) -> bool {
     canonical(a) == canonical(b)
 }
 
-fn state(plugin: &ManagedPlugin, catalog: &Catalog) -> ManagedState {
+pub(crate) fn state(plugin: &ManagedPlugin, catalog: &Catalog) -> ManagedState {
     let Some(installed) = catalog
         .plugins
         .iter()
@@ -404,7 +626,10 @@ fn state(plugin: &ManagedPlugin, catalog: &Catalog) -> ManagedState {
         (ManagedSource::Url { sha256, .. }, _) if installed.revision == *sha256 => {
             ManagedState::Current
         }
-        (ManagedSource::Url { .. }, Some(InstallSource::Url(_))) => ManagedState::Outdated,
+        // A reviewed URL update replaces a Git install in place, keeping its settings.
+        (ManagedSource::Url { .. }, Some(InstallSource::Url(_) | InstallSource::Git(_))) => {
+            ManagedState::Outdated
+        }
         (
             ManagedSource::Git {
                 repository,
@@ -429,7 +654,7 @@ fn state(plugin: &ManagedPlugin, catalog: &Catalog) -> ManagedState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{GitSource, Manifest, PluginInfo};
     use std::fs;
@@ -448,7 +673,11 @@ mod tests {
             plugins.join(",")
         )
     }
-    fn installed(id: &str, source: Option<InstallSource>, origin: &'static str) -> PluginInfo {
+    pub(crate) fn installed(
+        id: &str,
+        source: Option<InstallSource>,
+        origin: &'static str,
+    ) -> PluginInfo {
         PluginInfo {
             manifest: Manifest {
                 id: id.into(),
@@ -534,7 +763,7 @@ mod tests {
             ("[]", "Expected a JSON object"),
             (r#"{"source":"A","plugins":[]}"#, "Missing version"),
             (
-                r#"{"version":2,"source":"A","plugins":[]}"#,
+                r#"{"version":3,"source":"A","plugins":[]}"#,
                 "Unsupported version",
             ),
             (
@@ -694,6 +923,8 @@ mod tests {
                 url: "https://cdn.example.com/acme.url.json".into(),
                 sha256: digest.clone(),
             },
+            install: Install::Recommend,
+            update: Update::Review,
         };
         let url = |sha256: &str| {
             Some(InstallSource::Url(crate::UrlSource {
@@ -723,8 +954,20 @@ mod tests {
             state(&plugin, &at(&old, url(&old), "external")),
             ManagedState::Outdated
         );
+        // Its reviewed update replaces the Git install in place.
         assert_eq!(
             state(&plugin, &at(&old, git(REPO, Some(COMMIT), "."), "external")),
+            ManagedState::Outdated
+        );
+        let folder = Some(InstallSource::Folder(
+            crate::ReloadSource::folder(std::env::temp_dir(), ".".into()).unwrap(),
+        ));
+        assert_eq!(
+            state(&plugin, &at(&old, folder, "external")),
+            ManagedState::Other
+        );
+        assert_eq!(
+            state(&plugin, &at(&old, None, "external")),
             ManagedState::Other
         );
         assert_eq!(
@@ -795,7 +1038,7 @@ mod tests {
         let fifo = dir.path().join("fifo.json");
         let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        let Managed::Invalid { reason, .. } = status(Ok(fifo.clone()), &empty) else {
+        let Managed::Invalid { reason, .. } = status(Ok(fifo.clone()), &empty, None) else {
             panic!("a FIFO must not be read");
         };
         assert!(reason.contains("regular file"));
@@ -804,10 +1047,13 @@ mod tests {
         fs::write(&real, policy(&[entry("acme.one")])).unwrap();
         let link = dir.path().join("link.json");
         symlink(&real, &link).unwrap();
-        assert!(matches!(status(Ok(link), &empty), Managed::Ready { .. }));
+        assert!(matches!(
+            status(Ok(link), &empty, None),
+            Managed::Ready { .. }
+        ));
         let dangling = dir.path().join("dangling.json");
         symlink(dir.path().join("missing.json"), &dangling).unwrap();
-        assert_eq!(status(Ok(dangling), &empty), Managed::Absent);
+        assert_eq!(status(Ok(dangling), &empty, None), Managed::Absent);
     }
 
     #[test]
@@ -824,7 +1070,7 @@ mod tests {
             .collect();
         let parsed = parse(&policy(&many)).unwrap();
         assert_eq!(parsed.plugins.len(), MAX_PLUGINS);
-        assert!(parsed.problems[0].contains("Only the first 64"));
+        assert!(parsed.problems[0].contains(&format!("Only the first {MAX_PLUGINS}")));
     }
 
     #[test]
@@ -850,32 +1096,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(FILE_NAME);
         let empty = catalog(vec![]);
-        assert_eq!(status(Ok(file.clone()), &empty), Managed::Absent);
+        assert_eq!(status(Ok(file.clone()), &empty, None), Managed::Absent);
 
         fs::write(&file, "{").unwrap();
-        let Managed::Invalid { reason, .. } = status(Ok(file.clone()), &empty) else {
+        let Managed::Invalid { reason, .. } = status(Ok(file.clone()), &empty, None) else {
             panic!("expected invalid");
         };
         assert!(reason.contains("Invalid JSON"));
 
         fs::write(&file, vec![b' '; MAX_BYTES as usize + 1]).unwrap();
-        let Managed::Invalid { reason, .. } = status(Ok(file.clone()), &empty) else {
+        let Managed::Invalid { reason, .. } = status(Ok(file.clone()), &empty, None) else {
             panic!("expected invalid");
         };
         assert!(reason.contains("256 KiB"));
 
         fs::write(&file, [0xff, 0xfe]).unwrap();
         assert!(matches!(
-            status(Ok(file.clone()), &empty),
+            status(Ok(file.clone()), &empty, None),
             Managed::Invalid { .. }
         ));
 
         fs::remove_file(&file).unwrap();
         fs::create_dir(&file).unwrap();
-        assert!(matches!(status(Ok(file), &empty), Managed::Invalid { .. }));
+        assert!(matches!(
+            status(Ok(file), &empty, None),
+            Managed::Invalid { .. }
+        ));
 
         assert!(matches!(
-            status(Err("bad".into()), &empty),
+            status(Err("bad".into()), &empty, None),
             Managed::Invalid { .. }
         ));
     }
@@ -939,7 +1188,7 @@ mod tests {
             plugins,
             problems,
             ..
-        } = status(Ok(file), &installed)
+        } = status(Ok(file), &installed, None)
         else {
             panic!("expected a usable policy");
         };
@@ -953,16 +1202,311 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_the_stored_packaged_policy_only_without_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(FILE_NAME);
+        let empty = catalog(vec![]);
+        let url = "https://plugins.example/policy.json";
+        let stored = dir.path().join(packaged_file_name(url));
+        let fetched = Some((url, &PackagedFetch::Fetched));
+        assert_eq!(
+            effective(dir.path(), None, None, None, &empty),
+            Managed::Absent
+        );
+
+        fs::write(&stored, policy(&[entry("acme.packaged")])).unwrap();
+        assert_eq!(
+            effective(dir.path(), None, None, None, &empty),
+            Managed::Absent
+        );
+        let Managed::Ready { path, plugins, .. } =
+            effective(dir.path(), None, fetched, None, &empty)
+        else {
+            panic!("expected the packaged policy");
+        };
+        assert_eq!(path, stored.display().to_string());
+        assert_eq!(plugins[0].plugin.id, "acme.packaged");
+        assert_eq!(plugins[0].state, ManagedState::Missing);
+        assert_eq!(
+            effective(dir.path(), Some("".into()), fetched, None, &empty),
+            effective(dir.path(), None, fetched, None, &empty)
+        );
+
+        fs::write(&file, policy(&[entry("acme.file")])).unwrap();
+        let Managed::Ready { plugins, .. } = effective(dir.path(), None, fetched, None, &empty)
+        else {
+            panic!("expected the file");
+        };
+        assert_eq!(plugins[0].plugin.id, "acme.file");
+        fs::write(&file, "{").unwrap();
+        assert!(matches!(
+            effective(dir.path(), None, fetched, None, &empty),
+            Managed::Invalid { path, .. } if path == file.display().to_string()
+        ));
+
+        #[cfg(unix)]
+        {
+            let missing = dir.path().join("missing.json");
+            assert_eq!(
+                effective(dir.path(), Some(missing.into()), fetched, None, &empty),
+                Managed::Absent
+            );
+        }
+    }
+
+    #[test]
+    fn reports_a_packaged_policy_that_has_not_arrived() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = catalog(vec![]);
+        let url = "https://plugins.example/policy.json";
+        let failed = PackagedFetch::Failed("HTTP 503".into());
+        assert_eq!(
+            effective(
+                dir.path(),
+                None,
+                Some((url, &PackagedFetch::Pending)),
+                None,
+                &empty
+            ),
+            Managed::Loading { url: url.into() }
+        );
+        assert_eq!(
+            effective(dir.path(), None, Some((url, &failed)), None, &empty),
+            Managed::Unavailable {
+                url: url.into(),
+                reason: "HTTP 503".into()
+            }
+        );
+        let json = serde_json::to_value(effective(
+            dir.path(),
+            None,
+            Some((url, &failed)),
+            None,
+            &empty,
+        ))
+        .unwrap();
+        assert_eq!(json["status"], "unavailable");
+        assert_eq!(json["url"], url);
+
+        fs::write(
+            dir.path().join(packaged_file_name(url)),
+            policy(&[entry("acme.kept")]),
+        )
+        .unwrap();
+        let Managed::Ready { plugins, .. } =
+            effective(dir.path(), None, Some((url, &failed)), None, &empty)
+        else {
+            panic!("a failed refresh keeps the last good copy");
+        };
+        assert_eq!(plugins[0].plugin.id, "acme.kept");
+
+        fs::write(dir.path().join(FILE_NAME), policy(&[])).unwrap();
+        assert!(matches!(
+            effective(dir.path(), None, Some((url, &failed)), None, &empty),
+            Managed::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn stores_only_usable_packaged_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("app");
+        let url = "https://plugins.example/policy.json";
+        let stored = home.join(packaged_file_name(url));
+        let good = policy(&[entry("acme.one")]);
+        assert_eq!(store_packaged(&home, url, good.as_bytes(), None), Ok(true));
+        assert_eq!(fs::read_to_string(&stored).unwrap(), good);
+        assert_eq!(store_packaged(&home, url, good.as_bytes(), None), Ok(false));
+
+        let oversized = format!("{good}{}", " ".repeat(MAX_BYTES as usize));
+        for bad in [
+            b"{".as_slice(),
+            br#"{"version":3,"source":"Acme IT","plugins":[]}"#,
+            &[0xff, 0xfe],
+            oversized.as_bytes(),
+        ] {
+            assert!(store_packaged(&home, url, bad, None).is_err());
+            assert_eq!(fs::read_to_string(&stored).unwrap(), good);
+        }
+
+        let next = policy(&[entry("acme.two")]);
+        assert_eq!(store_packaged(&home, url, next.as_bytes(), None), Ok(true));
+        assert_eq!(fs::read_to_string(&stored).unwrap(), next);
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn keeps_each_packaged_copy_for_its_own_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let empty = catalog(vec![]);
+        let (old_url, new_url) = (
+            "https://plugins.example/old.json",
+            "https://plugins.example/new.json",
+        );
+        assert_ne!(packaged_file_name(old_url), packaged_file_name(new_url));
+        fs::write(home.join("packaged-managed-plugins.json"), policy(&[])).unwrap();
+        store_packaged(home, old_url, policy(&[entry("acme.old")]).as_bytes(), None).unwrap();
+        assert!(!home.join("packaged-managed-plugins.json").exists());
+
+        let failed = PackagedFetch::Failed("HTTP 404".into());
+        assert_eq!(
+            effective(home, None, Some((new_url, &failed)), None, &empty),
+            Managed::Unavailable {
+                url: new_url.into(),
+                reason: "HTTP 404".into()
+            }
+        );
+        assert!(home.join(packaged_file_name(old_url)).exists());
+
+        store_packaged(home, new_url, policy(&[entry("acme.new")]).as_bytes(), None).unwrap();
+        assert!(!home.join(packaged_file_name(old_url)).exists());
+        let Managed::Ready { plugins, .. } = effective(
+            home,
+            None,
+            Some((new_url, &PackagedFetch::Fetched)),
+            None,
+            &empty,
+        ) else {
+            panic!("expected the new URL's copy");
+        };
+        assert_eq!(plugins[0].plugin.id, "acme.new");
+    }
+
+    #[test]
     fn serializes_for_the_frontend() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(FILE_NAME);
         fs::write(&file, policy(&[entry("acme.one")])).unwrap();
-        let json = serde_json::to_value(status(Ok(file), &catalog(vec![]))).unwrap();
+        let json = serde_json::to_value(status(Ok(file), &catalog(vec![]), None)).unwrap();
         assert_eq!(json["status"], "ready");
         assert_eq!(json["source"], "Acme IT");
         assert_eq!(json["plugins"][0]["id"], "acme.one");
         assert_eq!(json["plugins"][0]["state"], "missing");
         assert_eq!(json["plugins"][0]["commit"], COMMIT);
+        assert_eq!(json["plugins"][0]["install"], "recommend");
+        assert_eq!(json["plugins"][0]["update"], "review");
         assert_eq!(json["problems"], serde_json::json!([]));
+        assert!(json.get("automatic").is_none());
+    }
+
+    #[test]
+    fn version_2_entries_choose_how_they_install_and_update() {
+        let v2 =
+            |entries: &[String]| policy(entries).replacen(r#""version":1"#, r#""version":2"#, 1);
+        let with = |fields: &str| entry("acme.one").replacen('{', &format!("{{{fields},"), 1);
+        let parsed = parse(&v2(&[
+            entry("acme.default"),
+            with(r#""install":"automatic","update":"automatic""#).replace("acme.one", "acme.auto"),
+            with(r#""install":"manual""#).replace("acme.one", "acme.manual"),
+            with(r#""install":"recommend","update":"review""#).replace("acme.one", "acme.spelled"),
+        ]))
+        .unwrap();
+        assert!(parsed.problems.is_empty(), "{:?}", parsed.problems);
+        let modes = parsed
+            .plugins
+            .iter()
+            .map(|p| (p.id.as_str(), p.install, p.update))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            modes,
+            [
+                ("acme.default", Install::Recommend, Update::Review),
+                ("acme.auto", Install::Automatic, Update::Automatic),
+                ("acme.manual", Install::Manual, Update::Review),
+                ("acme.spelled", Install::Recommend, Update::Review),
+            ]
+        );
+
+        let bad = parse(&v2(&[
+            with(r#""install":"always""#),
+            with(r#""update":true"#).replace("acme.one", "acme.two"),
+        ]))
+        .unwrap();
+        assert!(bad.plugins.is_empty());
+        assert!(
+            bad.problems[0].contains("install must be"),
+            "{:?}",
+            bad.problems
+        );
+        assert!(
+            bad.problems[1].contains("update must be"),
+            "{:?}",
+            bad.problems
+        );
+
+        // Version 1 keeps rejecting the new fields, so it never installs on its own.
+        let v1 = parse(&policy(&[with(r#""install":"automatic""#)])).unwrap();
+        assert!(v1.plugins.is_empty());
+        assert!(
+            v1.problems[0].contains("unknown field \"install\""),
+            "{:?}",
+            v1.problems
+        );
+    }
+
+    #[test]
+    fn a_signature_url_and_file_sit_beside_their_policy() {
+        assert_eq!(
+            signature_url("https://plugins.example/policy.json"),
+            "https://plugins.example/policy.json.sig"
+        );
+        assert_eq!(
+            signature_url("https://plugins.example/policy.json?v=2"),
+            "https://plugins.example/policy.json.sig?v=2"
+        );
+        assert_eq!(
+            signature_path(Path::new("/etc/buzz/managed-plugins.json")),
+            Path::new("/etc/buzz/managed-plugins.json.sig")
+        );
+    }
+
+    #[test]
+    fn keeps_the_packaged_signature_with_its_policy() {
+        let key = "04".repeat(32);
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let url = "https://plugins.example/policy.json";
+        let v2 = policy(&[entry("acme.one").replacen('{', r#"{"install":"automatic","#, 1)])
+            .replacen(r#""version":1"#, r#""version":2"#, 1);
+        let scratch = home.join("scratch.json");
+        fs::write(&scratch, &v2).unwrap();
+        let signer = crate::sign_policy(&scratch, &key).unwrap();
+        let signature = fs::read(signature_path(&scratch)).unwrap();
+        let empty = catalog(vec![]);
+        let fetched = Some((url, &PackagedFetch::Fetched));
+        let read = || effective(home, None, fetched, Some(&signer), &empty);
+
+        assert_eq!(
+            store_packaged(home, url, v2.as_bytes(), Some(&signature)),
+            Ok(true)
+        );
+        let Managed::Ready {
+            signed, plugins, ..
+        } = read()
+        else {
+            panic!("expected the packaged policy");
+        };
+        assert!(signed);
+        assert_eq!(plugins[0].plugin.install, Install::Automatic);
+
+        assert_eq!(store_packaged(home, url, v2.as_bytes(), None), Ok(true));
+        assert!(!signature_path(&home.join(packaged_file_name(url))).exists());
+        let Managed::Ready {
+            signed, plugins, ..
+        } = read()
+        else {
+            panic!("expected the packaged policy");
+        };
+        assert!(!signed);
+        assert_eq!(plugins[0].plugin.install, Install::Recommend);
+
+        let other = "https://plugins.example/other.json";
+        store_packaged(home, url, v2.as_bytes(), Some(&signature)).unwrap();
+        store_packaged(home, other, v2.as_bytes(), Some(&signature)).unwrap();
+        assert!(!home.join(packaged_file_name(url)).exists());
+        assert!(!signature_path(&home.join(packaged_file_name(url))).exists());
+        assert!(signature_path(&home.join(packaged_file_name(other))).exists());
+        assert!(store_packaged(home, url, v2.as_bytes(), Some(&[b' '; 17 * 1024])).is_err());
     }
 }

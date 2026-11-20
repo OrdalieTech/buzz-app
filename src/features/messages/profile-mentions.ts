@@ -1,3 +1,7 @@
+import {
+  preparedMarkdown,
+  type PreparedMarkdown,
+} from "./markdown-preparation";
 import type { AgentLibrary } from "../agents/library";
 import type { ChannelMessage, Profile } from "../relay/contracts";
 import { profileTarget } from "../profiles/target";
@@ -19,7 +23,12 @@ type Part = { text: string; target?: string | undefined };
 export function profileMentionParts(
   row: Pick<
     ChannelMessage,
-    "content" | "edited" | "attachmentSeams" | "mentions" | "mentionReferences"
+    | "content"
+    | "edited"
+    | "attachmentSeams"
+    | "mentions"
+    | "mentionReferences"
+    | "mentionLabels"
   >,
   profiles: ReadonlyMap<string, Profile> | undefined,
   agents: AgentLibrary["identities"] = [],
@@ -35,7 +44,7 @@ export function profileMentionParts(
   for (const id of new Set(identities)) {
     const target = profileTarget(id);
     if (!target) continue;
-    const labels = [
+    const labels = row.mentionLabels?.find((item) => item.id === id)?.names ?? [
       ...profileMentionNames(profiles?.get(id)),
       ...agents
         .filter((agent) => agent.pubkey === id)
@@ -65,6 +74,28 @@ export function profileMentionParts(
       i++;
       continue;
     }
+    // A qualified span names its signed key, so its name may differ in case:
+    // mobile keeps the spelling the author typed.
+    let bound: { end: number; target: string } | undefined;
+    for (const [name, keys] of candidates) {
+      if (
+        text.slice(i + 1, i + 1 + name.length).toLowerCase() !==
+        name.toLowerCase()
+      )
+        continue;
+      const qualifier = QUALIFIER.exec(text.slice(i + 1 + name.length));
+      const target = profileTarget(qualifier?.[1] ?? "");
+      if (qualifier && target && keys.has(target)) {
+        bound = { end: i + 1 + name.length + qualifier[0].length, target };
+        break;
+      }
+    }
+    if (bound && !spansSeam(i, bound.end)) {
+      if (i > plain) parts.push({ text: text.slice(plain, i) });
+      parts.push({ text: text.slice(i, bound.end), target: bound.target });
+      plain = i = bound.end;
+      continue;
+    }
     const candidate = candidates.find(
       ([name]) =>
         text.startsWith(name, i + 1) &&
@@ -77,11 +108,11 @@ export function profileMentionParts(
     }
     const [name, keys] = candidate;
     const end = i + 1 + name.length;
-    // Legacy namesake qualifiers carry a different exact identity. Do not let a
-    // known shorter name claim their prefix; qualified rendering is deferred.
-    const qualifier = /^ \([a-f0-9]{64}\)/i.exec(text.slice(end))?.[0];
+    // A qualifier no signed key with this name carries stays literal, and a
+    // known shorter name cannot claim its prefix.
+    const qualifier = QUALIFIER.exec(text.slice(end));
     if (qualifier) {
-      i = end + qualifier.length;
+      i = end + qualifier[0].length;
       continue;
     }
     if (keys.size === 1) {
@@ -94,6 +125,38 @@ export function profileMentionParts(
   if (plain < text.length) parts.push({ text: text.slice(plain) });
   return parts.length ? parts : [{ text }];
 }
+
+/** The renderer and forwarded metadata share the same Markdown exclusions. */
+export function renderedProfileMentionParts(
+  row: Parameters<typeof profileMentionParts>[0],
+  profiles: Parameters<typeof profileMentionParts>[1],
+  agents: AgentLibrary["identities"] = [],
+  prepared: PreparedMarkdown = preparedMarkdown(row.content),
+): Part[] {
+  if (prepared.kind === "plain") return [{ text: prepared.content }];
+  const normalized = {
+    ...row,
+    content: prepared.content,
+    // Seams index the folded body, before link normalization.
+    ...(row.edited || (row.attachmentSeams && prepared.content !== row.content)
+      ? { edited: true as const }
+      : {}),
+  };
+  let offset = 0;
+  let rangeIndex = 0;
+  return profileMentionParts(normalized, profiles, agents).map((part) => {
+    const start = offset;
+    offset += part.text.length;
+    while ((prepared.literalRanges[rangeIndex]?.end ?? Infinity) <= start)
+      rangeIndex++;
+    return part.target &&
+      (prepared.literalRanges[rangeIndex]?.start ?? Infinity) < offset
+      ? { text: part.text }
+      : part;
+  });
+}
+
+const QUALIFIER = /^ \(([a-f0-9]{64})\)/i;
 
 // Evaluate exclusions on the full body BEFORE splitting link/emoji rendering.
 // Deliberately conservative for incomplete code/link syntax; not a Markdown parser.

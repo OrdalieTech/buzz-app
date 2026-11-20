@@ -17,8 +17,13 @@ import {
   outsideMentionDetail,
   remoteMentionDetail,
 } from "./mention-candidates";
+import { outsideMentionReferences } from "../../features/messages/mention-admission";
 import { matchesMentionQuery, pendingMentionQuery } from "./mention-query";
-import { continuedMention, matchingMentions } from "./mention-ranking";
+import {
+  channelMember,
+  continuedMention,
+  matchingMentions,
+} from "./mention-ranking";
 import { resolveSpaceMention } from "./resolve-space-mention";
 import { SelectedMentionContext } from "../../features/messages/selected-mention-context";
 import { DraftMentionRoster } from "../../features/messages/draft-mention-roster";
@@ -231,7 +236,12 @@ export function MentionCompletion({
               model.managedBy.get(recipient.pubkey),
               memberKeys.has(recipient.pubkey)
                 ? undefined
-                : inviteAgents
+                : inviteAgents &&
+                    !outsideMentionReferences(
+                      channel,
+                      agents.identities,
+                      recipient.pubkey,
+                    )
                   ? parentAdmission
                     ? "Adds to channel"
                     : "Adds to chat"
@@ -314,8 +324,8 @@ export function MentionCompletion({
     // Space is undecided, not declined, only while evidence is still arriving:
     // members, names or agents loading, or the directory search waiting or
     // running. Then the host may hold the name and let the resolver apply
-    // section 5 once the choice set is known. A name already known to continue
-    // the query declines Space whatever else arrives: the next word may
+    // section 5 once the choice set is known. A known longer name that blocks
+    // the query whatever else arrives declines Space: the next word may
     // complete that longer name, so Space stays prose and the query open. The
     // known set is every candidate the chooser has, not only the shown rows:
     // members or roster, offered agents and the directory rows received so
@@ -326,9 +336,14 @@ export function MentionCompletion({
       !teams.blocksSpace &&
       (model.pending || model.directory.loading) &&
       pendingMentionQuery(query.query) &&
-      // A continuing name starts with the query: only indexed matches can have one.
       !continuedMention(
-        matchingMentions(model.candidates, query.query),
+        // A continuing name starts with the query: only indexed matches can
+        // have one. A member still unknown or unnamed may have the exact
+        // name, which no outside name blocks, so until every member is known
+        // and named only members' names decline.
+        matchingMentions(model.candidates, query.query).filter(
+          (c) => channelMember(c) || !model.missingNames,
+        ),
         query.query,
       );
     const withdraw = publish({

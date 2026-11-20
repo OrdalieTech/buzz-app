@@ -63,6 +63,7 @@ import {
   bestieDetailRoute,
   bestieDetailTarget,
 } from "./routes";
+import { FirstAgentWelcome, useFirstAgentWelcome } from "./FirstAgentWelcome";
 import styles from "./PinnedBestie.module.css";
 
 /** Bestie owns its pinned destination; Messages owns conversation tabs and readers. */
@@ -74,7 +75,8 @@ export function BestieConversation({
   navigator,
   navigation,
   channel,
-  bestie,
+  agent,
+  community,
   icon,
 }: {
   session: RelaySession;
@@ -84,9 +86,12 @@ export function BestieConversation({
   navigator: Navigation;
   navigation?: PageNavigation | undefined;
   channel: ChannelSummary;
-  bestie: string;
+  agent: { pubkey: string; name: string; picture?: string | undefined };
+  community?: string | undefined;
   icon: ReactNode;
 }) {
+  const bestie = agent.name;
+  const welcome = useFirstAgentWelcome(scope, agent.pubkey, channel.id);
   const settingsTrigger = useRef<HTMLButtonElement>(null);
   const membersTrigger = useRef<HTMLElement | null>(null);
   const [membersOpen, setMembersOpen] = useState(false);
@@ -260,6 +265,16 @@ export function BestieConversation({
       }),
     );
   };
+  const openLink = (url: string) => {
+    if (!session.viewer) return false;
+    const target = buzzLinkTarget(url, {
+      viewer: session.viewer,
+      communityOrigin: scope.slice(0, -65),
+    });
+    if (!target || !ownsCurrentVisit()) return false;
+    void navigator.open(target);
+    return true;
+  };
   const secondary = useConversationTabs({
     state,
     relay: host.relay,
@@ -279,16 +294,7 @@ export function BestieConversation({
     isLive: ownsCurrentVisit,
     fallbackFocus: main,
     mainPane: true,
-    openLink: (url) => {
-      if (!session.viewer) return false;
-      const target = buzzLinkTarget(url, {
-        viewer: session.viewer,
-        communityOrigin: scope.slice(0, -65),
-      });
-      if (!target || !ownsCurrentVisit()) return false;
-      void navigator.open(target);
-      return true;
-    },
+    openLink,
     routed:
       routed?.channelId === channel.id && navigation && !preserveNavigation
         ? { channelId: channel.id, messageId: routed.messageId, navigation }
@@ -590,6 +596,15 @@ export function BestieConversation({
                             >
                               <MessageManagementStatus />
                               <ChannelBody
+                                intro={
+                                  welcome ? (
+                                    <FirstAgentWelcome
+                                      name={bestie}
+                                      picture={agent.picture}
+                                      community={community}
+                                    />
+                                  ) : undefined
+                                }
                                 viewer={session.viewer}
                                 cached={!!channel.cached}
                                 revealMessageId={sent}
@@ -651,6 +666,8 @@ export function BestieConversation({
                 onOpenLink={(target) =>
                   secondary.openConversationLink(channel.id, target)
                 }
+                // Adding someone can start or open another DM: go there.
+                onOpenMessage={openLink}
               />
             )}
             {secondary.drag.feedback}

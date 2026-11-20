@@ -29,6 +29,11 @@ import {
   slotId,
   uint32,
 } from "../src/features/relay/read-state-model.ts";
+import {
+  FOLLOW_PLAINTEXT_BYTES,
+  parseFollowPayload,
+} from "../src/features/relay/follow-sync.ts";
+import { followCoordinate } from "../src/features/relay/read-state-host.ts";
 import { projectSidebarPreferences } from "../src/features/relay/sidebar-preferences.ts";
 import { validTypingTemplate } from "../src/features/relay/typing-protocol.ts";
 import { validateWorkflowEvent } from "../src/features/workflows/protocol.ts";
@@ -462,6 +467,32 @@ async function decodeReadState(events: unknown) {
       throw typeof error === "string" ? error : invalid;
     }
     decoded.push({ eventId: event.id, blob });
+  }
+  return decoded;
+}
+
+/** Rust `decode_thread_follows`: verified, self-authored follow slots; an
+ * unreadable payload is null. */
+async function decodeThreadFollows(events: unknown) {
+  const invalid = "Invalid thread-follows event";
+  if (!Array.isArray(events) || events.length > 16 || size(events) > 512 * KIB)
+    throw "Thread-follows decode capacity exceeded";
+  const key = conversation(await secret());
+  const decoded = [];
+  for (const raw of events) {
+    if (size(raw) > 96 * KIB) throw invalid;
+    const event = await owned(raw, invalid);
+    if (!followCoordinate(event)) throw invalid;
+    let payload: unknown = null;
+    try {
+      const plaintext = nip44.v2.decrypt(event.content, key);
+      if (size(plaintext) <= FOLLOW_PLAINTEXT_BYTES) {
+        const parsed = JSON.parse(plaintext);
+        parseFollowPayload(parsed);
+        payload = parsed;
+      }
+    } catch {}
+    decoded.push({ eventId: event.id, payload });
   }
   return decoded;
 }
@@ -921,6 +952,49 @@ export const keyCommands: Record<string, (args: Args) => unknown> = {
     const body = JSON.stringify(event);
     if (size(body) > 64 * KIB) throw "Invalid read-state event";
     await decodeReadState([event]);
+    return send(url, "POST", body);
+  },
+  relay_decode_thread_follows({ community, events }) {
+    origin(community);
+    return decodeThreadFollows(events);
+  },
+  async relay_sign_thread_follows({ community, intent }) {
+    origin(community);
+    const owner = await secret();
+    if (
+      !record(intent) ||
+      !slotId(intent.slot) ||
+      !uint32(intent.createdAt) ||
+      Math.abs(intent.createdAt - now()) > 60
+    )
+      throw "Invalid thread-follows signing intent";
+    try {
+      parseFollowPayload(intent.payload);
+    } catch {
+      throw "Unsupported thread-follows payload";
+    }
+    const plaintext = JSON.stringify(intent.payload);
+    if (size(plaintext) > FOLLOW_PLAINTEXT_BYTES)
+      throw "Thread-follows publication capacity exceeded";
+    return sign(
+      {
+        kind: 30078,
+        created_at: intent.createdAt,
+        content: nip44.v2.encrypt(plaintext, conversation(owner)),
+        tags: [
+          ["d", `thread-follows:${intent.slot}`],
+          ["t", "thread-follows"],
+        ],
+      },
+      owner,
+    );
+  },
+  async relay_publish_thread_follows({ community, event }) {
+    const url = requestUrl(community, "/events", "POST");
+    const body = JSON.stringify(event);
+    if (size(body) > 64 * KIB) throw "Invalid thread-follows event";
+    if ((await decodeThreadFollows([event]))[0]?.payload === null)
+      throw "Invalid thread-follows event";
     return send(url, "POST", body);
   },
   async relay_agent_observer({ community, event }) {

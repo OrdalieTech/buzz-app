@@ -1,11 +1,17 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { afterEach, expect, it } from "vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  render,
+  renderHook,
+  screen,
+} from "@testing-library/react";
 import type { SessionSnapshot } from "./service";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
-import { CommunitySignIn } from "./CommunitySignIn";
+import { CommunitySignIn, useExplainedRefusal } from "./CommunitySignIn";
 import { federatedFixture } from "./testing";
 afterEach(cleanup);
 it.each(["storage-unavailable", "storage-denied"])(
@@ -27,6 +33,23 @@ it.each(["storage-unavailable", "storage-denied"])(
     expect(h.service.signIn).not.toHaveBeenCalled();
   },
 );
+it("says an unreadable saved sign-in is not a permissions problem, and that signing in can't fix it", () => {
+  const h = federatedFixture();
+  h.publish({ status: "unavailable", failure: "storage-corrupt" });
+  render(
+    <CommunitySignIn
+      identity={h.service}
+      error="Federated sign-in is required"
+      retry={vi.fn()}
+    />,
+  );
+  const alert = screen.getByRole("alert");
+  expect(alert).toHaveTextContent(
+    "Buzz can’t read its saved sign-in for this server, and signing in again may not replace it. If this keeps happening, contact support.",
+  );
+  expect(alert).not.toHaveTextContent("credential permissions");
+  expect(alert).not.toHaveTextContent("storage-corrupt");
+});
 it.each([null, "Builderlab"])(
   "names server %s and requires explicit sign-in before retrying admission",
   async (organization) => {
@@ -296,3 +319,58 @@ it.each([
     expect(retry).toHaveBeenCalledOnce();
   },
 );
+
+it("keeps an explained refusal hidden until its error clears, so a resolving sign-in never shows it raw", () => {
+  const h = federatedFixture();
+  const refusal = "Federated sign-in is required";
+  const { result, rerender } = renderHook(
+    ({ error }) => useExplainedRefusal(h.service, error),
+    { initialProps: { error: refusal } },
+  );
+  expect(result.current).toBe(true);
+  // Signed in before the retry clears the error: still explained.
+  act(() => {
+    h.publish({ status: "signed-in" });
+  });
+  expect(result.current).toBe(true);
+  rerender({ error: "" });
+  expect(result.current).toBe(false);
+  // A new refusal is judged fresh: signed in, nothing explains it.
+  rerender({ error: refusal });
+  expect(result.current).toBe(false);
+});
+it.each([
+  [130, "about 2 minutes off"],
+  [-130, "about 2 minutes off"],
+])(
+  "keeps a refusal's own copy and adds a clock hint at %s s",
+  (clockOffset, hint) => {
+    const h = federatedFixture();
+    h.publish({ failure: "adapter-refused", clockOffset });
+    render(
+      <CommunitySignIn
+        identity={h.service}
+        error="adapter-refused"
+        retry={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Buzz couldn’t confirm your organization sign-in for this community.",
+    );
+    expect(screen.getByText(new RegExp(hint))).toHaveTextContent(
+      "Check your date and time settings.",
+    );
+  },
+);
+it("adds no clock hint without a measured offset", () => {
+  const h = federatedFixture();
+  h.publish({ failure: "adapter-refused", clockOffset: null });
+  render(
+    <CommunitySignIn
+      identity={h.service}
+      error="adapter-refused"
+      retry={vi.fn()}
+    />,
+  );
+  expect(screen.queryByText(/clock looks about/)).toBeNull();
+});

@@ -96,14 +96,14 @@ fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
 /// The addresses to connect to for `url`, when its port is 443 and every
 /// address its name resolves to is public. One private answer refuses all.
 pub(super) async fn public_addresses(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
-    const REFUSED: &str = "Public image host is not a public address";
+    const REFUSED: &str = "Public host is not a public address";
     if url.port_or_known_default() != Some(443) {
-        return Err("Public images are read from port 443 only".into());
+        return Err("Public hosts are read from port 443 only".into());
     }
     let addresses: Vec<SocketAddr> = match url.host() {
         Some(url::Host::Domain(name)) => tokio::net::lookup_host((name, 443))
             .await
-            .map_err(|_| "Public image host did not resolve")?
+            .map_err(|_| "Public host did not resolve")?
             .collect(),
         Some(url::Host::Ipv4(ip)) => vec![SocketAddr::new(ip.into(), 443)],
         Some(url::Host::Ipv6(ip)) => vec![SocketAddr::new(ip.into(), 443)],
@@ -123,14 +123,19 @@ pub(super) async fn fetch(
     max_bytes: usize,
     timeout: Duration,
 ) -> Result<Reply, String> {
-    read_image(request(url, addresses, timeout)?, max_bytes).await
+    read_image(
+        request(url, addresses, &TYPES.join(","), timeout)?,
+        max_bytes,
+    )
+    .await
 }
 
-/// The GET `fetch` sends, on a client of its own that can reach only
-/// `addresses` for the URL's name.
-fn request(
+/// A GET for `url`, on a client of its own that can reach only `addresses`
+/// for the URL's name.
+pub(super) fn request(
     url: reqwest::Url,
     addresses: &[SocketAddr],
+    accept: &str,
     timeout: Duration,
 ) -> Result<reqwest::RequestBuilder, String> {
     let mut builder = reqwest::Client::builder()
@@ -148,7 +153,7 @@ fn request(
         .map_err(|_| "Host request client is unavailable")?;
     Ok(client
         .get(url)
-        .header(reqwest::header::ACCEPT, TYPES.join(","))
+        .header(reqwest::header::ACCEPT, accept)
         .timeout(timeout))
 }
 
@@ -305,7 +310,7 @@ mod tests {
         let (address, server) = reply(response);
         let url =
             reqwest::Url::parse(&format!("http://image.invalid:{}/img", address.port())).unwrap();
-        let request = request(url, &[address], Duration::from_secs(5))?;
+        let request = request(url, &[address], &TYPES.join(","), Duration::from_secs(5))?;
         let result = tauri::async_runtime::block_on(read_image(request, max));
         let sent = server
             .recv_timeout(Duration::from_secs(5))

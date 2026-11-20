@@ -46,6 +46,7 @@ export function Select({
   align = "start",
   size,
   appearance = "outlined",
+  describedBy,
 }: {
   label: string;
   description?: ReactNode;
@@ -58,7 +59,7 @@ export function Select({
   valueLabel?: string | undefined;
   valueTitle?: string;
   /** Compact metadata stays visible while the selected value truncates. */
-  valueSuffix?: string | undefined;
+  valueSuffix?: ReactNode;
   /** Decorative 20px icon, avatar, or custom accessory shown before the selected value. */
   leading?: ReactNode;
   /** Anchor the popup to the corresponding trigger edge. */
@@ -67,6 +68,8 @@ export function Select({
   /** Match adjacent controls without changing the selection treatment. */
   size?: "xs" | "sm" | "md";
   appearance?: "outlined" | "glass-ghost" | "inverted" | "link";
+  /** Text the trigger is described by, such as its row's subtitle. */
+  describedBy?: string | undefined;
   disabled?: boolean;
   value: string;
   groups: readonly SelectGroup[];
@@ -151,6 +154,7 @@ export function Select({
             // Base UI adds aria-labelledby after the commit that inserts the
             // trigger, so it can be unnamed until a later task. Name it now.
             aria-label={label}
+            {...(describedBy ? { "aria-describedby": describedBy } : {})}
             render={(props) => (
               <Button
                 {...props}

@@ -797,6 +797,7 @@
      rather than preserve an exploratory #f9f9f9 stop or recreate it with
      alpha. */
   --neutral-quiet-hover: #f1f1f2; /* hover between quiet fill and selection */
+  --neutral-inset-subtle: #fafafb; /* Halfway from panel to inset, rounded to display channels. */
   --neutral-2: #f5f5f6; /* quiet compact controls, callouts, and grouping */
   --neutral-3: #e8e8e8; /* chrome track in light; bg-panel in dark */
   --neutral-4: #dadada; /* border-primary in light mode            */
@@ -933,6 +934,7 @@
   --bubble-neutral: #2e2e2e;
   --bubble-received: #292929;
   --neutral-1: #000000;
+  --neutral-inset-subtle: #151515; /* Halfway between panel (#1a1a1a) and inset (#101010). */
   --neutral-2: #101010;
   --neutral-3: #1a1a1a;
   --neutral-4: #232323;
@@ -1104,11 +1106,16 @@
   --surface-popover: var(--neutral-1);
   --surface-elevated-glass: var(--popover-glass-fill);
   --surface-inset: var(--neutral-2);
+  --surface-inset-subtle: var(--neutral-inset-subtle);
   --surface-inverse: var(--neutral-11);
   --surface-text-selection: var(--neutral-12);
   --text-on-selection: var(--neutral-1);
   --surface-text-selection-own: var(--neutral-12);
   --text-on-selection-own: var(--neutral-1);
+  /* Find on screen paints matches like a browser's find bar, dark text in both modes. */
+  --surface-find-match: var(--amber-5);
+  --surface-find-match-active: var(--orange-7);
+  --text-on-find-match: var(--neutral-12);
   --surface-message: var(--bubble-received);
   --surface-message-own: var(--bubble-neutral);
   --surface-message-hover: var(--bubble-hover);
@@ -1171,6 +1178,25 @@
   --surface-categorical-purple: var(--purple-3);
   --icon-categorical-purple: var(--purple-11);
   --icon-categorical-purple-own: var(--icon-categorical-purple);
+  /* Further categorical hues: a step-3 fill under a step-11 glyph, so result
+   * kinds (channels, people, agents, plugins) read apart at a glance. */
+  --surface-categorical-blue: var(--blue-3);
+  --surface-categorical-blue-hover: var(--blue-4);
+  --text-categorical-blue: var(--blue-12);
+  --icon-categorical-blue: var(--blue-11);
+  --surface-categorical-green: var(--green-3);
+  --surface-categorical-green-hover: var(--green-4);
+  --text-categorical-green: var(--green-12);
+  --icon-categorical-green: var(--green-11);
+  --surface-categorical-amber: var(--amber-3);
+  --surface-categorical-amber-hover: var(--amber-4);
+  --text-categorical-amber: var(--amber-12);
+  --icon-categorical-amber: var(--amber-11);
+  --surface-categorical-orange: var(--orange-3);
+  --icon-categorical-orange: var(--orange-11);
+  /* Matched characters in search results. */
+  --surface-search-match: var(--amber-4);
+  --text-search-match: var(--amber-12);
   --text-link: var(--text-standard);
   --affordance-link-hover: var(--affordance-subtle-hover);
   --border-standard: var(--neutral-3);
@@ -1197,6 +1223,9 @@
   --affordance-backdrop-hover: var(--backdrop-hover-fill);
   --affordance-backdrop-pressed: var(--backdrop-pressed-fill);
   --affordance-subtle-pressed: var(--neutral-4);
+  --affordance-toast: var(--affordance-subtle);
+  --affordance-toast-hover: var(--affordance-subtle-hover);
+  --affordance-toast-pressed: var(--affordance-subtle-pressed);
   /* Rows: hover and the ink on hovered or selected rows. Distinct from quiet
      control fills, so rows can take color before controls do. */
   --affordance-row-hover: var(--affordance-subtle);
@@ -1284,11 +1313,15 @@
   --surface-popover: var(--neutral-raised);
   --surface-elevated-glass: var(--popover-glass-fill);
   --surface-inset: var(--neutral-2);
+  --surface-inset-subtle: var(--neutral-inset-subtle);
   --surface-inverse: var(--neutral-11);
   --surface-text-selection: var(--neutral-12);
   --text-on-selection: var(--neutral-1);
   --surface-text-selection-own: var(--neutral-12);
   --text-on-selection-own: var(--neutral-1);
+  --surface-find-match: var(--amber-9);
+  --surface-find-match-active: var(--orange-11);
+  --text-on-find-match: var(--neutral-1);
   --text-navigation: var(--neutral-11);
   --text-navigation-unread: var(--neutral-12);
   --text-standard: var(--neutral-12);
@@ -1323,6 +1356,25 @@
   --surface-categorical-purple: var(--purple-3);
   --icon-categorical-purple: var(--purple-11);
   --icon-categorical-purple-own: var(--icon-categorical-purple);
+  /* Further categorical hues: a step-3 fill under a step-11 glyph, so result
+   * kinds (channels, people, agents, plugins) read apart at a glance. */
+  --surface-categorical-blue: var(--blue-3);
+  --surface-categorical-blue-hover: var(--blue-4);
+  --text-categorical-blue: var(--blue-12);
+  --icon-categorical-blue: var(--blue-11);
+  --surface-categorical-green: var(--green-3);
+  --surface-categorical-green-hover: var(--green-4);
+  --text-categorical-green: var(--green-12);
+  --icon-categorical-green: var(--green-11);
+  --surface-categorical-amber: var(--amber-3);
+  --surface-categorical-amber-hover: var(--amber-4);
+  --text-categorical-amber: var(--amber-12);
+  --icon-categorical-amber: var(--amber-11);
+  --surface-categorical-orange: var(--orange-3);
+  --icon-categorical-orange: var(--orange-11);
+  /* Matched characters in search results. */
+  --surface-search-match: var(--amber-4);
+  --text-search-match: var(--amber-12);
   --text-link: var(--text-standard);
   --affordance-link-hover: var(--affordance-subtle-hover);
   --border-standard: var(--neutral-5);
@@ -1349,6 +1401,9 @@
   --affordance-backdrop-hover: var(--backdrop-hover-fill);
   --affordance-backdrop-pressed: var(--backdrop-pressed-fill);
   --affordance-subtle-pressed: var(--neutral-5);
+  --affordance-toast: var(--neutral-quiet-hover);
+  --affordance-toast-hover: var(--neutral-6);
+  --affordance-toast-pressed: var(--neutral-7);
   --affordance-row-hover: var(--affordance-subtle);
   --text-row-subtle: var(--text-subtle);
   --text-row-metadata: var(--text-metadata);
@@ -1416,6 +1471,7 @@
   --size-emoji-display: calc(var(--type-rem) * 2.625);
   --size-emoji-line: calc(var(--type-rem) * 3);
   --size-emoji-inline: calc(var(--type-rem) * 1.375);
+  --size-emoji-picker: calc(var(--type-rem) * 1.75);
 
   --text-primary: var(--text-standard);
   --text-secondary: var(--text-subtle);
@@ -1635,6 +1691,9 @@
   --text-message-link: var(--accent-link);
   --surface-sidebar-selected: var(--accent-9);
   --text-sidebar-selected: var(--accent-contrast);
+  /* Corner counts keep a dark fill and readable accent ink in both modes. */
+  --surface-dock-count: var(--mono-2-dark);
+  --text-dock-count: var(--accent-link-dark);
   --text-sidebar-hover: var(--accent-12);
   --affordance-sidebar-hover: var(--accent-2);
   --affordance-accent-prominent: var(--accent-9);
@@ -1681,6 +1740,9 @@
   --text-message-link: var(--accent-link);
   --surface-sidebar-selected: var(--accent-9);
   --text-sidebar-selected: var(--accent-contrast);
+  /* Corner counts keep a dark fill and readable accent ink in both modes. */
+  --surface-dock-count: var(--mono-2-dark);
+  --text-dock-count: var(--accent-link-dark);
   --text-sidebar-hover: var(--accent-12);
   --affordance-sidebar-hover: var(--accent-3);
   --affordance-accent-prominent: var(--accent-9);
@@ -2062,6 +2124,8 @@
   --text-color-sidebar-selected: var(--text-sidebar-selected);
   --text-color-sidebar-hover: var(--text-sidebar-hover);
   --color-surface-sidebar-selected: var(--surface-sidebar-selected);
+  --color-surface-dock-count: var(--surface-dock-count);
+  --text-color-dock-count: var(--text-dock-count);
   --color-affordance-sidebar-hover: var(--affordance-sidebar-hover);
   --text-color-message-own: var(--text-message-own);
   --text-color-message-link-own: var(--text-message-link-own);
@@ -2078,6 +2142,7 @@
   --color-surface-composer: var(--surface-composer);
   --color-surface-popover: var(--surface-popover);
   --color-surface-inset: var(--surface-inset);
+  --color-surface-inset-subtle: var(--surface-inset-subtle);
   --color-surface-inverse: var(--surface-inverse);
   --text-color-on-media: var(--text-on-media);
   --border-color-media-glass: var(--border-media-glass);
@@ -2097,6 +2162,10 @@
   --text-color-success: var(--text-success);
   --text-color-categorical-purple: var(--text-categorical-purple);
   --color-surface-categorical-purple: var(--surface-categorical-purple);
+  --text-color-categorical-blue: var(--text-categorical-blue);
+  --text-color-categorical-green: var(--text-categorical-green);
+  --text-color-categorical-amber: var(--text-categorical-amber);
+  --text-color-search-match: var(--text-search-match);
   --text-color-accent: var(--text-accent);
   --border-color-standard: var(--border-standard);
   --border-color-message-thread: var(--border-message-thread);
@@ -2109,6 +2178,7 @@
   --text-color-on-selection: var(--text-on-selection);
   --color-surface-text-selection-own: var(--surface-text-selection-own);
   --text-color-on-selection-own: var(--text-on-selection-own);
+  --text-color-on-find-match: var(--text-on-find-match);
   --color-affordance-prominent: var(--affordance-prominent);
   --color-affordance-prominent-hover: var(--affordance-prominent-hover);
   --color-affordance-prominent-pressed: var(--affordance-prominent-pressed);

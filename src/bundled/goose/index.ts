@@ -6,8 +6,20 @@ import { repositoriesContext } from "../../features/communities/repositories";
 import { isTauri } from "@tauri-apps/api/core";
 import type { PluginModule } from "../../plugins/api";
 import { GooseLogoIcon } from "../../shared/design-system/icons";
-import { type Config, config, DEFAULT_CONFIG, GooseRuntime } from "./runtime";
+import {
+  type Config,
+  config,
+  DEFAULT_CONFIG,
+  GooseRuntime,
+  running,
+} from "./runtime";
+import {
+  type RecommendedCandidate,
+  onRecommended,
+  recommendedRun,
+} from "../../features/agents/recommended";
 import { gooseRun } from "./run";
+import { readModelSettings } from "../../features/agents/model-settings";
 import { explainTurn, GooseSetup, REVIEW_REFUSED } from "./setup";
 import { createTabs } from "./tabs";
 import { GooseHistory } from "./transcript";
@@ -21,6 +33,9 @@ export const apply: PluginModule["apply"] = (ctx) => {
   if (!isTauri()) return;
   const { agents, host } = ctx;
   const typeKey = `${ctx.pluginOwner?.id ?? "buzz.goose"}/${TYPE_ID}`;
+  // goose is bundled: a candidate needs only its provider and model offered.
+  const offered = (candidate: RecommendedCandidate) => setup.offers(candidate);
+  const recommended = recommendedRun(TYPE_ID, offered);
   const runtime = new GooseRuntime(
     host,
     agents.relay,
@@ -29,6 +44,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
     () => agents.tools(),
     repositoriesContext,
     agents.storage,
+    recommended,
   );
   const desktop =
     host.spawn && host.resolveDirectory
@@ -82,6 +98,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
     setup,
     runtime,
     history,
+    recommended,
   });
   const sync = () => {
     const snapshot = agents.snapshot();
@@ -106,6 +123,12 @@ export const apply: PluginModule["apply"] = (ctx) => {
     description:
       "goose on this computer, with any provider goose supports. Each thread it is mentioned in is one continuing session.",
     defaults: () => ({ config: DEFAULT_CONFIG }),
+    settingsProposal: { compactAt: true, resolveRecommended: recommended.find },
+    readModelSettings: (saved) =>
+      readModelSettings(config(saved), {
+        provider: true,
+        recommended: onRecommended(saved),
+      }),
     importShared: (source) =>
       source.runtime === "goose" || source.runtime === "goose-ai"
         ? {
@@ -115,7 +138,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
           }
         : undefined,
     exportShared: (saved) => {
-      const { provider, model } = config(saved);
+      const { provider, model } = running(saved, recommended.current());
       return { runtime: "goose", ...(provider && { provider }), model };
     },
     Create,
@@ -132,25 +155,27 @@ export const apply: PluginModule["apply"] = (ctx) => {
     adopt: (carry, saved) => ({
       ...saved,
       instructions: carry.instructions ?? saved.instructions,
+      scope: carry.sessionScope ?? saved.scope,
       workspace: carry.workspace ?? saved.workspace,
     }),
     carry: (saved) => {
-      const { instructions, workspace } = config(saved);
+      const { instructions, workspace, scope } = config(saved);
       return {
         ...(instructions.trim() && { instructions }),
         ...(workspace !== DEFAULT_CONFIG.workspace && { workspace }),
+        ...(scope !== DEFAULT_CONFIG.scope && { sessionScope: scope }),
       };
     },
     summary: (agent) => {
-      const { model, provider } = config(agent.config);
+      const { model, provider } = running(agent.config, recommended.current());
       return [provider, model].filter(Boolean).join(" · ") || "Goose";
     },
     sessions: {
-      list: (key) => {
-        const live = runtime.sessions(key);
+      list: (agentKey) => {
+        const live = runtime.sessions(agentKey);
         const busy = new Map(live.map((view) => [view.key, view.busy]));
         const used = new Map(
-          runtime.conversations(key).map(({ key, at }) => [key, at]),
+          runtime.conversations(agentKey).map(({ key, at }) => [key, at]),
         );
         // Open ones are listed even when saving them failed. A one-off turn
         // joins no conversation.
@@ -158,10 +183,14 @@ export const apply: PluginModule["apply"] = (ctx) => {
         return [...used]
           .sort(([, a], [, b]) => b - a)
           .map(([key, at]) => {
-            const [channelId = key, root] = key.split("/");
+            const { channelId, root, community } = runtime.source(
+              agentKey,
+              key,
+            );
             const working = busy.get(key);
             return {
               channelId,
+              ...(community && { community }),
               ...(root && { root }),
               at,
               ...(working !== undefined && {
@@ -198,6 +227,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
       },
     ],
     models: (agent) => setup.picks(config(agent.config)),
+    recommends: offered,
     ...gooseRun(runtime),
   });
 };

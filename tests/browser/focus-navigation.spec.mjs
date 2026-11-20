@@ -372,11 +372,14 @@ test("covered panes and notifications preserve focus and F6 recovery", async ({
     await expect(search).toBeFocused();
     await expect(alpha).toHaveText("Alpha draft");
   }
-  // Repeat with a notification above the competing dock. Toasts now rise above
-  // docked composers; pin the stack to its base offset so a covered composer's
-  // focus recovery stays exercised.
+  // Force overlap with the competing dock to exercise covered-composer focus
+  // recovery independently of the production toast's top-right placement.
   await page.addStyleTag({
-    content: ":root { --buzz-toast-clearance: 0px !important; }",
+    content: `[data-sonner-toaster] {
+      top: auto !important;
+      bottom: 8px !important;
+      height: var(--front-toast-height) !important;
+    }`,
   });
   await page.setViewportSize({ width: 1440, height: 900 });
   await composer.fill("Toast draft");
@@ -578,13 +581,23 @@ test.extend({ readState: true, threadUnread: true })(
     await page
       .getByRole("textbox", { name: "Message #Alpha", exact: true })
       .click();
-    const newest = Math.max(...history.map((event) => event.created_at));
+    // Channel catch-up stops at the newest top-level post, never a reply.
+    const newest = Math.max(
+      ...history
+        .filter(
+          (event) =>
+            !event.tags.some(
+              ([name, , , marker]) => name === "e" && marker === "reply",
+            ),
+        )
+        .map((event) => event.created_at),
+    );
     await expect
-      .poll(async () => (await frontiers())["activity:alpha"] ?? 0)
+      .poll(async () => (await frontiers())["alpha"] ?? 0)
       .toBeGreaterThanOrEqual(newest);
     await page.setViewportSize({ width: 600, height: 900 });
     await expect(tab).toBeFocused();
-    const caughtUp = (await frontiers())["activity:alpha"];
+    const caughtUp = (await frontiers())["alpha"];
     const message = app.append(
       "primary",
       "alpha",
@@ -603,16 +616,14 @@ test.extend({ readState: true, threadUnread: true })(
     // message has passed too.
     const reply = app.reply(root.id);
     await expect
-      .poll(async () =>
-        read(await frontiers(), reply, `thread-activity:${root.id}`),
-      )
+      .poll(async () => read(await frontiers(), reply, `thread:${root.id}`))
       .toBe(true);
-    expect(read(await frontiers(), message, "activity:alpha")).toBe(false);
+    expect(read(await frontiers(), message, "alpha")).toBe(false);
     await page
       .getByRole("button", { name: "Close Thread root 1 tab", exact: true })
       .click();
     await expect
-      .poll(async () => read(await frontiers(), message, "activity:alpha"))
+      .poll(async () => read(await frontiers(), message, "alpha"))
       .toBe(true);
   },
 );
@@ -644,10 +655,12 @@ test.extend({
       'div[tabindex="-1"]:has(> [data-main-workspace])',
     );
     // Beside the tab the page stays live. Narrowing from it hands focus to
-    // the tab. Opening lands on the reply first; let it, or it takes focus
+    // the tab. Opening focuses the composer first; let it, or it takes focus
     // back from the row.
     await expect(covered).not.toHaveAttribute("inert");
-    await expect(side.locator("[data-message-id]:focus")).toHaveCount(1);
+    await expect(
+      side.getByRole("textbox", { name: "Reply to thread" }),
+    ).toBeFocused();
     await row.focus();
     await expect(row).toBeFocused();
     await page.setViewportSize({ width: 600, height: 900 });
@@ -752,98 +765,104 @@ test.extend({ companionFixture: true })(
 
 // A side panel's launcher sits in the conversation the panel covers at narrow
 // widths, so Escape returns focus to it once the close uncovers it.
-test("escaping a side panel over the conversation returns focus to its launcher", async ({
-  page,
-  app,
-}) => {
-  await page.addInitScript(() => {
-    localStorage.setItem(
-      "buzzodz.plugins.v1",
-      JSON.stringify({ version: 2, enabled: { "buzz.todos": true } }),
-    );
-  });
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await open(page, app);
-  const conversation = page.locator('article[aria-label="Conversation"]');
-  const launcher = page.getByRole("button", {
-    name: "Toggle channel todos",
-    exact: true,
-  });
-  await launcher.click();
-  const todos = page.getByRole("region", { name: "Todos panel", exact: true });
-  await expect(todos).toBeVisible();
-  await page
-    .getByRole("textbox", { name: "Message #Alpha", exact: true })
-    .click();
-  await page.setViewportSize({ width: 600, height: 900 });
-  await expect(todos).toBeFocused();
-  await expect(conversation).toHaveAttribute("inert", "");
-  await page.keyboard.press("Escape");
-  await expect(todos).toHaveCount(0);
-  await expect(conversation).not.toHaveAttribute("inert");
-  await expect(launcher).toBeFocused();
-});
-
-// A side panel restored by a page remount has no launcher element to return
-// to, so Escape lands on the page's fallback once the close uncovers it.
-test("escaping a restored side panel over the conversation returns focus to the page", async ({
-  page,
-  app,
-}) => {
-  await page.addInitScript(() => {
-    localStorage.setItem(
-      "buzzodz.plugins.v1",
-      JSON.stringify({ version: 2, enabled: { "buzz.todos": true } }),
-    );
-  });
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await open(page, app);
-  const conversation = page.locator('article[aria-label="Conversation"]');
-  await page
-    .getByRole("button", { name: "Toggle channel todos", exact: true })
-    .click();
-  const todos = page.getByRole("region", { name: "Todos panel", exact: true });
-  await expect(todos).toBeVisible();
-  await activityRow(page).click();
-  await expect(todos).toHaveCount(0);
-  await openPage(page, "Messages");
-  await expect(todos).toBeVisible();
-  await page
-    .getByRole("textbox", { name: "Message #Alpha", exact: true })
-    .click();
-  await page.setViewportSize({ width: 600, height: 900 });
-  await expect(todos).toBeFocused();
-  await expect(conversation).toHaveAttribute("inert", "");
-  await page.keyboard.press("Escape");
-  await expect(todos).toHaveCount(0);
-  await expect(conversation).not.toHaveAttribute("inert");
-  await expect(
-    page.getByRole("button", { name: "Channel actions", exact: true }),
-  ).toBeFocused();
-});
-
-// Close-all keeps a launcher's side panel open, so at a narrow width the dock
-// still covers the conversation and the closed tab's focus lands in it.
-test.extend({ readState: true, threadUnread: true })(
-  "closing all tabs under a side panel that stays keeps focus in the dock",
+test.extend({ companionFixture: true })(
+  "escaping a side panel over the conversation returns focus to its launcher",
   async ({ page, app }) => {
     await page.addInitScript(() => {
       localStorage.setItem(
         "buzzodz.plugins.v1",
-        JSON.stringify({ version: 2, enabled: { "buzz.todos": true } }),
+        JSON.stringify({ version: 2, enabled: { "fixture.side-panel": true } }),
+      );
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await open(page, app);
+    const conversation = page.locator('article[aria-label="Conversation"]');
+    const launcher = page.getByRole("button", {
+      name: "Toggle side panel fixture",
+      exact: true,
+    });
+    await launcher.click();
+    const sidePanel = page.getByRole("region", {
+      name: "Side fixture panel",
+      exact: true,
+    });
+    await expect(sidePanel).toBeVisible();
+    await page
+      .getByRole("textbox", { name: "Message #Alpha", exact: true })
+      .click();
+    await page.setViewportSize({ width: 600, height: 900 });
+    await expect(sidePanel).toBeFocused();
+    await expect(conversation).toHaveAttribute("inert", "");
+    await page.keyboard.press("Escape");
+    await expect(sidePanel).toHaveCount(0);
+    await expect(conversation).not.toHaveAttribute("inert");
+    await expect(launcher).toBeFocused();
+  },
+);
+
+// A side panel restored by a page remount has no launcher element to return
+// to, so Escape lands on the page's fallback once the close uncovers it.
+test.extend({ companionFixture: true })(
+  "escaping a restored side panel over the conversation returns focus to the page",
+  async ({ page, app }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem(
+        "buzzodz.plugins.v1",
+        JSON.stringify({ version: 2, enabled: { "fixture.side-panel": true } }),
       );
     });
     await page.setViewportSize({ width: 1440, height: 900 });
     await open(page, app);
     const conversation = page.locator('article[aria-label="Conversation"]');
     await page
-      .getByRole("button", { name: "Toggle channel todos", exact: true })
+      .getByRole("button", { name: "Toggle side panel fixture", exact: true })
       .click();
-    const todos = page.getByRole("region", {
-      name: "Todos panel",
+    const sidePanel = page.getByRole("region", {
+      name: "Side fixture panel",
       exact: true,
     });
-    await expect(todos).toBeVisible();
+    await expect(sidePanel).toBeVisible();
+    await activityRow(page).click();
+    await expect(sidePanel).toHaveCount(0);
+    await openPage(page, "Messages");
+    await expect(sidePanel).toBeVisible();
+    await page
+      .getByRole("textbox", { name: "Message #Alpha", exact: true })
+      .click();
+    await page.setViewportSize({ width: 600, height: 900 });
+    await expect(sidePanel).toBeFocused();
+    await expect(conversation).toHaveAttribute("inert", "");
+    await page.keyboard.press("Escape");
+    await expect(sidePanel).toHaveCount(0);
+    await expect(conversation).not.toHaveAttribute("inert");
+    await expect(
+      page.getByRole("button", { name: "Channel actions", exact: true }),
+    ).toBeFocused();
+  },
+);
+
+// Close-all keeps a launcher's side panel open, so at a narrow width the dock
+// still covers the conversation and the closed tab's focus lands in it.
+test.extend({ companionFixture: true, readState: true, threadUnread: true })(
+  "closing all tabs under a side panel that stays keeps focus in the dock",
+  async ({ page, app }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem(
+        "buzzodz.plugins.v1",
+        JSON.stringify({ version: 2, enabled: { "fixture.side-panel": true } }),
+      );
+    });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await open(page, app);
+    const conversation = page.locator('article[aria-label="Conversation"]');
+    await page
+      .getByRole("button", { name: "Toggle side panel fixture", exact: true })
+      .click();
+    const sidePanel = page.getByRole("region", {
+      name: "Side fixture panel",
+      exact: true,
+    });
+    await expect(sidePanel).toBeVisible();
     const root = app.histories
       .get("primary/alpha")
       .find((event) => event.content === "Thread root 1");
@@ -857,7 +876,7 @@ test.extend({ readState: true, threadUnread: true })(
       .locator("[data-panel-workspace]")
       .getByRole("tab", { name: "Thread root 1", exact: true });
     await expect(tab).toBeVisible();
-    await expect(todos).toBeVisible();
+    await expect(sidePanel).toBeVisible();
     await page.setViewportSize({ width: 600, height: 900 });
     await settlePanelMotion(page);
     await expect(conversation).toHaveAttribute("inert", "");
@@ -871,22 +890,22 @@ test.extend({ readState: true, threadUnread: true })(
       }),
     ).toBe(true);
     await expect(tab).toHaveCount(0);
-    await expect(todos).toBeVisible();
+    await expect(sidePanel).toBeVisible();
     await expect(conversation).toHaveAttribute("inert", "");
-    await expect(todos).toBeFocused();
+    await expect(sidePanel).toBeFocused();
   },
 );
 
-// Panes that stay open keep focus in the dock, in page order: closing Todos
-// under the companion hands focus to the companion, and a thread tab above the
-// companion takes it first.
+// Panes that stay open keep focus in the dock, in page order: closing the side
+// panel under the companion hands focus to the companion, and a thread tab above
+// the companion takes it first.
 test.extend({ companionFixture: true, readState: true, threadUnread: true })(
   "a dock that still covers the conversation keeps focus in page order",
   async ({ page, app }) => {
     await page.addInitScript(() => {
       localStorage.setItem(
         "buzzodz.plugins.v1",
-        JSON.stringify({ version: 2, enabled: { "buzz.todos": true } }),
+        JSON.stringify({ version: 2, enabled: { "fixture.side-panel": true } }),
       );
     });
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -897,13 +916,13 @@ test.extend({ companionFixture: true, readState: true, threadUnread: true })(
       exact: true,
     });
     await page
-      .getByRole("button", { name: "Toggle channel todos", exact: true })
+      .getByRole("button", { name: "Toggle side panel fixture", exact: true })
       .click();
-    const todos = page.getByRole("region", {
-      name: "Todos panel",
+    const sidePanel = page.getByRole("region", {
+      name: "Side fixture panel",
       exact: true,
     });
-    await expect(todos).toBeVisible();
+    await expect(sidePanel).toBeVisible();
     await page
       .getByRole("button", { name: "Companion fixture", exact: true })
       .click();
@@ -912,14 +931,14 @@ test.extend({ companionFixture: true, readState: true, threadUnread: true })(
       exact: true,
     });
     await expect(companion).toBeVisible();
-    await expect(todos).toBeVisible();
+    await expect(sidePanel).toBeVisible();
     await composer.click();
     await page.setViewportSize({ width: 600, height: 900 });
-    await expect(todos).toBeFocused();
+    await expect(sidePanel).toBeFocused();
     await expect(conversation).toHaveAttribute("inert", "");
-    // The companion still covers Todos' launcher, so it takes focus.
+    // The companion still covers the side panel's launcher, so it takes focus.
     await page.keyboard.press("Escape");
-    await expect(todos).toHaveCount(0);
+    await expect(sidePanel).toHaveCount(0);
     await expect(conversation).toHaveAttribute("inert", "");
     await expect(companion).toBeFocused();
 

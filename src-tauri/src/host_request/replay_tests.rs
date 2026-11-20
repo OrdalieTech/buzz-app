@@ -73,6 +73,8 @@ impl App {
             .unwrap(),
         )
         .unwrap();
+        buzzodz_plugins::sign_release(&source, &nostr::key::SecretKey::generate().to_secret_hex())
+            .unwrap();
         let installed = manager.install(&source).unwrap();
         let revision = installed
             .plugins

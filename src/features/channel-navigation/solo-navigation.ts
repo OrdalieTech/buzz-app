@@ -1,17 +1,29 @@
 import { Service, type Context } from "@deepseek-ai/cordis";
 import { createContributions } from "../../plugins/contributions";
-import { readView, viewRevision, writeView } from "../../shared/view-state";
+import {
+  readView,
+  subscribeView,
+  viewRevision,
+  writeView,
+} from "../../shared/view-state";
 import type { RelayData, RelaySnapshot } from "../relay/service";
 import type { RelaySession } from "../relay/session";
-import type { JsonValue } from "../navigation/targets";
+import { parseOpenTarget, type JsonValue } from "../navigation/targets";
 import type { PluginManager } from "../../plugins/manager";
 import { relayPartition } from "../relay/partition";
 import { ownSolo, soloLabels } from "../solo/labels";
-import { regionLabels, soloRegionLabel } from "../solo/region-labels";
+import {
+  REGION_PREFIX,
+  regionLabels,
+  soloRegionLabel,
+} from "../solo/region-labels";
+import { soloDraft, soloDraftTarget } from "./routes";
+import { createSoloWorkspaces } from "./solo-workspaces";
 import {
   projectSoloRegions,
   type RegisteredSoloSource,
   type SoloPlacement,
+  type SoloRegion,
 } from "./solo-navigation-model";
 import type {
   SoloNavigation,
@@ -33,15 +45,45 @@ export type SoloNavigationSnapshot = SoloPlacement &
 const readers = new WeakMap<RelaySession, SoloNavigationService>();
 export const soloNavigationFor = (session: RelaySession) =>
   readers.get(session);
+/** Region drafts share a workspace slot unless the source supplies a stable key. */
+export const regionDraftKey = (
+  label: string,
+  workspace?: string,
+  key?: string,
+) =>
+  `solo:region:${label}${key ? `:draft:${encodeURIComponent(key)}` : workspace ? `:project:${workspace}` : ""}`;
+/** View state linking a chat to the region draft it was started from. */
+export const regionStartKey = (channelId: string) =>
+  `solo-region-start:${channelId}`;
 const sameBinding = (a: SoloRegionBinding | undefined, b: SoloRegionBinding) =>
   !!a &&
   a.scope === b.scope &&
   a.viewer === b.viewer &&
   a.incarnation === b.incarnation;
 
+// Excluded, managed and live follow from each region's chats and reason.
+const sameRegion = (a: SoloRegion, b: SoloRegion) =>
+  a.key === b.key &&
+  a.label === b.label &&
+  a.title === b.title &&
+  a.source === b.source &&
+  a.snapshot === b.snapshot &&
+  a.reason === b.reason &&
+  a.hidden === b.hidden &&
+  a.channels.length === b.channels.length &&
+  a.channels.every((channel, index) => channel === b.channels[index]);
+const samePlacement = (a: SoloNavigationSnapshot, b: SoloNavigationSnapshot) =>
+  a.binding === b.binding &&
+  a.regions.length === b.regions.length &&
+  a.regions.every((region, index) => {
+    const other = b.regions[index];
+    return other !== undefined && sameRegion(region, other);
+  });
+
 /** The connection owns source binding even while the sidebar is unmounted. */
 export class SoloNavigationService extends Service implements SoloNavigation {
   readonly version = 2 as const;
+  readonly workspaces;
   private readonly contributions;
   private readonly listeners = new Set<() => void>();
   private readonly runtimes = new Map<RegisteredSoloSource, Runtime>();
@@ -49,7 +91,11 @@ export class SoloNavigationService extends Service implements SoloNavigation {
   private session: RelaySession | undefined;
   private connection: RelaySnapshot | undefined;
   private stopChannels: (() => void) | undefined;
-  private value: SoloNavigationSnapshot = { regions: [], excluded: new Set() };
+  private value: SoloNavigationSnapshot = {
+    regions: [],
+    excluded: new Set(),
+    managed: new Set(),
+  };
   private readonly titles = new Map<string, string>();
   private readonly states = new Map<string, JsonValue>();
   private pendingReveal: string | undefined;
@@ -66,6 +112,13 @@ export class SoloNavigationService extends Service implements SoloNavigation {
     private readonly plugins?: Pick<PluginManager, "snapshot" | "subscribe">,
   ) {
     super(ctx, "soloNavigation");
+    this.workspaces = createSoloWorkspaces(
+      (binding) =>
+        sameBinding(this.binding, binding)
+          ? this.session?.sidebarPreferences
+          : undefined,
+      relay.subscribe,
+    );
     this.contributions = createContributions<
       SoloRegionSource & { identity: object }
     >(ctx);
@@ -133,8 +186,6 @@ export class SoloNavigationService extends Service implements SoloNavigation {
   presentation(source: RegisteredSoloSource, binding: SoloRegionBinding) {
     const active = () =>
       sameBinding(this.binding, binding) && this.sources().includes(source);
-    const key = `solo-region-state:${binding.viewer}:${source.key}`;
-    const memoryKey = `${binding.scope}/${key}`;
     return {
       revealRequests: {
         subscribe: (listener: (channelId: string) => void) => {
@@ -156,19 +207,39 @@ export class SoloNavigationService extends Service implements SoloNavigation {
           return stop;
         },
       },
-      state: {
-        get: () => {
-          const saved = viewRevision(binding.scope, key);
-          if (saved === undefined && this.states.has(memoryKey))
+      state: this.regionState(source, binding),
+    };
+  }
+  private regionState(
+    source: RegisteredSoloSource,
+    binding: SoloRegionBinding,
+  ) {
+    binding = Object.freeze({ ...binding });
+    const active = () =>
+      sameBinding(this.binding, binding) && this.sources().includes(source);
+    const key = `solo-region-state:${binding.viewer}:${source.key}`;
+    const memoryKey = `${binding.scope}/${key}`;
+    const current = () => {
+      if (!active()) throw new Error("This Solo region binding has ended");
+    };
+    return {
+      get: () => {
+        current();
+        const saved = viewRevision(binding.scope, key);
+        if (saved === undefined) {
+          if (this.states.has(memoryKey))
             return structuredClone(this.states.get(memoryKey));
-          try {
-            return saved ? (JSON.parse(saved) as JsonValue) : undefined;
-          } catch {
-            return undefined;
-          }
-        },
-        set: (value: JsonValue) => {
-          if (!active()) return false;
+          throw new Error("Solo region storage is unavailable");
+        }
+        try {
+          return saved === null ? undefined : (JSON.parse(saved) as JsonValue);
+        } catch {
+          throw new Error("Solo region state is invalid");
+        }
+      },
+      set: (value: JsonValue) => {
+        if (!active()) return false;
+        try {
           const json = JSON.stringify(value);
           if (
             json === undefined ||
@@ -176,10 +247,39 @@ export class SoloNavigationService extends Service implements SoloNavigation {
           )
             return false;
           const copy = JSON.parse(json) as JsonValue;
-          if (!writeView(binding.scope, key, copy)) return false;
+          const previous = this.states.get(memoryKey);
+          // writeView notifies synchronously; a listener can accept a newer value.
           this.states.set(memoryKey, copy);
+          if (!writeView(binding.scope, key, copy)) {
+            if (previous === undefined) this.states.delete(memoryKey);
+            else this.states.set(memoryKey, previous);
+            return false;
+          }
           return true;
-        },
+        } catch {
+          return false;
+        }
+      },
+      subscribe: (listener: () => void) => {
+        current();
+        const signal = this.runtimes.get(source)?.controller.signal;
+        if (!signal || signal.aborted)
+          throw new Error("This Solo region binding has ended");
+        const stopView = subscribeView(binding.scope, (changedKey) => {
+          if (active() && (changedKey === undefined || changedKey === key)) {
+            try {
+              listener();
+            } catch {
+              /* A source listener cannot reject an accepted storage write. */
+            }
+          }
+        });
+        const stop = () => {
+          stopView();
+          signal.removeEventListener("abort", stop);
+        };
+        signal.addEventListener("abort", stop, { once: true });
+        return stop;
       },
     };
   }
@@ -250,7 +350,11 @@ export class SoloNavigationService extends Service implements SoloNavigation {
         const binding = this.binding;
         const connection = this.relay.snapshot();
         if (!this.session) {
-          this.value = { regions: [], excluded: new Set() };
+          this.value = {
+            regions: [],
+            excluded: new Set(),
+            managed: new Set(),
+          };
           continue;
         }
         for (const source of entries) {
@@ -285,7 +389,9 @@ export class SoloNavigationService extends Service implements SoloNavigation {
             if (
               !["loading", "ready", "unavailable"].includes(next.status) ||
               (next.notice !== undefined &&
-                (typeof next.notice !== "string" || next.notice.length > 120))
+                (typeof next.notice !== "string" ||
+                  next.notice.length > 120)) ||
+              (next.hidden !== undefined && typeof next.hidden !== "boolean")
             )
               throw new Error("Invalid region snapshot");
             if (
@@ -307,12 +413,21 @@ export class SoloNavigationService extends Service implements SoloNavigation {
             runtime.failed = true;
           }
         }
+        const plugins = this.plugins?.snapshot();
+        const configuration = plugins?.configuration;
+        const pluginForRegionLabel = (label: string) =>
+          configuration?.status === "ready"
+            ? configuration.catalog.plugins.find((plugin) =>
+                label.startsWith(`${REGION_PREFIX}${plugin.manifest.id}:`),
+              )
+            : undefined;
         const placement = projectSoloRegions(
           this.session.channels.list().channels,
           connection.viewer ?? this.session.viewer ?? "",
           binding
             ? [...this.runtimes.values()]
             : entries.map((source) => ({ source, failed: false })),
+          this.value.binding === binding ? this.value.regions : [],
           (label, title) => {
             const key = `solo-region-title:${label}`;
             const scope = connection.scope;
@@ -326,24 +441,20 @@ export class SoloNavigationService extends Service implements SoloNavigation {
               this.titles.get(cacheKey) ?? readView(scope, key, "Plugin chats");
             return typeof saved === "string" ? saved : "Plugin chats";
           },
+          (label) => pluginForRegionLabel(label)?.enabled === false,
         );
-        const plugins = this.plugins?.snapshot();
-        const configuration = plugins?.configuration;
-        this.value = {
+        const next: SoloNavigationSnapshot = {
           ...placement,
           regions: placement.regions.map((region) => {
             if (region.reason !== "off") return region;
             if (configuration?.status === "loading")
               return { ...region, reason: "loading" as const };
             if (configuration?.status !== "ready") return region;
-            const plugin = configuration.catalog.plugins.find((plugin) =>
-              region.key.startsWith(`${plugin.manifest.id}/`),
-            );
+            const plugin = pluginForRegionLabel(region.label);
             if (!plugin) return { ...region, reason: "not-installed" as const };
             if (
-              !plugin.enabled ||
-              (plugin.source === "external" &&
-                configuration.externalPluginsPaused)
+              plugin.source === "external" &&
+              configuration.externalPluginsPaused
             )
               return region;
             const activation = plugins?.activation[plugin.manifest.id];
@@ -359,12 +470,46 @@ export class SoloNavigationService extends Service implements SoloNavigation {
           }),
           ...(binding ? { binding } : {}),
         };
+        // The roster changes on every message; keep the snapshot when the
+        // placement did not, so the sidebar does not re-render for it.
+        const previous = this.value;
+        this.value = samePlacement(previous, next) ? previous : next;
+        const isDisabledChat = (id: string | undefined) =>
+          id !== undefined &&
+          next.regions.some(
+            (region) =>
+              region.reason === "disabled" &&
+              region.channels.some((channel) => channel.id === id),
+          );
+        if (isDisabledChat(this.pendingReveal)) this.pendingReveal = undefined;
+        if (isDisabledChat(this.pendingHostReveal?.id))
+          this.pendingHostReveal = undefined;
       } while (this.refreshAgain);
     } finally {
       this.refreshing = false;
     }
     for (const listener of this.listeners) listener();
   };
+  /** The running source that owns a region draft, with its binding. */
+  draftRegion(label: string) {
+    const region = this.value.regions.find((item) => item.label === label);
+    const binding = this.value.binding;
+    return region?.source && !region.reason && binding
+      ? { source: region.source, binding }
+      : undefined;
+  }
+  async openCreatedWorkspace(workspaceId: string): Promise<boolean> {
+    const region = this.value.regions.find(
+      (item) => item.source && !item.hidden && item.reason !== "disabled",
+    );
+    const source = region?.source;
+    if (!source?.composeWorkspaces || !source.openWorkspace) return false;
+    const binding = this.value.binding;
+    if (!binding || region?.reason)
+      throw new Error("Workspace selection is not ready. Try again.");
+    await source.openWorkspace(binding, workspaceId);
+    return true;
+  }
   retry = (key: string) => {
     if (this.sources().some((source) => source.key === key)) this.bind(true);
   };
@@ -395,9 +540,97 @@ export class SoloNavigationService extends Service implements SoloNavigation {
         throw new Error("This Solo region binding has ended");
       return host.session;
     };
+    const started = (binding: SoloRegionBinding, channelId: string) => {
+      current(binding);
+      const saved = readView<unknown>(
+        binding.scope,
+        regionStartKey(channelId),
+        null,
+      );
+      if (
+        !saved ||
+        typeof saved !== "object" ||
+        !("region" in saved) ||
+        saved.region !== label
+      )
+        return;
+      const draft =
+        "draft" in saved
+          ? soloDraft({
+              kind: "solo-draft",
+              region: label,
+              draft: saved.draft as JsonValue,
+            })?.draft
+          : { context: { saved: saved as JsonValue } };
+      if ("draft" in saved && !draft)
+        throw new Error("This chat's saved draft context is invalid");
+      return {
+        ...("workspace" in saved && typeof saved.workspace === "string"
+          ? {
+              workspace: saved.workspace,
+            }
+          : {}),
+        ...(draft ? { draft } : {}),
+      };
+    };
     this.contributions.register(this.ctx, { ...source, identity });
     return Object.freeze({
       label,
+      draftContext: true,
+      state(binding) {
+        current(binding);
+        const registered = host
+          .sources()
+          .find((entry) => entry.identity === identity);
+        if (!registered) throw new Error("This Solo region binding has ended");
+        return host.regionState(registered, binding);
+      },
+      openDraft(binding, input = {}) {
+        current(binding);
+        const { workspace } = input;
+        if (
+          workspace !== undefined &&
+          (typeof workspace !== "string" ||
+            !workspace ||
+            workspace.length > 256)
+        )
+          throw new Error("Invalid workspace");
+        // The navigation parser bounds and copies source-owned JSON before retention.
+        const target = parseOpenTarget(
+          soloDraftTarget(binding.scope, {
+            region: label,
+            ...(workspace ? { project: workspace } : {}),
+            ...(input.draft !== undefined ? { draft: input.draft } : {}),
+          }),
+        );
+        if (workspace && !input.draft?.key) {
+          // As New chat in a workspace: it starts there, and instructions
+          // chosen for another workspace do not carry over.
+          const key = regionDraftKey(label, workspace);
+          const settings = readView<unknown>(
+            binding.scope,
+            `${key}:settings`,
+            null,
+          );
+          if (
+            readView(binding.scope, `${key}:new-project`, workspace) !==
+              workspace &&
+            settings &&
+            typeof settings === "object"
+          )
+            writeView(binding.scope, `${key}:settings`, {
+              ...settings,
+              canvas: undefined,
+            });
+          writeView(binding.scope, `${key}:new-project`, null);
+        }
+        void host.ctx.navigation?.open(target);
+      },
+      started,
+      forget(binding, channelId) {
+        if (started(binding, channelId))
+          writeView(binding.scope, regionStartKey(channelId), null);
+      },
       async createChat(binding, input) {
         const session = current(binding);
         const start = session.channelWrites.start(

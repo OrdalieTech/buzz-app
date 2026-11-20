@@ -1,3 +1,5 @@
+import { traceDraft } from "./draft-diagnostics";
+
 // View intent is durable and explicitly partitioned; connection generations are not storage keys.
 const viewListeners = new Map<string, Set<(key?: string) => void>>();
 const composerDraftKey =
@@ -10,6 +12,7 @@ export function draftCoordinates(key: string) {
 }
 // `key` names the one key that changed; undefined means any key may have.
 const changed = (scope: string, key?: string) => {
+  if (key) traceDraft(scope, key, "notify");
   for (const listener of viewListeners.get(scope) ?? []) listener(key);
 };
 /** Same durable view keys as the composer; no parallel draft store or index. */
@@ -29,8 +32,10 @@ export function subscribeView(scope: string, listener: (key?: string) => void) {
       }
       if (!event.key.startsWith("buzz-view.v1:")) return;
       const pair: unknown = JSON.parse(event.key.slice("buzz-view.v1:".length));
-      if (Array.isArray(pair) && pair[0] === scope)
+      if (Array.isArray(pair) && pair[0] === scope) {
+        if (typeof pair[1] === "string") traceDraft(scope, pair[1], "storage");
         listener(typeof pair[1] === "string" ? pair[1] : undefined);
+      }
     } catch {
       /* Storage may be unavailable while a window is closing. */
     }
@@ -59,16 +64,31 @@ export function viewRevision(scope: string, key: string) {
   }
 }
 export function writeView(scope: string, key: string, value: unknown) {
+  let phase: "serialize-failed" | "write-failed" | "notify-failed" =
+    "serialize-failed";
   try {
     const revision = JSON.stringify(value);
+    phase = "write-failed";
+    traceDraft(scope, key, "write");
     localStorage.setItem(
       `buzz-view.v1:${JSON.stringify([scope, key])}`,
       revision,
     );
-    if (viewRevision(scope, key) !== revision) return false;
+    const current = viewRevision(scope, key);
+    if (current !== revision) {
+      traceDraft(scope, key, "write-mismatch", 0, {
+        expected: revision,
+        current,
+        next: revision,
+        flags: 0,
+      });
+      return false;
+    }
+    phase = "notify-failed";
     changed(scope, key);
     return true;
   } catch {
+    traceDraft(scope, key, phase);
     // Ordinary view callers remain usable in memory; recovery callers check this.
     return false;
   }

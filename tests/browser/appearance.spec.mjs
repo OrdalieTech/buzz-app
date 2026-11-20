@@ -376,7 +376,9 @@ test("storage denial is visible and retryable; another window updates a live con
   try {
     await other.goto(app.origin);
     await settings(other);
-    const settingsSessions = app.report.sessions.length;
+    const settingsSessions = app.report.sessions.filter(
+      (c) => c === "primary",
+    ).length;
     await other.evaluate((key) => {
       const original = Storage.prototype.setItem;
       window.restoreStorage = () => {
@@ -430,7 +432,9 @@ test("storage denial is visible and retryable; another window updates a live con
     await expectAnchor(page, before);
     // Settings may acquire its captured community profile; a mode change must not
     // create another relay session after the destination is ready.
-    expect(app.report.sessions.length).toBe(settingsSessions);
+    expect(app.report.sessions.filter((c) => c === "primary").length).toBe(
+      settingsSessions,
+    );
     await page.screenshot({ path: testInfo.outputPath("messages-dark.png") });
     await chooseColorMode(other, "Light");
     await expectMode(page, "light");
@@ -461,7 +465,9 @@ test("saved dark document paints before the application module is allowed to exe
   // Completing a no-op module keeps React from executing without leaving a
   // pending script request. WebKit stalls animation frames when that pending
   // request coexists with @font-face rules, even after styles are computed.
-  await page.route(/\/assets\/.*\.js$/, (route) =>
+  // Only the entry is withheld: a modulepreloaded shared chunk served empty
+  // would poison WebKit's module map for the reload below.
+  await page.route(/\/assets\/index-[^/]*\.js$/, (route) =>
     route.fulfill({
       contentType: "application/javascript",
       headers: { "cache-control": "no-store" },

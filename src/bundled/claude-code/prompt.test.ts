@@ -2,7 +2,6 @@ import { expect, it } from "vitest";
 import { quoted } from "../../features/agent-harness/turn-records";
 import type { ConversationWake } from "../../features/agents/service";
 import type { EventData } from "../../features/relay/events";
-import { BUZZ_PROMPT } from "../../buzz-mcp/prompt";
 import { mentionSection } from "../../features/agent-harness/base-prompt";
 import threadHandoff from "./session_handoff_thread.md?raw";
 import {
@@ -188,7 +187,8 @@ it("builds the harness system prompt with instructions and core memory", () => {
     memory: "I am Claude.",
   });
   expect(prompt).toMatch(/^<base>\n/);
-  expect(prompt).toContain(BUZZ_PROMPT);
+  expect(prompt).toContain("## Audience");
+  expect(prompt).toContain("## Product help");
   expect(prompt).toContain("## Session Model");
   expect(prompt).toContain(
     "<workspace>\nCurrent working directory: ~/.buzz\n</workspace>",
@@ -207,6 +207,31 @@ it("builds the harness system prompt with instructions and core memory", () => {
   expect(systemPrompt({ scope: "channel", cwd: "/w" })).not.toContain(
     "<core-memory>",
   );
+});
+
+it("points a conversation in its own folder to the agent's workspace", () => {
+  const own = systemPrompt({ scope: "thread", cwd: "/repo", workspace: "/ws" });
+  expect(own).toContain(
+    "<workspace>\nCurrent working directory: /repo\n</workspace>",
+  );
+  expect(own).toContain(
+    "Your persistent workspace is at `/ws`, not in your working directory, which is this conversation's own folder:",
+  );
+  expect(own).toContain("See `AGENTS.md` in your workspace");
+  expect(own).toContain(
+    "These paths are relative to your workspace — start there for your own files rather than scanning `$HOME` or `/`. Keep them there; do not create them in your working directory.",
+  );
+  expect(own).not.toContain("Your persistent workspace is in your working");
+  expect(own).not.toContain("These paths are relative to your working");
+  // Without a folder, the workspace is the working directory, as before.
+  const plain = systemPrompt({ scope: "thread", cwd: "~/.buzz" });
+  expect(plain).toContain(
+    "Your persistent workspace is in your working directory:",
+  );
+  expect(plain).toContain(
+    "These paths are relative to your working directory — start there",
+  );
+  expect(plain).not.toContain("this conversation's own folder");
 });
 
 it("names the agent first when it is known", () => {
@@ -488,7 +513,7 @@ it("keeps a wake's text from forging an event record", () => {
 
 it("always includes the Buzz tools' guidance, and leaves attention's to its tools", () => {
   const prompt = systemPrompt({ scope: "thread", cwd: "/w" });
-  expect(prompt).toContain(BUZZ_PROMPT);
+  expect(prompt).toContain("## Audience");
   expect(prompt).not.toContain("## Attention");
 });
 
@@ -529,4 +554,60 @@ it("tells a turn a mention starts what it owes the mention, and a wake's turn no
   expect(system).not.toContain("MUST reply");
   expect(system).not.toContain("MUST publish");
   expect(system).not.toContain("belongs to a different session of you");
+});
+
+it("keeps each context message's meaningful tags, not its bookkeeping", () => {
+  const tags = [
+    ["p", bob],
+    ["q", "1".repeat(64)],
+    ["buzz:request", "1".repeat(64)],
+  ];
+  const signature = "8".repeat(128);
+  const prompt = turnPrompt({
+    agent,
+    event: event("3", "now"),
+    channel: { id: "chan" },
+    scope: "channel",
+    topLevel: true,
+    context: [
+      event("2", "earlier", {
+        tags: [
+          ["h", "chan"],
+          ["auth", bob, "kind=9", signature],
+          ["client-id", "c1"],
+          ...tags,
+          ["ms", "5"],
+        ],
+      }),
+    ],
+    total: 2,
+  });
+  expect(prompt).toContain(
+    `"content":"earlier","tags":${JSON.stringify(tags)}`,
+  );
+  expect(prompt).not.toContain(signature);
+});
+
+it("bounds each context message's content and tags together", () => {
+  const content = "y".repeat(3900);
+  const prompt = turnPrompt({
+    agent,
+    event: event("3", "now"),
+    channel: { id: "chan" },
+    scope: "channel",
+    topLevel: true,
+    context: [
+      event("2", content, {
+        tags: [
+          ["p", bob],
+          ["t", "x".repeat(100)],
+          ["t", "release"],
+        ],
+      }),
+    ],
+    total: 2,
+  });
+  expect(prompt).toContain(
+    `"content":"${content}","tags":[["p","${bob}"],["t","release"]],"tags_omitted":true}`,
+  );
 });

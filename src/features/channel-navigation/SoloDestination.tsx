@@ -1,9 +1,11 @@
 import { useSoloRowActivation } from "./useSoloRowActivation";
+import { SoloChatTitle } from "../solo/SoloChatTitle";
 import {
   type ReactNode,
   type RefObject,
   type FocusEvent,
   createContext,
+  useCallback,
   useContext,
   useLayoutEffect,
   useRef,
@@ -36,8 +38,8 @@ import { DotsThreeIcon } from "../../shared/design-system/icons";
 import type { Navigation } from "../navigation/controller";
 import type { ChannelSummary } from "../relay/contracts";
 import type { RelaySession } from "../relay/session";
-import { conversationTarget } from "./routes";
-import type { SoloRegion } from "./solo-navigation-model";
+import { conversationTarget, matchesConversation } from "./routes";
+import { soloSuccessor } from "./solo-successor";
 import type {
   SoloCardProps,
   SoloConversationLinkProps,
@@ -48,7 +50,8 @@ import styles from "./SoloDestination.module.css";
 
 export const RegionDestinationContext = createContext<
   | {
-      region: SoloRegion;
+      channels: readonly ChannelSummary[];
+      live: ReadonlySet<string>;
       session: RelaySession;
       navigator: Navigation;
       pendingClick: RefObject<ReturnType<typeof setTimeout> | undefined>;
@@ -67,7 +70,9 @@ type ConversationState = Readonly<{
   open(): void;
   canRename: boolean;
   rename(): boolean;
-  focusTarget(): HTMLElement | false;
+  finalFocus(): HTMLElement | false;
+  closeMenu(popup: HTMLElement | null): void;
+  openMenu(): void;
 }>;
 const ConversationContext = createContext<ConversationState | undefined>(
   undefined,
@@ -79,10 +84,19 @@ export function RegionConversation(props: SoloConversationProps) {
   const handoff = useChannelNavigation();
   const root = useRef<HTMLDivElement>(null);
   const restoreRename = useRef(false);
-  const channel = context?.region.channels.find(
+  const afterClose = useRef<() => void>(undefined);
+  const chosen = useRef(false);
+  const chosenItem = useRef<HTMLElement>(null);
+  const openMenu = useCallback(() => {
+    afterClose.current = undefined;
+    chosen.current = false;
+    chosenItem.current = null;
+  }, []);
+  useLayoutEffect(() => openMenu, [openMenu]);
+  const channel = context?.channels.find(
     (channel) => channel.id === props.channelId,
   );
-  const visible = !!channel && !!context?.region.live.has(channel.id);
+  const visible = !!channel && !!context?.live.has(channel.id);
   const [dialog, setDialog] = useState<"rename" | "settings" | "share">();
   const [error, setError] = useState<string>();
   const focusProps = useDestinationFocus(root, props.channelId, visible);
@@ -109,12 +123,42 @@ export function RegionConversation(props: SoloConversationProps) {
         onLifecycle={
           handoff
             ? (action) => {
-                if (active())
-                  handoff.openLifecycle(
-                    channel,
-                    action,
-                    focusTarget() || undefined,
-                  );
+                if (!active()) return;
+                const visit = navigator.snapshot();
+                const leavesOpenChat =
+                  action !== "unarchive" &&
+                  visit.entry.target.kind === "conversation" &&
+                  visit.entry.target.channelId === channel.id;
+                const neighbors =
+                  handoff.soloNeighbors.current?.(channel.id) ?? [];
+                const trigger = focusTarget() || undefined;
+                handoff.openLifecycle(channel, action, trigger, undefined, {
+                  close() {
+                    if (trigger?.isConnected)
+                      trigger.focus({ preventScroll: true });
+                  },
+                  depart(check) {
+                    // The row can unmount before completion, or the user can
+                    // reopen its chat while the session-owned deletion runs.
+                    const active =
+                      check === "current"
+                        ? matchesConversation(
+                            navigator.snapshot().entry.target,
+                            scope,
+                            channel.id,
+                          )
+                        : leavesOpenChat && !visit.attempt.signal.aborted;
+                    if (active)
+                      void navigator.open(
+                        soloSuccessor(
+                          scope,
+                          session.channels.list().channels,
+                          neighbors,
+                          channel.id,
+                        ),
+                      );
+                  },
+                });
               }
             : undefined
         }
@@ -123,18 +167,22 @@ export function RegionConversation(props: SoloConversationProps) {
         <>
           <MenuSeparator />
           <MenuGroup>
-            {props.menuActions.slice(0, 6).map((action) => (
+            {props.menuActions.map((action) => (
               <MenuItem
                 key={action.id}
-                onClick={() => {
-                  if (!active()) return;
-                  try {
-                    void Promise.resolve(action.onSelect()).catch(() => {
-                      if (active()) setError("The action could not run.");
-                    });
-                  } catch {
-                    setError("The action could not run.");
-                  }
+                onClick={(event) => {
+                  chosen.current = true;
+                  chosenItem.current = event.currentTarget;
+                  afterClose.current = () => {
+                    if (!active()) return;
+                    try {
+                      void Promise.resolve(action.onSelect()).catch(() => {
+                        if (active()) setError("The action could not run.");
+                      });
+                    } catch {
+                      setError("The action could not run.");
+                    }
+                  };
                 }}
               >
                 <MenuIcon>{action.icon}</MenuIcon>
@@ -148,10 +196,12 @@ export function RegionConversation(props: SoloConversationProps) {
   );
   const state: ConversationState = {
     channel,
-    selected: current === channel.id,
+    selected: props.selected ?? current === channel.id,
     menu,
     open() {
-      if (active()) void navigator.open(conversationTarget(scope, channel.id));
+      if (!active()) return;
+      if (props.onOpen) props.onOpen();
+      else void navigator.open(conversationTarget(scope, channel.id));
     },
     canRename:
       session.channelDetails.available && !channel.readOnly && !channel.cached,
@@ -166,11 +216,26 @@ export function RegionConversation(props: SoloConversationProps) {
       setDialog("rename");
       return true;
     },
-    focusTarget,
+    finalFocus: () => (chosen.current ? false : focusTarget()),
+    openMenu,
+    closeMenu(popup) {
+      if (!popup?.contains(chosenItem.current)) return;
+      const action = afterClose.current;
+      afterClose.current = undefined;
+      if (!action || !root.current?.isConnected || !active()) return;
+      const current = document.activeElement;
+      if (
+        current !== document.body &&
+        current !== focusTarget() &&
+        !popup?.contains(current)
+      )
+        return;
+      (focusTarget() || undefined)?.focus({ preventScroll: true });
+      action();
+    },
   };
   return (
     <div
-      ref={root}
       data-solo-destination-root={channel.id}
       {...focusProps}
       className={`${styles.destination} ${rowStyles.sidebarContents}`}
@@ -237,7 +302,18 @@ function ConversationLink(props: SoloConversationLinkProps) {
       {...(primary ? { "data-solo-destination-id": state.channel.id } : {})}
       aria-label={props["aria-label"]}
       aria-describedby={props["aria-describedby"]}
-      label={props.label}
+      label={
+        !props.multiline && props.label === state.channel.name ? (
+          <SoloChatTitle
+            key={state.channel.id}
+            channelId={state.channel.id}
+            title={state.channel.name}
+            details={context?.session.channelDetails}
+          />
+        ) : (
+          props.label
+        )
+      }
       icon={props.icon}
       trailing={props.trailing}
       multiline={!!props.multiline}
@@ -251,6 +327,7 @@ function ConversationMenu({ children }: { children: ReactNode }) {
   const state = useContext(ConversationContext);
   const [open, setOpen] = useState(false);
   const [anchor, setAnchor] = useState<HTMLElement>();
+  const popup = useRef<HTMLDivElement>(null);
   if (!state) return null;
   if (state.channel.cached)
     return <div className={styles.menu}>{children}</div>;
@@ -258,8 +335,12 @@ function ConversationMenu({ children }: { children: ReactNode }) {
     <ContextMenuRoot
       open={open}
       onOpenChange={(next) => {
+        if (next) state.openMenu();
         setOpen(next);
         if (!next) setAnchor(undefined);
+      }}
+      onOpenChangeComplete={(next) => {
+        if (!next) state.closeMenu(popup.current);
       }}
     >
       <ContextMenuTrigger
@@ -271,6 +352,7 @@ function ConversationMenu({ children }: { children: ReactNode }) {
           ) {
             event.preventDefault();
             event.stopPropagation();
+            state.openMenu();
             setAnchor(event.currentTarget);
             setOpen(true);
           }
@@ -281,7 +363,10 @@ function ConversationMenu({ children }: { children: ReactNode }) {
       <MenuPopup
         aria-label={`Actions for ${state.channel.name}`}
         anchor={anchor}
-        finalFocus={state.focusTarget}
+        ref={(element) => {
+          if (element) popup.current = element;
+        }}
+        finalFocus={state.finalFocus}
       >
         {state.menu}
       </MenuPopup>
@@ -291,9 +376,17 @@ function ConversationMenu({ children }: { children: ReactNode }) {
 
 function ConversationActions() {
   const state = useContext(ConversationContext);
+  const popup = useRef<HTMLDivElement>(null);
   if (!state || state.channel.cached) return null;
   return (
-    <MenuRoot>
+    <MenuRoot
+      onOpenChange={(next) => {
+        if (next) state.openMenu();
+      }}
+      onOpenChangeComplete={(next) => {
+        if (!next) state.closeMenu(popup.current);
+      }}
+    >
       <MenuTrigger
         render={(props) => (
           <IconButton
@@ -309,7 +402,10 @@ function ConversationActions() {
       <MenuPopup
         aria-label={`Actions for ${state.channel.name}`}
         align="end"
-        finalFocus={state.focusTarget}
+        ref={(element) => {
+          if (element) popup.current = element;
+        }}
+        finalFocus={state.finalFocus}
       >
         {state.menu}
       </MenuPopup>
@@ -367,12 +463,10 @@ export function RecoveryDestination({ channelId }: { channelId: string }) {
   useLayoutEffect(() => {
     if (context?.current === channelId) context.retryReveal();
   });
-  const channel = context?.region.channels.find(
-    (channel) => channel.id === channelId,
-  );
+  const channel = context?.channels.find((channel) => channel.id === channelId);
   if (!context || !channel) return null;
   return (
-    <div ref={root} data-solo-destination-root={channelId} {...focusProps}>
+    <div data-solo-destination-root={channelId} {...focusProps}>
       <NavigationItem
         data-solo-destination-id={channelId}
         label={channel.name}
@@ -401,14 +495,21 @@ function useDestinationFocus(
 ) {
   const focused = useRef(false);
   const neighbors = useRef<string[]>([]);
-  useLayoutEffect(() => {
-    if (!focused.current) return;
+  const rememberNeighbors = useCallback(() => {
     const region = root.current?.closest("[data-sidebar-section]");
     if (region)
       neighbors.current = [
         ...region.querySelectorAll<HTMLElement>("[data-solo-destination-id]"),
       ].map((row) => row.dataset.soloDestinationId ?? "");
-  });
+  }, [root]);
+  const attach = useCallback(
+    (node: HTMLDivElement | null) => {
+      // The source can reorder siblings without rendering this destination.
+      if (!node && focused.current) rememberNeighbors();
+      root.current = node;
+    },
+    [rememberNeighbors, root],
+  );
   useLayoutEffect(() => {
     if (!visible) return;
     const node = root.current;
@@ -418,15 +519,19 @@ function useDestinationFocus(
         "[data-solo-destination-root]",
       );
       if (!node || (owner ? owner !== node : !focused.current)) return;
-      const rows = neighbors.current;
-      const index = rows.indexOf(channelId);
-      const ids = [
-        channelId,
-        ...rows.slice(index + 1),
-        ...rows.slice(0, index).reverse(),
-      ];
       queueMicrotask(() => {
         if (document.activeElement !== document.body) return;
+        // The ref can capture the final order after this effect cleans up.
+        const rows = neighbors.current;
+        const index = rows.indexOf(channelId);
+        const ids = [
+          channelId,
+          ...rows.slice(index + 1),
+          ...rows.slice(0, index).reverse(),
+        ];
+        const section = document.querySelector(
+          `[data-sidebar-section="${CSS.escape(region?.getAttribute("data-sidebar-section") ?? "")}"]`,
+        );
         const candidates = [
           ...ids.map(
             (id) =>
@@ -435,9 +540,10 @@ function useDestinationFocus(
                 `[data-solo-destination-id="${CSS.escape(id)}"]`,
               ),
           ),
-          document.querySelector<HTMLElement>(
-            `[data-sidebar-section="${CSS.escape(region?.getAttribute("data-sidebar-section") ?? "")}"] summary`,
-          ),
+          ...(section?.querySelectorAll<HTMLElement>(
+            "[data-solo-destination-id]",
+          ) ?? []),
+          section?.querySelector<HTMLElement>("summary"),
           document.querySelector<HTMLElement>("[data-solo-heading]"),
           ...document.querySelectorAll<HTMLElement>(
             '[data-sidebar-section^="solo-region:"] summary',
@@ -452,13 +558,10 @@ function useDestinationFocus(
     };
   }, [root, channelId, visible]);
   return {
+    ref: attach,
     onFocusCapture() {
       focused.current = true;
-      const region = root.current?.closest("[data-sidebar-section]");
-      if (region)
-        neighbors.current = [
-          ...region.querySelectorAll<HTMLElement>("[data-solo-destination-id]"),
-        ].map((row) => row.dataset.soloDestinationId ?? "");
+      rememberNeighbors();
     },
     onBlurCapture(event: FocusEvent<HTMLDivElement>) {
       if (

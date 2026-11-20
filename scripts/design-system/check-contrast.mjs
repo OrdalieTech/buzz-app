@@ -156,6 +156,10 @@ const TEXT_ROLES = [
  * every fill it can actually sit on, and hover is one of them.
  */
 const PAIRS = [
+  ...["--text-standard", "--text-subtle", "--text-metadata"].map((role) => [
+    role,
+    "--surface-inset-subtle",
+  ]),
   ["--text-control-selected", "--surface-control-selected"],
   ...[
     "affordance-call-join",
@@ -194,6 +198,7 @@ const PAIRS = [
   ].map((role) => [role, "--affordance-navigation-selected"]),
   // Small status/count badges on a selected row keep their own readable pair.
   ["--text-row-selected-detail", "--surface-row-selected-detail"],
+  ["--text-dock-count", "--surface-dock-count"],
   ["--text-subtle", "--affordance-popover-selected"],
   ...["control", "control-hover", "control-pressed", "selected"].map(
     (state) => ["--text-standard", `--affordance-floating-${state}`],
@@ -280,11 +285,18 @@ const BOUNDARY_ROLES = [
   "--chart-series-2",
   "--chart-series-3",
   "--chart-series-4",
+  // Categorical glyphs and dots stand on the palette's surfaces.
+  "--icon-categorical-blue",
+  "--icon-categorical-green",
+  "--icon-categorical-amber",
+  "--icon-categorical-orange",
   ...MESSAGE_ICON_ROLES,
 ];
 
 const TINT_PAIRS = [
   ["--text-warning", "--affordance-warning"],
+  ["--text-on-find-match", "--surface-find-match"],
+  ["--text-on-find-match", "--surface-find-match-active"],
   ["--text-success", "--affordance-success"],
   ["--text-success", "--affordance-success-hover"],
   ["--text-success", "--affordance-success-pressed"],
@@ -296,6 +308,13 @@ const TINT_PAIRS = [
   ["--green-12", "--green-3"],
   ["--purple-12", "--purple-3"],
   ["--purple-12", "--purple-4"],
+  ["--text-categorical-blue", "--surface-categorical-blue"],
+  ["--text-categorical-blue", "--surface-categorical-blue-hover"],
+  ["--text-categorical-green", "--surface-categorical-green"],
+  ["--text-categorical-green", "--surface-categorical-green-hover"],
+  ["--text-categorical-amber", "--surface-categorical-amber"],
+  ["--text-categorical-amber", "--surface-categorical-amber-hover"],
+  ["--text-search-match", "--surface-search-match"],
 ];
 
 const css = readFileSync(TOKENS, "utf8");
@@ -534,6 +553,7 @@ const accentFamilies = [
   ),
 ];
 const ACCENT_PAIRS = [
+  ["--text-dock-count", "--surface-dock-count"],
   ["--text-on-selection", "--surface-text-selection"],
   ["--text-on-selection-own", "--surface-text-selection-own"],
   ["--text-sidebar-selected", "--surface-sidebar-selected"],

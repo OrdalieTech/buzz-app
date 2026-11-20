@@ -9,3 +9,43 @@ export function writeClipboardText(text: string): Promise<void> {
     ? invoke("clipboard_write_text", { text })
     : navigator.clipboard.writeText(text);
 }
+
+/** Keep semantic HTML and its plain-text alternative together.
+ * The desktop host retains clipboard ownership and avoids WebKit activation
+ * loss. Browser writes start synchronously inside the menu's user gesture. */
+export function writeClipboardRichText(
+  text: string,
+  html: string,
+  options?: { fallbackToPlainText?: boolean },
+): Promise<void> {
+  if (isTauri()) return invoke("clipboard_write_text", { text, html });
+  if (
+    typeof ClipboardItem === "undefined" ||
+    typeof navigator.clipboard?.write !== "function" ||
+    ClipboardItem.supports?.("text/html") === false
+  )
+    return options?.fallbackToPlainText
+      ? writeClipboardText(text)
+      : Promise.reject(new Error("Rich clipboard copies are not supported."));
+  return navigator.clipboard.write([
+    new ClipboardItem({
+      "text/plain": new Blob([text], { type: "text/plain" }),
+      "text/html": new Blob([html], { type: "text/html" }),
+    }),
+  ]);
+}
+
+/** How long a copied secret stays on the clipboard before Buzz clears it. */
+export const SECRET_CLIPBOARD_SECONDS = 60;
+
+/** Copies a secret such as a private key. In the app, the host writes it and
+ * clears the clipboard after `SECRET_CLIPBOARD_SECONDS` if it still holds it;
+ * a browser build can't read the clipboard back, so it only copies. */
+export function writeClipboardSecret(text: string): Promise<void> {
+  return isTauri()
+    ? invoke("clipboard_write_text", {
+        text,
+        clearAfterSecs: SECRET_CLIPBOARD_SECONDS,
+      })
+    : navigator.clipboard.writeText(text);
+}

@@ -9,11 +9,16 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, onTestFinished, vi } from "vitest";
 import { keypair, signed } from "../features/relay/testing";
 import { stubAvatarBrowserApis } from "../features/agents/avatar-testing";
 import type { RelayEvent } from "../features/relay/events";
 import type { Context } from "@deepseek-ai/cordis";
+import {
+  parseOpenTarget,
+  type OpenTarget,
+} from "../features/navigation/targets";
+import type { SessionSnapshot } from "../features/federated-identity/service";
 import { App } from "./App";
 import { createServices, type AppServices } from "./services";
 import { shellSnapshot } from "./navigation";
@@ -573,11 +578,12 @@ it("reconnects the selected Membership community after its transport fails", asy
   await screen.findByRole("button", { name: "Try again" });
   expect(current.communities.snapshot().selected).toBe(primary);
   expect(current.relay.snapshot().status).toBe("error");
-  const retry = vi.spyOn(current.relay, "retry");
+  const retry = vi.spyOn(current.relay, "tryAgain");
   fixture.offline(false);
   fireEvent.click(screen.getByRole("button", { name: "Try again" }));
   await screen.findByRole("heading", { name: "Membership" });
-  expect(retry).toHaveBeenCalledOnce();
+  // The route and its relay both retry; the relay joins the second call.
+  expect(retry).toHaveBeenCalled();
   expect(current.navigation.snapshot().status).toBe("opened");
 });
 it("does not reconnect an unrelated community when the addressed Settings scope is denied", async () => {
@@ -585,7 +591,7 @@ it("does not reconnect an unrelated community when the addressed Settings scope 
   fixture.offline();
   const current = restoreMembership();
   await screen.findByRole("button", { name: "Try again" });
-  const retry = vi.spyOn(current.relay, "retry");
+  const retry = vi.spyOn(current.relay, "tryAgain");
   act(() => {
     void current.navigation.open({
       ...membershipTarget,
@@ -871,6 +877,20 @@ it("Back closes Settings onto the view beneath and Forward reopens it; other sho
   expect(current.navigation.snapshot().entry.target).toEqual(beneath);
   fireEvent.keyDown(document.body, { ctrlKey: true, key: "]" });
   expect(await screen.findByRole("dialog", { name: "Settings" })).toBeVisible();
+  await act(async () => {
+    await current.navigation.open({
+      ...settings,
+      route: { version: 1, params: "invite" },
+    });
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Close Settings" }));
+  await waitFor(() =>
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull(),
+  );
+  await act(async () => current.navigation.back());
+  expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+  await act(async () => current.navigation.forward());
+  expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
 });
 
 it("keeps the shell's snapshot when a visit opens, and follows any other change", () => {
@@ -894,4 +914,212 @@ it("keeps the shell's snapshot when a visit opens, and follows any other change"
   expect(view()).not.toBe(opening);
   expect(view()).toBe(navigation.snapshot());
   host.dispose();
+});
+
+/** Where Builderlab's Identity links open Settings. Like every link, it names
+ * no community. */
+const organizationSignIn = {
+  version: 1,
+  kind: "settings",
+  section: "identity",
+  part: "organization-sign-in",
+} as const;
+
+/** The app settled on the view Settings opens over; with that view and any
+ * uncaught errors. `prepare` runs before the app first renders. */
+async function startedApp(prepare?: (services: AppServices) => void) {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  // Identity lands on Community sign-ins, which jsdom cannot scroll to; a
+  // test that asserts on the landing stubs it first.
+  HTMLElement.prototype.scrollIntoView ??= () => {};
+  onTestFinished(() => {
+    Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+  });
+  activation.release();
+  const current = createServices();
+  services = current;
+  prepare?.(current);
+  const errors: unknown[] = [];
+  const record = (event: ErrorEvent) => errors.push(event.error);
+  window.addEventListener("error", record);
+  onTestFinished(() => window.removeEventListener("error", record));
+  render(<App services={current} />);
+  await waitFor(() =>
+    expect(current.navigation.snapshot().status).not.toBe("pending"),
+  );
+  const beneath = current.navigation.snapshot().entry.target;
+  return { current, beneath, errors };
+}
+
+/** Opens `target`; Settings, once it shows it. */
+async function openSettings(current: AppServices, target: OpenTarget) {
+  void current.navigation.open(target);
+  await waitFor(() => {
+    expect(current.navigation.snapshot().entry.target).toEqual(
+      parseOpenTarget(target),
+    );
+    expect(current.navigation.snapshot().status).toBe("opened");
+  });
+  return screen.findByRole("dialog", { name: "Settings" });
+}
+
+/** Close retired the whole Settings visit: from where it closed to, neither
+ * Back nor Forward has an entry left to reopen it. */
+function expectSettingsRetired(current: AppServices) {
+  expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+  expect(current.navigation.snapshot().entry.target.kind).not.toBe("settings");
+  expect(current.navigation.snapshot().canGoBack).toBe(false);
+  expect(current.navigation.snapshot().canGoForward).toBe(false);
+}
+
+it.each(["Close Settings", "Escape"])(
+  "closes Settings opened at Community sign-ins (%s)",
+  async (close) => {
+    const { current, beneath, errors } = await startedApp();
+    await openSettings(current, organizationSignIn);
+    if (close === "Escape")
+      fireEvent.keyDown(document.activeElement ?? document.body, {
+        key: "Escape",
+      });
+    else fireEvent.click(screen.getByRole("button", { name: close }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull(),
+    );
+    expect(current.navigation.snapshot().entry.target).toEqual(beneath);
+    expectSettingsRetired(current);
+    expect(errors).toEqual([]);
+  },
+);
+
+it("keeps Community sign-ins through a section switch and Back, and still closes Settings", async () => {
+  const { current, beneath, errors } = await startedApp();
+  const dialog = await openSettings(current, organizationSignIn);
+  fireEvent.click(within(dialog).getByRole("button", { name: "Appearance" }));
+  await waitFor(() =>
+    expect(current.navigation.snapshot().entry.target).toEqual({
+      version: 1,
+      kind: "settings",
+      section: "appearance",
+      scope: null,
+    }),
+  );
+  current.navigation.back();
+  await waitFor(() =>
+    expect(current.navigation.snapshot().entry.target).toEqual(
+      organizationSignIn,
+    ),
+  );
+  current.navigation.forward();
+  await waitFor(() =>
+    expect(current.navigation.snapshot().entry.target).toMatchObject({
+      section: "appearance",
+    }),
+  );
+  // Close retires the Community sign-ins visit behind it as well, though
+  // only the section names Personal space.
+  fireEvent.click(screen.getByRole("button", { name: "Close Settings" }));
+  await waitFor(() =>
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull(),
+  );
+  expect(current.navigation.snapshot().entry.target).toEqual(beneath);
+  expectSettingsRetired(current);
+  expect(errors).toEqual([]);
+});
+
+it.each([false, true])(
+  "retires the sections behind a link to Settings, which names no community, on Close (in a community: %s)",
+  async (community) => {
+    if (community) membershipFixture();
+    const { current, beneath, errors } = await startedApp();
+    await openSettings(current, {
+      version: 1,
+      kind: "settings",
+      section: "appearance",
+      scope: community
+        ? { viewer: viewer.pubkey, communityOrigin: secondary }
+        : null,
+    });
+    await openSettings(current, organizationSignIn);
+    fireEvent.click(screen.getByRole("button", { name: "Close Settings" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull(),
+    );
+    expect(current.navigation.snapshot().entry.target).toEqual(beneath);
+    expectSettingsRetired(current);
+    expect(errors).toEqual([]);
+  },
+);
+
+it("focuses Community sign-ins when a link opens Settings there, and the dialog's initial focus leaves the landing in place", async () => {
+  const scrollIntoView = vi.fn();
+  HTMLElement.prototype.scrollIntoView = scrollIntoView;
+  onTestFinished(() => {
+    Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+  });
+  // Identity shows the section to a Buzz viewer.
+  membershipFixture();
+  const { current, errors } = await startedApp((services) => {
+    const signedIn: SessionSnapshot = {
+      ...services.federatedIdentity.snapshot(),
+      status: "signed-in",
+      authority: {
+        id: "test",
+        identityOrigin: "https://builderlab.example",
+        apiBasePath: "/api/goose/",
+        signIn: "on-demand",
+        organization: null,
+        communityHosts: [],
+      },
+      email: "a@example.com",
+      failure: null,
+    };
+    vi.spyOn(services.federatedIdentity, "snapshot").mockReturnValue(signedIn);
+  });
+  // Opened from outside Settings, as an app panel's Open settings does.
+  const dialog = await openSettings(current, organizationSignIn);
+  const heading = within(dialog).getByRole("heading", {
+    name: "Community sign-ins",
+  });
+  // The dialog places its initial focus after a microtask and a frame.
+  for (let frame = 0; frame < 3; frame++)
+    await act(() => new Promise((resolve) => requestAnimationFrame(resolve)));
+  expect(heading).toHaveFocus();
+  expect(scrollIntoView.mock.contexts).toEqual([heading]);
+  expect(
+    within(dialog).getByRole("button", { name: "Sign out of organization" }),
+  ).not.toHaveFocus();
+  expect(errors).toEqual([]);
+});
+
+it("closes Settings with a plugin import visit left behind", async () => {
+  const { current, beneath, errors } = await startedApp();
+  const dialog = await openSettings(current, {
+    version: 1,
+    kind: "settings",
+    section: "plugins",
+    pluginImport: {
+      repository: "https://example.com/p.git",
+      reference: "main",
+    },
+  });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Appearance" }));
+  await waitFor(() =>
+    expect(current.navigation.snapshot().entry.target).toMatchObject({
+      section: "appearance",
+    }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Close Settings" }));
+  await waitFor(() =>
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull(),
+  );
+  expect(current.navigation.snapshot().entry.target).toEqual(beneath);
+  expectSettingsRetired(current);
+  expect(errors).toEqual([]);
 });

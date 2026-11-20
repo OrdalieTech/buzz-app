@@ -82,9 +82,10 @@ function setup(
     agentMemories: { open: vi.fn() },
     workflowAuthority: workflowKey.pubkey,
   };
+  const state = { status: "ready" };
   const relay = {
     snapshot: () => ({
-      status: "ready",
+      status: state.status,
       session,
       viewer: alice,
       scope: `https://kit.example:${alice}`,
@@ -125,7 +126,7 @@ function setup(
       current: () => true,
       ...extra,
     }) as unknown as Delivery;
-  return { kit, agent, delivery, published, restored, read };
+  return { kit, agent, delivery, published, restored, read, session, state };
 }
 
 describe("harnessKit.conversation", () => {
@@ -289,6 +290,28 @@ describe("harnessKit.turnPrompt", () => {
     expect(again.text).toBe(later.text);
   });
 
+  it("ends the prompt with its conversation's instructions, keyed as its notes are", async () => {
+    const root = message("1", "Kick off");
+    const event = reply("4", "1", "@Ampy and now?");
+    const { kit, agent, delivery } = setup({ thread: [root, event] });
+    const conversationInstructions = vi.fn(() => ({
+      plugin: "acme.tasks",
+      text: "Review only.",
+    }));
+    Object.assign(agent, { conversationInstructions });
+    const d = delivery({ type: "mention", event });
+    const conversation = await kit.conversation(d, "thread");
+    if (!conversation) throw new Error("not admitted");
+    const { text } = await kit.turnPrompt(d, conversation);
+    expect(text).toMatch(
+      /<owner-instructions source="acme\.tasks">\n[\s\S]*\n\nReview only\.\n<\/owner-instructions>$/,
+    );
+    expect(conversationInstructions).toHaveBeenCalledWith(
+      channel,
+      "1".repeat(64),
+    );
+  });
+
   it("keeps a mark for each thread of a channel conversation", async () => {
     const rootA = message("1", "Thread A");
     const rootB = message("2", "Thread B");
@@ -373,6 +396,9 @@ describe("harnessKit.systemPrompt", () => {
     expect(text).toContain("~/work");
     expect(text).toContain(`<repos for="https://kit.example:${alice}"/>`);
     expect(text).not.toContain("<buzz-tools-unavailable>");
+    await expect(text).toMatchFileSnapshot(
+      "./sections/snapshots/kit.thread.txt",
+    );
   });
 
   it("tells a session without tools that its final message is its reply", async () => {
@@ -477,6 +503,30 @@ describe("harnessKit.tools", () => {
     expect(JSON.stringify(without)).toContain("cannot read ./a.txt");
     await call(kit.tools(agent, conversation, { read }));
     expect(read).toHaveBeenCalledWith("./a.txt");
+  });
+
+  it("builds its client again after a reload, with the new session's relay key", async () => {
+    const { kit, agent, session, state } = setup();
+    const relay = keypair();
+    Object.assign(session, { relayAuthor: relay.pubkey });
+    state.status = "connecting";
+    // The call arrives mid-reload; its wait ends with the community ready.
+    Object.assign(agent, {
+      settle: vi.fn(async () => {
+        state.status = "ready";
+        return true;
+      }),
+    });
+    const answer = (await kit.tools(agent)({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "solo_worker_connections", arguments: {} },
+    })) as unknown;
+    expect(agent.settle).toHaveBeenCalled();
+    expect(JSON.stringify(answer)).not.toContain(
+      "does not know its relay's key",
+    );
   });
 
   it("standalone prompts carry the agent's routing context", () => {

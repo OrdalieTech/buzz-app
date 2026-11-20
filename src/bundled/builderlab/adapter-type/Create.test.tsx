@@ -199,6 +199,15 @@ it.each([
   },
 );
 
+it("shows the instruction limit as accessible field help", async () => {
+  await fixture(false);
+  const instructions = screen.getByRole("textbox", {
+    name: "Instructions Optional",
+  });
+  expect(screen.getByText("Up to 20,000 characters.")).toBeVisible();
+  expect(instructions).toHaveAccessibleDescription("Up to 20,000 characters.");
+});
+
 it("loads the catalog and keeps instructions alongside explicit model and effort choices", async () => {
   const h = await fixture();
   expect(h.ready).toHaveBeenLastCalledWith(false);

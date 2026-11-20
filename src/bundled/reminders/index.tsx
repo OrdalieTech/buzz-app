@@ -4,6 +4,7 @@ import type { RelaySession } from "../../features/relay/session";
 import type { Reminder, Reminders } from "../../features/relay/reminders";
 import type { OpenTarget } from "../../features/navigation/targets";
 import { plainText } from "../../features/notifications/content";
+import { CountBadge } from "../../shared/design-system/ui/CountBadge";
 import { AlarmIcon } from "../../shared/design-system/icons/index";
 import {
   countDue,
@@ -233,11 +234,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
     const { state } = useReminders(relay);
     const at = useSyncExternalStore(subscribeClock, readClock, readClock);
     const due = countDue(state.reminders, at);
-    return due ? (
-      <span className={styles.badge} role="img" aria-label={`${due} due`}>
-        {due}
-      </span>
-    ) : null;
+    return <CountBadge count={due} label={`${due} due`} />;
   }
 
   ctx.pages.register({

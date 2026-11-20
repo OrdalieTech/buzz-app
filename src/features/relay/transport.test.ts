@@ -1,3 +1,4 @@
+import { ARTIFACT_KIND } from "../agents/agent-config-artifacts";
 import { assert, afterEach, expect, it, vi } from "vitest";
 import {
   connectBrokerTransport,
@@ -99,6 +100,49 @@ it("publishes the unchanged signed event bytes through the host's /events reques
     controller.signal,
   );
 });
+it("sends a message while task artifacts wait for native HTTP capacity", async () => {
+  const started: string[] = [];
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const transport = await connectSignedTransport(
+    hostSigner(key, async (_url, body) => {
+      const event = JSON.parse(body) as { id: string; kind: number };
+      started.push(event.id);
+      if (event.kind === ARTIFACT_KIND) await held;
+      return Response.json({ accepted: true, event_id: event.id });
+    }),
+    "https://publication-priority.test",
+    "relay",
+  );
+  assert.exists(transport.writer);
+  const writer = transport.writer;
+  const signal = new AbortController().signal;
+  const artifacts = Array.from({ length: 5 }, (_, index) =>
+    signed(key, { kind: ARTIFACT_KIND, content: String(index), tags: [] }),
+  );
+  const results = artifacts.map((event) => writer.publish(event, signal));
+  try {
+    const chat = signed(key, {
+      kind: 9,
+      content: "priority message",
+      tags: [["h", "c"]],
+    });
+    await writer.publish(chat, signal);
+    expect(started).toEqual([
+      ...artifacts.slice(0, 4).map((event) => event.id),
+      chat.id,
+    ]);
+    release();
+    await Promise.all(results);
+    expect(started.at(-1)).toBe(artifacts[4]?.id);
+  } finally {
+    release();
+    await Promise.allSettled(results);
+  }
+});
+
 it("distinguishes explicit rejection from invalid or missing delivery receipts", async () => {
   const event = signed(key, { kind: 9, content: "hello", tags: [["h", "c"]] });
   const transport = await connectSignedTransport(
@@ -353,7 +397,8 @@ it("saves the viewer's config artifacts when the broker admits kind 45010", asyn
     content: "{}",
     tags: [],
   });
-  let returned = artifact;
+  let returned = artifact,
+    refuse = false;
   const fetcher = vi.fn(async (url: string) => {
     if (url.endsWith("/session"))
       return Response.json({
@@ -362,7 +407,11 @@ it("saves the viewer's config artifacts when the broker admits kind 45010", asyn
         writeKinds: [9, 45010],
       });
     if (url.endsWith("/sign")) return Response.json(returned);
-    return Response.json({ accepted: true, event_id: artifact.id });
+    return Response.json({
+      accepted: !refuse,
+      event_id: artifact.id,
+      message: refuse ? "rate-limited: try later" : "",
+    });
   });
   vi.stubGlobal("fetch", fetcher);
   const transport = await connectBrokerTransport();
@@ -379,6 +428,14 @@ it("saves the viewer's config artifacts when the broker admits kind 45010", asyn
     "/api/relay/sign",
     "/api/relay/publish",
   ]);
+  refuse = true;
+  const refused = await writer
+    .publish(saved, signal)
+    .catch((error: unknown) => error);
+  expect(writer.isNotSent?.(refused)).toBe(true);
+  expect(writer.isNotSent?.(new Error((refused as Error).message))).toBe(false);
+  expect(writer.isNotSent?.(new PublishRejected("denied"))).toBe(false);
+  refuse = false;
   // Only this viewer's artifacts.
   await expect(
     writer.sign({ kind: 9, content: "", tags: [], created_at: 1 }, signal),

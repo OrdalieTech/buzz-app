@@ -8,6 +8,8 @@ import type { ChannelMessage } from "../relay/contracts";
  * Lists publish row lookup and editing; shortcuts act on the focused row.
  */
 export type MessageList = Readonly<{
+  /** The session partition used by the message's existing Copy link action. */
+  scope?: string | undefined;
   row(id: string): ChannelMessage | undefined;
   /** The conversation's newest message, rendered or not. */
   newest(): string | undefined;
@@ -20,6 +22,9 @@ export type MessageList = Readonly<{
   markUnread(row: ChannelMessage): void;
   /** Where Escape and Down past the newest message return focus. */
   composer(): HTMLElement | null;
+  /** Append copied message HTML and its source links to this list's own composer. */
+  quote(html: string, sourceLinks?: readonly string[]): boolean;
+  canQuote(): boolean;
 }>;
 
 const ROW = "[data-message-id]";
@@ -48,13 +53,20 @@ function rowsIn(list: HTMLElement) {
   );
 }
 
-/** The innermost registered list containing this element. */
-function listFor(element: Element) {
+/** The innermost registered list containing this node. */
+function listFor(element: Node) {
   let found: HTMLElement | undefined;
   for (const list of lists.keys())
     if (list.contains(element) && (!found || found.contains(list)))
       found = list;
   return found;
+}
+
+/** The innermost registered list containing this node, with its controller. */
+export function messageListOf(node: Node) {
+  const element = listFor(node);
+  const list = element && lists.get(element);
+  return element && list ? { element, list } : undefined;
 }
 
 export function selectMessage(row: HTMLElement) {

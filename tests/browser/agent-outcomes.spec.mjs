@@ -74,12 +74,19 @@ test("a remote failure shares its expandable history and preserves its message a
   await expect(toggle).toContainText("Couldn’t finish");
   // The task failed without publishing a reply: retiring live progress must
   // leave a persistent explanation, even beyond the former preview timeout.
-  await page.clock.runFor(120000);
+  // Jump rather than run: with wall time frozen, a timer armed for a wall-clock
+  // deadline (the presence read gate) re-arms with the same delay each time it
+  // fires. That delay is whatever was left at the freeze, so running 120 s of
+  // timers could take tens of thousands of turns and outlast the test.
+  await page.clock.fastForward(120000);
   await expect(toggle).toContainText("Couldn’t finish");
   await expect(
     history.locator('[data-message-activity] [data-state="working"]'),
   ).toHaveCount(0);
   await page.clock.resume();
+  // The jump froze wall time while the broker kept real time; if it ran long,
+  // signed read-state events would now exceed the broker's 60 s clock skew.
+  await page.clock.setSystemTime(Date.now());
   await toggle.focus();
   await page.keyboard.press("Enter");
   await expect(toggle).toHaveAttribute("aria-expanded", "true");
@@ -88,6 +95,9 @@ test("a remote failure shares its expandable history and preserves its message a
   ).toBeVisible();
   await expect(history.getByRole("button", { name: /Retry/ })).toHaveCount(0);
   await toggle.click();
+  // 120 s of browser time outran the broker's real 15 s keepalive, so the live
+  // stream's 45 s heartbeat restarted it; publish once a channel REQ is back.
+  await expect.poll(() => app.relay.hasRoute("primary", "alpha")).toBe(true);
   const publish = (content, tags, offset) => {
     const event = finalizeEvent(
       {
