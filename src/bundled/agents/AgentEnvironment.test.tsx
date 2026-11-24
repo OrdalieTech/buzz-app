@@ -1,9 +1,16 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AgentSaveState } from "../../features/agents/AgentSaveButton";
+import { ToastProvider } from "../../shared/design-system/ui/Toast";
 import type {
   Agent,
   Agents,
@@ -444,4 +451,136 @@ it("keeps the restart offer across leaving and coming back until a restart succe
   view();
   await screen.findByText("SAVED_KEY");
   expect(screen.queryByRole("button", { name: "Restart agent" })).toBeNull();
+});
+
+it("edits the device list when no agent is named", async () => {
+  const user = userEvent.setup();
+  render(<AgentEnvironment />);
+  await replaceSaved(user);
+  await user.type(screen.getByLabelText("Value of SAVED_KEY"), "new");
+  await user.click(button("Save"));
+  expect(calls("agent_env_status")[0]?.[1]).toEqual({ agent: undefined });
+  expect(calls("agent_env_set")[0]?.[1]).toEqual({
+    agent: undefined,
+    rows: [{ name: "SAVED_KEY", value: "new" }],
+  });
+  expect(
+    screen.getByText("Variables every local agent on this device starts with."),
+  ).toBeInTheDocument();
+});
+
+it("restarting every agent asks first, then reloads Buzz", async () => {
+  const user = userEvent.setup();
+  const reload = vi.fn();
+  vi.stubGlobal("location", { ...window.location, reload });
+  native.invoke.mockImplementation(async (command) =>
+    command === "agent_env_status" ? { names, saved: true } : undefined,
+  );
+  try {
+    render(<AgentEnvironment />);
+    expect(
+      await screen.findByText("Changes saved. Restart agents to apply them."),
+    ).toBeInTheDocument();
+    await user.click(button("Restart agents"));
+    expect(screen.getByText(/ends calls and turns in progress/)).toBeVisible();
+    expect(reload).not.toHaveBeenCalled();
+    await user.click(button("Restart"));
+    expect(reload).toHaveBeenCalledOnce();
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it("marks an agent's variables that override the device list", async () => {
+  names = ["SAVED_KEY", "OWN"];
+  native.invoke.mockImplementation(async (command, args) =>
+    command === "agent_env_status"
+      ? { names: (args as { agent?: string }).agent ? names : ["SAVED_KEY"] }
+      : undefined,
+  );
+  const openSettings = vi.fn();
+  const user = userEvent.setup();
+  render(
+    <AgentEnvironment
+      agent={AGENT}
+      restartAgent={restartAgent}
+      openSettings={openSettings}
+    />,
+  );
+  expect(
+    await screen.findByText("Overrides the device-wide value"),
+  ).toBeInTheDocument();
+  expect(screen.getAllByText("Overrides the device-wide value")).toHaveLength(
+    1,
+  );
+  await user.click(button("device-wide variables"));
+  expect(openSettings).toHaveBeenCalledWith("agents");
+});
+
+it("a restarted agent's banner stays gone though native still says saved", async () => {
+  native.invoke.mockImplementation(async (command) =>
+    command === "agent_env_status" ? { names, saved: true } : undefined,
+  );
+  render(<AgentEnvironment agent={AGENT} restartAgent={restartAgent} />);
+  await screen.findByText("SAVED_KEY");
+  expect(screen.queryByRole("button", { name: "Restart agent" })).toBeNull();
+});
+
+it("an agent's override note follows a device save made over its page", async () => {
+  let device: string[] = [];
+  native.invoke.mockImplementation(async (command, args) => {
+    const { agent, rows } = args as {
+      agent?: string;
+      rows?: { name: string }[];
+    };
+    if (command === "agent_env_status")
+      return { names: agent ? ["OWN"] : device };
+    if (command === "agent_env_set" && !agent)
+      device = (rows ?? []).map((row) => row.name);
+    return undefined;
+  });
+  const user = userEvent.setup();
+  const page = render(
+    <AgentEnvironment agent={AGENT} restartAgent={restartAgent} />,
+  );
+  await within(page.container).findByText("OWN");
+  expect(screen.queryByText("Overrides the device-wide value")).toBeNull();
+  const settings = render(<AgentEnvironment />);
+  const inSettings = within(settings.container);
+  await user.click(
+    await inSettings.findByRole("button", { name: "Add variable" }),
+  );
+  await user.type(inSettings.getByLabelText("Variable name"), "OWN");
+  await user.type(inSettings.getByLabelText("Value of OWN"), "device");
+  await user.click(inSettings.getByRole("button", { name: "Save" }));
+  expect(
+    await within(page.container).findByText("Overrides the device-wide value"),
+  ).toBeInTheDocument();
+});
+
+it("says a device save that fails after Settings closes", async () => {
+  const user = userEvent.setup();
+  let reject!: (reason: unknown) => void;
+  native.invoke.mockImplementation(async (command) => {
+    if (command === "agent_env_status") return { names };
+    if (command === "agent_env_set")
+      return new Promise((_, no) => (reject = no));
+    return undefined;
+  });
+  const view = (open: boolean) => (
+    <ToastProvider>{open && <AgentEnvironment />}</ToastProvider>
+  );
+  const { rerender } = render(view(true));
+  await replaceSaved(user);
+  await user.type(screen.getByLabelText("Value of SAVED_KEY"), "secret-value");
+  await user.click(button("Save"));
+  await waitFor(() => expect(calls("agent_env_set")).toHaveLength(1));
+  // Settings closes while the store is still writing.
+  rerender(view(false));
+  reject("store denied SAVED_KEY");
+  expect(
+    await screen.findByText("Couldn't save environment variables"),
+  ).toBeInTheDocument();
+  expect(document.body).not.toHaveTextContent("SAVED_KEY");
+  expect(document.body).not.toHaveTextContent("secret-value");
 });

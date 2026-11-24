@@ -531,6 +531,7 @@ function setup(
     bindExecution: async () => {},
     executionBinding: () => undefined,
     inspectExecution: async () => undefined,
+    startsProtected: async () => false,
     execution: async () => undefined,
     harness: {} as Agents["harness"],
     subscribeSteps: () => () => {},

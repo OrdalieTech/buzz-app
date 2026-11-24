@@ -5,6 +5,8 @@ import { GooseRuntime } from "./runtime";
 import { GooseSetup } from "./setup";
 import { GooseHistory } from "./transcript";
 import { apply } from "./index";
+import { fakeSpawn } from "./goose-testing";
+import type { Spawn } from "./goose";
 
 vi.mock("@tauri-apps/api/core", () => ({ isTauri: () => true }));
 afterEach(() => vi.restoreAllMocks());
@@ -124,6 +126,48 @@ it("lists the models of the providers that answer when another's list fails", as
   await expect(registered.models()).resolves.toEqual([
     { provider: "openai", id: "gpt-5", label: "OpenAI · GPT-5" },
   ]);
+});
+
+it("discovers review models without the device's environment variables", async () => {
+  const fake = fakeSpawn({
+    providers: [
+      {
+        providerId: "openai",
+        providerName: "OpenAI",
+        configured: true,
+        visibleInSetup: true,
+      },
+    ],
+    supported: ["gpt-5"],
+  });
+  const started: Parameters<Spawn>[1][] = [];
+  const spawn: Spawn = async (id, options) => {
+    if (id === "goose") started.push(options);
+    return fake.spawn(id, options);
+  };
+  const registerModels = vi.fn();
+  apply({
+    pluginOwner: { id: "buzz.goose", revision: "r1" },
+    host: { request: vi.fn(), spawn, resolveDirectory: fake.resolveDirectory },
+    agentProtection: { registerModels },
+    agents: {
+      register: vi.fn(),
+      relay: () => undefined,
+      subscribe: () => () => {},
+      snapshot: () => ({ status: "loading" }),
+    },
+    effect: vi.fn(),
+  } as never);
+  const [registered] = registerModels.mock.calls[0] as [
+    { models(): Promise<unknown> },
+  ];
+  started.length = 0;
+  await expect(registered.models()).resolves.toEqual([
+    { provider: "openai", id: "gpt-5", label: "OpenAI · gpt-5" },
+  ]);
+  // The provider list and its live model list, each in its own goose.
+  expect(started.length).toBeGreaterThanOrEqual(2);
+  for (const options of started) expect(options).not.toHaveProperty("secrets");
 });
 
 it("lists no review models for the providers Goose reviews refuse", async () => {

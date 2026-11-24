@@ -206,8 +206,12 @@ it("shares a Claude agent's model as the claude runtime and imports it back", ()
   ).toBeUndefined();
 });
 
-it("registers review models from the discovered catalog", async () => {
+it.each([
+  ["a saved key", true],
+  ["no saved key", false],
+])("lists review models only with a saved key (%s)", async (_, saved) => {
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+  vi.spyOn(ClaudeAuth.prototype, "has").mockResolvedValue(saved);
   vi.spyOn(ClaudeSetup.prototype, "catalog").mockResolvedValue([
     { value: "opus", displayName: "Opus" },
     { value: "haiku" },
@@ -221,10 +225,14 @@ it("registers review models from the discovered catalog", async () => {
     agents: { register: vi.fn(), relay: () => undefined },
     effect: vi.fn(),
   } as never);
-  await expect(registerModels.mock.calls[0]?.[0].models()).resolves.toEqual([
-    { id: "opus", label: "Opus" },
-    { id: "haiku", label: "haiku" },
-  ]);
+  await expect(registerModels.mock.calls[0]?.[0].models()).resolves.toEqual(
+    saved
+      ? [
+          { id: "opus", label: "Opus" },
+          { id: "haiku", label: "haiku" },
+        ]
+      : [],
+  );
 });
 
 it.each([true, false])(

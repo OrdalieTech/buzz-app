@@ -392,8 +392,8 @@ enum Stream {
 /// arguments. `env` adds variables (`null` removes one) to the app's own
 /// environment, less any Buzz identity: an agent's key never leaves the app.
 /// `secrets` names native-held secrets, each only for the processes it belongs
-/// to; a secret that is not saved is left unset. `agent-env`, the list saved
-/// for the local agent `env_agent`, is set before `env` so the harness's
+/// to; a secret that is not saved is left unset. `agent-env`, the device's list
+/// then the local agent `env_agent`'s, is set before `env` so the harness's
 /// variables win; the others are set after it.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -423,15 +423,11 @@ pub(crate) async fn plugin_host_process_spawn<R: tauri::Runtime>(
         .transpose()?;
     let page = processes.page();
     let plugin = id.clone();
+    let grants_revision = revision.clone();
     let (declared, registry, policies) = with_manager(manager, move |manager| {
         let registry = manager.storage_root().to_path_buf();
         let policies = manager.managed_policy_paths();
-        manager
-            .host_grants(&id, &revision)?
-            .processes
-            .into_iter()
-            .find(|process| process.id == process_id)
-            .ok_or_else(|| "Process is not declared".into())
+        declared_process(&manager, &id, &grants_revision, &process_id)
             .map(|declared| (declared, registry, policies))
     })
     .await?;
@@ -533,13 +529,13 @@ pub(crate) async fn plugin_host_process_spawn<R: tauri::Runtime>(
             &app.state(),
             &secrets,
             env_agent.as_deref(),
-            &plugin,
-            &declared.id,
+            &declared,
+            &revision,
             protected,
         )
         .await?
     } else {
-        Vec::new()
+        Default::default()
     };
     set_environment(
         &mut command,
@@ -570,23 +566,15 @@ pub(crate) async fn plugin_host_process_spawn<R: tauri::Runtime>(
             }
         }
     }
-    for secret in secrets {
-        if secret == crate::agent_env::SECRET {
-            continue;
-        }
-        if secret != crate::claude_key::SECRET
-            || !crate::claude_key::may_have(&plugin, &declared.id)
-        {
-            return Err("That secret is not available to this process".into());
-        }
-        // The agent's own key outranks the shared one.
-        if agent_key(&agent_env).is_some() {
-            continue;
-        }
-        if let Some(key) = app.state::<crate::claude_key::ClaudeKey>().key().await? {
-            command.env(crate::claude_key::ENV, &*key);
-        }
-    }
+    grant_secrets(
+        &mut command,
+        &secrets,
+        &plugin,
+        &declared.id,
+        &agent_env,
+        &app.state(),
+    )
+    .await?;
     if let Some(mcp) = mcp {
         command.env(
             "BUZZ_AGENT_CONNECTION",
@@ -641,13 +629,13 @@ pub(crate) async fn plugin_host_process_spawn<R: tauri::Runtime>(
 /// paths, plus the `login_shell` variables it forwards and then the agent's
 /// `agent_env`, less any Buzz identity these hold, plus the plugin's
 /// `environment` (`None` removes a variable), which wins over `agent_env`
-/// except for an Anthropic API key the agent's list sets.
+/// except for an Anthropic API key the agent's own list sets.
 /// `BUZZ_VERSION` is always this app's version, so a command can tell it runs
 /// under Buzz.
-fn set_environment(
+pub(crate) fn set_environment(
     command: &mut Command,
     login_shell: &[(std::ffi::OsString, std::ffi::OsString)],
-    agent_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    agent_env: &crate::agent_env::Lists,
     path: &OsStr,
     environment: &HashMap<String, Option<String>>,
     version: &str,
@@ -666,13 +654,13 @@ fn set_environment(
         }
     }
     command.envs(login_shell.iter().cloned());
-    command.envs(agent_env.iter().cloned());
+    command.envs(agent_env.vars().cloned());
     // Never pass on an identity the app was started with, even one the user
     // asked their login shell or the agent list to forward.
     for name in std::env::vars_os()
         .map(|(name, _)| name)
         .chain(login_shell.iter().map(|(name, _)| name.clone()))
-        .chain(agent_env.iter().map(|(name, _)| name.clone()))
+        .chain(agent_env.vars().map(|(name, _)| name.clone()))
     {
         let text = name.to_string_lossy();
         if text.starts_with("BUZZ_") || text.starts_with("NOSTR_") {
@@ -693,21 +681,53 @@ fn set_environment(
         };
     }
     // An Anthropic key saved for the agent is one the person chose for it,
-    // unlike an inherited one, which a harness may remove.
-    if let Some((name, value)) = agent_key(agent_env) {
+    // unlike an inherited one or the device list's, which a harness may
+    // remove: Claude does when it uses the person's own setup.
+    if let Some((name, value)) = agent_env.own_key() {
         command.env(name, value);
     }
     command.env("BUZZ_VERSION", version);
     Ok(())
 }
 
-/// The Anthropic API key in an agent's list, if it has one.
-fn agent_key(
-    agent_env: &[(std::ffi::OsString, std::ffi::OsString)],
-) -> Option<&(std::ffi::OsString, std::ffi::OsString)> {
-    agent_env
-        .iter()
-        .find(|(name, _)| name == crate::claude_key::ENV)
+/// Sets the native-held `secrets` process `process_id` of `plugin` asks for,
+/// refusing any it may not have. `agent_env`'s lists are already set.
+pub(crate) async fn grant_secrets(
+    command: &mut Command,
+    secrets: &[String],
+    plugin: &str,
+    process_id: &str,
+    agent_env: &crate::agent_env::Lists,
+    shared: &crate::claude_key::ClaudeKey,
+) -> Result<(), String> {
+    for secret in secrets {
+        if secret == crate::agent_env::SECRET {
+            continue;
+        }
+        if secret != crate::claude_key::SECRET || !crate::claude_key::may_have(plugin, process_id) {
+            return Err("That secret is not available to this process".into());
+        }
+        let shared = match agent_env.key() {
+            Some(_) => None,
+            None => shared.key().await?,
+        };
+        set_claude_key(command, agent_env, shared.as_deref().map(|key| &**key));
+    }
+    Ok(())
+}
+
+/// Sets the Anthropic key for a launch granted `claude_key::SECRET`: the
+/// agent's own list's, then the device list's, then `shared`.
+fn set_claude_key(
+    command: &mut Command,
+    agent_env: &crate::agent_env::Lists,
+    shared: Option<&str>,
+) {
+    if let Some((name, value)) = agent_env.key() {
+        command.env(name, value);
+    } else if let Some(key) = shared {
+        command.env(crate::claude_key::ENV, key);
+    }
 }
 
 /// The mounted or extracted AppImage this app runs from: `APPDIR` only when
@@ -998,6 +1018,21 @@ fn runs_protected_claude(plugin: &str, process_id: &str, protected: bool) -> boo
 pub(crate) fn verified_artifact(mut artifact: ProcessArtifact) -> Result<PathBuf, String> {
     artifact.path = expand_home(&artifact.path)?.to_string_lossy().into_owned();
     verify_artifact(&artifact)
+}
+
+/// Process `process_id` as the grants of plugin `id` at `revision` declare it.
+pub(crate) fn declared_process(
+    manager: &buzzodz_plugins::Manager,
+    id: &str,
+    revision: &str,
+    process_id: &str,
+) -> buzzodz_plugins::Result<HostProcess> {
+    manager
+        .host_grants(id, revision)?
+        .processes
+        .into_iter()
+        .find(|process| process.id == process_id)
+        .ok_or_else(|| "Process is not declared".into())
 }
 
 /// A manifest may place an artifact under the user's home, written `~/…`.

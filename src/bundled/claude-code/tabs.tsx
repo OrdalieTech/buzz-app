@@ -80,7 +80,7 @@ import {
   type SavedConversation,
   modelName as resolvedModelName,
 } from "./runtime";
-import { Missing, SignedIn, SignIn } from "./auth";
+import { Missing, PROTECTED_NEEDS, SignedIn, SignIn } from "./auth";
 import type { ClaudeModel } from "./claude";
 import type { ClaudeSetup } from "./setup";
 import type { ClaudeDefaults } from "./defaults";
@@ -1581,6 +1581,18 @@ export function createTabs({
             {error}
           </p>
         )}
+        {/* Protected launches never get the device list, so ordinary
+         * readiness doesn't mean this agent can run. */}
+        {agent.protection &&
+          execution?.remote === false &&
+          setupState.protectedReady === false && (
+            <div className="grid gap-2">
+              <p role="status" className="m-0 text-body-sm">
+                {PROTECTED_NEEDS}
+              </p>
+              <SignIn setup={setup} disabled={saving} />
+            </div>
+          )}
         {settingsSection !== "runtime" && (
           <>
             <SettingsGroup>

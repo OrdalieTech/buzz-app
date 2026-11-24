@@ -166,6 +166,14 @@ pub struct HostProcess {
     pub bundled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ProcessArtifact>,
+    /// The process runs a local agent, so it may ask for the environment
+    /// variables local agents start with. Honored only in a bundled plugin.
+    #[serde(
+        default,
+        rename = "agentEnv",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub agent_env: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

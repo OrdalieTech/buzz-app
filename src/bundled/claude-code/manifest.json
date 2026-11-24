@@ -33,6 +33,7 @@
       },
       {
         "id": "claude-sh",
+        "agentEnv": true,
         "program": "bash",
         "args": ["-c"]
       },

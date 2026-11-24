@@ -68,6 +68,7 @@ impl Fixture {
             .manage(PluginManager(Ok(manager.clone())))
             .manage(crate::host_process::HostProcesses::default())
             .manage(crate::agent_env::AgentEnvs::new())
+            .manage(crate::claude_key::ClaudeKey::new())
             .manage(registry)
             .manage(identity)
             .invoke_handler(move |invoke| {

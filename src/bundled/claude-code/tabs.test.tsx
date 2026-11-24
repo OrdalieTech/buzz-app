@@ -61,7 +61,14 @@ const nativeKey = vi.hoisted(() => {
     if (!/^sk-ant-[A-Za-z0-9_-]+$/.test(value.trim()))
       throw "That is not an Anthropic API key. Create one at console.anthropic.com and paste it here.";
   };
-  return { saved: true, saves: [] as string[], check, save: check };
+  return {
+    saved: true,
+    saves: [] as string[],
+    check,
+    save: check,
+    /** Whether the device-wide list sets `ANTHROPIC_API_KEY`. */
+    device: false,
+  };
 });
 vi.mock("@tauri-apps/api/core", () => ({
   isTauri: () => desktop.tauri,
@@ -69,6 +76,8 @@ vi.mock("@tauri-apps/api/core", () => ({
     // An IPC round trip, as the host's process steps answer after a turn.
     await new Promise((resolve) => setTimeout(resolve, 0));
     if (command === "claude_api_key_status") return nativeKey.saved;
+    if (command === "agent_env_status" && nativeKey.device)
+      return { names: ["ANTHROPIC_API_KEY"] };
     if (command === "claude_api_key_set") {
       const value = args?.value ?? "";
       nativeKey.saves.push(value);
@@ -109,6 +118,7 @@ vi.mock("motion/react", async (actual) => ({
 
 beforeEach(() => {
   desktop.tauri = true;
+  nativeKey.device = false;
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
   // jsdom has no layout observers; the model picker sizes itself with one.
   vi.stubGlobal(
@@ -200,7 +210,10 @@ function applied({
   channels,
   remote = false,
   own = {},
+  startsProtected = false,
 }: {
+  /** Whether a new agent starts protected, from the owner's defaults. */
+  startsProtected?: boolean;
   /** What `claude auth status` reports: the person's own setup, signed out
    * unless `status` is set; it answers once `held` settles, when set. */
   own?: { status?: object; held?: Promise<void> };
@@ -323,6 +336,7 @@ function applied({
       storage,
       core: async () => undefined,
       tools: () => [],
+      startsProtected: async () => startsProtected,
       executionBinding: () => (remote ? { provider: "nexus/blox" } : undefined),
       inspectExecution: vi.fn(async () =>
         remote ? { provider: "nexus/blox" } : undefined,
@@ -1714,6 +1728,45 @@ it("keeps provider readiness quiet and agent sessions out of Settings", async ()
   expect(
     screen.getByText("No other conversations saved in this app yet."),
   ).toBeInTheDocument();
+});
+
+it("tells a protected agent a device-list key isn't enough, and refuses new protected agents", async () => {
+  const NEEDS =
+    "Protected Claude agents need your own Claude sign-in or a saved API key. Keys on the device list don't count.";
+  nativeKey.device = true;
+  const { type } = installed({
+    keySaved: false,
+    startsProtected: true,
+    own: { status: { loggedIn: false } },
+  });
+  const Settings = tab(type, 0);
+  // Ordinary agents still run on the device list, so they say nothing.
+  render(<Settings agent={agent()} save={vi.fn()} />);
+  expect(await screen.findByLabelText("Workspace")).toBeInTheDocument();
+  await expect(type.admitsCreation?.check()).resolves.toBe(NEEDS);
+  expect(screen.queryByText(NEEDS)).toBeNull();
+  cleanup();
+  const guarded = {
+    ...agent(),
+    protection: { provider: "security.test", policy: {} },
+  } as Agent<Config>;
+  render(<Settings agent={guarded} save={vi.fn()} />);
+  const notice = (await screen.findByText(NEEDS)).parentElement as HTMLElement;
+  // Saving a key there admits it at once.
+  const user = userEvent.setup();
+  await user.type(
+    within(notice).getByLabelText("Anthropic API key"),
+    "sk-ant-api03-new",
+  );
+  await user.click(within(notice).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(screen.queryByText(NEEDS)).toBeNull());
+  await expect(type.admitsCreation?.check()).resolves.toBeUndefined();
+});
+
+it("admits new unprotected agents on a device-list key", async () => {
+  nativeKey.device = true;
+  const { type } = installed({ keySaved: false });
+  await expect(type.admitsCreation?.check()).resolves.toBeUndefined();
 });
 
 it("edits the model through the Settings dropdown and preserves agent inheritance", async () => {

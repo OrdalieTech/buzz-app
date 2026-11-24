@@ -654,6 +654,7 @@ export function AgentDetails({
                       <AgentEnvironment
                         agent={agent.pubkey}
                         restartAgent={() => agents.restartAgent(agent.pubkey)}
+                        openSettings={openSettings}
                       />
                     )}
                 </div>

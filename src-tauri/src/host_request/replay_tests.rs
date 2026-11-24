@@ -88,6 +88,7 @@ impl App {
             .manage(PluginManager(Ok(manager)))
             .manage(HostCalls::default())
             .manage(crate::agent_env::AgentEnvs::new())
+            .manage(crate::claude_key::ClaudeKey::new())
             .invoke_handler(crate::commands())
             .build(crate::app_context())
             .unwrap();

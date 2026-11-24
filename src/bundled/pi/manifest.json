@@ -21,11 +21,13 @@
       },
       {
         "id": "pi-sh",
+        "agentEnv": true,
         "program": "bash",
         "args": ["-c"]
       },
       {
         "id": "node",
+        "agentEnv": true,
         "program": "node",
         "args": ["--input-type=module", "-e"]
       },

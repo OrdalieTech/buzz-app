@@ -2,6 +2,7 @@ import { useState, useSyncExternalStore } from "react";
 import type { PageNavigation } from "../features/navigation/service";
 import type { Agents } from "../features/agents/service";
 import { AgentDefaults } from "../bundled/agents/AgentDefaults";
+import { AgentEnvironment } from "../bundled/agents/AgentEnvironment";
 import { BaseInstructions } from "../features/agents/BaseInstructions";
 import { Header, InlineHeader } from "../shared/design-system/ui/Header";
 
@@ -88,6 +89,9 @@ export function AgentSettings({
           onProvider={onProvider}
         />
       )}
+      {/* Mounted while the section is hidden, so a save that settles after
+          leaving it keeps its error and value. */}
+      {agents && <AgentEnvironment />}
       <div className="mt-section-gap">
         <InlineHeader title="Agent behavior" />
         <SettingsGroup>

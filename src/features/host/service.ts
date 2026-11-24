@@ -125,8 +125,8 @@ export type HostProcessOptions = Readonly<{
   /** Secrets native code holds; one that is not saved is left unset. Each is
    * only for the processes it belongs to: `anthropic-api-key`
    * (`ANTHROPIC_API_KEY`) for Buzz's Claude, set after `env`, and `agent-env`,
-   * the environment variables saved for the local agent `envAgent`, set
-   * before `env` so the harness's own variables win. */
+   * the environment variables saved for every local agent, then those of the
+   * local agent `envAgent`, set before `env` so the harness's own win. */
   secrets?: readonly ("anthropic-api-key" | "agent-env")[];
   /** The local agent (pubkey) whose own environment variables `agent-env`
    * adds. Native checks it is a local, unprotected agent here. */

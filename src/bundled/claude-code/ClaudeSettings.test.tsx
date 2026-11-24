@@ -562,8 +562,9 @@ it("offers replacement and confirmed removal without reading the saved key", asy
   await user.click(screen.getByRole("menuitem", { name: "Replace" }));
   expect(screen.getByLabelText("Anthropic API key")).toHaveValue("");
   expect(
-    native.invoke.mock.calls.every(
-      ([command]) => command === "claude_api_key_status",
+    native.invoke.mock.calls.every(([command]) =>
+      // Statuses only: the device list's names, never a value.
+      ["claude_api_key_status", "agent_env_status"].includes(command),
     ),
   ).toBe(true);
 });
@@ -644,8 +645,9 @@ it("discards replacement drafts when the page closes", async () => {
   expect(input).not.toHaveValue("sk-ant-draft");
   expect(input).toHaveAttribute("readonly");
   expect(
-    native.invoke.mock.calls.every(
-      ([command]) => command === "claude_api_key_status",
+    native.invoke.mock.calls.every(([command]) =>
+      // Statuses only: the device list's names, never a value.
+      ["claude_api_key_status", "agent_env_status"].includes(command),
     ),
   ).toBe(true);
   expect(await replaceKey(user)).toHaveValue("");

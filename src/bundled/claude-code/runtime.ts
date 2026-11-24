@@ -206,9 +206,9 @@ export type SavedConversation = Conversation &
  * process. */
 const STOP_WAIT_MS = 5_000;
 /** An agent's own `claude`, and the check of which custom headers it starts
- * with, ask for the environment variables saved for that agent; its pinned
- * protected copy and other setup steps never do. A spare, started for no
- * agent yet, asks with none named and gets none. */
+ * with, ask for the device's environment variables and that agent's; its
+ * pinned protected copy and other setup steps never do. A spare, started for
+ * no agent yet, asks with none named and gets the device's alone. */
 const agentEnv = (
   id: string,
   options: Parameters<Spawn>[1],

@@ -215,8 +215,8 @@ export const GooseProcess = {
       signal?: AbortSignal;
       onProcess?: (goose: AcpProcess) => void;
       agent?: Readonly<{ pubkey: string; relay: string }>;
-      /** Native-held secrets: only a local agent's own launch asks for
-       * `agent-env`. */
+      /** Native-held secrets: a local agent's own launch asks for
+       * `agent-env`, and a goose Buzz starts briefly for its device list. */
       secrets?: HostProcessOptions["secrets"];
     }>,
   ) => {

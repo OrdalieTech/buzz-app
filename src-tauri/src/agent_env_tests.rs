@@ -45,13 +45,8 @@ fn keep(name: &str) -> Row {
 fn env(store: &Arc<FakeStore>) -> AgentEnv {
     AgentEnv::with(Box::new(store.clone()))
 }
-async fn given(
-    env: &AgentEnv,
-    plugin: &str,
-    process: &str,
-    protected: bool,
-) -> Vec<(String, String)> {
-    env.for_process(plugin, process, protected)
+async fn given(env: &AgentEnv) -> Vec<(String, String)> {
+    env.for_process()
         .await
         .into_iter()
         .map(|(n, v)| (n.into_string().unwrap(), v.into_string().unwrap()))
@@ -59,48 +54,10 @@ async fn given(
 }
 
 #[tokio::test]
-async fn only_local_agent_processes_get_the_list() {
-    let store = Arc::new(FakeStore::default());
-    let env = env(&store);
-    env.set(vec![set("FOO", "bar")]).await.unwrap();
-    let foo = vec![("FOO".to_string(), "bar".to_string())];
-    for (plugin, process) in [
-        ("buzz.claude-code", "claude-sh"),
-        ("buzz.codex", "codex-sh"),
-        ("buzz.goose", "goose"),
-        ("buzz.pi", "pi-sh"),
-        ("buzz.pi", "node"),
-    ] {
-        assert_eq!(
-            given(&env, plugin, process, false).await,
-            foo,
-            "{plugin} {process}"
-        );
-        assert!(
-            given(&env, plugin, process, true).await.is_empty(),
-            "protected {plugin}"
-        );
-    }
-    for (plugin, process) in [
-        ("buzz.claude-code", "claude-protected-arm64"),
-        ("buzz.claude-code", "read"),
-        ("buzz.pi", "pi-protected-sh"),
-        ("other.plugin", "claude-sh"),
-    ] {
-        assert!(
-            given(&env, plugin, process, false).await.is_empty(),
-            "{plugin} {process}"
-        );
-    }
-}
-
-#[tokio::test]
 async fn an_unreadable_store_starts_agents_without_the_list() {
     let store = Arc::new(FakeStore::default());
     *store.unreadable.lock().unwrap() = true;
-    assert!(given(&env(&store), "buzz.goose", "goose", false)
-        .await
-        .is_empty());
+    assert!(given(&env(&store)).await.is_empty());
 }
 
 #[tokio::test]
@@ -123,7 +80,7 @@ async fn rows_keep_replace_or_delete_saved_values() {
         .await
         .unwrap();
     assert_eq!(
-        given(&env, "buzz.goose", "goose", false).await,
+        given(&env).await,
         [("A", "1"), ("B", "two"), ("D", "4")].map(|(n, v)| (n.to_string(), v.to_string()))
     );
     assert!(env.status().await.unwrap().saved);
@@ -140,10 +97,7 @@ async fn a_failed_save_changes_nothing() {
     assert!(env.set(vec![set("A", "2")]).await.is_err());
     assert!(env.set(vec![set("PATH", "/x")]).await.is_err());
     assert!(!env.status().await.unwrap().saved);
-    assert_eq!(
-        given(&env, "buzz.goose", "goose", false).await,
-        vec![("A".into(), "1".into())]
-    );
+    assert_eq!(given(&env).await, vec![("A".into(), "1".into())]);
 }
 
 #[tokio::test]
@@ -176,6 +130,7 @@ async fn every_blocked_name_is_rejected_in_any_case() {
             "XDG_DATA_HOME",
             "XDG_CONFIG_HOME",
             "LOCALAPPDATA",
+            "APPDATA",
         ])
     {
         let mixed: String = name
@@ -253,10 +208,10 @@ pub(crate) fn envs() -> (AgentEnvs, Stores) {
     (envs, stores)
 }
 async fn agent_given(envs: &AgentEnvs, pubkey: &str) -> Vec<(String, String)> {
-    envs.for_process(pubkey, "buzz.goose", "goose", false)
+    envs.for_process(Some(pubkey))
         .await
-        .into_iter()
-        .map(|(n, v)| (n.into_string().unwrap(), v.into_string().unwrap()))
+        .vars()
+        .map(|(n, v)| (n.to_str().unwrap().into(), v.to_str().unwrap().into()))
         .collect()
 }
 
@@ -271,11 +226,10 @@ async fn each_agent_gets_only_its_own_list() {
         vec![("FOO".to_string(), "ada".to_string())]
     );
     assert!(agent_given(&envs, BO).await.is_empty());
-    assert!(envs
-        .for_process(ADA, "buzz.goose", "goose", true)
-        .await
-        .is_empty());
-    assert_eq!(envs.status(BO).await.unwrap().names, Vec::<String>::new());
+    assert_eq!(
+        envs.status(Some(BO)).await.unwrap().names,
+        Vec::<String>::new()
+    );
 }
 
 #[tokio::test]
@@ -290,7 +244,7 @@ async fn an_agent_list_uses_the_same_rules() {
         .await
         .is_err());
     assert!(envs.set("ADA", vec![], || Ok(true)).await.is_err());
-    assert!(envs.status("../x").await.is_err());
+    assert!(envs.status(Some("../x")).await.is_err());
 }
 
 #[tokio::test]
@@ -405,34 +359,29 @@ async fn a_spawn_gets_only_an_eligible_named_agents_list() {
     deleting.deleting = true;
     let (_dir, host) = host_with(&[agent_row(ADA), deleting]);
     let asks = vec![SECRET.to_string()];
+    let goose = bundled("buzz.goose", "goose");
     let spawn =
-        |agent, protected| for_spawn(&envs, &host, &asks, agent, "buzz.goose", "goose", protected);
-    assert_eq!(spawn(Some(ADA), false).await.unwrap().len(), 1);
-    // No agent named: no list in this build.
-    assert!(spawn(None, false).await.unwrap().is_empty());
+        |agent, protected| for_spawn(&envs, &host, &asks, agent, &goose, "bundled", protected);
+    assert_eq!(spawn(Some(ADA), false).await.unwrap().vars().count(), 1);
+    // No agent named: the device list alone, empty here.
+    assert_eq!(spawn(None, false).await.unwrap().vars().count(), 0);
+    envs.set_device(vec![set("BAR", "device")]).await.unwrap();
+    assert_eq!(spawn(None, false).await.unwrap().vars().count(), 1);
+    assert_eq!(spawn(Some(ADA), false).await.unwrap().vars().count(), 2);
     // An agent being removed, or not here, is refused.
     assert!(spawn(Some(BO), false).await.is_err());
     let absent = "c".repeat(64);
     assert!(spawn(Some(&absent), false).await.is_err());
-    // Protected launches and processes outside the allowlist are refused.
+    // Protected launches are refused.
     assert!(spawn(Some(ADA), true).await.is_err());
-    assert!(for_spawn(
-        &envs,
-        &host,
-        &asks,
-        Some(ADA),
-        "buzz.goose",
-        "install",
-        false
-    )
-    .await
-    .is_err());
     // A process that doesn't ask gets nothing.
     assert!(
-        for_spawn(&envs, &host, &[], Some(ADA), "buzz.goose", "goose", false)
+        for_spawn(&envs, &host, &[], Some(ADA), &goose, "bundled", false)
             .await
             .unwrap()
-            .is_empty()
+            .vars()
+            .next()
+            .is_none()
     );
 }
 
@@ -444,4 +393,270 @@ fn the_anthropic_key_has_one_spelling_where_names_ignore_case() {
     assert!(check("ANTHROPIC_API_KEY", true).is_ok());
     // Elsewhere it's another variable.
     assert!(check("anthropic_api_key", false).is_ok());
+}
+
+#[tokio::test]
+async fn every_agent_gets_the_device_list_and_its_own_wins() {
+    let (envs, stores) = envs();
+    envs.set_device(vec![set("FOO", "device"), set("BAR", "device")])
+        .await
+        .unwrap();
+    envs.set(ADA, vec![set("FOO", "ada")], || Ok(true))
+        .await
+        .unwrap();
+    // The process takes the last of a repeated name, so Ada's comes after.
+    assert_eq!(
+        agent_given(&envs, ADA).await,
+        vec![
+            ("BAR".to_string(), "device".to_string()),
+            ("FOO".to_string(), "device".to_string()),
+            ("FOO".to_string(), "ada".to_string()),
+        ]
+    );
+    // As a command gets it, Ada's value wins.
+    let command = command_env(&envs.for_process(Some(ADA)).await);
+    assert!(command.contains(&("FOO".to_string(), "ada".to_string())));
+    assert!(!command.contains(&("FOO".to_string(), "device".to_string())));
+    assert_eq!(agent_given(&envs, BO).await.len(), 2);
+    assert_eq!(envs.for_process(None).await.vars().count(), 2);
+    assert_eq!(
+        envs.status(None).await.unwrap().names,
+        vec!["BAR".to_string(), "FOO".to_string()]
+    );
+    // An agent's cleanup leaves the device list.
+    envs.forget(ADA).await.unwrap();
+    assert_eq!(agent_given(&envs, ADA).await.len(), 2);
+    assert!(stores.lock().unwrap().contains_key("default"));
+}
+
+#[tokio::test]
+async fn a_page_load_clears_saved_and_keeps_the_lists() {
+    let (envs, stores) = envs();
+    let pubkey = "a".repeat(64);
+    envs.set_device(vec![set("FOO", "1")]).await.unwrap();
+    envs.set(&pubkey, vec![set("BAR", "2")], || Ok(true))
+        .await
+        .unwrap();
+    assert!(envs.status(None).await.unwrap().saved);
+    assert!(envs.status(Some(&pubkey)).await.unwrap().saved);
+    envs.page_load();
+    let device = envs.status(None).await.unwrap();
+    let own = envs.status(Some(&pubkey)).await.unwrap();
+    assert!(!device.saved && !own.saved);
+    assert_eq!(device.names, ["FOO"]);
+    assert_eq!(own.names, ["BAR"]);
+    assert_eq!(stores.lock().unwrap().len(), 2);
+}
+
+/// `process` as the bundled catalog's manifest for `plugin` declares it.
+fn bundled(plugin: &str, process: &str) -> buzzodz_plugins::HostProcess {
+    buzzodz_plugins::bundled_manifests()
+        .into_iter()
+        .find(|manifest| manifest.id == plugin)
+        .and_then(|manifest| manifest.host)
+        .and_then(|host| host.processes.into_iter().find(|p| p.id == process))
+        .unwrap_or_else(|| panic!("{plugin} declares no {process}"))
+}
+
+/// A plugin manager over a temp home, with `test.claimant` installed and
+/// enabled: a non-bundled plugin whose `goose` process declares `agentEnv`.
+fn manager_with_claimant() -> (tempfile::TempDir, buzzodz_plugins::Manager, String) {
+    let root = tempfile::tempdir().unwrap();
+    let manager =
+        buzzodz_plugins::Manager::open(Some(root.path().join("data")), "test", false).unwrap();
+    let source = root.path().join("plugin");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("plugin.js"), "export function apply() {}").unwrap();
+    std::fs::write(
+        source.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "id": "test.claimant", "name": "Claimant", "apiVersion": 1,
+            "host": {"processes": [
+                {"id": "goose", "program": "goose-acp", "agentEnv": true}
+            ]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    buzzodz_plugins::sign_release(&source, &nostr::key::SecretKey::generate().to_secret_hex())
+        .unwrap();
+    let revision = manager
+        .install(&source)
+        .unwrap()
+        .plugins
+        .into_iter()
+        .find(|p| p.manifest.id == "test.claimant")
+        .unwrap()
+        .revision;
+    manager.change("enable", "test.claimant").unwrap();
+    // Off by default; on, so its refusal is the capability's.
+    manager.change("enable", "buzz.mesh-compute").unwrap();
+    (root, manager, revision)
+}
+
+/// The variables a spawn of `plugin`'s `process` at `revision` starts with,
+/// through the native spawn's own lookup and list wiring, as a command gets
+/// them; `None` when the spawn is refused.
+async fn launched(
+    manager: &buzzodz_plugins::Manager,
+    envs: &AgentEnvs,
+    host: &crate::app_agents::AppAgentHost,
+    plugin: &str,
+    revision: &str,
+    process: &str,
+) -> Option<Vec<(String, String)>> {
+    let declared =
+        crate::host_process::declared_process(manager, plugin, revision, process).unwrap();
+    let list = for_spawn(
+        envs,
+        host,
+        &[SECRET.into()],
+        Some(ADA),
+        &declared,
+        revision,
+        false,
+    )
+    .await
+    .ok()?;
+    Some(command_env(&list))
+}
+
+/// The spawn's own environment setup, with nothing but `list` added.
+fn spawn_env(command: &mut tokio::process::Command, list: &Lists) {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    crate::host_process::set_environment(command, &[], list, &path, &Default::default(), "0")
+        .unwrap();
+}
+
+fn command_env(list: &Lists) -> Vec<(String, String)> {
+    let mut command = tokio::process::Command::new("/usr/bin/true");
+    spawn_env(&mut command, list);
+    command
+        .as_std()
+        .get_envs()
+        .filter_map(|(n, v)| Some((n.to_str()?.to_owned(), v?.to_str()?.to_owned())))
+        .filter(|(n, _)| list.vars().any(|(name, _)| name == n.as_str()))
+        .collect()
+}
+
+async fn fixture() -> (
+    AgentEnvs,
+    tempfile::TempDir,
+    crate::app_agents::AppAgentHost,
+) {
+    let (envs, _) = envs();
+    envs.set(ADA, vec![set("FOO", "ada")], || Ok(true))
+        .await
+        .unwrap();
+    let (dir, host) = host_with(&[agent_row(ADA)]);
+    (envs, dir, host)
+}
+
+async fn launch_of(
+    plugin: &str,
+    revision: Option<&str>,
+    process: &str,
+) -> Option<Vec<(String, String)>> {
+    let (envs, _dir, host) = fixture().await;
+    let (_root, manager, claimant) = manager_with_claimant();
+    let revision = revision.unwrap_or(&claimant);
+    launched(&manager, &envs, &host, plugin, revision, process).await
+}
+
+#[tokio::test]
+async fn a_plugin_that_is_not_bundled_gets_nothing_even_declaring_it() {
+    assert_eq!(launch_of("test.claimant", None, "goose").await, None);
+}
+
+#[tokio::test]
+async fn a_harness_helper_process_gets_nothing() {
+    assert_eq!(
+        launch_of("buzz.goose", Some("bundled"), "read-protected").await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn the_mesh_goose_launch_is_refused() {
+    assert_eq!(
+        launch_of("buzz.mesh-compute", Some("bundled"), "goose").await,
+        None
+    );
+}
+
+#[test]
+fn bundled_harnesses_declare_exactly_their_agent_processes() {
+    let mut declared: Vec<(String, String)> = buzzodz_plugins::bundled_manifests()
+        .into_iter()
+        .flat_map(|manifest| {
+            let id = manifest.id.clone();
+            manifest
+                .host
+                .into_iter()
+                .flat_map(|host| host.processes)
+                .filter(|process| process.agent_env)
+                .map(move |process| (id.clone(), process.id))
+        })
+        .collect();
+    declared.sort();
+    let expected: Vec<(String, String)> = [
+        ("buzz.claude-code", "claude-sh"),
+        ("buzz.codex", "codex-sh"),
+        ("buzz.goose", "goose"),
+        ("buzz.pi", "node"),
+        ("buzz.pi", "pi-sh"),
+    ]
+    .iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+    assert_eq!(declared, expected);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bundled_harness_child_sees_its_list() {
+    let (envs, _) = envs();
+    envs.set(ADA, vec![set("TEST_AGENT_ENV", "fixture")], || Ok(true))
+        .await
+        .unwrap();
+    let (_dir, host) = host_with(&[agent_row(ADA)]);
+    let (_root, manager, _) = manager_with_claimant();
+    let declared =
+        crate::host_process::declared_process(&manager, "buzz.goose", "bundled", "goose").unwrap();
+    let list = for_spawn(
+        &envs,
+        &host,
+        &[SECRET.into()],
+        Some(ADA),
+        &declared,
+        "bundled",
+        false,
+    )
+    .await
+    .unwrap();
+    let mut command = tokio::process::Command::new("/usr/bin/printenv");
+    command.arg("TEST_AGENT_ENV");
+    spawn_env(&mut command, &list);
+    let output = command.output().await.unwrap();
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "fixture");
+}
+
+#[tokio::test]
+async fn a_save_that_keeps_no_value_replaces_a_damaged_device_list() {
+    let damaged = || {
+        let store = Arc::new(FakeStore::default());
+        *store.text.lock().unwrap() = Some("not json".into());
+        store
+    };
+    let (full, stores) = envs();
+    stores.lock().unwrap().insert(DEVICE.into(), damaged());
+    // Keeping a value needs the damaged list, so it fails.
+    assert!(full.set_device(vec![keep("FOO")]).await.is_err());
+    full.set_device(vec![set("FOO", "1")]).await.unwrap();
+    assert_eq!(full.status(None).await.unwrap().names, ["FOO"]);
+
+    let (empty, stores) = envs();
+    stores.lock().unwrap().insert(DEVICE.into(), damaged());
+    empty.set_device(Vec::new()).await.unwrap();
+    assert!(empty.status(None).await.unwrap().names.is_empty());
 }

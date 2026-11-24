@@ -167,19 +167,29 @@ if that desktop app is up and running.
   **Activity** (its past sessions) and plugin tabs such as **Attention**.
   Local Claude and Codex transcripts can open on recent activity. Choose
   **Load earlier activity** to see more history.
-- **Settings → Agent details → Environment variables** sets variables one
-  local Claude Code, Codex, Goose or Pi agent starts with, such as API keys.
-  They're kept in the OS credential store on this computer, never synced, and
-  values aren't shown again after saving. Protected agents don't get them, and
-  a harness's own variables win, except that a saved `ANTHROPIC_API_KEY` wins
-  over the shared Claude key. Names that choose a model, provider or
-  endpoint, `PATH`, and `BUZZ_*`/`NOSTR_*` are refused. A save applies to agent
-  processes started afterward; running ones keep the old list until
-  **Restart agent**, which stops only that agent's processes in every
-  community so its next message starts them with the saved list. It asks
-  first, and it's refused while the agent is answering or in a call. A Codex or Pi agent
-  with its own list runs in its own process. Removing the agent from its last
-  community on this computer deletes its list.
+- **Settings → Agent details → Environment variables** sets variables one local
+  Claude Code, Codex, Goose or Pi agent starts with, such as API keys. They're
+  kept in the OS credential store on this computer, never synced, and values
+  aren't shown again after saving. Protected agents don't get them, and a
+  harness's own variables win, except that a saved `ANTHROPIC_API_KEY` wins over
+  the shared Claude key. Names that choose a model, provider or endpoint,
+  `PATH`, and `BUZZ_*`/`NOSTR_*` are refused. A save applies to agent processes
+  started afterward; running ones keep the old list until **Restart agent**,
+  which stops only that agent's processes in every community so its next message
+  starts them with the saved list. It asks first, and it's refused while the
+  agent is answering or in a call. A Codex or Pi agent with its own list runs in
+  its own process. Removing the agent from its last community on this computer
+  deletes its list.
+- **Settings → Agent setup → Environment variables**, below **Harness
+  defaults**, is one list every local agent on this device starts with. An
+  agent's own list wins over it for a variable with the same name. **Restart
+  agents** asks first, then reloads Buzz, which ends calls and turns in
+  progress, so every local agent's next message starts it with the saved list.
+  A device-list `ANTHROPIC_API_KEY` doesn't replace your own Claude setup.
+  On Windows, the Anthropic key is saved only as `ANTHROPIC_API_KEY`.
+- Each harness reads its own variable names: Codex uses its own sign-in, not
+  `OPENAI_API_KEY`, and a credential under a different name can still outrank
+  the one an agent's list sets.
 - **Instructions** change how an agent behaves. They don't give it new tools,
   accounts or permissions.
 - **Settings → Agent setup → Base instructions** shows the instructions Buzz

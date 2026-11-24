@@ -23,6 +23,7 @@ import {
 } from "../../features/agents/AISettings";
 import {
   bounded,
+  CHECK_MS,
   followRecommended,
   onRecommended,
   recommendedCandidates,
@@ -59,6 +60,7 @@ import { InlineHeader } from "../../shared/design-system/ui/Header";
 import { Input } from "../../shared/design-system/ui/Input";
 import { useNamePrompt, useShake } from "./useNamePrompt";
 import { MigrationPreview } from "./AgentSettingsHost";
+import { ProviderDialog } from "./ProviderDialog";
 import { RemoteAgentIntroduction } from "./RemoteAgentIntroduction";
 
 const message = (error: unknown) =>
@@ -78,6 +80,64 @@ const reveal = (element: HTMLElement | null) => {
 };
 
 /** Use each registered provider's icon in creation and library cards. */
+type Admission =
+  | Readonly<{ state: "checking" | "open" | "unknown" }>
+  | Readonly<{ state: "held"; reason: string }>;
+type Gate = NonNullable<RegisteredAgentType["admitsCreation"]>;
+const OPEN: Admission = { state: "open" };
+const CHECKING: Admission = { state: "checking" };
+
+/** `gate`'s answer within `CHECK_MS`; a rejection or a slower answer is
+ * unknown, which holds creation as a refusal does. */
+const admit = (gate: Gate) =>
+  new Promise<Admission>((resolve) => {
+    const timer = setTimeout(() => resolve({ state: "unknown" }), CHECK_MS);
+    const done = (value: Admission) => {
+      clearTimeout(timer);
+      resolve(value);
+    };
+    // A throw before it returns a promise is an unknown answer too.
+    Promise.resolve()
+      .then(() => gate.check())
+      .then(
+        (reason) =>
+          done(reason === undefined ? OPEN : { state: "held", reason }),
+        () => done({ state: "unknown" }),
+      );
+  });
+
+/** Whether `gate` lets a new agent be made now, asked again when it says
+ * so or on `retry`. No gate always lets it. */
+function useAdmission(gate: Gate | undefined) {
+  const [answer, setAnswer] = useState<{ gate: Gate; value: Admission }>();
+  const asking = useRef<() => void>(undefined);
+  useEffect(() => {
+    if (!gate) return;
+    let latest = 0;
+    let current = true;
+    const ask = () => {
+      const mine = ++latest;
+      setAnswer({ gate, value: CHECKING });
+      void admit(gate).then(
+        (value) => current && mine === latest && setAnswer({ gate, value }),
+      );
+    };
+    asking.current = ask;
+    ask();
+    const unsubscribe = gate.subscribe(ask);
+    return () => {
+      current = false;
+      unsubscribe();
+    };
+  }, [gate]);
+  const admission = !gate
+    ? OPEN
+    : answer?.gate === gate
+      ? answer.value
+      : CHECKING;
+  return { admission, retry: () => asking.current?.() };
+}
+
 export function TypeIcon({
   type,
   size = 16,
@@ -406,7 +466,16 @@ export function AgentCreateDialog({
   // The harness's own setup rows say when it is ready. Automatic shows none:
   // its pick already found the harness ready, and `waiting` covers no pick.
   const picked = automatic && !!pick && pick.type.key === type?.key;
-  const canCreate = !Configuration || configurationReady || picked;
+  // Asked of every new local agent, Automatic's included: `picked` never
+  // passes a type's own refusal.
+  const gate = !update && !type?.remote ? type?.admitsCreation : undefined;
+  const { admission, retry } = useAdmission(gate);
+  // The type's own setup, where its credentials are set.
+  const [settingUp, setSettingUp] = useState(false);
+  const setUpButton = useRef<HTMLButtonElement>(null);
+  const canCreate =
+    admission.state === "open" &&
+    (!Configuration || configurationReady || picked);
   const close = () => setOpen(false);
   const chooseModel = (
     item: RegisteredAgentType,
@@ -493,6 +562,18 @@ export function AgentCreateDialog({
       if (picked && !(await bounded(pick.type.recommends?.(pick.candidate)))) {
         setAsked((count) => count + 1);
         setError(`${pick.type.title} isn’t ready on this computer.`);
+        setPending(false);
+        return;
+      }
+      // Asked again: it may have changed since it was shown.
+      const admitted = gate ? await admit(gate) : OPEN;
+      if (admitted.state !== "open") {
+        retry();
+        setError(
+          admitted.state === "held"
+            ? admitted.reason
+            : `Couldn’t check whether ${type.title} can make this agent. Try again.`,
+        );
         setPending(false);
         return;
       }
@@ -809,7 +890,8 @@ export function AgentCreateDialog({
                   disabled={pending}
                   onChange={chooseAutomatic}
                   summary={
-                    recommendation.status === "checking" ? (
+                    recommendation.status === "checking" ||
+                    admission.state === "checking" ? (
                       <Checking />
                     ) : undefined
                   }
@@ -873,6 +955,31 @@ export function AgentCreateDialog({
               />
             ) : (
               <SettingsGroup>{localRows}</SettingsGroup>
+            )}
+            {admission.state === "held" && (
+              <p className="m-0 flex items-center gap-2 text-body-sm">
+                <span role="status">{admission.reason}</span>
+                {type?.provider && (
+                  <Button
+                    ref={setUpButton}
+                    size="sm"
+                    onClick={() => setSettingUp(true)}
+                  >
+                    Set up
+                  </Button>
+                )}
+              </p>
+            )}
+            {admission.state === "unknown" && type && (
+              <p
+                role="status"
+                className="m-0 flex items-center gap-2 text-body-sm"
+              >
+                Couldn’t check whether {type.title} can make this agent.
+                <Button size="sm" onClick={retry}>
+                  Retry
+                </Button>
+              </p>
             )}
           </section>
           {reviewingSettings ? (
@@ -939,6 +1046,16 @@ export function AgentCreateDialog({
           />
           {errorMessage}
         </div>
+      )}
+      {settingUp && (
+        <ProviderDialog
+          type={type}
+          finalFocus={setUpButton}
+          onClose={() => {
+            setSettingUp(false);
+            retry();
+          }}
+        />
       )}
     </Dialog>
   );

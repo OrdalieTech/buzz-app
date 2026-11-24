@@ -32,6 +32,7 @@
       },
       {
         "id": "codex-sh",
+        "agentEnv": true,
         "program": "bash",
         "args": ["-c"]
       },

@@ -941,6 +941,21 @@ describe("GooseSetup", () => {
     });
   });
 
+  it("checks providers with the device's environment variables", async () => {
+    const fake = fakeSpawn();
+    const asked: Parameters<Spawn>[1][] = [];
+    const spawn: Spawn = async (id, options) => {
+      if (id === "goose") asked.push(options);
+      return fake.spawn(id, options);
+    };
+    await new GooseSetup({ ...fake, spawn }).providers();
+    expect(asked.length).toBeGreaterThan(0);
+    for (const options of asked) {
+      expect(options?.secrets).toEqual(["agent-env"]);
+      expect(options?.envAgent).toBeUndefined();
+    }
+  });
+
   it("says when the bundled goose-acp is missing", async () => {
     const fake = fakeSpawn();
     const spawn: Spawn = async (id, options) => {

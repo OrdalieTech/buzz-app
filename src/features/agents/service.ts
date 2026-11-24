@@ -1273,6 +1273,13 @@ export type AgentType<Config = unknown> = {
    * follows Recommended (`recommended.ts`): an agent whose config is on it
    * runs on the current candidate for its type. */
   recommends?(candidate: RecommendedCandidate): Promise<boolean>;
+  /** Whether a new agent of this type may be created now. `check` answers
+   * why not, or undefined when it may; a rejection is an unknown answer, which
+   * holds creation too. `subscribe` says when to ask again. */
+  admitsCreation?: Readonly<{
+    check(): Promise<string | undefined>;
+    subscribe(listener: () => void): () => void;
+  }>;
   /** Runtime routes its supported security boundaries through AgentHandle.protection. */
   protection?: true;
   /** Uses the agent's saved execution target for native process and file I/O. */
@@ -1679,6 +1686,9 @@ export type Agents = {
   ): Promise<void>;
   executionBinding(agent: AgentKey): AgentExecutionBinding | undefined;
   inspectExecution(agent: AgentKey): Promise<AgentExecutionBinding | undefined>;
+  /** Whether a new agent made here now starts protected: its owner's
+   * protection defaults, which native creation applies. */
+  startsProtected(): Promise<boolean>;
   /** Only the agent's native harness can open its bound target. */
   execution(
     agent: AgentKey,
@@ -2481,6 +2491,9 @@ export class AgentsService extends Service implements Agents {
   executionBinding(key: AgentKey) {
     if (!this.liveMember(key)) throw new Error("No such agent on this device");
     return this.executions.read(key);
+  }
+  async startsProtected() {
+    return (await this.protection.snapshot()).defaults !== null;
   }
   async inspectExecution(key: AgentKey) {
     if (!this.liveMember(key)) throw new Error("No such agent on this device");

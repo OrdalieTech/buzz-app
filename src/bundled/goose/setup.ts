@@ -155,6 +155,10 @@ export class GooseSetup {
   constructor(
     private readonly host: GooseHost | undefined,
     private readonly defaultsChanged: () => void = () => {},
+    /** Whether its goose gets the device's environment variables; the
+     * protection picker's does not, as the review worker it offers for
+     * never gets them. */
+    private readonly deviceEnv = true,
   ) {}
 
   snapshot = () => this.state;
@@ -679,7 +683,7 @@ export class GooseSetup {
     run: (goose: GooseProcess, cwd: string) => Promise<T>,
     env: Readonly<Record<string, string>> = {},
   ): Promise<T> {
-    return briefly(this.host, run, env);
+    return briefly(this.host, run, env, undefined, this.deviceEnv);
   }
 }
 
@@ -705,12 +709,15 @@ export async function readNoProxy(spawn: Spawn): Promise<Inherited> {
 }
 
 /** Runs `run` against a `goose-acp` started for it in the home folder, and
- * stops it after. It serves no Buzz tools; `signal` stops its startup. */
+ * stops it after. It serves no Buzz tools; `signal` stops its startup. Unless
+ * `deviceEnv` is false it gets the device's environment variables, naming no
+ * agent, so a provider key kept only there counts as set up. */
 export async function briefly<T>(
   host: GooseHost | undefined,
   run: (goose: GooseProcess, cwd: string) => Promise<T>,
   env: Readonly<Record<string, string>> = {},
   signal?: AbortSignal,
+  deviceEnv = true,
 ): Promise<T> {
   if (!host) throw new Error("goose runs only in the desktop app");
   const cwd = await host.resolveDirectory("~");
@@ -718,6 +725,7 @@ export async function briefly<T>(
   const goose = await GooseProcess.start(host.spawn, {
     cwd,
     env,
+    ...(deviceEnv && { secrets: ["agent-env" as const] }),
     ...(signal && { signal }),
   });
   try {

@@ -1371,6 +1371,7 @@ pub fn run() {
                 webview.state::<federated_identity::socket::Sockets>().clear();
                 webview.state::<federated_identity::FederatedIdentity>().clear_discoveries();
                 webview.state::<HostProcesses>().stop_all();
+                webview.state::<agent_env::AgentEnvs>().page_load();
                 webview.state::<HostMcpServers>().stop_all();
                 webview.state::<HostForward>().stop_all();
                 webview.state::<app_agents::AppAgentHost>().page_load();

@@ -453,6 +453,20 @@ function discoverable() {
   return { spawn, sessions: claude.processes };
 }
 
+it("discovers models with the device's environment variables, as an ordinary agent", async () => {
+  const { spawn } = discoverable();
+  await new ClaudeSetup(spawn).catalog();
+  const discovery = spawn.mock.calls.filter(
+    ([id, options]) =>
+      id === "claude" && options?.args?.includes("--safe-mode"),
+  );
+  expect(discovery.length).toBeGreaterThan(0);
+  for (const [, options] of discovery) {
+    expect(options?.secrets).toContain("agent-env");
+    expect(options).not.toHaveProperty("envAgent");
+  }
+});
+
 it("offers the model catalog without the picker, discovering it once for concurrent callers", async () => {
   const { spawn, sessions } = discoverable();
   const setup = new ClaudeSetup(spawn);
