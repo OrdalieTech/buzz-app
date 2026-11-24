@@ -143,6 +143,7 @@ import {
 import { isApplePlatform } from "../shortcuts/format";
 import { macWebKit, webKit } from "./mac-webkit";
 import { useMessageAutocorrectPreference } from "./autocorrect-preference";
+import { useMarkdownAsTypedPreference } from "./markdown-input-preference";
 import { composerLinkUrl } from "./composer-link";
 import { messageLinkParts } from "./message-link-parts";
 import { updatePlainLinks, type PlainLink } from "./composer-link-edit";
@@ -479,6 +480,7 @@ export function EditableInput({
   const mount = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const { enabled: autocorrect } = useMessageAutocorrectPreference();
+  const { enabled: markdownAsTyped } = useMarkdownAsTypedPreference();
   const current = useRef({
     draft,
     decorationsFor,
@@ -498,6 +500,7 @@ export function EditableInput({
     disabled,
     placeholder,
     autocorrect,
+    markdownAsTyped,
   });
   current.current = {
     draft,
@@ -518,6 +521,7 @@ export function EditableInput({
     disabled,
     placeholder,
     autocorrect,
+    markdownAsTyped,
   };
   const tokenClassName = styles.token ?? "";
   const tokenClass = useRef(tokenClassName);
@@ -611,6 +615,11 @@ export function EditableInput({
     // `buzz:paste-plain` sent just before its command, marks it as raw.
     let plainPaste = false;
     const editable = () => !current.current.disabled && !locked.current;
+    // A chat composer whose device keeps Markdown as typed is plain source: no
+    // typed conversion and no formatting commands, as the toolbar is hidden.
+    const markdownAsTyped = () =>
+      current.current.markdownAsTyped &&
+      current.current.markdownMode === "chat";
     // Selection events and completion read value/selection several times per
     // keystroke; projectComposerDocument memoizes per immutable document.
     const projection = () => projectComposerDocument(editor.state.doc);
@@ -2422,6 +2431,7 @@ export function EditableInput({
           // never reaches this rule; a marker line has no completion trigger.
           if (
             from === to &&
+            !markdownAsTyped() &&
             (composerFenceDelimiters.has(text) ||
               composerPrefixDelimiters.has(text) ||
               composerInlineDelimiters.has(text)) &&
@@ -2480,10 +2490,10 @@ export function EditableInput({
             (current.current.markdownMode !== "document" ||
               format.mark !== "spoiler")
           ) {
-            if (!event.repeat) toggleFormat(format.mark);
+            if (!event.repeat && !markdownAsTyped()) toggleFormat(format.mark);
             return true;
           }
-          if (primary && linkBindings.some(pressed)) {
+          if (primary && !markdownAsTyped() && linkBindings.some(pressed)) {
             const edit = editLink();
             if (
               edit &&
@@ -2696,7 +2706,7 @@ export function EditableInput({
             );
             if (format) {
               event.preventDefault();
-              toggleFormat(format.mark);
+              if (!markdownAsTyped()) toggleFormat(format.mark);
               return true;
             }
             if (event.inputType.startsWith("history")) {

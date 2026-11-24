@@ -76,9 +76,12 @@ export function ComposerFormattingTools({
   editLink,
   trailing,
   persistent = false,
+  formatting = true,
   markdownMode = "chat",
 }: {
   children: ReactNode;
+  /** False drops the formatting toggle and list, as when Markdown stays as typed. */
+  formatting?: boolean;
   /** Document surfaces expose the formatting list without a toggle. */
   persistent?: boolean;
   markdownMode?: ComposerMarkdownMode;
@@ -95,7 +98,7 @@ export function ComposerFormattingTools({
       ? options.filter(([label]) => label !== "Spoiler")
       : options;
   const [toggled, setOpen] = useState(false);
-  const open = persistent || toggled;
+  const open = formatting && (persistent || toggled);
   const reduceMotion = useReducedMotion();
   const [keyboardToggle, setKeyboardToggle] = useState(false);
   const instant = reduceMotion || keyboardToggle;
@@ -234,15 +237,17 @@ export function ComposerFormattingTools({
             transition={transition}
           >
             {children}
-            <motion.div
-              className={styles.fixed}
-              initial={instant ? false : { x: -8, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              exit={{ x: instant ? 0 : -8, opacity: 0 }}
-              transition={transition}
-            >
-              {formatToggle}
-            </motion.div>
+            {formatting && (
+              <motion.div
+                className={styles.fixed}
+                initial={instant ? false : { x: -8, opacity: 0 }}
+                animate={{ x: 0, opacity: 1 }}
+                exit={{ x: instant ? 0 : -8, opacity: 0 }}
+                transition={transition}
+              >
+                {formatToggle}
+              </motion.div>
+            )}
             {trailing}
           </ToolGroup>
         )}

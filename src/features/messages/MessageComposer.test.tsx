@@ -122,6 +122,7 @@ import { fromMarkdown } from "mdast-util-from-markdown";
 import { setRememberAgentsPreference } from "./mention-preferences";
 import * as modelStorage from "./solo-model-picks-storage";
 import { setSendWithModEnterPreference } from "./send-key-preference";
+import { setMarkdownAsTypedPreference } from "./markdown-input-preference";
 import { setDefaultAgent } from "../solo/default-agent";
 import { ResourcePicker } from "../../bundled/repos/ResourcePicker";
 import { entityHref } from "../repos/routes";
@@ -754,6 +755,22 @@ it("publishes typing for text edits but not caret-driven token expansion", () =>
   expect(send).not.toHaveBeenCalled();
   h.fill(`${text}x`);
   expect(send).toHaveBeenCalledTimes(1);
+});
+
+it("hides the formatting toggle while this device keeps Markdown as typed, live", () => {
+  try {
+    mount();
+    const toggle = () =>
+      screen.queryByRole("button", { name: "Toggle formatting" });
+    expect(toggle()).toBeVisible();
+    act(() => setMarkdownAsTypedPreference(true));
+    expect(toggle()).toBeNull();
+    act(() => setMarkdownAsTypedPreference(false));
+    expect(toggle()).toBeVisible();
+  } finally {
+    act(() => setMarkdownAsTypedPreference(false));
+    localStorage.removeItem("buzz-message-markdown-as-typed.v1");
+  }
 });
 
 it("types into a long chip-heavy draft without redrawing its link chips", async () => {

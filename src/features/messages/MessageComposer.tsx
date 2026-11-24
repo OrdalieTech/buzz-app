@@ -174,6 +174,7 @@ import { ComposerAccessories } from "../conversation/ComposerAccessories";
 import { ComposerTools } from "../conversation/ComposerTools";
 import { ComposerLinkDialog } from "./ComposerLinkDialog";
 import { ComposerFormattingTools } from "./ComposerFormattingTools";
+import { useMarkdownAsTypedPreference } from "./markdown-input-preference";
 import { AgentsContext, useSessionState } from "../agents/react";
 import { ComposerModels, type DraftPicks } from "./ComposerModels";
 import type { MentionPicks } from "../relay/messages";
@@ -1291,6 +1292,7 @@ function Composer({
   );
   const [linkEdit, setLinkEdit] = useState<ComposerLinkEdit | null>(null);
   if (!active && linkEdit) setLinkEdit(null);
+  const { enabled: markdownAsTyped } = useMarkdownAsTypedPreference();
   const [activeFormats, setActiveFormats] = useState<readonly ComposerFormat[]>(
     [],
   );
@@ -4637,6 +4639,7 @@ function Composer({
             <div className={styles.composerToolRow}>
               {active && (
                 <ComposerFormattingTools
+                  formatting={!markdownAsTyped}
                   disabled={editingDisabled}
                   singleRow={chatPresentation || !!trailingTool}
                   // Conversation controls (Berd's project) follow the tools.

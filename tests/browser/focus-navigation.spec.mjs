@@ -29,6 +29,31 @@ async function focusKeys(page) {
   };
 }
 
+// With typed Markdown kept as source, the composer leaves ⌘K/Ctrl+K to Search.
+test("search opens from a composer that keeps Markdown as typed", async ({
+  page,
+  app,
+}) => {
+  await page.addInitScript(() =>
+    localStorage.setItem("buzz-message-markdown-as-typed.v1", "on"),
+  );
+  await open(page, app);
+  const { mod } = await focusKeys(page);
+  const alpha = page
+    .locator("[data-main-workspace], [data-solo-focus-pane]")
+    .getByRole("textbox", { name: "Message #Alpha", exact: true });
+  await alpha.click();
+  await page.keyboard.type("**draft**");
+  await page.keyboard.press(`${mod}+k`);
+  const search = page.getByRole("dialog", { name: "Search Buzz", exact: true });
+  await expect(
+    search.getByRole("combobox", { name: "Search Buzz", exact: true }),
+  ).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(search).toHaveCount(0);
+  await expect(alpha).toHaveText("**draft**");
+});
+
 // Browser focus, modal dismissal and native editor selection require a real
 // browser. The app and broker are real; upstream relay traffic is modeled.
 test("search, composer and split-pane keyboard focus preserve both drafts", async ({
