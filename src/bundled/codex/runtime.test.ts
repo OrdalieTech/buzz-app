@@ -3181,6 +3181,36 @@ it("starts a turn on the model its owner picked, at an effort that model support
     { model: "test-model", effort: "low" },
   ]);
 });
+it("starts a routed turn on its route's choice, and nothing when it was stopped", async () => {
+  const f = fixture();
+  const route = vi.fn(async () => ({ model: "deep-model", effort: "xhigh" }));
+  await f.runtime.run({ ...f.delivery("@Codex", "a".repeat(64)), route });
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(1));
+  expect(route).toHaveBeenCalledTimes(1);
+  expect(f.starts()[0]?.params).toMatchObject({
+    model: "deep-model",
+    effort: "xhigh",
+  });
+  const stopped = vi.fn(async () => undefined);
+  await f.runtime.run({
+    ...f.delivery("@Codex", "b".repeat(64)),
+    route: stopped,
+  });
+  await vi.waitFor(() => expect(stopped).toHaveBeenCalled());
+  await f.runtime.run(f.delivery("@Codex next", "c".repeat(64)));
+  await vi.waitFor(() => expect(f.starts()).toHaveLength(2));
+  // The next turn Codex starts is the plain one.
+  expect(JSON.stringify(f.starts()[1]?.params)).toContain("@Codex next");
+});
+it("shows a saved route no router offers as Codex's default", async () => {
+  const f = fixture();
+  const agent = {
+    key: pubkey,
+    pubkey,
+    config: { workspace: "/tmp/codex-test", model: "route:gone" },
+  } as Agent;
+  expect((await f.runtime.preview(agent)).current).toBe("test-model");
+});
 it("runs a mid-turn pick that differs from the running turn as the next turn instead of steering", async () => {
   const f = fixture();
   const settings = (wire: Wire) => {

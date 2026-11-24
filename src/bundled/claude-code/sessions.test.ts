@@ -884,6 +884,36 @@ it("runs a turn with the model and effort it was delivered with, starting over i
   expect(fresh?.efforts).toEqual(["low", "high"]);
 });
 
+it("asks a model route for a new turn's pick, and not for a steer", async () => {
+  const { pool, claudes } = sessions({ hold: true });
+  const route = vi.fn(async () => ({ model: "haiku", effort: "low" }));
+  const first = pool.deliver("c/root", "first", 1, { route });
+  await flush();
+  const process = claudes()[0];
+  if (!process) throw new Error("no process");
+  const steer = vi.fn(async () => ({ model: "sonnet" }));
+  const second = pool.deliver("c/root", "plain", 2, {
+    steer: "steer",
+    route: steer,
+  });
+  await flush();
+  expect(process.prompts).toEqual(["first", "steer"]);
+  expect(process.models).toEqual(["haiku", "haiku"]);
+  expect(route).toHaveBeenCalledTimes(1);
+  expect(steer).not.toHaveBeenCalled();
+  process.finish();
+  await expect(first).resolves.toEqual({ ok: true });
+  await expect(second).resolves.toEqual({ ok: true });
+});
+
+it("sends nothing when a model route's choice was stopped", async () => {
+  const { pool, claudes } = sessions();
+  await expect(
+    pool.deliver("c/root", "hello", 1, { route: async () => undefined }),
+  ).resolves.toEqual({ ok: true, undelivered: true });
+  expect(claudes().flatMap((process) => process.prompts)).toEqual([]);
+});
+
 it("runs any number of conversations at once", async () => {
   const { pool, live } = sessions({ hold: true });
   for (let index = 0; index < 12; index++)

@@ -4,6 +4,7 @@
 // into Buzz.
 import type { ModelChoice } from "../../features/agents/ModelPicker";
 import { withProviderWords } from "../../features/agents/failure-words";
+import { routeOf } from "../../features/agents/model-routes";
 import type {
   ProtectedSpawn,
   ReviewPrompt,
@@ -283,9 +284,12 @@ export class GooseSetup {
     // A provider not set up offers only the model the agent names.
     const ready = Boolean(id && !listed?.needs);
     const offered = ready ? await this.models(id ?? "") : [];
-    // A model its provider does not list is still the one it runs on.
+    // A model its provider does not list is still the one it runs on; a
+    // saved route is the current choice, and the agents service lists it.
     const named =
-      !current || offered.some((model) => model.id === current)
+      !current ||
+      routeOf(current) ||
+      offered.some((model) => model.id === current)
         ? offered
         : [{ id: current, label: current }, ...offered];
     // Without levels a model offers no slider, so a failed read costs only it.

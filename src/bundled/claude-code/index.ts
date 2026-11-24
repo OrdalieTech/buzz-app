@@ -15,6 +15,7 @@ import { ClaudeLogoIcon } from "../../shared/design-system/icons";
 import { claudeRun, TYPE_ID } from "./run";
 import {
   followRecommended,
+  onAutomatic,
   recommendedRun,
 } from "../../features/agents/recommended";
 import type { AgentHandle } from "../../features/agents/service";
@@ -25,6 +26,7 @@ import { ClaudeRuntime, type Config, config, DEFAULT_CONFIG } from "./runtime";
 import { ClaudeSetup, withScript } from "./setup";
 import { createTabs } from "./tabs";
 import { targetKey } from "../../features/navigation/targets";
+import { activeRoute, routeLabel } from "../../features/agents/model-routes";
 import type { ClaudeConnection } from "./ClaudeSettings";
 import { readUsage } from "./usage";
 import { usageOn } from "../../features/agents/standalone-sessions";
@@ -317,12 +319,19 @@ export const apply: PluginModule["apply"] = (ctx) => {
         { id: "thinking", label: "Thinking", isOverride: Boolean(effort) },
       ];
     },
-    summary: (agent) =>
-      followRecommended(
+    summary: (agent) => {
+      const { model } = followRecommended(
         agent.config,
         config(agent.config),
         recommended.current(),
-      ).model || "Claude",
+      );
+      return (
+        activeRoute(TYPE_ID, model, onAutomatic(agent.config, TYPE_ID))
+          ?.label ??
+        routeLabel(TYPE_ID, model) ??
+        (model || "Claude")
+      );
+    },
     ...(spawn &&
       readFile && {
         usage: async (agent, { since, signal }) => {

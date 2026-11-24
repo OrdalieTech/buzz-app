@@ -12,6 +12,11 @@ import { afterEach, expect, it, vi } from "vitest";
 import { StrictMode, useState } from "react";
 import { ModelPicker, type ModelChoice } from "./ModelPicker";
 import {
+  type ModelRouter,
+  resetModelRoutesForTests,
+  setModelRouters,
+} from "./model-routes";
+import {
   DeepSeekLogoIcon,
   GrokLogoIcon,
   ZaiLogoIcon,
@@ -21,7 +26,10 @@ import {
   GoogleLogoIcon,
 } from "../../shared/design-system/icons";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetModelRoutesForTests();
+});
 
 it.each([
   ["Gemini 3 Pro", "Gemini", GoogleLogoIcon],
@@ -996,3 +1004,103 @@ it.each([false, true])(
     expect(onChange).not.toHaveBeenCalled();
   },
 );
+
+const routes = (exclusive = false): ModelRouter => ({
+  id: "test",
+  routes: (harness) =>
+    harness === "claude-code"
+      ? {
+          routes: [
+            {
+              id: "auto-balanced",
+              label: "Auto Balanced",
+              description: "Opus, Sonnet",
+            },
+            { id: "auto-premium", label: "Auto Premium" },
+          ],
+          exclusive,
+        }
+      : undefined,
+  select: async () => undefined,
+});
+
+it.each([false, true])(
+  "lists a harness's model routes beside Default (grouped: %s)",
+  async (groupByFamily) => {
+    setModelRouters([routes()]);
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <ModelPicker
+        harness="claude-code"
+        groupByFamily={groupByFamily}
+        models={[
+          { id: "opus", label: "Claude Opus" },
+          { id: "sonnet", label: "Claude Sonnet" },
+        ]}
+        value="route:auto-balanced"
+        defaultLabel="Claude"
+        onChange={onChange}
+      />,
+    );
+    const trigger = groupByFamily
+      ? screen.getByRole("button", { name: /^Model:/ })
+      : control();
+    expect(trigger).toHaveTextContent("Auto Balanced");
+    // A split arrow marks a route, in either menu.
+    const split = ".tabler-icon-arrows-split-2";
+    expect(trigger.querySelector(split)).not.toBeNull();
+    await user.click(trigger);
+    const role = groupByFamily ? "menuitemradio" : "option";
+    const rows = await screen.findAllByRole(role);
+    expect(rows.slice(0, 3).map((row) => row.textContent)).toEqual([
+      expect.stringContaining("Default"),
+      expect.stringContaining("Auto Balanced"),
+      expect.stringContaining("Auto Premium"),
+    ]);
+    expect(rows.map((row) => Boolean(row.querySelector(split)))).toEqual(
+      rows.map((_, index) => index === 1 || index === 2),
+    );
+    await user.click(screen.getByRole(role, { name: /Auto Premium/ }));
+    expect(onChange).toHaveBeenCalledExactlyOnceWith("route:auto-premium");
+  },
+);
+
+it("shows only routes and the pinned model when the routes are exclusive", async () => {
+  setModelRouters([routes(true)]);
+  const user = userEvent.setup();
+  render(
+    <ModelPicker
+      harness="claude-code"
+      models={[
+        { id: "opus", label: "Claude Opus" },
+        { id: "sonnet", label: "Claude Sonnet" },
+      ]}
+      value="opus"
+      defaultLabel="Claude"
+      onChange={vi.fn()}
+    />,
+  );
+  await user.click(control());
+  expect(
+    (await screen.findAllByRole("option")).map((row) => row.textContent),
+  ).toEqual([
+    "Default",
+    "Auto BalancedOpus, Sonnet",
+    "Auto Premium",
+    "Claude Opus",
+  ]);
+});
+
+it("names a saved route whose plugin is off", () => {
+  render(
+    <ModelPicker
+      harness="claude-code"
+      models={[{ id: "opus", label: "Claude Opus" }]}
+      value="route:auto-balanced"
+      defaultLabel="Claude"
+      onChange={vi.fn()}
+    />,
+  );
+  expect(control()).toHaveTextContent("Unavailable route");
+});

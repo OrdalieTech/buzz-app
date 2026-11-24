@@ -16,6 +16,7 @@ import {
 } from "../../features/agent-harness/session-scope";
 import { protectionTranscript } from "./protection-transcript";
 import { compactAt } from "../../features/agents/compact-at";
+import { launchModel, routeOf } from "../../features/agents/model-routes";
 import type { PRESET } from "../../features/agents/recommended";
 import { fileStore } from "../../features/agents/state";
 import type { AgentExecution } from "../../features/agents/execution";
@@ -271,9 +272,11 @@ type Entry = {
  * compaction. */
 const where = ({ workspace, model, effort, ...config }: Config) => {
   const tokens = compactAt(config.compactAt);
+  // A saved model route picks per turn; the process starts on the default.
+  const launch = launchModel(model.trim());
   return {
     cwd: workspace,
-    ...(model.trim() ? { model: model.trim() } : {}),
+    ...(launch ? { model: launch } : {}),
     ...(effort ? { effort } : {}),
     ...(tokens ? { compactAt: tokens } : {}),
   };
@@ -761,7 +764,8 @@ export class ClaudeRuntime {
   /** `models`, saying whether Claude itself lists the current model. */
   private async catalog(agent: AgentKey) {
     const entry = this.agents.get(agent);
-    const configured = entry?.config.model.trim();
+    const saved = entry?.config.model.trim();
+    const configured = saved && launchModel(saved);
     const {
       models: listed,
       model: reported,
@@ -781,6 +785,9 @@ export class ClaudeRuntime {
         ...resting(offeredEfforts),
       };
     });
+    // A saved route is the current choice; the agents service lists it.
+    if (saved && routeOf(saved))
+      return { current: saved, models, listed: true };
     const current =
       offered.find(
         (model) => own === model.value || own === model.resolvedModel,
@@ -1277,6 +1284,7 @@ export class ClaudeRuntime {
       channelId,
       model,
       effort,
+      route: chooseModel,
       synced,
       team,
       workingUntil,
@@ -1632,6 +1640,7 @@ export class ClaudeRuntime {
             ...(model ? { model } : {}),
             ...(effort ? { effort } : {}),
           },
+          ...(chooseModel ? { route: chooseModel } : {}),
           admit,
           // Mentions already show the host's fallback under the request.
           ...this.turnAttribution(
@@ -1986,6 +1995,8 @@ export class ClaudeRuntime {
   private async refusal(agent: AgentKey, kept: string | undefined) {
     if (!kept) return undefined;
     const { current, models, listed } = await this.catalog(agent);
+    // A route picks its own effort each turn.
+    if (routeOf(current)) return undefined;
     const own = models.find((model) => model.id === current);
     // A model Claude doesn't list has no levels to check the effort against.
     if (!listed || !own)

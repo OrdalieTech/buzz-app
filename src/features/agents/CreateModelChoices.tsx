@@ -3,6 +3,7 @@ import { ModelPicker, type ModelChoice } from "./ModelPicker";
 
 /** Compact model field; catalogs and config changes stay with the type. */
 export function CreateModelChoices({
+  harness,
   showEffort = true,
   effort,
   effortLabel,
@@ -20,6 +21,8 @@ export function CreateModelChoices({
   error,
   retry,
 }: {
+  /** The agent type's id: its plugins' model routes join the menu. */
+  harness?: string | undefined;
   showEffort?: boolean;
   effort?: string | undefined;
   effortLabel?: string | undefined;
@@ -44,6 +47,7 @@ export function CreateModelChoices({
           {...(showEffort && onEffortChange
             ? { effort, effortLabel, onEffortChange }
             : {})}
+          harness={harness}
           includeDefault={includeDefault}
           defaultModel={defaultModel}
           appearance={modelAppearance ?? "outlined"}

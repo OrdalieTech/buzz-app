@@ -5,6 +5,7 @@ import {
   object,
   validCatalogEnvelope,
 } from "./catalog-envelope";
+import { sharedModel } from "./synced-route";
 
 export type SharedAgent = {
   /** `owner:d`, unique per publisher and catalog slug. */
@@ -48,7 +49,10 @@ export function sharedAgents(events: readonly EventData[]): SharedAgent[] {
           name: String(body.display_name).trim(),
           owner: event.pubkey,
           ...(picture?.startsWith("https:") ? { picture } : {}),
-          model: typeof body.model === "string" ? body.model.trim() : "",
+          model: sharedModel(
+            typeof body.model === "string" ? body.model.trim() : "",
+            body.model_route,
+          ),
           ...(typeof body.runtime === "string" && body.runtime.trim()
             ? { runtime: body.runtime.trim() }
             : {}),

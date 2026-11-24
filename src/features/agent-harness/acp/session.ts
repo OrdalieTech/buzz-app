@@ -12,6 +12,11 @@ type Waiter = (settled: Settled) => void;
 
 /** A session's settings, as `session/new` and `session/set_config_option`
  * return them. */
+/** Chooses a turn's model and effort as it starts (`Delivery.route`);
+ * undefined sends nothing. */
+export type TurnRoute = () => Promise<
+  Readonly<{ model?: string; effort?: string }> | undefined
+>;
 export type ConfigOptions = {
   configOptions?: {
     category?: string | null;
@@ -70,6 +75,7 @@ export class AcpSession {
     waiter?: Waiter;
     delivered?: () => void;
     accepted?: () => void;
+    route?: TurnRoute;
   }[] = [];
   /** The model the running turn runs on; empty is its provider's default. */
   private model = "";
@@ -163,6 +169,8 @@ export class AcpSession {
     effort?: string,
     /** A synced level the turn must run on, or it fails before its prompt. */
     kept?: string,
+    /** Chooses `model` and `effort` as a turn for this message starts. */
+    route?: TurnRoute,
   ): Promise<Settled> {
     if (this.closed)
       return Promise.resolve({ ok: false, error: "The session was closed" });
@@ -184,7 +192,7 @@ export class AcpSession {
       (!model || model === this.model) &&
       (!effort || effort === this.level)
     )
-      void this.steer(text, activity, waiter, model, effort, kept);
+      void this.steer(text, activity, waiter, model, effort, kept, route);
     else {
       this.queue.push({
         text,
@@ -196,6 +204,7 @@ export class AcpSession {
         ...(model ? { model } : {}),
         ...(effort ? { effort } : {}),
         ...(kept ? { kept } : {}),
+        ...(route ? { route } : {}),
       });
       this.acknowledge(activity, waiter, true);
       void this.pump();
@@ -323,6 +332,7 @@ export class AcpSession {
     model?: string,
     effort?: string,
     kept?: string,
+    route?: TurnRoute,
   ) {
     this.steering.add(waiter);
     const prior = this.steered;
@@ -380,8 +390,9 @@ export class AcpSession {
           waiter,
           ...(model ? { model } : {}),
           ...(effort ? { effort } : {}),
-          // As a turn of its own, it is checked like any other.
+          // As a turn of its own, it is checked and routed like any other.
           ...(kept ? { kept } : {}),
+          ...(route ? { route } : {}),
         });
         this.acknowledge(activity, waiter, true);
       }
@@ -439,13 +450,25 @@ export class AcpSession {
           waiter,
           delivered,
           accepted,
+          route,
         } = this.queue.shift() ?? {
           text: "",
         };
         let sent = false;
         try {
           await this.beforeTurn?.();
-          await this.select(model, effort);
+          // A model route chooses as its turn starts.
+          const chosen = route ? await route() : { model, effort };
+          if (!chosen) {
+            if (waiter) this.discard(waiter);
+            continue;
+          }
+          // A level can't be cleared in place, so a routed turn that names
+          // none runs on, and records, the one the session has.
+          await this.select(
+            chosen.model,
+            chosen.effort || (route ? this.level || undefined : undefined),
+          );
           // A harness may ignore a level its model lacks, and keep one across
           // a model switch without its being set again.
           if (kept && !this.levels.includes(kept))

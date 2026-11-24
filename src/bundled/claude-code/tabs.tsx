@@ -39,6 +39,14 @@ import { Dialog } from "../../shared/design-system/ui/Dialog";
 import { useToastNotification } from "../../shared/design-system/ui/Toast";
 import { Accordion } from "../../shared/design-system/ui/Accordion";
 import { ModelPicker } from "../../features/agents/ModelPicker";
+import {
+  activeRoute,
+  routeLabel,
+  routeModel,
+  routeOf,
+  useInitialRoute,
+  useModelRoutes,
+} from "../../features/agents/model-routes";
 import { AISettings, runsOnDetails } from "../../features/agents/AISettings";
 import { CompactionField } from "../../features/agents/Compaction";
 import { withCompactAt } from "../../features/agents/compact-at";
@@ -474,6 +482,12 @@ export function createTabs({
       defaults.subscribe,
       defaults.snapshot,
     );
+    useInitialRoute(
+      "claude-code",
+      !props.agent && !onRecommended(config),
+      current.model,
+      (model) => onChange({ ...current, model, effort: "" }),
+    );
     const ready =
       state.status?.state === "ready" &&
       !state.running &&
@@ -508,6 +522,7 @@ export function createTabs({
     return (
       <CreateModelChoices
         {...props}
+        harness={execution?.remote ? undefined : "claude-code"}
         models={modelChoices(state.models)}
         value={current.model}
         defaultModel={
@@ -536,8 +551,9 @@ export function createTabs({
             ...current,
             model,
             effort:
-              state.models.length === 0 ||
-              efforts.some((level) => level.id === current.effort)
+              !routeOf(model) &&
+              (state.models.length === 0 ||
+                efforts.some((level) => level.id === current.effort))
                 ? current.effort
                 : "",
           });
@@ -598,15 +614,17 @@ export function createTabs({
       state.models,
       current.effort,
     );
+    const routed = Boolean(routeOf(model));
     return (
       <Select
         label="Thinking"
-        valueLabel={current.effort ? undefined : "Automatic"}
-        valueSuffix={current.effort ? undefined : " · Default"}
+        valueLabel={routed ? "Auto" : current.effort ? undefined : "Automatic"}
+        valueSuffix={current.effort || routed ? undefined : " · Default"}
         variant="compact"
         value={current.effort}
         groups={[{ label: "", options: effortOptions }]}
         disabled={
+          routed ||
           disabled ||
           state.status?.state !== "ready" ||
           Boolean(state.running) ||
@@ -1380,6 +1398,7 @@ export function createTabs({
       try {
         if (
           settingsHost?.proposedModelOrEffort &&
+          !routeOf(config.model) &&
           (config.model || config.effort)
         ) {
           const models = remote ? [] : await setup.catalog();
@@ -1415,6 +1434,12 @@ export function createTabs({
     // Inert in a build that recommends nothing for Claude.
     const following =
       onRecommended(draft) && candidatesFor("claude-code").length > 0;
+    // The route Automatic runs on, while a plugin offers one.
+    useModelRoutes("claude-code");
+    // A remote target runs on its own models: no routes there.
+    const automaticRoute = remote
+      ? undefined
+      : activeRoute("claude-code", "", true);
     const found = useRecommended(following);
     // A remote target runs Recommended on its own default.
     const resolved = remote ? null : found;
@@ -1429,11 +1454,14 @@ export function createTabs({
     const describe = (config: Config, group: SettingGroup) => {
       if (group === "model") {
         const model = config.model
-          ? modelName(config.model, setupState.models)
+          ? (routeLabel("claude-code", config.model) ??
+            modelName(config.model, setupState.models))
           : remote
             ? "Target default"
             : `${providerDefaultLabel(providerDefaults.model, setupState.models)} · Default`;
-        return `${model} · ${config.effort ? effortLabel(config.effort) : "Automatic"} thinking`;
+        return routeOf(config.model)
+          ? model
+          : `${model} · ${config.effort ? effortLabel(config.effort) : "Automatic"} thinking`;
       }
       if (group === "scope")
         return config.scope === "community"
@@ -1496,6 +1524,7 @@ export function createTabs({
     const modelControl = (
       <>
         <ModelPicker
+          harness={remote ? undefined : "claude-code"}
           allowCustomModel
           models={modelChoices(setupState.models)}
           value={draft.model}
@@ -1529,9 +1558,11 @@ export function createTabs({
               offRecommended({
                 ...draft,
                 model,
+                // A route picks each turn's thinking itself.
                 effort:
-                  setupState.models.length === 0 ||
-                  next.some((level) => level.id === draft.effort)
+                  !routeOf(model) &&
+                  (setupState.models.length === 0 ||
+                    next.some((level) => level.id === draft.effort))
                     ? draft.effort
                     : "",
               }),
@@ -1540,10 +1571,22 @@ export function createTabs({
         />
         <Select
           label="Thinking"
-          valueLabel={draft.effort ? undefined : "Automatic"}
-          valueSuffix={draft.effort ? undefined : " · Default"}
+          valueLabel={
+            routeOf(draft.model)
+              ? "Auto"
+              : draft.effort
+                ? undefined
+                : "Automatic"
+          }
+          valueSuffix={
+            draft.effort || routeOf(draft.model) ? undefined : " · Default"
+          }
           variant="preference"
           value={draft.effort}
+          disabled={Boolean(routeOf(draft.model))}
+          {...(routeOf(draft.model) && {
+            description: "Chosen for each conversation's turns",
+          })}
           groups={[{ label: "", options: effortOptions }]}
           onValueChange={(effort) =>
             setDraft(offRecommended({ ...draft, effort }))
@@ -1604,6 +1647,7 @@ export function createTabs({
                   {...runsOnDetails(
                     { title: "Claude", icon: ClaudeLogoIcon },
                     resolved,
+                    automaticRoute,
                   )}
                   onChange={(on) =>
                     // Manual starts from the recommendation it ran on.
@@ -1611,7 +1655,14 @@ export function createTabs({
                       on
                         ? readConfig(withRecommended(draft))
                         : offRecommended(
-                            followRecommended(draft, draft, resolved),
+                            // Or from its Automatic route.
+                            automaticRoute
+                              ? {
+                                  ...draft,
+                                  model: routeModel(automaticRoute.id),
+                                  effort: "",
+                                }
+                              : followRecommended(draft, draft, resolved),
                           ),
                     )
                   }

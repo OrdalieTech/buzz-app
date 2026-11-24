@@ -10,7 +10,7 @@
 import { absoluteWorkspace } from "../../../bundled/codex/config";
 import type { SessionAction } from "../../agents/service";
 import type { AcpProcess } from "./process";
-import type { AcpSession } from "./session";
+import type { AcpSession, TurnRoute } from "./session";
 import { codeOf, errorMessage } from "./steps";
 import type {
   ActivityReceipt,
@@ -283,6 +283,9 @@ export class AgentSessions {
   >();
   /** Conversations `exclusive` holds, which messages wait for. */
   private readonly held = new Map<string, Held>();
+  /** Conversations whose idle session a message keeps while its model route
+   * chooses, so one that comes meanwhile does not go first. */
+  private readonly choosing = new Map<string, Promise<void>>();
   /** Conversations whose last held work left a session not yet retired. */
   private readonly outliving = new Map<string, Outliving>();
   /** Holds waiting their turn, by conversation, which `interrupt` ends. */
@@ -367,7 +370,9 @@ export class AgentSessions {
    * takes that name;
    * `model`, one of the agent's
    * provider's, and `effort`, one of its thinking levels, are what its turn
-   * runs on, and `kept`, a synced level, one it must run on. Once `signal` aborts, it stops
+   * runs on, and `kept`, a synced level, one it must run on; `route`
+   * chooses them instead for a turn it starts (`Delivery.route`). Once
+   * `signal` aborts, it stops
    * waiting for a session to open, which is then kept for the next message,
    * and sends nothing. */
   async deliver(
@@ -383,6 +388,7 @@ export class AgentSessions {
       model,
       effort,
       kept,
+      route,
       ...activity
     }: Readonly<{
       current?: () => boolean;
@@ -393,79 +399,122 @@ export class AgentSessions {
       model?: string;
       effort?: string;
       kept?: string;
+      route?: TurnRoute;
     }> &
       ActivityReceipt = {},
   ): Promise<Settled> {
-    for (;;) {
-      if (current && !current()) return { ok: true, undelivered: true };
-      if (this.disposed) return { ...this.stopped, undelivered: true };
-      // One that arrives while `exclusive` holds the conversation waits.
-      const held = this.held.get(key);
-      if (held) {
-        try {
-          await abortable(held.done, signal);
-        } catch {
-          return this.late;
-        }
-        continue;
-      }
-      // Or while a session held work left running has yet to exit.
-      const outliving = this.outliving.get(key);
-      if (outliving) {
-        if (outliving.failed)
-          return { ok: false, error: this.unconfirmed, undelivered: true };
-        try {
-          await abortable(
-            Promise.race([outliving.settled, this.stopping]),
-            signal,
-          );
-        } catch {
-          return this.late;
-        }
-        continue;
-      }
-      // A message that arrives while its conversation's session opens uses it.
-      const opening = this.opening.get(key);
-      if (opening) {
-        // The session stays shared; only this message gives up on it.
-        try {
-          await abortable(
-            opening.catch(() => undefined),
-            signal,
-          );
-        } catch {
-          return this.late;
-        }
-        continue;
-      }
-      const live = this.live.get(key);
-      if (!live) break;
-      if (
-        !live.session.open ||
-        (!live.session.busy && (this.stale(live) || this.leveled(live, effort)))
-      ) {
-        this.drop(key, live);
-        break;
-      }
-      // A harness that cannot take a new prompt in place needs a new session.
-      if (!live.session.busy && !live.process.repromptable) {
-        const { systemPrompt } = await this.options.launch(key);
-        if (this.live.get(key) !== live) continue;
-        if (systemPrompt !== live.systemPrompt) {
-          this.drop(key, live);
+    // This message's hold on an idle session while its route chooses: kept
+    // until it sends the turn, opens a session or gives up.
+    let release: (() => void) | undefined;
+    try {
+      for (;;) {
+        if (current && !current()) return { ok: true, undelivered: true };
+        if (this.disposed) return { ...this.stopped, undelivered: true };
+        // One that arrives while `exclusive` holds the conversation waits.
+        const held = this.held.get(key);
+        if (held) {
+          try {
+            await abortable(held.done, signal);
+          } catch {
+            return this.late;
+          }
           continue;
         }
+        // Or while a session held work left running has yet to exit.
+        const outliving = this.outliving.get(key);
+        if (outliving) {
+          if (outliving.failed)
+            return { ok: false, error: this.unconfirmed, undelivered: true };
+          try {
+            await abortable(
+              Promise.race([outliving.settled, this.stopping]),
+              signal,
+            );
+          } catch {
+            return this.late;
+          }
+          continue;
+        }
+        // A message that arrives while its conversation's session opens uses it.
+        const opening = this.opening.get(key);
+        if (opening) {
+          // The session stays shared; only this message gives up on it.
+          try {
+            await abortable(
+              opening.catch(() => undefined),
+              signal,
+            );
+          } catch {
+            return this.late;
+          }
+          continue;
+        }
+        // Or while another message chooses its model for the idle session.
+        const choosing = this.choosing.get(key);
+        if (choosing && !release) {
+          try {
+            await abortable(choosing, signal);
+          } catch {
+            return this.late;
+          }
+          continue;
+        }
+        const live = this.live.get(key);
+        if (!live) break;
+        // A turn on an idle session is chosen now, so its level is checked as
+        // a picked one is; a busy session's queue asks once the turn starts.
+        if (route && live.session.open && !live.session.busy) {
+          if (!release) {
+            let done!: () => void;
+            const held = new Promise<void>((resolve) => {
+              done = resolve;
+            });
+            this.choosing.set(key, held);
+            release = () => {
+              if (this.choosing.get(key) === held) this.choosing.delete(key);
+              done();
+            };
+          }
+          const chosen = await route();
+          if (!chosen) return { ok: true, undelivered: true };
+          ({ model, effort } = chosen);
+          route = undefined;
+          continue;
+        }
+        if (
+          !live.session.open ||
+          (!live.session.busy &&
+            (this.stale(live) || this.leveled(live, effort)))
+        ) {
+          this.drop(key, live);
+          break;
+        }
+        // A harness that cannot take a new prompt in place needs a new session.
+        if (!live.session.busy && !live.process.repromptable) {
+          const { systemPrompt } = await this.options.launch(key);
+          if (this.live.get(key) !== live) continue;
+          if (systemPrompt !== live.systemPrompt) {
+            this.drop(key, live);
+            continue;
+          }
+        }
+        return this.answer(
+          key,
+          live,
+          seen,
+          text,
+          { ...activity, ...(current ? { current } : {}) },
+          model,
+          effort,
+          kept,
+          route,
+        );
       }
-      return this.answer(
-        key,
-        live,
-        seen,
-        text,
-        { ...activity, ...(current ? { current } : {}) },
-        model,
-        effort,
-        kept,
-      );
+    } finally {
+      // Sending made the session busy, so a message waiting now queues
+      // behind this one. One that goes on to open a session reserves it
+      // below before a waiting one resumes.
+      release?.();
     }
     // Reserved before anything is awaited, so a message that comes meanwhile
     // waits for this session instead of opening another.
@@ -506,6 +555,7 @@ export class AgentSessions {
           model,
           effort,
           kept,
+          route,
         ),
       };
     })();
@@ -1116,6 +1166,7 @@ export class AgentSessions {
     model: string | undefined,
     effort?: string,
     kept?: string,
+    route?: TurnRoute,
   ) {
     const sent = live.session.send(
       text,
@@ -1129,6 +1180,7 @@ export class AgentSessions {
       model,
       effort,
       kept,
+      route,
     );
     // A final Buzz send can answer before the harness finishes its model work.
     void live.session.idle().then(() => {

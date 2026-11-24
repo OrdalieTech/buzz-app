@@ -110,6 +110,10 @@ type DeliveryOptions = Readonly<{
   refresh?: (fresh?: boolean) => Promise<string>;
   fresh?: () => Promise<string>;
   pick?: TurnPick;
+  /** Chooses `pick` for a turn this message starts, asked once a process
+   * would take it as a new turn (`Delivery.route`); a steer asks nothing.
+   * Undefined sends nothing. */
+  route?: () => Promise<TurnPick | undefined>;
   /** The thread whose history was supplied to a shared channel session. */
   contextRoot?: string;
   /** Rejects a turn the current settings can't start, asked after every
@@ -362,6 +366,7 @@ export class AgentSessions {
       refresh,
       fresh,
       pick = {},
+      route,
       contextRoot,
       admit,
       attribute,
@@ -414,6 +419,12 @@ export class AgentSessions {
         }
       if (attribute && !live.process.busy)
         await this.attribute(key, live, attribute);
+      // Its model route chooses for a new turn only.
+      if (route && !live.process.busy) {
+        const chosen = await route();
+        if (!chosen) return { ok: true, undelivered: true };
+        pick = chosen;
+      }
       if (current && !current()) return { ok: true, undelivered: true };
       if (this.disposed)
         return { ok: false, error: "Claude was stopped", undelivered: true };

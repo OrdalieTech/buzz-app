@@ -18,8 +18,10 @@ import { reviewModel } from "./security-review";
 import {
   candidatesFor,
   followRecommended,
+  onAutomatic,
   recommendationReady,
 } from "../../features/agents/recommended";
+import { activeRoute, routeLabel } from "../../features/agents/model-routes";
 import { AppServer, listModels } from "./rpc";
 import { CODEX_ROUTES, HARNESS } from "./gateway";
 /** How often Buzz's copy of Codex looks for a new release. */
@@ -282,12 +284,19 @@ export const apply: PluginModule["apply"] = (ctx) => {
       ];
     },
     migrationWarning: "Any commands Codex left running will stop.",
-    summary: (agent) =>
-      followRecommended(
+    summary: (agent) => {
+      const { model } = followRecommended(
         agent.config,
         config(agent.config),
         providerController.recommended(),
-      ).model || "Codex",
+      );
+      return (
+        activeRoute(TYPE_ID, model, onAutomatic(agent.config, TYPE_ID))
+          ?.label ??
+        routeLabel(TYPE_ID, model) ??
+        (model || "Codex")
+      );
+    },
     recommends: (candidate) => providerController.recommends(candidate),
     ...(spawn &&
       readFile && {

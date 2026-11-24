@@ -3,6 +3,7 @@ import {
   type SessionScope,
 } from "../../features/agent-harness/session-scope";
 import { compactAt } from "../../features/agents/compact-at";
+import { launchModel } from "../../features/agents/model-routes";
 import { PRESET } from "../../features/agents/recommended";
 
 export type Config = {
@@ -31,9 +32,12 @@ export type Model = {
   defaultReasoningEffort: string;
   supportedReasoningEfforts: { reasoningEffort: string; description: string }[];
 };
-/** Buzz owns model preferences; an unset choice follows Codex's recommendation. */
+/** Buzz owns model preferences; an unset choice follows Codex's
+ * recommendation, as does a saved model route outside the turn it picks. */
 export function resolveModel(selected: string, models: readonly Model[]) {
-  return selected || models.find((model) => model.isDefault)?.model;
+  return (
+    launchModel(selected) || models.find((model) => model.isDefault)?.model
+  );
 }
 /** A turn uses the first supported choice, then the selected model's default. */
 export function resolveEffort(

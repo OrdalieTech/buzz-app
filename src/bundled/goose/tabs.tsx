@@ -37,6 +37,13 @@ import {
   ModelPicker,
 } from "../../features/agents/ModelPicker";
 import {
+  activeRoute,
+  routeModel,
+  routeOf,
+  useInitialRoute,
+  useModelRoutes,
+} from "../../features/agents/model-routes";
+import {
   OpenedConversation,
   useOpenTranscript,
 } from "../../features/agents/OpenedConversation";
@@ -567,6 +574,7 @@ export function createTabs({
         {!hideModel && provider && (provider.configured || rows) && (
           <ModelPicker
             key={`models:${id}`}
+            harness="goose"
             groupByFamily
             modelLabelPrefixes={
               id.startsWith("databricks")
@@ -681,8 +689,13 @@ export function createTabs({
     disabled?: boolean;
     onChange(effort: string): void;
   }>) {
+    // A route picks each turn's level itself.
+    const routed = Boolean(routeOf(choice.model));
     const [efforts, retry] = useRead(
-      () => setup.efforts(choice),
+      () =>
+        routed
+          ? Promise.resolve({ current: "", levels: [] })
+          : setup.efforts(choice),
       `${choice.provider}\u0000${choice.model.trim()}:${revision}`,
     );
     const failed =
@@ -703,13 +716,20 @@ export function createTabs({
         variant={compact ? "compact" : "preference"}
         {...(compact && { align: "end" as const })}
         value={value}
-        {...(!value
+        {...(routed
           ? {
-              valueLabel: fallback ?? "Default",
-              ...(compact && fallback ? { valueSuffix: " · Default" } : {}),
+              valueLabel: "Auto",
+              ...(!compact && {
+                description: "Chosen for each conversation's turns",
+              }),
             }
-          : {})}
-        disabled={disabled}
+          : !value
+            ? {
+                valueLabel: fallback ?? "Default",
+                ...(compact && fallback ? { valueSuffix: " · Default" } : {}),
+              }
+            : {})}
+        disabled={routed || disabled}
         {...(failed && !compact ? { description: failed } : {})}
         groups={[
           {
@@ -1220,6 +1240,7 @@ export function createTabs({
   }
 
   function CreateModel({
+    agent,
     config,
     onChange,
     onReadyChange,
@@ -1230,6 +1251,12 @@ export function createTabs({
     // A pick here takes the agent off Recommended, from what it runs on.
     const resolved = useRecommended(onRecommended(config));
     const current = offRecommended(running(config, resolved));
+    useInitialRoute(
+      "goose",
+      !agent && !onRecommended(config),
+      current.model,
+      (model) => onChange({ ...current, model, effort: "" }),
+    );
     const [open, setOpen] = useState(false);
     const [listing, reload] = useRead(() => setup.providers(), "providers");
     const provider = current.provider || listing.value?.defaults.provider || "";
@@ -1254,7 +1281,7 @@ export function createTabs({
     useEffect(() => onReadyChange?.(ready), [onReadyChange, ready]);
     const [thinking] = useRead(
       () =>
-        provider && selectedModel
+        provider && selectedModel && !routeOf(selectedModel)
           ? setup.efforts({ provider, model: selectedModel })
           : Promise.resolve({ current: "", levels: [] }),
       `${provider}\u0000${selectedModel}`,
@@ -1289,6 +1316,7 @@ export function createTabs({
         >
           <ModelPicker
             compact
+            harness="goose"
             groupByFamily
             includeDefault={false}
             resetLabel="Use Goose default"
@@ -1404,6 +1432,9 @@ export function createTabs({
     // Inert in a build that recommends nothing for goose.
     const following = onRecommended(draft) && candidatesFor("goose").length > 0;
     const resolved = useRecommended(following);
+    // The route Automatic runs on, while a plugin offers one.
+    useModelRoutes("goose");
+    const automaticRoute = activeRoute("goose", "", true);
     const manual = (
       <>
         {settingsHost?.typeControl?.(configChanged)}
@@ -1413,7 +1444,14 @@ export function createTabs({
           rows
           value={draft}
           onChange={(choice) =>
-            setDraft(offRecommended({ ...draft, ...choice }))
+            setDraft(
+              offRecommended({
+                ...draft,
+                ...choice,
+                // A route picks each turn's level itself.
+                ...(routeOf(choice.model) ? { effort: "" } : {}),
+              }),
+            )
           }
         />
         <ThinkingField
@@ -1440,7 +1478,7 @@ export function createTabs({
             throw new Error(
               "Clear the model and thinking overrides to use the target’s defaults.",
             );
-          if (next.model) {
+          if (next.model && !routeOf(next.model)) {
             const provider =
               next.provider || (await setup.providers()).defaults.provider;
             if (
@@ -1499,13 +1537,23 @@ export function createTabs({
                   {...runsOnDetails(
                     { title: "Goose", icon: GooseLogoIcon },
                     resolved,
+                    automaticRoute,
                   )}
                   onChange={(on) =>
-                    // Manual starts from the recommendation it ran on.
+                    // Manual starts from the recommendation it ran on, or
+                    // from its Automatic route on that provider.
                     setDraft(
                       on
                         ? readConfig(withRecommended(draft))
-                        : offRecommended(running(draft, resolved)),
+                        : offRecommended(
+                            automaticRoute
+                              ? {
+                                  ...running(draft, resolved),
+                                  model: routeModel(automaticRoute.id),
+                                  effort: "",
+                                }
+                              : running(draft, resolved),
+                          ),
                     )
                   }
                 >

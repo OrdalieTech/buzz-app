@@ -18,9 +18,11 @@ import {
 } from "./runtime";
 import {
   type RecommendedCandidate,
+  onAutomatic,
   onRecommended,
   recommendedRun,
 } from "../../features/agents/recommended";
+import { activeRoute, routeLabel } from "../../features/agents/model-routes";
 import { REQUEST_TIMEOUT_MS } from "./goose";
 import { gooseRun } from "./run";
 import { readModelSettings } from "../../features/agents/model-settings";
@@ -201,7 +203,10 @@ export const apply: PluginModule["apply"] = (ctx) => {
     },
     summary: (agent) => {
       const { model, provider } = running(agent.config, recommended.current());
-      return [provider, model].filter(Boolean).join(" · ") || "Goose";
+      const route =
+        activeRoute(TYPE_ID, model, onAutomatic(agent.config, TYPE_ID))
+          ?.label ?? routeLabel(TYPE_ID, model);
+      return [provider, route ?? model].filter(Boolean).join(" · ") || "Goose";
     },
     sessions: {
       ready: (agentKey) => runtime.listed(agentKey),

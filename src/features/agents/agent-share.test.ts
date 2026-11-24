@@ -224,6 +224,43 @@ it("publishes a catalog entry the marketplace lists as it was shared", () => {
   ]);
 });
 
+it("shares a model route beside the model, so older readers run their default", async () => {
+  const definition = shareable(
+    agent({ ...saved, model: "route:auto-balanced" }),
+    echo,
+  );
+  expect(definition.model).toBe("route:auto-balanced");
+  const content = catalogContent(definition);
+  const body = JSON.parse(content);
+  expect(body.model).toBeUndefined();
+  expect(body.model_route).toBe("auto-balanced");
+  const event: EventData = {
+    id: "1".repeat(64),
+    pubkey: owner,
+    created_at: 10,
+    kind: 30175,
+    tags: [
+      ["d", pubkey],
+      ["shared", "true"],
+    ],
+    content,
+  };
+  expect(validCatalogEnvelope(event)).toBe(true);
+  expect(sharedAgents([event])[0]?.model).toBe("route:auto-balanced");
+  // A model an older version shared wins over a route left beside it.
+  expect(
+    sharedAgents([
+      { ...event, content: JSON.stringify({ ...body, model: "echo-2" }) },
+    ])[0]?.model,
+  ).toBe("echo-2");
+
+  const snapshot = snapshotJson(definition);
+  const exported = JSON.parse(snapshot).definition;
+  expect(exported.model).toBeUndefined();
+  expect(exported.modelRoute).toBe("auto-balanced");
+  expect(await readSnapshot(new Blob([snapshot]))).toEqual(definition);
+});
+
 it("reads back what it exports", async () => {
   const definition = shareable(
     agent(saved, "https://media.example/ada.png"),

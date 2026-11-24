@@ -713,6 +713,23 @@ describe("GooseSetup", () => {
     });
   });
 
+  it("offers an agent on a model route its provider's own models", async () => {
+    const { setup: configured } = setup({
+      saved: new Map([["anthropic", new Set(["ANTHROPIC_API_KEY"])]]),
+    });
+    await expect(
+      configured.picks({ provider: "anthropic", model: "route:auto-balanced" }),
+    ).resolves.toEqual({
+      current: "route:auto-balanced",
+      // No row for the route itself, and none for the provider's default
+      // model the provider doesn't list.
+      models: [
+        { id: "claude-opus-5-5", label: "claude-opus-5-5", efforts: [] },
+        { id: "claude-haiku-5-5", label: "claude-haiku-5-5", efforts: [] },
+      ],
+    });
+  });
+
   it("saves a provider's fields into goose and reads the list again", async () => {
     const saved = new Map<string, Set<string>>();
     const { fake, setup: goose } = setup({ saved });

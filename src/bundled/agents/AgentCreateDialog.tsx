@@ -19,8 +19,14 @@ import {
 import {
   AISettings,
   Checking,
+  RouteLine,
   UsesLine,
 } from "../../features/agents/AISettings";
+import {
+  activeRoute,
+  routeModel,
+  useModelRoutes,
+} from "../../features/agents/model-routes";
 import {
   bounded,
   CHECK_MS,
@@ -417,6 +423,9 @@ export function AgentCreateDialog({
   const [asked, setAsked] = useState(0);
   const recommendation = useRecommendedPick(types, recommendable, asked);
   const { pick } = recommendation.status === "found" ? recommendation : {};
+  // A plugin's route that Automatic runs on for the pick's harness.
+  useModelRoutes(pick?.type.id ?? "");
+  const automaticRoute = pick && activeRoute(pick.type.id, "", true);
   // No local harness can run an Automatic agent here: one thing to set up.
   const nothingSetUp =
     automatic && recommendable && recommendation.status === "none";
@@ -527,15 +536,20 @@ export function AgentCreateDialog({
     // While the pick runs, its effect takes the harness once known.
     if (on && pick && pick.type.key !== type?.key)
       chooseModel(pick.type, carried(pick.type));
-    // Manual starts from what Automatic picked.
-    if (!on && pick && pick.type.key === type?.key)
-      setConfig(
-        followRecommended(
-          withRecommended(config as object),
-          config as { model: string; effort: string },
-          pick.candidate,
-        ),
+    // Manual starts from what Automatic picked: its route, when a plugin
+    // offers one, on the candidate's provider.
+    if (!on && pick && pick.type.key === type?.key) {
+      const picked = followRecommended(
+        withRecommended(config as object),
+        config as { model: string; effort: string },
+        pick.candidate,
       );
+      setConfig(
+        automaticRoute
+          ? { ...picked, model: routeModel(automaticRoute.id), effort: "" }
+          : picked,
+      );
+    }
   };
   // Automatic has nothing to create with until, and unless, a pick is found.
   const waiting = automatic && !type?.remote && !pick;
@@ -886,7 +900,7 @@ export function AgentCreateDialog({
                 <AISettings
                   automatic={automatic}
                   harnessIcon={automatic ? pick?.type.icon : type?.icon}
-                  modelName={pick?.candidate.label}
+                  modelName={automaticRoute?.label ?? pick?.candidate.label}
                   disabled={pending}
                   onChange={chooseAutomatic}
                   summary={
@@ -896,13 +910,21 @@ export function AgentCreateDialog({
                     ) : undefined
                   }
                   model={
-                    pick && (
-                      <UsesLine
+                    automaticRoute ? (
+                      <RouteLine
                         icon={pick.type.icon}
                         title={pick.type.title}
-                        candidate={pick.candidate}
-                        skipped={pick.skipped[0]?.title}
+                        route={automaticRoute}
                       />
+                    ) : (
+                      pick && (
+                        <UsesLine
+                          icon={pick.type.icon}
+                          title={pick.type.title}
+                          candidate={pick.candidate}
+                          skipped={pick.skipped[0]?.title}
+                        />
+                      )
                     )
                   }
                 >

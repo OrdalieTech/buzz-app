@@ -35,6 +35,7 @@ import {
   wakeLands,
 } from "../../features/agent-harness/plugin-wake";
 import { compactAt } from "../../features/agents/compact-at";
+import { routeFor } from "../../features/agents/model-routes";
 import {
   composeBase,
   sectionsKey,
@@ -210,6 +211,9 @@ type Request = {
   /** The model and effort the owner picked for this turn. */
   model?: string;
   effort?: string;
+  /** Chooses them as the turn this request starts begins
+   * (`Delivery.route`); one that steers asks nothing. */
+  route?: Delivery["route"];
   /** The synced settings in `settings`. */
   synced?: Delivery["synced"];
   /** Called once a final send answers this request, or one steered after it
@@ -1106,10 +1110,13 @@ export class CodexRuntime {
       throw new Error("The protected agent has no live policy binding");
     handle?.protection?.assertAvailable();
     const settings = this.resolveConfig(agent.config);
+    // A saved route is current only while a router offers it.
+    const routed = routeFor("codex", settings.model) !== undefined;
     const key = JSON.stringify([
       settings.model,
       settings.effort,
       handle?.protection?.key,
+      routed,
     ]);
     const existing = this.previews.get(agent.key);
     if (existing?.key === key) return existing.ready;
@@ -1154,6 +1161,10 @@ export class CodexRuntime {
       });
       // A configured model this Codex does not list still leaves the
       // listed ones to pick, so the picker stays.
+      // A saved route is the current choice; the agents service lists it.
+      // One no router offers runs on Codex's default, which is current.
+      if (routed)
+        return { current: settings.model, models: offered, sendDefaults: true };
       return !model || models.some((row) => row.model === model)
         ? { current: model ?? "", models: offered, sendDefaults: true }
         : {
@@ -2628,6 +2639,7 @@ export class CodexRuntime {
       ...(toolRoot ? { toolRoot } : {}),
       ...(delivery.model ? { model: delivery.model } : {}),
       ...(delivery.effort ? { effort: delivery.effort } : {}),
+      ...(delivery.route ? { route: delivery.route } : {}),
       ...(delivery.synced ? { synced: delivery.synced } : {}),
       activityScope: topLevel
         ? channelId
@@ -3411,6 +3423,30 @@ export class CodexRuntime {
         if (request.current && !request.current()) {
           request.answered();
           return;
+        }
+        // Its model route chooses as the turn begins; messages behind it
+        // steer in on that choice.
+        if (request.route) {
+          let chosen: Awaited<ReturnType<NonNullable<Delivery["route"]>>>;
+          try {
+            chosen = await request.route();
+          } finally {
+            delete request.route;
+          }
+          if (!chosen) {
+            request.answered(true);
+            return;
+          }
+          if (chosen.model) request.model = chosen.model;
+          if (chosen.effort) request.effort = chosen.effort;
+          if (entry.abort.signal.aborted) {
+            request.failActivity("Codex was stopped");
+            return;
+          }
+          if (request.current && !request.current()) {
+            request.answered();
+            return;
+          }
         }
         try {
           await entry.after;

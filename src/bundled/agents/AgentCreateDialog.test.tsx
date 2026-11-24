@@ -42,6 +42,10 @@ import {
   uploadAvatar,
 } from "../../features/profiles/avatar-upload";
 import { CHECK_MS } from "../../features/agents/recommended";
+import {
+  resetModelRoutesForTests,
+  setModelRouters,
+} from "../../features/agents/model-routes";
 import { AgentCreateDialog } from "./AgentCreateDialog";
 import {
   BuilderlabLogoIcon,
@@ -2250,6 +2254,44 @@ describe("Recommended setup", () => {
         },
       }),
     );
+  });
+
+  it("starts Custom on the Automatic route when a plugin offers one", async () => {
+    setModelRouters([
+      {
+        id: "test",
+        routes: (id) =>
+          id === "codex"
+            ? {
+                routes: [{ id: "auto-a", label: "Auto A" }],
+                automatic: "auto-a",
+              }
+            : undefined,
+        select: async () => undefined,
+      },
+    ]);
+    try {
+      const { agents, dialog, user } = setup([echo, goose, codex]);
+      await inspectModel(user, dialog, "Auto A");
+      await chooseCustom(user, dialog);
+      expect(harnessSelect(dialog)).toHaveTextContent("Codex");
+      await user.type(within(dialog).getByLabelText("Name"), "Agent A");
+      await user.click(createButton());
+      // The route, not the candidate it would have started on.
+      expect(agents.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "test/codex",
+          config: {
+            notes: "start",
+            instructions: "Be brief.",
+            model: "route:auto-a",
+            effort: "",
+          },
+        }),
+      );
+    } finally {
+      resetModelRoutesForTests();
+    }
   });
 
   it("lets the owner choose manually while the pick is still running, even with one harness", async () => {

@@ -30,9 +30,11 @@ import type {
   TeamUpdateInput,
   AgentHandoff,
   RegisteredAgentType,
+  SessionPlace,
   Trigger,
   Agents,
 } from "./service";
+import type { RoutedPick, TurnPick } from "./model-routes";
 import type { LocalAgentActivity, WorkOutcome } from "./local-activity";
 import type { MentionRefusal } from "./owner-attestation";
 import { threadReference } from "../relay/thread-reference";
@@ -607,6 +609,16 @@ export type RunnerHost = {
   progress(key: AgentKey, progress: TimerProgress): void;
   /** The team sections of its prompt; empty without a team. */
   team(key: AgentKey): string;
+  /** When the agent runs on a model route for this turn, given the owner's
+   * `pick` for it: what chooses the model and effort of a turn it starts. */
+  route?(
+    agent: Agent,
+    type: RegisteredAgentType,
+    trigger: Trigger,
+    place: SessionPlace | undefined,
+    pick: Readonly<{ model?: string; effort?: string }>,
+    signal: AbortSignal,
+  ): Promise<((signal: AbortSignal) => Promise<RoutedPick>) | undefined>;
   /** What its next run starts with, from this device's storage only. */
   start(agent: Agent): Start<unknown> | Promise<Start<unknown>>;
   prepareSession?(
@@ -3497,7 +3509,67 @@ export class AgentRunners {
         anchor,
         signal,
       );
-      const pick = await pickFor(job.trigger, agent, type);
+      const owned = await pickFor(job.trigger, agent, type);
+      // A watch or timer run as a standalone turn keeps its own picks: the
+      // harness starts it on its default, so no route chooses for it.
+      const runsAlone = !addressed(trigger) && !anchor && !!type.runOnce;
+      const choose = runsAlone
+        ? undefined
+        : await this.host.route?.(
+            agent,
+            type,
+            trigger,
+            trigger.type === "mention"
+              ? {
+                  channelId: job.channelId ?? channelOf(trigger.event) ?? "",
+                  root:
+                    threadReference(trigger.event)?.rootId ?? trigger.event.id,
+                }
+              : anchor && {
+                  channelId: anchor.channel,
+                  ...(anchor.root ? { root: anchor.root } : {}),
+                },
+            owned,
+            signal,
+          );
+      // The harness's Stop for this request, once it offers one.
+      let harnessStop: (() => Promise<void>) | undefined;
+      let selecting = false;
+      let chosen: Promise<TurnPick | undefined> | undefined;
+      // Asked by the harness as the turn starts, once: Stop meanwhile ends
+      // the choice, and the request with it.
+      const route =
+        choose &&
+        (() =>
+          (chosen ??= (async () => {
+            const stop = new AbortController();
+            selecting = true;
+            job.work?.interruptible(async () => {
+              stop.abort(new Error("The owner stopped the request"));
+              await harnessStop?.().catch(() => {});
+            });
+            try {
+              const { routed, ended, ...pick } = await choose(
+                AbortSignal.any([lifetime, stop.signal]),
+              );
+              // The conversation's last routed turn ends with its work.
+              if (ended) void working.settled.then(ended, ended);
+              // The turn's activity says what its route chose, and why.
+              if (routed)
+                job.work?.notice(
+                  `${routed.route.label}${routed.fallback ? " fell back to" : " chose"} ${routed.label}${routed.rationale ? `: ${routed.rationale}` : ""}`,
+                );
+              return pick;
+            } catch (error) {
+              if (stop.signal.aborted) return undefined;
+              throw error;
+            } finally {
+              selecting = false;
+              if (harnessStop) job.work?.interruptible(harnessStop);
+            }
+          })()));
+      // A route's pick is the turn's, chosen as it starts.
+      const pick = route ? {} : owned;
       const start = await this.host.start(agent);
       if (!start.ok) throw new Error(start.reason);
       const team = this.host.team(agent.key);
@@ -3567,6 +3639,7 @@ export class AgentRunners {
         revisions: start.revisions,
         ...(start.synced && { synced: start.synced }),
         ...pick,
+        ...(route ? { route } : {}),
         ...(team ? { team } : {}),
         signal,
         ...(job.guardedWake ? { accepted: job.guardedWake.accepted } : {}),
@@ -3580,8 +3653,11 @@ export class AgentRunners {
                 void admission?.then((admitted) => admitted?.acknowledged());
               },
               superseded: () => job.work?.supersede(),
-              interruptible: (stop: () => Promise<void>) =>
-                job.work?.interruptible(stop),
+              interruptible: (stop: () => Promise<void>) => {
+                harnessStop = stop;
+                // While a route chooses, its Stop calls this one too.
+                if (!selecting) job.work?.interruptible(stop);
+              },
               step: (tool: string, target?: string) =>
                 job.work?.step(tool, target),
             }

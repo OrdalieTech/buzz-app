@@ -9,7 +9,7 @@ import type {
 } from "../relay/artifact-sync";
 import { PublishRejected } from "../relay/outbox";
 import { keypair, signed } from "../relay/testing";
-import { AgentConfigStore } from "./agent-config";
+import { AgentConfigStore, syncedSettings } from "./agent-config";
 import {
   artifactD,
   artifactTemplate,
@@ -945,5 +945,37 @@ describe("settings fields", () => {
       agentType: "example/echo",
       settings: { model: "m2" },
     });
+  });
+
+  it("keeps a model route out of the settings versions without routes read", () => {
+    const published = fields("settings", typed, {
+      model: "route:auto-balanced",
+    });
+    expect(published).toMatchObject({
+      settings: { model: "" },
+      modelRoute: "auto-balanced",
+    });
+    const read = (body: object) =>
+      syncedSettings(JSON.stringify(body), "example/echo", typed.schema);
+    expect(read(published)).toEqual({
+      settings: { model: "route:auto-balanced" },
+    });
+    // A version without routes keeps the field it doesn't know when it
+    // saves a model; that model takes the agent off the route.
+    const older = { ...published, settings: { model: "m2" } };
+    expect(read(older)).toEqual({ settings: { model: "m2" } });
+    // Saved here off the route, the field goes.
+    const off = fields(
+      "settings",
+      typed,
+      { model: "m3" },
+      sign({
+        kind: 45010,
+        created_at: 1,
+        content: JSON.stringify(published),
+        tags: [],
+      }),
+    );
+    expect(JSON.parse(JSON.stringify(off))).not.toHaveProperty("modelRoute");
   });
 });

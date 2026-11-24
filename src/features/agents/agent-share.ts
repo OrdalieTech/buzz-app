@@ -8,6 +8,7 @@ import { newer, type EventData } from "../relay/events";
 import type { RelaySession } from "../relay/session";
 import { AGENT_CATALOG_KIND, object } from "./catalog-envelope";
 import { delivered } from "./relay-removal";
+import { sharedModel, sharedRoute } from "./synced-route";
 import type { Agent, RegisteredAgentType } from "./service";
 import type { SharedAgent } from "./shared-agents";
 
@@ -151,7 +152,9 @@ export function shareable(
 /** A kind 30175 body, in NIP-AP field order. Agents here run on stock
  * transport, which a shared head names. */
 export function catalogContent(definition: SharedDefinition): string {
-  const { name, picture, instructions, runtime, model, provider } = definition;
+  const { name, picture, instructions, runtime, provider } = definition;
+  // A route goes in `model_route`, so an older reader runs its default.
+  const { model, route } = sharedRoute(definition.model);
   return JSON.stringify({
     display_name: name,
     system_prompt: instructions,
@@ -159,6 +162,7 @@ export function catalogContent(definition: SharedDefinition): string {
     ...(picture && { avatar_url: picture }),
     runtime,
     ...(model && { model }),
+    ...(route && { model_route: route }),
     ...(provider && { provider }),
   });
 }
@@ -242,7 +246,8 @@ export async function unshare(
 
 /** A buzz-agent-snapshot v1 `.agent.json` without memory. */
 export function snapshotJson(definition: SharedDefinition): string {
-  const { name, picture, instructions, runtime, model, provider } = definition;
+  const { name, picture, instructions, runtime, provider } = definition;
+  const { model, route } = sharedRoute(definition.model);
   return JSON.stringify(
     {
       format: "buzz-agent-snapshot",
@@ -252,6 +257,7 @@ export function snapshotJson(definition: SharedDefinition): string {
         ...(instructions && { systemPrompt: instructions }),
         runtime,
         ...(model && { model }),
+        ...(route && { modelRoute: route }),
         ...(provider && { provider }),
       },
       profile: { displayName: name, ...(picture && { avatarUrl: picture }) },
@@ -354,7 +360,7 @@ export async function readSnapshot(file: Blob): Promise<SharedDefinition> {
   return {
     name,
     ...(picture && { picture }),
-    model: text(definition.model),
+    model: sharedModel(text(definition.model), definition.modelRoute),
     ...(runtime && { runtime }),
     ...(provider && { provider }),
     instructions,

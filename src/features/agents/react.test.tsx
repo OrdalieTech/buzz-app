@@ -1,9 +1,22 @@
 // @vitest-environment jsdom
 import type { ReactNode } from "react";
-import { act, waitFor, renderHook } from "@testing-library/react";
-import { expect, it } from "vitest";
+import { act, cleanup, waitFor, renderHook } from "@testing-library/react";
+import { afterEach, expect, it } from "vitest";
+import {
+  type HarnessRoutes,
+  resetModelRoutesForTests,
+  setModelRouters,
+  withRoutes,
+} from "./model-routes";
 import { useAgent, useMentionModels, AgentsContext } from "./react";
 import type { Agent, Agents, Models } from "./service";
+
+// Unmount first: a mounted hook would render again, after its test, when the
+// routers are cleared.
+afterEach(() => {
+  cleanup();
+  resetModelRoutesForTests();
+});
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -130,4 +143,55 @@ it("discards pending metadata after the mentioned agent changes", async () => {
     pending.resolve(models("Old model"));
   });
   expect(result.current.map((choice) => choice.pubkey)).toEqual(["new"]);
+});
+
+it("lists a mentioned agent's models again when a plugin changes its routes", async () => {
+  let offered: HarnessRoutes = {
+    routes: [{ id: "auto-balanced", label: "Auto Balanced" }],
+  };
+  const notify = new Set<() => void>();
+  setModelRouters([
+    {
+      id: "router",
+      routes: () => offered,
+      subscribe: (listener) => {
+        notify.add(listener);
+        return () => notify.delete(listener);
+      },
+      select: async () => undefined,
+    },
+  ]);
+  const agent = { pubkey: "agent", type: "codex", name: "Codex" } as Agent;
+  const snapshot = { status: "ready", agents: [agent] };
+  const types = [
+    {
+      key: "codex",
+      models: async () => withRoutes("codex", models("GPT test")),
+    },
+  ];
+  const service = {
+    subscribe: () => () => {},
+    snapshot: () => snapshot,
+    types: () => types,
+  } as unknown as Agents;
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <AgentsContext.Provider value={service}>{children}</AgentsContext.Provider>
+  );
+  const { result } = renderHook(() => useMentionModels(["agent"]), {
+    wrapper,
+  });
+  const ids = () => result.current[0]?.models.map((model) => model.id);
+  await waitFor(() =>
+    expect(ids()).toEqual(["route:auto-balanced", "GPT test"]),
+  );
+
+  offered = { routes: [{ id: "auto-fast", label: "Auto Fast" }] };
+  act(() => {
+    for (const listener of notify) listener();
+  });
+  await waitFor(() => expect(ids()).toEqual(["route:auto-fast", "GPT test"]));
+
+  act(() => setModelRouters([]));
+  await waitFor(() => expect(ids()).toEqual(["GPT test"]));
+  expect(result.current[0]?.loading).toBeUndefined();
 });

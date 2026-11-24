@@ -38,7 +38,9 @@ import {
   CircleNotchIcon,
   CircleDottedIcon,
   GaugeIcon,
+  ArrowsSplitIcon,
 } from "../../shared/design-system/icons/index";
+import { routeOf, useLatestRoutedTurn } from "../agents/model-routes";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
 import { Button } from "../../shared/design-system/ui/Button";
 import {
@@ -516,6 +518,17 @@ function unavailableSavedPick(
   return `${reason} ${fallback}. Your saved choice is retained until you reset it.`;
 }
 
+/** `text` with a line break allowed after each `.`, `_` and `/`, where a
+ * long model id such as `provider.family.model-name` reads best split. */
+function breakable(text: string) {
+  let at = 0;
+  return text.split(/(?<=[._/])/).flatMap((part) => {
+    const start = at;
+    at += part.length;
+    return start ? [<wbr key={start} />, part] : [part];
+  });
+}
+
 function AgentChoice({
   choice,
   availability,
@@ -540,6 +553,7 @@ function AgentChoice({
   thumb?: Ref<HTMLInputElement>;
 }) {
   const [feedback, setFeedback] = useState("");
+  const latest = useLatestRoutedTurn(choice.pubkey);
   if (choice.loading)
     return (
       <div
@@ -576,6 +590,13 @@ function AgentChoice({
       ? runs.efforts.find((item) => item.id === value.effort)?.id
       : undefined;
   const several = choice.models.length > 1;
+  const onRoute = !!routeOf(runs.id);
+  // What its route chose for its latest turn here: the one running, or the
+  // last one. Only while it still runs on a route.
+  const chose =
+    latest && (onRoute || choice.automatic)
+      ? `${latest.fallback ? "Latest turn fell back to" : "Latest turn:"} ${latest.label}`
+      : undefined;
   // Chat choices stay explicit even when they match the provider default.
   // An effort the new model lacks falls back to its default.
   const chooseModel = (id: string) => {
@@ -611,6 +632,9 @@ function AgentChoice({
             <MenuRadioGroup value={runs.id} onValueChange={chooseModel}>
               {choice.models.map((item) => (
                 <MenuRadioItem key={item.id} value={item.id} closeOnClick>
+                  {routeOf(item.id) && (
+                    <ArrowsSplitIcon size={16} aria-hidden="true" />
+                  )}
                   {item.label}
                 </MenuRadioItem>
               ))}
@@ -682,7 +706,11 @@ function AgentChoice({
           ) : (
             <div className={styles.status}>
               <span className={styles.statusIcon}>
-                <CircleDottedIcon size={20} aria-hidden="true" />
+                {onRoute ? (
+                  <ArrowsSplitIcon size={20} aria-hidden="true" />
+                ) : (
+                  <CircleDottedIcon size={20} aria-hidden="true" />
+                )}
               </span>
               <div className={styles.statusCopy}>
                 {runs.id && several ? (
@@ -698,6 +726,18 @@ function AgentChoice({
             </div>
           )}
         </div>
+      )}
+      {chose && (
+        <span
+          className={`${styles.latest} ${styles.controls}`}
+          title={
+            latest?.rationale
+              ? `${latest.route}: ${latest.rationale}`
+              : latest?.route
+          }
+        >
+          {breakable(chose)}
+        </span>
       )}
       {feedback && (
         <span className={`${styles.about} ${styles.controls}`} role="status">
