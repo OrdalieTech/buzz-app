@@ -207,10 +207,17 @@
   }
   // The macOS window starts hidden until the app's launch script shows it;
   // show it explicitly, through the same window command, before measuring.
-  // and place it like the reference measurements: a 579px thread pane.
   async function show({ x = 18, y = 51, width = 1504, height = 916 } = {}) {
     const native = window.__TAURI_INTERNALS__;
     if (!native) throw new Error("not running in the desktop app");
+    if (await native.invoke("plugin:window|is_fullscreen", { label: "main" }))
+      throw new Error("exit fullscreen before running native thread perf");
+    // Move before resizing so AppKit does not clamp height against a stale
+    // origin, then re-apply position in case resizing shifted the frame.
+    await native.invoke("plugin:window|set_position", {
+      label: "main",
+      value: { Logical: { x, y } },
+    });
     await native.invoke("plugin:window|set_size", {
       label: "main",
       value: { Logical: { width, height } },
@@ -221,9 +228,26 @@
     });
     await native.invoke("plugin:window|show", { label: "main" });
     await native.invoke("plugin:window|set_focus", { label: "main" });
-    // Animation frames do not run while the window is hidden; wait on a timer.
-    await pause(300);
-    return status();
+    // AppKit applies show and placement asynchronously, and animation frames do
+    // not run while hidden; wait briefly then poll until the target rect settles.
+    await pause(100);
+    const deadline = performance.now() + 3_000;
+    for (;;) {
+      const current = status();
+      const [wx, wy, ww, wh] = current.window;
+      if (
+        Math.abs(wx - x) <= 2 &&
+        Math.abs(wy - y) <= 2 &&
+        Math.abs(ww - width) <= 2 &&
+        Math.abs(wh - height) <= 2
+      )
+        return current;
+      if (performance.now() > deadline)
+        throw new Error(
+          `window did not settle at ${width}x${height}+${x}+${y} (actual ${ww}x${wh}+${wx}+${wy})`,
+        );
+      await pause(50);
+    }
   }
   const handlers = {
     status,

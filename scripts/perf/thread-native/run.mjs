@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { frameMetrics, summarize, videoMetrics } from "./analyze.mjs";
+import { fitWindow, REFERENCE_WINDOW, threadCapture } from "./geometry.mjs";
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -31,9 +32,24 @@ const stamp = new Date().toISOString().replaceAll(":", "-").slice(0, 19);
 const out = values.out ?? join(root, `test-results/perf-native/${stamp}`);
 mkdirSync(join(out, "videos"), { recursive: true });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+async function stopCapture(child, closed) {
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGINT");
+    const grace = await withTimeout(closed, 2_000);
+    if (grace) return grace;
+    if (child.exitCode === null && child.signalCode === null)
+      child.kill("SIGKILL");
+  }
+  return (await withTimeout(closed, 2_000)) ?? { timedOut: true };
+}
 
-// The reference geometry: a 579px thread pane on the main display.
-const WINDOW = { x: 18, y: 51, width: 1504, height: 916 };
 // ffmpeg lists devices on stderr and exits non-zero.
 const device = spawnSync(
   "ffmpeg",
@@ -45,6 +61,23 @@ if (device === undefined)
 const drive = join(out, "drive");
 execFileSync("swiftc", ["-O", join(here, "drive.swift"), "-o", drive]);
 const input = (...args) => execFileSync(drive, args.map(String));
+const screen = JSON.parse(
+  execFileSync(drive, ["screen"], { encoding: "utf8" }),
+);
+const targetWindow = fitWindow(screen);
+console.log(
+  `display ${screen.frame.width}x${screen.frame.height}@${screen.scale}x` +
+    (screen.refreshHz ? ` (${screen.refreshHz} Hz)` : "") +
+    `, window ${targetWindow.width}x${targetWindow.height}+${targetWindow.x}+${targetWindow.y}` +
+    (targetWindow.fitted
+      ? ` (fitted from ${REFERENCE_WINDOW.width}x${REFERENCE_WINDOW.height})`
+      : ""),
+);
+if (screen.refreshHz && screen.refreshHz !== 60) {
+  console.warn(
+    `warning: main display reports ${screen.refreshHz} Hz; frame targets assume 60 Hz`,
+  );
+}
 
 let sequence = 0;
 async function command(type, extra = {}, timeoutMs = 60_000) {
@@ -176,8 +209,9 @@ try {
     // Show and place the window from inside the app: it starts hidden, and
     // Accessibility does not list it. A click on empty title bar then
     // activates it: WebKit throttles timers and frames in an occluded window.
-    await command("show", WINDOW);
-    input("click", WINDOW.x + 342, WINDOW.y + 27);
+    // At >= 1280px wide, x + 280 sits in the empty gap between left controls and Search.
+    const shown = await command("show", targetWindow);
+    input("click", shown.window[0] + 280, shown.window[1] + 22);
     await command("open", {}, 90_000);
     const preloaded = await command("preload", {}, 180_000);
     if (
@@ -188,15 +222,16 @@ try {
         `${label}: workload incomplete ${JSON.stringify(preloaded)}`,
       );
     const status = await command("bottom");
-    const [wx, wy] = [WINDOW.x, WINDOW.y];
-    const [tx, ty, tw, th] = status.thread.rect.map(Math.round);
-    const scale = status.dpr;
+    const { crop, focus, center } = threadCapture(
+      status.window,
+      status.thread.rect,
+      screen,
+      status.dpr,
+    );
     // Focus with a press in the thread's empty right gutter, then rest the
     // pointer mid-pane, where trackpad scrolling happens.
-    input("click", wx + tx + tw - 12, wy + ty + Math.round(th * 0.55));
-    const cx = wx + tx + Math.round(tw / 2);
-    const cy = wy + ty + Math.round(th / 2);
-    input("move", cx, cy);
+    input("click", focus[0], focus[1]);
+    input("move", center[0], center[1]);
     await sleep(800);
     const video = join(out, "videos", `${label}.mp4`);
     const capture = spawn(
@@ -219,7 +254,7 @@ try {
         "-t",
         "11",
         "-vf",
-        `crop=${tw * scale}:${th * scale}:${(wx + tx) * scale}:${(wy + ty) * scale}`,
+        `crop=${crop.width}:${crop.height}:${crop.x}:${crop.y}`,
         "-r",
         "60",
         "-c:v",
@@ -230,20 +265,44 @@ try {
         "18",
         video,
       ],
-      { stdio: "ignore" },
+      { stdio: ["ignore", "ignore", "pipe"] },
     );
-    const captured = new Promise((resolve) => capture.on("exit", resolve));
-    await sleep(1000);
-    await command("record", { label });
-    // Up hard, reverse mid-coast, up again (positive velocity scrolls toward older).
-    execFileSync(drive, ["fling", cx, cy, 7000, -7000, 7000], {
-      env: { ...process.env, FLING_COAST_MS: "500" },
+    let captureErr = "";
+    capture.stderr.on("data", (chunk) => {
+      captureErr += chunk.toString();
     });
-    await sleep(300);
-    await command("jump");
-    await sleep(1500);
-    const recording = await command("stop");
-    await captured;
+    const captured = new Promise((resolve) => {
+      capture.once("error", (error) => resolve({ error }));
+      capture.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    let recording;
+    try {
+      await sleep(1000);
+      await command("record", { label });
+      // Up hard, reverse mid-coast, up again (positive velocity scrolls toward older).
+      execFileSync(drive, ["fling", center[0], center[1], 7000, -7000, 7000], {
+        env: { ...process.env, FLING_COAST_MS: "500" },
+      });
+      await sleep(300);
+      await command("jump");
+      await sleep(1500);
+      recording = await command("stop");
+    } catch (error) {
+      await stopCapture(capture, captured);
+      throw error;
+    }
+    const captureResult = await withTimeout(captured, 15_000);
+    if (!captureResult) {
+      await stopCapture(capture, captured);
+      throw new Error(
+        `${label}: ffmpeg timed out waiting to finish${captureErr.trim() ? `: ${captureErr.trim()}` : ""}`,
+      );
+    }
+    if (captureResult.error) throw captureResult.error;
+    if (captureResult.code !== 0)
+      throw new Error(
+        `${label}: ffmpeg exited (${captureResult.code ?? captureResult.signal}): ${captureErr.trim()}`,
+      );
     // Gestures that never reached the thread (another window took them) are
     // not a measurement: retry the run, at most twice. A busy main thread
     // coalesces wheel events, so check the distance scrolled, not their count.
@@ -263,14 +322,41 @@ try {
       ...frameMetrics(recording),
       ...videoMetrics(video),
     };
-    runs.push({ arm, rep, label, metrics, wheels: recording.wheels.length });
+    runs.push({
+      arm,
+      rep,
+      label,
+      metrics,
+      wheels: recording.wheels.length,
+      window: status.window,
+      threadRect: status.thread.rect,
+      crop,
+    });
     writeFileSync(join(out, `${label}.json`), JSON.stringify(recording));
     console.log(label, JSON.stringify(metrics));
   }
-  const summary = summarize(runs);
+  const lastThread = runs.at(-1)?.threadRect;
+  const geometryLines = [
+    `Display: ${screen.frame.width}x${screen.frame.height}@${screen.scale}x` +
+      (screen.refreshHz ? ` (${screen.refreshHz} Hz)` : "") +
+      `, window: ${targetWindow.width}x${targetWindow.height}+${targetWindow.x}+${targetWindow.y}` +
+      (lastThread
+        ? `, thread pane: ${Math.round(lastThread[2])}x${Math.round(lastThread[3])}.`
+        : "."),
+    ...(targetWindow.fitted
+      ? [
+          `Note: window was fitted to the display (smaller than the ${REFERENCE_WINDOW.width}x${REFERENCE_WINDOW.height} reference); compare arms within this run only, not against the targets or table in docs/performance.md.`,
+        ]
+      : []),
+  ];
+  const summary = `${summarize(runs, { targets: !targetWindow.fitted })}\n${geometryLines.join("\n")}`;
   writeFileSync(
     join(out, "results.json"),
-    JSON.stringify({ arms, runs }, null, 1),
+    JSON.stringify(
+      { arms, display: screen, window: targetWindow, runs },
+      null,
+      1,
+    ),
   );
   writeFileSync(join(out, "summary.md"), `${summary}\n`);
   console.log(`\n${summary}\n\nResults: ${out}`);

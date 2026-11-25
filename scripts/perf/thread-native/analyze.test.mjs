@@ -69,7 +69,9 @@ test("rejects a run without scrolling input", () => {
 test("reports a steady 60 Hz run as meeting the frame target", () => {
   const metrics = frameMetrics({ frames: steady, wheels });
   expect(metrics.framesOver33).toBe(0);
-  expect(
-    summarize([{ arm: "head", metrics: { ...metrics, blankFrames: 0 } }]),
-  ).toContain("(target met)");
+  const runs = [{ arm: "head", metrics: { ...metrics, blankFrames: 0 } }];
+  expect(summarize(runs)).toContain("(target met)");
+  const fitted = summarize(runs, { targets: false });
+  expect(fitted).toContain("| blankFrames | 0 [0–0] |");
+  expect(fitted).not.toMatch(/target met|ceiling/);
 });

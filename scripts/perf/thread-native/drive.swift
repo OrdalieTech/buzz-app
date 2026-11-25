@@ -1,4 +1,5 @@
 // Synthetic pointer and trackpad input for the native thread-scroll harness.
+//   drive screen
 //   drive move <x> <y>
 //   drive click <x> <y>
 //   drive fling <x> <y> <v0 px/s> [<v0> ...]
@@ -27,7 +28,29 @@ func wheel(_ dy: Double, phase: Int64, momentum: Int64) {
 }
 func sleepMs(_ ms: Double) { usleep(useconds_t(ms * 1000)) }
 
-switch a[1] {
+switch a.dropFirst().first {
+case "screen":
+  let mainId = CGMainDisplayID()
+  guard let screen = NSScreen.screens.first(where: {
+    ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == mainId
+  }) ?? NSScreen.screens.first else {
+    fputs("no main display\n", stderr); exit(1)
+  }
+  let f = screen.frame
+  let v = screen.visibleFrame
+  let payload: [String: Any] = [
+    "frame": ["width": f.width, "height": f.height],
+    "visible": [
+      "x": v.origin.x,
+      "y": f.maxY - v.maxY,
+      "width": v.width,
+      "height": v.height,
+    ],
+    "scale": screen.backingScaleFactor,
+    "refreshHz": screen.maximumFramesPerSecond,
+  ]
+  let data = try! JSONSerialization.data(withJSONObject: payload)
+  print(String(data: data, encoding: .utf8)!)
 case "move":
   move(CGPoint(x: Double(a[2])!, y: Double(a[3])!))
 case "click":

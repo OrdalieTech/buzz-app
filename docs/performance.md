@@ -118,6 +118,9 @@ between arms (ABBA) over one Rust build.
 Before you start:
 - It needs a logged-in macOS session, Screen Recording and Accessibility
   permission for the terminal, an idle machine and the main display at 60 Hz.
+- It places the window at the `1504×916` reference size when the main display's
+  usable area holds it, and otherwise fits it to the display (minimum
+  `1280×700` usable) for within-run ABBA comparisons.
 - It opens a real Buzz window, takes over the pointer with synthetic trackpad
   gestures, and records the screen. Don't use the computer while it runs.
 - It signs with an ephemeral fixture key, but shares the Keychain and plugin
