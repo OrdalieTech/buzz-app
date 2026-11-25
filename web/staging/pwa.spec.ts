@@ -36,7 +36,7 @@ const invoke = (page: Page, command: string, args?: object) =>
   );
 const shell = (page: Page) =>
   expect(
-    page.getByRole("button", { name: "Create channel" }).first(),
+    page.getByRole("button", { name: "New options" }).first(),
   ).toBeVisible();
 async function profile(page: Page, name: string) {
   await page.getByLabel("Display name").fill(name);
@@ -109,7 +109,8 @@ test("chats through the browser host", async ({ browser }) => {
   await shell(bob);
 
   // A channel and a message.
-  await alice.getByRole("button", { name: "Create channel" }).first().click();
+  await alice.getByRole("button", { name: "New options" }).first().click();
+  await alice.getByRole("menuitem", { name: "New channel" }).click();
   await alice.getByLabel("Name").fill(`general-${run}`);
   await alice
     .getByRole("dialog")
@@ -118,7 +119,8 @@ test("chats through the browser host", async ({ browser }) => {
   await send(alice, `hello from the web ${run}`);
 
   // A direct message, delivered live to Bob.
-  await alice.getByRole("button", { name: "New message" }).click();
+  await alice.getByRole("button", { name: "New options" }).first().click();
+  await alice.getByRole("menuitem", { name: "New DM" }).click();
   await alice
     .getByRole("combobox", { name: "Message recipients" })
     .fill(bobName);
@@ -132,7 +134,8 @@ test("chats through the browser host", async ({ browser }) => {
   // Read state: unread survives a reload until read; once read, the relay
   // holds Bob's self-encrypted record and a reload keeps it read. Bob waits
   // in a channel of his own, where Messages reopens after the reload.
-  await bob.getByRole("button", { name: "Create channel" }).first().click();
+  await bob.getByRole("button", { name: "New options" }).first().click();
+  await bob.getByRole("menuitem", { name: "New channel" }).click();
   await bob.getByLabel("Name").fill(`bob-${run}`);
   await bob
     .getByRole("dialog")

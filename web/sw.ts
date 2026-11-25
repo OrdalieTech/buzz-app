@@ -34,7 +34,12 @@ function mediaTarget(request: Request) {
     !/^\/api\/relay\/[^/]+\/media$/.test(url.pathname)
   )
     return undefined;
-  const target = url.searchParams.get("url") ?? "";
+  // Upstream appends `?channel=` (native's disk cache key) to this URL, so it
+  // lands inside `url`; relay media here has no saved copy to file it under.
+  const target = (url.searchParams.get("url") ?? "").replace(
+    /\?channel=[^?#]*$/,
+    "",
+  );
   const media = URL.canParse(target) ? new URL(target) : undefined;
   return request.method === "GET" &&
     media?.protocol === "https:" &&

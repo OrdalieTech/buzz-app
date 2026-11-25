@@ -86,7 +86,8 @@ test("pairs a remote agent and reads what it publishes", async ({
   const viewer = (await invoke(owner, "identity_restore")) as string;
 
   // A channel for the agent to post in.
-  await owner.getByRole("button", { name: "Create channel" }).first().click();
+  await owner.getByRole("button", { name: "New options" }).first().click();
+  await owner.getByRole("menuitem", { name: "New channel" }).click();
   await owner.getByLabel("Name").fill(`orb-${run}`);
   await owner
     .getByRole("dialog")
@@ -221,7 +222,7 @@ test("pairs a remote agent and reads what it publishes", async ({
   await owner.getByRole("tab", { name: "Messages" }).click();
   await owner
     .getByRole("complementary", { name: "Sidebar" })
-    .getByRole("button", { name: `orb-${run}` })
+    .getByRole("button", { name: new RegExp(`^orb-${run}`) })
     .click();
   await expect(owner.getByText(`hello from ${name}`)).toBeVisible();
   await owner.getByRole("button", { name: `View ${name} profile` }).click();

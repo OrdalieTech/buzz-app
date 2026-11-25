@@ -267,10 +267,8 @@ for (const width of [1280, 390])
       // What the empty staging lacks: a channel with a message, a workspace
       // (a channel recipe) and a reminder on that message.
       await drawer();
-      await page
-        .getByRole("button", { name: "Create channel" })
-        .first()
-        .click();
+      await page.getByRole("button", { name: "New options" }).first().click();
+      await page.getByRole("menuitem", { name: "New channel" }).click();
       await page.getByLabel("Name").fill(`crawl-${Date.now().toString(36)}`);
       await page
         .getByRole("dialog")

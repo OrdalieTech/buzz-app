@@ -58,7 +58,7 @@ async function signUp(browser: Browser, name: string) {
   await page.getByLabel("Display name").fill(name);
   await page.getByRole("button", { name: "Publish profile & open" }).click();
   await expect(
-    page.getByRole("button", { name: "Create channel" }).first(),
+    page.getByRole("button", { name: "New options" }).first(),
   ).toBeVisible();
   await expect.poll(() => context.serviceWorkers().length).toBe(1);
   return { page, secret };
@@ -201,7 +201,8 @@ test("signs relay media and routes notifications to their message", async ({
   ).toBe(204);
 
   // A DM from Alice carrying an image and a fast-start H.264/AAC video.
-  await alice.page.getByRole("button", { name: "New message" }).click();
+  await alice.page.getByRole("button", { name: "New options" }).first().click();
+  await alice.page.getByRole("menuitem", { name: "New DM" }).click();
   await alice.page
     .getByRole("combobox", { name: "Message recipients" })
     .fill(`Bob ${run}`);
