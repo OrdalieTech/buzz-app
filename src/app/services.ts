@@ -37,6 +37,7 @@ import {
 import { AccountActionsService } from "../features/account-actions/service";
 import { ShortcutsService } from "../features/shortcuts/service";
 import { DecisionsService } from "../features/decisions/service";
+import { SpeechService } from "../features/speech/service";
 import { AgentsService } from "../features/agents/service";
 import { deviceSettings } from "./device-settings";
 import { createShortcutBindings } from "../features/shortcuts/preferences";
@@ -116,6 +117,7 @@ export function createServices() {
   const browser = new BrowserService(ctx);
   const shortcuts = new ShortcutsService(ctx, undefined, shortcutBindings);
   const decisions = new DecisionsService(ctx);
+  const speech = new SpeechService(ctx);
   const pages = new PagesService(ctx);
   const sidebarSections = new SidebarSectionsService(ctx);
   const pluginInstallRequests = createPluginInstallRequests();
@@ -451,6 +453,7 @@ export function createServices() {
     navigationHost,
     shortcuts,
     decisions,
+    speech,
     agents,
     accountActions,
     shortcutBindings,

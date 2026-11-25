@@ -4559,7 +4559,8 @@ test("Builderlab HTTP accepts full agent instructions and isolates the fixed nat
       }
       if (
         path.endsWith("/v3/builderlab/decisions") ||
-        path.endsWith("/v1/auth/hosted-site/native-session")
+        path.endsWith("/v1/auth/hosted-site/native-session") ||
+        path.endsWith("/v3/builderlab/transcription/calls")
       ) {
         nativeCalls.push({
           path,
@@ -4607,6 +4608,7 @@ test("Builderlab HTTP accepts full agent instructions and isolates the fixed nat
         can_use_remote_agents: true,
         can_use_builderlab_decisions: false,
         can_delete_buzz_communities: false,
+        can_use_hosted_transcription: false,
       },
     });
     const reads = accountReads;
@@ -4645,6 +4647,11 @@ test("Builderlab HTTP accepts full agent instructions and isolates the fixed nat
         "/v1/auth/hosted-site/native-session",
         "X-Buzz-Builderlab-Revision",
       ],
+      [
+        "transcription/calls",
+        "/v3/builderlab/transcription/calls",
+        "X-BB-Session-Credential",
+      ],
     ]) {
       const refused = await fetch(`${h.base}/api/builderlab/request`, {
         method: "POST",
@@ -4666,8 +4673,9 @@ test("Builderlab HTTP accepts full agent instructions and isolates the fixed nat
         headers: { "X-BB-Session-Credential": "fixture-only" },
       });
     }
-    expect(nativeCalls).toHaveLength(2);
+    expect(nativeCalls).toHaveLength(3);
     expect(nativeCalls[0].headers["X-Buzz-Community"]).toBe("buzz.example");
+    expect(nativeCalls[2].headers["X-Buzz-Community"]).toBe("buzz.example");
   } finally {
     await h.close();
   }

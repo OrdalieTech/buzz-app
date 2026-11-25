@@ -200,6 +200,7 @@
     "allow-app-agent-state-load",
     "allow-app-agent-state-set",
     "allow-decide",
+    "allow-speech-connect",
 
     "allow-title-bar-double-click",
     "allow-notification-show",

@@ -1153,7 +1153,7 @@ export function relayBrokerPlugin({
                 raw += part;
                 if (
                   raw.length >
-                  (action === "decisions"
+                  (action === "decisions" || action === "transcription/calls"
                     ? 128 * 1024
                     : action === "request"
                       ? 1024 * 1024
@@ -1171,6 +1171,11 @@ export function relayBrokerPlugin({
                 viewer: [
                   "/v1/auth/hosted-site/native-session",
                   "x-buzz-builderlab-revision",
+                ],
+                // Native speech posts a WebRTC offer the same way.
+                "transcription/calls": [
+                  "/v3/builderlab/transcription/calls",
+                  "x-bb-session-credential",
                 ],
               }[action];
               if (nativeRoute) {

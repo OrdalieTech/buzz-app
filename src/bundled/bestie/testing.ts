@@ -7,6 +7,7 @@ import {
 } from "../../features/agents/service";
 import { BrowserService } from "../../features/browser/service";
 import { DecisionsService } from "../../features/decisions/service";
+import { SpeechService } from "../../features/speech/service";
 import type { BrowserPlatform } from "../../features/browser/platform";
 import type {
   ClientSnapshot,
@@ -352,6 +353,7 @@ export async function bestieFixture(
   // Builderlab's Apps panel; no native browser here.
   new BrowserService(root, { available: false } as BrowserPlatform);
   new DecisionsService(root, localStorage);
+  new SpeechService(root, localStorage);
   root.provide("knownCommunities", {
     ...reader,
     pending: () => [],

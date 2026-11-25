@@ -26,6 +26,7 @@ async function fixture(reply: HostResponse | (() => Promise<HostResponse>)) {
         email: "a@example.com",
         canUseRemoteAgents: false,
         canUseBuilderlabDecisions: false,
+        canUseHostedTranscription: false,
       },
     }),
     undefined,

@@ -137,6 +137,7 @@ it("completes browser sign-in through a loopback callback without exposing the c
       can_delete_buzz_communities: false,
       can_use_remote_agents: false,
       can_use_builderlab_decisions: false,
+      can_use_hosted_transcription: false,
     },
   });
   expect(JSON.stringify(auth)).not.toContain("secret");
@@ -251,6 +252,21 @@ it.each([
     can_delete_buzz_communities: expected,
     can_use_remote_agents: false,
     can_use_builderlab_decisions: false,
+    can_use_hosted_transcription: false,
+  });
+});
+
+it("maps hosted transcription only from literal true", async () => {
+  const h = account({
+    "/v1/auth/me": () =>
+      Response.json({
+        subject: "auth0|owner",
+        expires_at: "2030",
+        capabilities: { can_use_hosted_transcription: true },
+      }),
+  });
+  expect((await signIn(h)).capabilities).toMatchObject({
+    can_use_hosted_transcription: true,
   });
 });
 
@@ -971,6 +987,7 @@ it("keeps the broker sign-in and account projection when a capability-only check
     capabilities: {
       can_use_remote_agents: true,
       can_use_builderlab_decisions: false,
+      can_use_hosted_transcription: false,
       can_delete_buzz_communities: false,
     },
   });

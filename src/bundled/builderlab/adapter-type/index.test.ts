@@ -46,6 +46,7 @@ async function fixture(subject = "account-a") {
         email: "a@example.com",
         canUseRemoteAgents: true,
         canUseBuilderlabDecisions: false,
+        canUseHostedTranscription: false,
       },
     }),
     undefined,
@@ -368,6 +369,7 @@ it("rejects a stop at once when signed out, without signing in or reaching Build
       email: "a@example.com",
       canUseRemoteAgents: true,
       canUseBuilderlabDecisions: false,
+      canUseHostedTranscription: false,
     },
   }));
   const session = createTestSession(acquire, undefined, {

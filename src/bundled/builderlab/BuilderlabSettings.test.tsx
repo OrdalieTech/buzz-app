@@ -130,6 +130,7 @@ it("keeps a pending login mounted while navigating between management and overvi
         email: "builder@example.com",
         canUseRemoteAgents: true,
         canUseBuilderlabDecisions: false,
+        canUseHostedTranscription: false,
       },
     }),
   );

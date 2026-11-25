@@ -11,6 +11,7 @@ const signedIn = (revision: string): Credential => ({
     email: "a@example.com",
     canUseRemoteAgents: true,
     canUseBuilderlabDecisions: false,
+    canUseHostedTranscription: false,
   },
 });
 

@@ -234,6 +234,8 @@ const capabilityFlags = (capabilities) => ({
     capabilities?.can_use_builderlab_decisions === true,
   can_delete_buzz_communities:
     capabilities?.can_delete_buzz_communities === true,
+  can_use_hosted_transcription:
+    capabilities?.can_use_hosted_transcription === true,
 });
 
 export function createBuilderlab({
@@ -542,6 +544,7 @@ export function createBuilderlab({
             [
               "/v3/builderlab/decisions",
               "/v1/auth/hosted-site/native-session",
+              "/v3/builderlab/transcription/calls",
             ].includes(path)
           : apps
             ? /^\/v1\/agent\//.test(path)
@@ -566,7 +569,11 @@ export function createBuilderlab({
             }
           : { "X-BB-Session-Credential": secret, Origin: new URL(api).origin }),
       };
-      if (path === "/v3/builderlab/decisions") {
+      // Decisions and speech bill the community they name.
+      if (
+        path === "/v3/builderlab/decisions" ||
+        path === "/v3/builderlab/transcription/calls"
+      ) {
         if (
           typeof input.community !== "string" ||
           !/^[a-z0-9.-]+(?::[0-9]+)?$/i.test(input.community) ||

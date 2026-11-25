@@ -280,3 +280,20 @@ native `decide` posts to the identity origin's API with that
 session as `Authorization: Bearer`, as for the build's other Builderlab calls;
 the token never reaches the webview. A 401 there refuses only that call, and
 native asks the adapter once whether the session still stands.
+
+It offers Builderlab as a speech to text provider the same way, reading
+`capabilities.can_use_hosted_transcription`, but like remote agents it signs
+in at the server of the community in view, since the call bills that
+community: a Builderlab customer's community (`buzz.{name}.builderlab.xyz`)
+transcribes at `{name}.builderlab.xyz`, not the build's server. Native
+`speech_connect` routes the call by its community to that server's NIP-FI
+session, posts the host's WebRTC offer to `v3/builderlab/transcription/calls`
+with the community in `x-buzz-community`, and returns Builderlab's SDP answer.
+In live development the broker forwards it to `BUZZ_BUILDERLAB_URL` with its
+own sign-in, as it does decisions; it names no model, so Builderlab chooses one. Audio
+then goes peer to peer, and the host commits it at each pause and at the end so
+Builderlab can meter the transcribed seconds. Builderlab hangs a call up at its
+cap: 30 seconds unless the listen asks for longer with `maxSeconds`, sent as
+`max_seconds`, so a forgotten microphone cannot run long. Voice commands never
+ask. Builderlab may grant less than was asked (its ceiling is an hour), and the
+granted `max_seconds` reaches the listen's `onCallLimit`.

@@ -25,6 +25,7 @@ import { builderlabType } from "./adapter-type";
 import { createKnownCommunitiesClient } from "./known-communities/client";
 import { startKnownCommunitiesSync } from "./known-communities/sync";
 import { offerBuilderlabDecisions } from "./decisions";
+import { offerBuilderlabSpeech } from "./speech";
 import type { AgentProviderSnapshot } from "../../features/agents/service";
 import { InlineHeader } from "../../shared/design-system/ui/Header";
 import { useAgentsSnapshot } from "../../features/agents/react";
@@ -49,6 +50,7 @@ export const inject = [
   "knownCommunities",
   "communityJoin",
   "decisions",
+  "speech",
   "navigation",
   ...(nativeBuilderlab() ? ["federatedIdentity"] : []),
 ];
@@ -68,8 +70,8 @@ export const apply: PluginModule["apply"] = (ctx) => {
   }
   const session = dev?.session ?? createNativeSession(ctx.federatedIdentity);
   ctx.effect(() => () => session.dispose());
-  // Remote agents use the sign-in server of the community in view; the rest
-  // of Builderlab stays with the build's.
+  // Remote agents and speech use the sign-in server of the community in view;
+  // the rest of Builderlab stays with the build's.
   const agentSession = dev
     ? session
     : followCommunity(session, ctx.federatedIdentity, ctx.relay);
@@ -207,6 +209,15 @@ export const apply: PluginModule["apply"] = (ctx) => {
       session,
       loginAvailable,
       dev?.decide,
+      openIdentity,
+    );
+    // Speech bills the community in view, so like remote agents it signs in
+    // at that community's server: a Builderlab customer's has its own.
+    offerBuilderlabSpeech(
+      ctx,
+      agentSession,
+      loginAvailable,
+      dev?.connectSpeech,
       openIdentity,
     );
     ctx.provide("builderlab", hostedAgentSettings(agentSession, agents));

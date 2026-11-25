@@ -41,6 +41,7 @@ it.each(["create", "community"] as const)(
         email: "",
         canUseRemoteAgents: true,
         canUseBuilderlabDecisions: false,
+        canUseHostedTranscription: false,
       },
     }));
     await session.signIn();
@@ -73,6 +74,7 @@ it("preserves the reserved app ID when sign-out interrupts initialization", asyn
       email: "",
       canUseRemoteAgents: true,
       canUseBuilderlabDecisions: false,
+      canUseHostedTranscription: false,
     },
   }));
   await session.signIn();
@@ -111,6 +113,7 @@ async function setup(responses: HostResponse[], signedIn = true) {
       email: "",
       canUseRemoteAgents: true,
       canUseBuilderlabDecisions: false,
+      canUseHostedTranscription: false,
     },
   }));
   if (signedIn) await session.signIn();

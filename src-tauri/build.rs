@@ -264,6 +264,7 @@ fn main() {
             "app_agent_state_load",
             "app_agent_state_set",
             "decide",
+            "speech_connect",
             "title_bar_double_click",
             "notification_show",
             "notification_permission_state",

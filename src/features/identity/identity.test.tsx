@@ -100,6 +100,7 @@ const credential: Credential = {
     email: "a@example.com",
     canUseRemoteAgents: false,
     canUseBuilderlabDecisions: false,
+    canUseHostedTranscription: false,
   },
 };
 const welcomeHeading = () => screen.getByRole("heading", { name: "Buzz" });
