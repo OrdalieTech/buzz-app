@@ -53,6 +53,14 @@ const address = (page) =>
   page.evaluate(() => history.state.buzzNavigationV1.entry.target);
 const avatar = (scope) =>
   scope.getByRole("button", { name: /^View .+ profile$/ }).first();
+// A point of the conversation left of the sheets over it, clear of them all.
+const background = async (page) => {
+  const pane = await page
+    .getByRole("article", { name: "Conversation", exact: true })
+    .boundingBox();
+  const sheet = await sheets(page).first().boundingBox();
+  return [(pane.x + sheet.x) / 2, pane.y + pane.height / 2];
+};
 
 test.describe("Side panel", () => {
   test.use({ threadPlacement: "side" });
@@ -291,7 +299,7 @@ test.describe("Inline", () => {
     await expect(composer(page)).toHaveText("Still typing this");
   });
 
-  test("thread → profile → pull request: Back walks them, reload restores, X closes the top", async ({
+  test("thread → profile → pull request: Back walks them, reload restores, X or a press around them closes the top", async ({
     page,
     app,
   }) => {
@@ -349,12 +357,30 @@ test.describe("Inline", () => {
     await expect(github(page)).toHaveCount(0);
     await expect(thread(page)).toBeVisible();
     expect((await address(page)).layer).toBeUndefined();
-    // Closing the thread closes a layer over it too.
+    // Escape closes only the top layer too.
     await avatar(thread(page)).click();
     await expect(profile(page)).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(profile(page)).toHaveCount(0);
-    await close(thread(page)).click();
+    // Closing the profile draws the thread again, inert until it shows; its
+    // reply box takes focus as it does.
+    await expect(
+      thread(page).getByRole("textbox", {
+        name: "Reply to thread",
+        exact: true,
+      }),
+    ).toBeFocused();
+    // A press in the top sheet closes nothing; each press on the conversation
+    // around the sheets closes the top one. The sheet is still moving when its
+    // heading shows, so the click waits for it to come to rest.
+    await activate(pullLink(thread(page)));
+    await pullHeading(github(page)).click();
+    await expect(github(page)).toBeVisible();
+    await page.mouse.click(...(await background(page)));
+    await expect(github(page)).toHaveCount(0);
+    await expect(thread(page)).toBeVisible();
+    expect((await address(page)).layer).toBeUndefined();
+    await page.mouse.click(...(await background(page)));
     await expect(thread(page)).toHaveCount(0);
     await expect(side(page).getByRole("tab")).toHaveCount(0);
   });

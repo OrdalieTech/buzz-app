@@ -580,13 +580,27 @@ function SheetHeader({
 }
 
 /** The dialog every sheet is: non-modal, so the rest of the app stays
- * interactive; only its own scrim dismisses it on an outside press, moving
- * focus never does, and Escape leaves it to a modal over it, such as media.
- * Once closed, focus returns to what opened it. */
+ * interactive; an outside press dismisses it only on a scrim around it,
+ * moving focus never does, and Escape leaves it to a modal over it, such as
+ * media. Once closed, focus returns to what opened it. */
 const behindModal = (sheet: HTMLElement | null) => {
   const modal = !!sheet && activeModal(sheet.ownerDocument);
   return !!modal && !modal.contains(sheet);
 };
+
+/** A press on the sheet's own scrim, or on the scrim of a sheet it is drawn
+ * in: a sheet over another dims only that sheet, so the view around a stack
+ * is the scrim of the sheet at the bottom. A scrim's parent is its sheet's
+ * portal, which holds that sheet and every sheet drawn in it, and no sheet
+ * of another pane. Only the top sheet of a stack is offered the press. */
+const pressedScrim = (
+  target: EventTarget | null | undefined,
+  popup: HTMLElement | null,
+) =>
+  target instanceof Element &&
+  target.hasAttribute("data-sheet-scrim") &&
+  !!popup &&
+  !!target.parentElement?.contains(popup);
 
 function SheetRoot({
   open,
@@ -594,7 +608,6 @@ function SheetRoot({
   onClosed,
   finalFocus,
   popup,
-  backdrop,
   children,
 }: {
   open: boolean;
@@ -602,7 +615,6 @@ function SheetRoot({
   onClosed(): void;
   finalFocus?: RefObject<HTMLElement | null> | undefined;
   popup: RefObject<HTMLElement | null>;
-  backdrop: RefObject<HTMLElement | null>;
   children: ReactNode;
 }) {
   return (
@@ -614,7 +626,7 @@ function SheetRoot({
           !next &&
           (details.reason === "focus-out" ||
             (details.reason === "outside-press" &&
-              details.event?.target !== backdrop.current) ||
+              !pressedScrim(details.event?.target, popup.current)) ||
             (details.reason === "escape-key" && behindModal(popup.current)))
         ) {
           details.cancel();
@@ -711,7 +723,6 @@ export function ComposerSheet({
   );
   useStackedHeight(surface, dock, open && !containsComposer, readerOnly);
   const popup = useRef<HTMLDivElement | null>(null);
-  const backdrop = useRef<HTMLDivElement | null>(null);
   const grown = useRef<HTMLDivElement | null>(null);
   const focus = useFinalFocusUnlessMoved(finalFocus, undefined);
   const grow = useGrowth();
@@ -729,7 +740,6 @@ export function ComposerSheet({
       }}
       finalFocus={finalFocus}
       popup={popup}
-      backdrop={backdrop}
     >
       <BaseDialog.Portal
         container={dock}
@@ -737,10 +747,10 @@ export function ComposerSheet({
         data-details-sheet=""
       >
         <BaseDialog.Backdrop
-          ref={backdrop}
           forceRender
           className={styles.scrim}
           style={style.scrim}
+          data-sheet-scrim=""
         />
         <SheetClip quick={!!quick}>
           <BaseDialog.Popup
