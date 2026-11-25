@@ -2,6 +2,7 @@ import { useSyncExternalStore, type ReactNode } from "react";
 import { MessageLoading } from "../messages/MessageLoading";
 import styles from "../messages/Messages.module.css";
 import type { ChannelSummary } from "../relay/contracts";
+import { viewerMember } from "../relay/membership";
 import { rosterRecovering } from "../relay/live-recovery";
 import { useRecoveryOwns } from "../relay/RecoveryNotice";
 import type { RelaySession } from "../relay/session";
@@ -34,8 +35,7 @@ export function confirmedChannel(
   if (view === "thread") return channel;
   return !channel.readOnly &&
     !channel.archived &&
-    (channel.channelType !== "solo" ||
-      !!channel.members?.includes(viewer ?? ""))
+    (channel.channelType !== "solo" || viewerMember(channel, viewer))
     ? channel
     : undefined;
 }

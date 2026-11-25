@@ -26,7 +26,10 @@ export type ChannelSummary = Readonly<{
   visibility?: "public" | "private" | undefined;
   /** Default for future participants; never an existing participant's role. */
   joinRole?: "member" | "guest" | undefined;
-  /** Viewer role from the relay-signed roster, independent of admission defaults. */
+  /** Viewer-scoped membership evidence; peer roster availability is independent.
+   * An explicit false outranks a retained peer roster. Cache freshness stays in cached. */
+  viewerMembership?: Readonly<{ pubkey: string; joined: boolean }>;
+  /** Viewer role from verified membership, independent of admission defaults. */
   viewerRole?: "owner" | "admin" | "member" | "guest" | "bot" | undefined;
   preview?: string | undefined;
   /** Newest verified user-visible activity for sidebar ordering, in Unix

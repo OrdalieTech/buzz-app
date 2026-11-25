@@ -1,3 +1,4 @@
+import { viewerMember } from "../../features/relay/membership";
 import { useChannelHistoryFocus } from "./useChannelHistoryFocus";
 import type { Conversation } from "../../features/conversation/service";
 import { StartLinkedChat, canStartLinkedChat } from "./StartLinkedChat";
@@ -2347,7 +2348,7 @@ function ChannelWorkspace({
               !item.cached &&
               !item.readOnly &&
               !item.archived &&
-              item.members?.includes(queries.viewer ?? ""),
+              viewerMember(item, queries.viewer),
           );
       if (linkedChat && linkedChat.id !== current?.id) {
         const id = `conversation:${linkedChat.id}`;
@@ -3241,9 +3242,7 @@ function ChannelWorkspace({
                               channel.cached ||
                               (channel.readOnly &&
                                 channel.viewerRole !== "guest") ||
-                              !channel.members?.includes(
-                                queries.viewer ?? "",
-                              ) ||
+                              !viewerMember(channel, queries.viewer) ||
                               !panels.snapshot().includes(panel) ||
                               !panel.channelMenu?.eligible(channel, queries)
                             )

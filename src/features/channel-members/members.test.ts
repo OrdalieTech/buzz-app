@@ -1,4 +1,4 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, assert, expect, it, vi } from "vitest";
 import { verifyEvent } from "nostr-tools";
 import { createRelaySession, type RelaySession } from "../relay/session";
 import {
@@ -14,6 +14,8 @@ import {
   addChannelMember,
   addChannelMembersAtOnce,
   canAddMembers,
+  canAddToDirectMessage,
+  canShareSoloChat,
 } from "./members";
 
 const cleanups: (() => void)[] = [];
@@ -2104,3 +2106,88 @@ it("leaves out someone archived while the roster is read", async () => {
     ),
   ).toEqual([[first, second]]);
 });
+
+it("keeps invitation and Solo sharing viewer gates independent of unloaded peers", () => {
+  const session = { viewer: "viewer", outbox: { supports: () => true } };
+  const channel = {
+    id: "channel",
+    name: "Updates",
+    channelType: "stream" as const,
+    viewerMembership: { pubkey: "viewer", joined: true },
+  };
+  expect(canAddMembers(session, channel)).toBe(true);
+  expect(canAddMembers(session, { ...channel, viewerRole: "guest" })).toBe(
+    false,
+  );
+  expect(canAddMembers(session, { ...channel, archived: true })).toBe(false);
+  expect(
+    canAddMembers(session, {
+      ...channel,
+      members: ["viewer"],
+      viewerMembership: { pubkey: "viewer", joined: false },
+    }),
+  ).toBe(false);
+  const soloSession = setup("solo").session;
+  assert(soloSession.viewer);
+  const solo = {
+    ...channel,
+    channelType: "solo" as const,
+    viewerMembership: { pubkey: soloSession.viewer, joined: true },
+  };
+  expect(canShareSoloChat(soloSession, solo)).toBe(true);
+  expect(canShareSoloChat(soloSession, { ...solo, cached: true })).toBe(false);
+  expect(
+    canShareSoloChat(soloSession, {
+      ...solo,
+      viewerRole: "guest",
+      readOnly: true,
+    }),
+  ).toBe(false);
+});
+
+it.each([
+  ["legacy roster", { members: ["viewer", "peer"] }, true],
+  [
+    "joined without a roster cannot exclude the moderation DM",
+    { viewerMembership: { pubkey: "viewer", joined: true } },
+    false,
+  ],
+  [
+    "joined with peer evidence but no viewer roster entry",
+    { members: ["peer"], viewerMembership: { pubkey: "viewer", joined: true } },
+    true,
+  ],
+  [
+    "moderation DM",
+    {
+      members: ["viewer", "relay"],
+      viewerMembership: { pubkey: "viewer", joined: true },
+    },
+    false,
+  ],
+  [
+    "denied with retained peers",
+    {
+      members: ["viewer", "peer"],
+      viewerMembership: { pubkey: "viewer", joined: false },
+    },
+    false,
+  ],
+])(
+  "uses viewer authority for DM additions: %s",
+  (_membership, evidence, expected) => {
+    const session = {
+      viewer: "viewer",
+      relayAuthor: "relay",
+      directMessages: { available: true },
+    };
+    expect(
+      canAddToDirectMessage(session, {
+        id: "dm",
+        name: "Direct message",
+        channelType: "dm",
+        ...evidence,
+      }),
+    ).toBe(expected);
+  },
+);

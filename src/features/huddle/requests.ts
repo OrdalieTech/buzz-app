@@ -1,3 +1,4 @@
+import { viewerMember } from "../relay/membership";
 import type { RelayData, RelaySnapshot } from "../relay/service";
 import type { RelaySession } from "../relay/session";
 import type { HuddleDestination } from "./bridge";
@@ -59,7 +60,7 @@ export function createHuddleRequests(
           channel.archived ||
           channel.readOnly ||
           channel.cached ||
-          !channel.members?.includes(connection?.viewer ?? "")
+          !viewerMember(channel, connection?.viewer)
         )
           return [];
         return recentHuddles(snapshot.events, channel.id, session.relayAuthor)
@@ -137,8 +138,8 @@ export function createHuddleRequests(
           room.archived ||
           room.readOnly ||
           room.cached ||
-          !room.members?.includes(connection?.viewer ?? "") ||
-          !room.members.includes(notice.actor) ||
+          !viewerMember(room, connection?.viewer) ||
+          !room.members?.includes(notice.actor) ||
           !event.tags.some(
             ([key, value]) => key === "h" && value === room.id,
           ) ||
@@ -235,7 +236,7 @@ export function createHuddleRequests(
           !c.archived &&
           !c.readOnly &&
           !c.cached &&
-          c.members?.includes(session.viewer ?? ""),
+          viewerMember(c, session.viewer),
       )
       .map((c) => c.id)
       .sort();

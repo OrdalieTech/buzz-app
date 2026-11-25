@@ -1,3 +1,4 @@
+import { viewerMember } from "../../features/relay/membership";
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { administerMember } from "../../features/channel-members/administration";
 import { canAddMembers } from "../../features/channel-members/members";
@@ -32,7 +33,7 @@ export function privateChannels(
         !channel.huddle &&
         (channel.channelType === "stream" || channel.channelType === "forum") &&
         channel.private &&
-        channel.members?.includes(viewer),
+        viewerMember(channel, viewer),
     )
     .sort(compareRecent);
   return {

@@ -1,3 +1,4 @@
+import { viewerMember } from "./membership";
 import type {
   ChannelQueries,
   ChannelMessage,
@@ -74,7 +75,7 @@ export function createInboxReactions({
     !channel.archived &&
     !channel.huddle &&
     !channel.metadataPending &&
-    channel.members?.includes(viewer);
+    viewerMember(channel, viewer);
   const allowed = (id: string) =>
     channels
       .list()

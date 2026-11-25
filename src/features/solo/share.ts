@@ -1,3 +1,4 @@
+import { viewerMember } from "../relay/membership";
 import {
   sameLabels,
   type ChannelDetailsDraft,
@@ -23,7 +24,7 @@ export function canShareConversation(
       !channel.cached &&
       !channel.readOnly &&
       !channel.archived &&
-      channel.members?.includes(session.viewer ?? "") &&
+      viewerMember(channel, session.viewer) &&
       canAddMembers(session, channel)
     )
   );
@@ -64,7 +65,7 @@ export async function checkShareDestination(
     destination.cached ||
     destination.archived ||
     destination.readOnly ||
-    !destination.members?.includes(session.viewer ?? "") ||
+    !viewerMember(destination, session.viewer) ||
     !chatShareDestination(destination)
   )
     throw new Error(

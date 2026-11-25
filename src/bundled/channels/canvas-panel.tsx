@@ -1,3 +1,4 @@
+import { viewerMember } from "../../features/relay/membership";
 import { useSyncExternalStore } from "react";
 import type { Context } from "@deepseek-ai/cordis";
 import { useListedChannel } from "../../features/relay/listed-channel";
@@ -14,7 +15,7 @@ function eligible(channel: ChannelSummary, session: RelaySession) {
   return (
     !channel.cached &&
     (!channel.readOnly || channel.viewerRole === "guest") &&
-    !!channel.members?.includes(session.viewer ?? "")
+    viewerMember(channel, session.viewer)
   );
 }
 

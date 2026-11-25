@@ -954,12 +954,14 @@ describe("discovery", () => {
         joinRole: "member",
         members: [alice.pubkey, bob.pubkey].sort(),
         owners: [],
+        viewerMembership: { pubkey: alice.pubkey, joined: true },
       },
       {
         id: "zeta",
         name: "zeta".slice(0, 8),
         members: [alice.pubkey],
         owners: [],
+        viewerMembership: { pubkey: alice.pubkey, joined: true },
       },
     ]);
     expect(

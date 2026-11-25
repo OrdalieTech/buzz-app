@@ -1,6 +1,7 @@
 import { addChannelMember } from "../channel-members/members";
 import { endLastHumanHuddle } from "./ending";
 import { createPcmSender } from "./sender";
+import { viewerMember } from "../relay/membership";
 import type { ChannelSummary } from "../relay/contracts";
 import type { AudioSettingsState } from "./audio-settings";
 import { createHuddleRequests } from "./requests";
@@ -236,7 +237,7 @@ export function createHuddles(
       !channel.archived &&
       !channel.readOnly &&
       !channel.cached &&
-      !!channel.members?.includes(destination.viewer);
+      viewerMember(channel, destination.viewer);
     // Admission through a parent must never become room-only admission merely
     // because the audio join subsequently adds the viewer to the temporary room.
     const parentAdmission = member(

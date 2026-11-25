@@ -61,6 +61,7 @@ it("keeps a guest joined and readable across admission-default changes until exp
   state.accept(roster("guest", 10));
   expect(state.channels()).toHaveLength(1);
   expect(state.get(id)).toMatchObject({
+    viewerMembership: { pubkey: viewer.pubkey, joined: true },
     viewerRole: "guest",
     joinRole: "guest",
     readOnly: true,

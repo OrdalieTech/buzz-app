@@ -54,7 +54,8 @@ function fakeSession() {
   };
   let channels: {
     id: string;
-    members: string[];
+    members?: string[];
+    viewerMembership?: { pubkey: string; joined: boolean };
     huddle?: true;
     cached?: true;
     channelType?: string;
@@ -111,6 +112,11 @@ function fakeSession() {
     },
     /** Lists channels repair cannot read while the roster is still loading. */
     loadUnreadable(channel: { id: string; members: string[]; cached?: true }) {
+      channels = [channel];
+      list.emit();
+    },
+    /** Explicit viewer evidence overrides a roster retained for its peers. */
+    membership(channel: (typeof channels)[number]) {
       channels = [channel];
       list.emit();
     },
@@ -178,6 +184,30 @@ it("follows the sidebar row a visit quieted, and keeps manual unread", () => {
   });
   expect(state()).toEqual({ unread: false, attention: 0 });
   fake.set("a", { observedCount: 0, manual: "local-only" });
+  expect(state()).toEqual({ unread: true, attention: 0 });
+});
+
+it("viewer membership excludes a removed viewer even when peer rosters remain", () => {
+  const fake = fakeSession();
+  const state = observe(fake);
+  fake.membership({
+    id: "a",
+    members: [viewer, "peer"],
+    viewerMembership: { pubkey: viewer, joined: false },
+  });
+  fake.set("a", { observedCount: 3 });
+  expect(state()).toEqual({ unread: false, attention: 0 });
+});
+
+it("viewer membership includes a joined viewer without a peer-roster entry", () => {
+  const fake = fakeSession();
+  const state = observe(fake);
+  fake.membership({
+    id: "a",
+    members: ["peer"],
+    viewerMembership: { pubkey: viewer, joined: true },
+  });
+  fake.set("a", { observedCount: 3 });
   expect(state()).toEqual({ unread: true, attention: 0 });
 });
 
@@ -271,7 +301,16 @@ it("keys every joined community's unread, opening its session and repair once", 
   expect(first.ensure).not.toHaveBeenCalled();
   first.loadUnreadable({ id: "a", members: ["someone-else"] });
   expect(first.ensure).not.toHaveBeenCalled();
-  first.load("a");
+  first.membership({
+    id: "a",
+    members: [viewer],
+    viewerMembership: { pubkey: viewer, joined: false },
+  });
+  expect(first.ensure).not.toHaveBeenCalled();
+  first.membership({
+    id: "a",
+    viewerMembership: { pubkey: viewer, joined: true },
+  });
   expect(first.ensure).toHaveBeenCalledTimes(1);
   expect(opened).not.toHaveBeenCalledWith(two, true);
   await vi.waitFor(() => expect(opened).toHaveBeenCalledWith(two, true));

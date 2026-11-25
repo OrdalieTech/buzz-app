@@ -1,4 +1,5 @@
 import { createInboxReactions } from "./inbox-reactions";
+import { viewerMember } from "./membership";
 import { byteSize } from "./budget";
 import type { ChannelQueries } from "./contracts";
 import type { RelayEvent, ReadFilter } from "./events";
@@ -84,7 +85,7 @@ export function createInboxFeed({
               channel.id === hs[0]?.[1] &&
               !channel.huddle &&
               !channel.cached &&
-              channel.members?.includes(viewer),
+              viewerMember(channel, viewer),
           ))
     );
   };

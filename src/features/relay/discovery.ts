@@ -518,6 +518,7 @@ export class DiscoveryState {
       ...(!this.authorized(id) || this.cached.has(id) || viewerRole === "guest"
         ? { readOnly: true as const }
         : {}),
+      viewerMembership: { pubkey: this.viewer, joined: this.authorized(id) },
       ...(viewerRole ? { viewerRole } : {}),
       ...(this.cached.has(id) ? { cached: true as const } : {}),
       name: this.name(id),

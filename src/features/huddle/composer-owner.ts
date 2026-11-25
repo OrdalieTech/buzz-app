@@ -1,4 +1,5 @@
 import { resolveForward } from "../messages/resolve-forward";
+import { viewerMember } from "../relay/membership";
 import { communityFromScope, relayGifRequests } from "../relay/gifs";
 import { onAutomatic } from "../agents/recommended";
 import { MAX_VOICE_SECONDS } from "../relay/voice-media";
@@ -106,7 +107,7 @@ export function createHuddleComposerOwner(
         c.readOnly ||
         c.cached ||
         !session.viewer ||
-        !c.members?.includes(session.viewer))
+        !viewerMember(c, session.viewer))
     )
       throw new Error("This Huddle conversation is read-only.");
   }

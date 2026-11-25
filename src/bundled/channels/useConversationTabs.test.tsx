@@ -2481,6 +2481,16 @@ it.each([
     text: "This conversation will appear once Buzz reconnects.",
   },
   {
+    name: "a Solo chat with denied viewer membership and retained peers",
+    kind: "conversation",
+    listed: {
+      channelType: "solo",
+      members: ["viewer"],
+      viewerMembership: { pubkey: "viewer", joined: false },
+    },
+    text: "This conversation is no longer available.",
+  },
+  {
     name: "an archived channel",
     kind: "conversation",
     listed: { archived: true as const, readOnly: true as const },

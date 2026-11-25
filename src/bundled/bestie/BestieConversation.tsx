@@ -1,3 +1,4 @@
+import { viewerMember } from "../../features/relay/membership";
 import {
   useCallback,
   useEffect,
@@ -674,9 +675,7 @@ export function BestieConversation({
                               current.cached ||
                               (current.readOnly &&
                                 current.viewerRole !== "guest") ||
-                              !current.members?.includes(
-                                session.viewer ?? "",
-                              ) ||
+                              !viewerMember(current, session.viewer) ||
                               !host.panels.snapshot().includes(panel) ||
                               !panel.channelMenu?.eligible(current, session)
                             )

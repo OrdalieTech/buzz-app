@@ -309,8 +309,15 @@ async function fixture({
     owner.dispose();
   });
   const send = vi.fn<typeof owner.session.messages.send>(() => "d".repeat(64));
+  let channelListOverride:
+    | ReturnType<typeof owner.session.channels.list>
+    | undefined;
   const session = {
     ...owner.session,
+    channels: {
+      ...owner.session.channels,
+      list: () => channelListOverride ?? owner.session.channels.list(),
+    },
     agentChoices,
     messages: { ...owner.session.messages, send },
   };
@@ -366,6 +373,9 @@ async function fixture({
     find: () => undefined,
   } as unknown as Agents;
   return {
+    setChannelList(next: ReturnType<typeof owner.session.channels.list>) {
+      channelListOverride = next;
+    },
     setPanels(next: readonly RegisteredPanel[]) {
       panels = next;
       for (const listener of panelListeners) listener();
@@ -1091,39 +1101,73 @@ it("offers the shared DM actions and channel details in Bestie", async () => {
   ).toBeInTheDocument();
 });
 
-it("opens eligible plugin menu items in the Bestie workspace", async () => {
-  const f = await fixture({ existing: true });
-  f.choose(pollen);
-  const user = userEvent.setup();
-  f.setPanels([
-    {
-      id: "canvas",
-      key: "test/canvas",
-      pluginId: "test",
-      revision: "1",
-      title: "Canvas",
-      matches: () => false,
-      channelMenu: {
-        label: "View canvas",
-        eligible: (channel) => channel.id === pollenDM,
-      },
-      component: ({ channelContext }) => (
-        <p>Canvas for {channelContext?.channelId}</p>
-      ),
-    } satisfies RegisteredPanel,
-  ]);
-  f.mount();
-  await user.click(
-    await screen.findByRole("button", { name: "Channel actions" }),
-  );
-  await user.click(
-    await screen.findByRole("menuitem", { name: "View canvas" }),
-  );
-  expect(await screen.findByText(`Canvas for ${pollenDM}`)).toBeVisible();
-  expect(
-    screen.getByRole("textbox", { name: "Message Pollen" }),
-  ).toBeInTheDocument();
-});
+it.each([
+  "legacy roster",
+  "joined without peers",
+  "denied with retained peers",
+])(
+  "opens eligible Bestie menu panels using viewer authority: %s",
+  async (membership) => {
+    const f = await fixture({ existing: true });
+    f.choose(pollen);
+    const user = userEvent.setup();
+    f.setPanels([
+      {
+        id: "canvas",
+        key: "test/canvas",
+        pluginId: "test",
+        revision: "1",
+        title: "Canvas",
+        matches: () => false,
+        channelMenu: {
+          label: "View canvas",
+          eligible: (channel) => channel.id === pollenDM,
+        },
+        component: ({ channelContext }) => (
+          <p>Canvas for {channelContext?.channelId}</p>
+        ),
+      } satisfies RegisteredPanel,
+    ]);
+    f.mount();
+    await user.click(
+      await screen.findByRole("button", { name: "Channel actions" }),
+    );
+    const action = await screen.findByRole("menuitem", { name: "View canvas" });
+    // Change only the authoritative read at click time. The rendered menu is
+    // already open, so denial must be rechecked by the Bestie handler itself.
+    const list = f.session.channels.list();
+    const current = list.channels.find((channel) => channel.id === pollenDM);
+    if (!current) throw new Error("Fixture needs the selected DM");
+    if (membership !== "legacy roster") {
+      const { members: _peers, ...withoutPeers } = current;
+      const updated =
+        membership === "joined without peers"
+          ? {
+              ...withoutPeers,
+              viewerMembership: { pubkey: f.viewer, joined: true },
+            }
+          : {
+              ...current,
+              viewerMembership: { pubkey: f.viewer, joined: false },
+            };
+      f.setChannelList({
+        ...list,
+        channels: list.channels.map((channel) =>
+          channel.id === pollenDM ? updated : channel,
+        ),
+      });
+    }
+    await user.click(action);
+    if (membership === "denied with retained peers") {
+      expect(screen.queryByText(`Canvas for ${pollenDM}`)).toBeNull();
+    } else {
+      expect(await screen.findByText(`Canvas for ${pollenDM}`)).toBeVisible();
+    }
+    expect(
+      screen.getByRole("textbox", { name: "Message Pollen" }),
+    ).toBeInTheDocument();
+  },
+);
 
 it("opens the DM an addition lands in, when Bestie's Members starts or finds another", async () => {
   const f = await fixture();

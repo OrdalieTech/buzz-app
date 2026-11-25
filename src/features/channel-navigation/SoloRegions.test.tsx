@@ -3011,6 +3011,58 @@ it("adds region entries to the existing workspace and channel heading menus", as
   );
 });
 
+it.each([
+  {
+    name: "a removed viewer with retained peers",
+    joined: false,
+    retainedRoster: true,
+  },
+  {
+    name: "a joined viewer without a peer roster",
+    joined: true,
+    retainedRoster: false,
+  },
+])(
+  "channel groups use viewer membership for $name",
+  async ({ joined, retainedRoster }) => {
+    const h = fixture();
+    const viewer = h.session.viewer;
+    assert(viewer);
+    h.roster([
+      {
+        id: "source",
+        name: "Source channel",
+        channelType: "stream",
+        ...(retainedRoster ? { members: [viewer] } : {}),
+        viewerMembership: { pubkey: viewer, joined },
+      },
+    ]);
+    await h.register({
+      component: ({ ui }) => {
+        const Group = ui.ChannelGroup;
+        assert(Group);
+        return (
+          <Group
+            channelId="source"
+            onSelect={() => {}}
+            expanded
+            controls="source-tasks"
+            disclosureLabel="Hide source tasks"
+            onToggle={() => {}}
+          >
+            Task content
+          </Group>
+        );
+      },
+    });
+    mount(h);
+    expect(!!screen.queryByRole("button", { name: "Source channel" })).toBe(
+      joined,
+    );
+    expect(!!screen.queryByText("Task content")).toBe(joined);
+  },
+);
+
 it("channel groups separate selection from disclosure, preserve children, and recheck task access", async () => {
   const h = fixture();
   const viewer = h.session.viewer;

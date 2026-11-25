@@ -30,6 +30,7 @@ import type { Navigation } from "../navigation/controller";
 import type { Panels } from "../panels/service";
 import type { RelayEvent } from "../relay/events";
 import { matchesEvent } from "../relay/projection";
+import { DiscoveryState } from "../relay/discovery";
 import {
   bounds,
   keypair,
@@ -906,6 +907,74 @@ it.each([
     expect(screen.getByRole("button", { name: "Copy text" })).toBeEnabled();
   },
 );
+
+it.each(["deny", "omit", "all"] as const)(
+  "does not restore draft or sent access from peers retained after %s",
+  (loss) => {
+    const h = fixture();
+    const viewer = h.session.viewer;
+    if (!viewer) throw new Error("Missing viewer");
+    const relay = keypair();
+    const discovery = new DiscoveryState(viewer, relay.pubkey);
+    const details = metadata(relay, "room", "Design", 10, [["public"]]);
+    discovery.accept(details);
+    discovery.accept(roster(relay, "room", [viewer], 10));
+    if (loss === "deny") discovery.deny("room");
+    else if (loss === "omit")
+      discovery.retain(new Set(), discovery.rosterVersions());
+    else discovery.denyAll();
+    discovery.resume("room", details);
+    const preview = discovery.get("room");
+    expect(preview?.members).toContain(viewer);
+    expect(preview?.viewerMembership?.joined).toBe(false);
+    if (!preview) throw new Error("Missing public preview");
+    const props = {
+      entry: { id: "draft:room", channelId: "room", text: "Keep this" },
+      title: "#Design",
+      session: h.session,
+      host: h.host,
+      autoFocus: false,
+      onClose: vi.fn(),
+      onOpen: vi.fn(),
+      onSaved: vi.fn(),
+    };
+    const view = render(<DraftPreview {...props} channel={preview} />);
+    expect(screen.getByText(/can’t post/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Copy text" })).toBeEnabled();
+    // Read-only public previews retain their existing Sent policy. This row
+    // exercises membership-based readability without that separate capability.
+    const { readOnly: _readOnly, ...membershipOnly } = preview;
+    view.rerender(
+      <DraftPreview {...props} mode="sent" channel={membershipOnly} />,
+    );
+    expect(screen.getByText(/not available for replying/)).toBeVisible();
+  },
+);
+
+it("opens a joined draft without waiting for a peer roster", async () => {
+  const h = fixture();
+  const viewer = h.session.viewer;
+  if (!viewer) throw new Error("Missing viewer");
+  render(
+    <DraftPreview
+      entry={{ id: "draft:room", channelId: "room", text: "Keep this" }}
+      title="#Design"
+      session={h.session}
+      host={h.host}
+      channel={{
+        id: "room",
+        name: "Design",
+        channelType: "stream",
+        viewerMembership: { pubkey: viewer, joined: true },
+      }}
+      autoFocus={false}
+      onClose={vi.fn()}
+      onOpen={vi.fn()}
+      onSaved={vi.fn()}
+    />,
+  );
+  expect(await screen.findByRole("textbox")).toBeVisible();
+});
 
 it("clears the live announcement between two sends to the same conversation", async () => {
   const h = fixture();

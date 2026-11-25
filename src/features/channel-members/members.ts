@@ -1,3 +1,4 @@
+import { viewerMember } from "../relay/membership";
 import { agentUnavailable } from "../agents/choices";
 import type { RelaySession } from "../relay/session";
 import type { ChannelSummary } from "../relay/contracts";
@@ -32,7 +33,7 @@ export function canAddMembers(
     channel.viewerRole !== "guest" &&
     !channel.archived &&
     expandable.has(channel.channelType ?? "") &&
-    (channel.members?.includes(session.viewer) ||
+    (viewerMember(channel, session.viewer) ||
       (channel.readOnly && !channel.private && channel.joinRole !== "guest"))
   );
 }
@@ -55,8 +56,9 @@ export function canAddToDirectMessage(
     channel.viewerRole !== "guest" &&
     !channel.archived &&
     !channel.cached &&
-    channel.members?.includes(session.viewer) &&
-    !(session.relayAuthor && channel.members.includes(session.relayAuthor))
+    viewerMember(channel, session.viewer) &&
+    (!session.relayAuthor ||
+      (channel.members && !channel.members.includes(session.relayAuthor)))
   );
 }
 
@@ -73,7 +75,7 @@ export function canShareSoloChat(
     !channel.readOnly &&
     !channel.cached &&
     !channel.archived &&
-    channel.members?.includes(session.viewer)
+    viewerMember(channel, session.viewer)
   );
 }
 

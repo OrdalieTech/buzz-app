@@ -1,3 +1,4 @@
+import { viewerMember } from "../../features/relay/membership";
 import { useProfileGeneration } from "../../features/relay/react";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { RelaySession } from "../../features/relay/session";
@@ -156,7 +157,7 @@ export function useSoloShare({
         !item.cached &&
         !item.archived &&
         ["stream", "forum"].includes(item.channelType ?? "") &&
-        item.members?.includes(session.viewer ?? "") &&
+        viewerMember(item, session.viewer) &&
         item.name
           .toLowerCase()
           .includes(query.trim().toLowerCase().replace(/^#/, "")),

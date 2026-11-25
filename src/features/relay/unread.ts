@@ -1,3 +1,4 @@
+import { viewerMember } from "./membership";
 import type { ProfileQueries } from "./profile-directory";
 import { workflowOwner } from "./workflow-attribution";
 import { agentAudience, detailsBrief, messageAudience } from "./audience";
@@ -632,24 +633,12 @@ export function createUnread({
   }
 
   let bytes = 0;
-  // Per member list: a large channel would otherwise be scanned for the
-  // viewer on every event.
-  const viewerIn = new WeakMap<readonly string[], boolean>();
-  const member = (members: readonly string[] | undefined) => {
-    if (!members) return false;
-    let found = viewerIn.get(members);
-    if (found === undefined) {
-      found = members.includes(viewer);
-      if (Object.isFrozen(members)) viewerIn.set(members, found);
-    }
-    return found;
-  };
   const allowed = (id: string) =>
     channels
       .list()
       .channels.some(
         (channel) =>
-          channel.id === id && !channel.cached && member(channel.members),
+          channel.id === id && !channel.cached && viewerMember(channel, viewer),
       );
   const keyFor = (target: ReadTarget) =>
     `${target.channelId}:${targetKey(target)}`;
@@ -1699,7 +1688,7 @@ export function createUnread({
           channel.metadataPending ||
           channel.cached ||
           channel.archived ||
-          !channel.members?.includes(viewer)
+          !viewerMember(channel, viewer)
         )
           continue;
         const dm = channel.channelType === "dm";
@@ -2209,9 +2198,7 @@ export function createUnread({
   const types = (list: ReturnType<ChannelQueries["list"]>) =>
     new Map(
       list.channels
-        .filter(
-          (channel) => !channel.cached && channel.members?.includes(viewer),
-        )
+        .filter((channel) => !channel.cached && viewerMember(channel, viewer))
         .map((channel) => [
           channel.id,
           `${channel.channelType ?? ""}:${!!channel.huddle}:${!!channel.metadataPending}`,
@@ -2227,9 +2214,7 @@ export function createUnread({
     list.channels
       .filter(
         (channel) =>
-          channel.archived &&
-          !channel.cached &&
-          channel.members?.includes(viewer),
+          channel.archived && !channel.cached && viewerMember(channel, viewer),
       )
       .map((channel) => channel.id)
       .sort()
@@ -2584,7 +2569,7 @@ export function createUnread({
       const ids = channels
         .list()
         .channels.filter(
-          (channel) => !channel.cached && channel.members?.includes(viewer),
+          (channel) => !channel.cached && viewerMember(channel, viewer),
         )
         .map((channel) => channel.id)
         // Batches key their marks, so they must not move when a channel is renamed.

@@ -126,6 +126,7 @@ async function page(
   sidebarPreferences?: RelaySession["sidebarPreferences"],
   uploadAttachment?: (file: File) => Promise<never>,
   linkedPanel?: Partial<RegisteredPanel>,
+  menuPanel = false,
 ) {
   const viewer = keypair(),
     authority = keypair();
@@ -179,6 +180,17 @@ async function page(
   await vi.waitFor(() =>
     expect(owner.session.channels.list().status).toBe("ready"),
   );
+  let channelListOverride:
+    | ReturnType<RelaySession["channels"]["list"]>
+    | undefined;
+  const menuSession = menuPanel
+    ? (Object.defineProperty(Object.create(owner.session), "channels", {
+        value: {
+          ...owner.session.channels,
+          list: () => channelListOverride ?? owner.session.channels.list(),
+        },
+      }) as RelaySession)
+    : undefined;
   const snapshot = {
     status: "ready" as const,
     generation: 1,
@@ -193,7 +205,7 @@ async function page(
             value: sidebarPreferences,
           },
         ) as typeof owner.session)
-      : owner.session,
+      : (menuSession ?? owner.session),
   };
   const relay: RelayData = {
     snapshot: () => snapshot,
@@ -211,6 +223,9 @@ async function page(
     title: "Notes",
     matches: () => false,
     channelPlacement: "tab",
+    ...(menuPanel && {
+      channelMenu: { label: "View notes", eligible: () => true },
+    }),
     channelLauncher: ({ context, toggle }) => (
       <button type="button" onClick={() => toggle(context.channelId)}>
         Open notes
@@ -302,9 +317,60 @@ async function page(
     root: root?.id,
     navigation,
     events,
+    setChannelList: (list: ReturnType<RelaySession["channels"]["list"]>) => {
+      channelListOverride = list;
+    },
     present: (request: PageNavigation) => mounted.rerender(view(request)),
   };
 }
+
+it.each([
+  "legacy roster",
+  "joined without peers",
+  "denied with retained peers",
+])(
+  "opens Channels menu panels using live viewer authority: %s",
+  async (membership) => {
+    const h = await page(
+      "stream",
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
+    await h.user.click(screen.getByRole("button", { name: "Channel actions" }));
+    const action = await screen.findByRole("menuitem", { name: "View notes" });
+    const list = h.session.channels.list();
+    const channel = list.channels.find((item) => item.id === "alpha");
+    if (!channel) throw new Error("Fixture needs Alpha");
+    if (membership !== "legacy roster") {
+      const { members: _peers, ...withoutPeers } = channel;
+      const updated = {
+        ...(membership === "joined without peers" ? withoutPeers : channel),
+        viewerMembership: {
+          pubkey: h.viewer,
+          joined: membership === "joined without peers",
+        },
+      };
+      h.setChannelList({
+        ...list,
+        channels: list.channels.map((item) =>
+          item.id !== channel.id ? item : updated,
+        ),
+      });
+    }
+    await h.user.click(action);
+    if (membership === "denied with retained peers")
+      expect(screen.queryByRole("textbox", { name: "Notes draft" })).toBeNull();
+    else
+      expect(
+        await screen.findByRole("textbox", { name: "Notes draft" }),
+      ).toBeVisible();
+  },
+);
 
 it("passes only the visible side thread's root to the timeline and clears it when hidden or moved", async () => {
   // A routed thread opens inline under the default; this is about its tab.
