@@ -1,7 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { createRelaySession } from "./session";
 import type { ReadFilter } from "./events";
-import { USER_STATUS_KIND } from "./user-status-policy";
 import {
   bounds,
   flush,
@@ -78,11 +77,7 @@ it("shares profile ownership between a standalone feature and the channel timeli
     bounds(relay, "c", "head", { has_more: false, next_cursor: null }),
   ]);
   await flush();
-  // The feature read no status, so the timeline reads only alice's status.
-  expect(pending.map((entry) => entry.filters)).toMatchObject([
-    [{ kinds: [USER_STATUS_KIND], authors: [alice.pubkey] }],
-  ]);
-  next().respond([]);
+  expect(pending).toHaveLength(0);
   profiles.respond([profile(alice, { name: "Alice" })]);
   await feature;
   expect(queries.profiles.snapshot().get(alice.pubkey)?.name).toBe("Alice");

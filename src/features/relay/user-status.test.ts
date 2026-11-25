@@ -818,11 +818,12 @@ it("leaves a failed profile read's statuses to their rows and skips statuses row
   expect(read.mock.calls[1]?.[0][0]?.authors).toEqual([bob.pubkey]);
 });
 
-it("reads statuses with the profiles of bylines, so their rows read nothing more", async () => {
+it("reads bylines' statuses after their background names, so their rows read nothing more", async () => {
   const relay = keypair();
   const carol = keypair();
   const queries: (readonly { kinds?: readonly number[] }[])[] = [];
   let answer!: () => void;
+  let answerStatus!: () => void;
   const owner = createRelaySession(
     {
       viewer: alice.pubkey,
@@ -830,46 +831,57 @@ it("reads statuses with the profiles of bylines, so their rows read nothing more
       media: (url) => url,
       async query(filters) {
         queries.push(filters);
-        if (!filters.some((filter) => filter.kinds?.includes(0))) return [];
+        if (filters[0]?.kinds?.includes(30315)) {
+          await new Promise<void>((resolve) => (answerStatus = resolve));
+          return [
+            signed(bob, {
+              kind: 30315,
+              created_at: now,
+              content: "Follows",
+              tags: [["d", "general"]],
+            }),
+          ];
+        }
+        if (!filters[0]?.kinds?.includes(0)) return [];
         await new Promise<void>((resolve) => (answer = resolve));
-        return [
-          signed(bob, { kind: 0, content: '{"name":"Bob"}', tags: [] }),
-          signed(bob, {
-            kind: 30315,
-            created_at: now,
-            content: "Bundled",
-            tags: [["d", "general"]],
-          }),
-        ];
+        return [signed(bob, { kind: 0, content: '{"name":"Bob"}', tags: [] })];
       },
     },
     { outboxStorage: { load: () => [], save() {} } },
   );
+  const kinds = () =>
+    queries
+      .filter((filters) =>
+        filters.some((f) => f.kinds?.includes(0) || f.kinds?.includes(30315)),
+      )
+      .map((filters) => filters.map((f) => f.kinds));
   try {
     const { profiles, statuses } = owner.session;
+    // The callers' priority: background reads run one at a time.
     const read = profiles.ensure([bob.pubkey], "background", {
       withStatuses: true,
     });
     await vi.advanceTimersByTimeAsync(0);
-    expect(queries.at(-1)?.map((filter) => filter.kinds)).toEqual([
-      [0],
-      [30315],
-    ]);
-    // The byline's row mounts while its profile read is out.
-    const before = queries.length;
+    expect(kinds()).toEqual([[[0]]]);
+    // The names publish without waiting on the status, which then follows.
+    answer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(profiles.snapshot().get(bob.pubkey)?.name).toBe("Bob");
+    expect(kinds()).toEqual([[[0]], [[30315]]]);
+    // The byline's row mounts while it is out and sends no read of its own.
     statuses.watch([bob.pubkey]);
     await vi.advanceTimersByTimeAsync(0);
-    answer();
+    answerStatus();
     await read;
     await vi.advanceTimersByTimeAsync(0);
-    expect(statuses.snapshot().get(bob.pubkey)?.text).toBe("Bundled");
-    expect(queries.slice(before)).toEqual([]);
+    expect(statuses.snapshot().get(bob.pubkey)?.text).toBe("Follows");
+    expect(kinds()).toHaveLength(2);
     // A view without bylines reads profiles alone.
     const alone = profiles.ensure([carol.pubkey], "background");
     await vi.advanceTimersByTimeAsync(0);
     answer();
     await alone;
-    expect(queries.at(-1)?.map((filter) => filter.kinds)).toEqual([[0]]);
+    expect(kinds().slice(2)).toEqual([[[0]]]);
   } finally {
     owner.dispose();
   }
@@ -946,9 +958,10 @@ it("keeps a live status or clear that lands while a prefetch is out, and drops s
   expect(read).not.toHaveBeenCalled();
 });
 
-it("loads names when the relay refuses a combined read, and rows read their own statuses", async () => {
+it("loads names when the relay refuses their status read, and rows read their own statuses", async () => {
   const relay = keypair();
   const queries: (readonly { kinds?: readonly number[] }[])[] = [];
+  let refused = false;
   const owner = createRelaySession(
     {
       viewer: alice.pubkey,
@@ -956,11 +969,15 @@ it("loads names when the relay refuses a combined read, and rows read their own 
       media: (url) => url,
       async query(filters) {
         queries.push(filters);
-        if (filters.length > 1) throw new Error("kind 30315 refused");
         if (filters[0]?.kinds?.includes(0))
           return [
             signed(bob, { kind: 0, content: '{"name":"Bob"}', tags: [] }),
           ];
+        if (!filters[0]?.kinds?.includes(30315)) return [];
+        if (!refused) {
+          refused = true;
+          throw new Error("kind 30315 refused");
+        }
         return [
           signed(bob, {
             kind: 30315,
@@ -975,12 +992,12 @@ it("loads names when the relay refuses a combined read, and rows read their own 
   );
   try {
     const { profiles, statuses } = owner.session;
-    const read = profiles.ensure([bob.pubkey], "background", {
+    const read = profiles.ensure([bob.pubkey], undefined, {
       withStatuses: true,
     });
     statuses.watch([bob.pubkey]);
-    // The names' one retry waits out the first recovery delay.
-    await vi.advanceTimersByTimeAsync(1000);
+    // Without a recovery delay: the names never waited on the status.
+    await vi.advanceTimersByTimeAsync(0);
     await read;
     await vi.advanceTimersByTimeAsync(0);
     expect(profiles.snapshot().get(bob.pubkey)?.name).toBe("Bob");
@@ -991,7 +1008,7 @@ it("loads names when the relay refuses a combined read, and rows read their own 
           filters.some((f) => f.kinds?.includes(0) || f.kinds?.includes(30315)),
         )
         .map((filters) => filters.map((f) => f.kinds)),
-    ).toEqual([[[0], [30315]], [[30315]], [[0]]]);
+    ).toEqual([[[0]], [[30315]], [[30315]]]);
   } finally {
     owner.dispose();
   }

@@ -137,8 +137,8 @@ export async function threadSample(
         !filter.depth_limit &&
         (filter.authors || (filter.ids && !filter["#h"])),
     );
-  // Rows and bylines' profile reads share status coverage, so no open asks
-  // for an author's status twice.
+  // Rows and the status reads beside bylines' profile reads share coverage,
+  // so no open asks for an author's status twice.
   const statusAuthors = new Set<string>();
   const statusRead = (filter: ReadFilter | undefined) => {
     if (!filter) return;
@@ -189,8 +189,7 @@ export async function threadSample(
         statusRead(first);
         events = [];
       } else if (first?.kinds?.includes(0)) {
-        assert.ok(filters.length <= 2);
-        statusRead(filters[1]);
+        assert.equal(filters.length, 1);
         assert.ok(
           first.authors?.every((id) =>
             [...data.profiles, data.headProfile].some((p) => p.pubkey === id),
@@ -320,7 +319,8 @@ export async function threadSample(
     await deadline(warmed.promise);
     const setupMs = performance.now() - setupStart;
     const setupRequests = requests.splice(0);
-    assert.equal(setupRequests.length, 3);
+    // Discovery, the head, and its author's profile and status.
+    assert.equal(setupRequests.length, 4);
     assert.ok(
       owner.session.profiling.snapshot().every((span) => span.outcome === "ok"),
       "setup still has pending work",
@@ -410,12 +410,8 @@ export async function threadSample(
           mode === "cold" ? 1 : 0,
         );
         assert.equal(
-          trace.filter(
-            (r) =>
-              r.filters.length === 2 &&
-              !lookup(r.filters) &&
-              !r.filters[0]?.kinds?.includes(0),
-          ).length,
+          trace.filter((r) => r.filters.length === 2 && !lookup(r.filters))
+            .length,
           4,
           "three data pages plus empty continuation",
         );

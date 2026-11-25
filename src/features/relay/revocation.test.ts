@@ -5,7 +5,6 @@ import { createRelaySession } from "./session";
 import { ReadError } from "./errors";
 import { eventDto, type RelayEvent } from "./events";
 import type { ReadTransport } from "./transport";
-import { USER_STATUS_KIND } from "./user-status-policy";
 import {
   type Key,
   bounds,
@@ -29,10 +28,17 @@ afterEach(() => {
   for (const owner of owners.splice(0)) owner.dispose();
 });
 function setup(
-  options: ChannelStoreOptions & { outboxStorage?: OutboxStorage } = {},
+  {
+    statuses = false,
+    ...options
+  }: ChannelStoreOptions & {
+    outboxStorage?: OutboxStorage;
+    /** Script status reads too, instead of answering them empty. */
+    statuses?: boolean;
+  } = {},
   verifyStored?: ReadTransport["verifyStored"],
 ) {
-  const wire = scriptedTransport(viewer.pubkey, relay.pubkey);
+  const wire = scriptedTransport(viewer.pubkey, relay.pubkey, { statuses });
   let incoming!: (events: readonly RelayEvent[]) => void;
   const owner = createRelaySession(
     {
@@ -637,15 +643,8 @@ it("finishes a profile read that was in flight when another channel's access end
   ]);
   await vi.waitFor(() => expect(h.pending).toHaveLength(1));
   const read = h.next();
-  // Statuses ride with the bylines' profile read.
   expect(read.filters).toEqual([
     { kinds: [0], authors: [alice.pubkey], limit: 500 },
-    {
-      kinds: [USER_STATUS_KIND],
-      "#d": ["general"],
-      authors: [alice.pubkey],
-      limit: 1,
-    },
   ]);
   h.emit([roster(relay, "a", [], 11)]);
   // A profile read does not depend on channel access, so the revoke spares it.
@@ -1154,7 +1153,7 @@ it.each([
 );
 
 it("keeps statuses shown and reads a retired status again at once when another channel's access ends", async () => {
-  const h = setup();
+  const h = setup({ statuses: true });
   h.emit(["a", "b"].map((id) => roster(relay, id, [viewer.pubkey], 10)));
   const status = (key: Key, content: string) =>
     signed(key, {

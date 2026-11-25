@@ -4,10 +4,10 @@ import { open } from "./timeline.mjs";
 
 test.use({ productionBroker: true });
 
-// Browser-only: the production broker forwards the combined profile and
-// status read to the modeled relay, and the row renders what that one read
+// Browser-only: the production broker forwards the status read that follows a
+// byline's profile read to the modeled relay, and the row renders what it
 // returned.
-test("a new author's status arrives with their name, and their row reads nothing more", async ({
+test("a new author's status follows their name, and their row reads nothing more", async ({
   page,
   app,
 }) => {
@@ -36,8 +36,7 @@ test("a new author's status arrives with their name, and their row reads nothing
       ({ filter }) =>
         filter.kinds?.includes(kind) && filter.authors?.includes(author),
     );
-  // The status rode the profile read: one of each, sent together.
+  // One of each: the row did not read the status again.
   await expect.poll(() => reads(0).length).toBe(1);
   expect(reads(30315)).toHaveLength(1);
-  expect(reads(30315)[0].at).toBeCloseTo(reads(0)[0].at, 0);
 });

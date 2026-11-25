@@ -336,32 +336,6 @@ export function policyRelay({
             filters.flatMap((filter) => answer(communityOf(url), filter)),
           );
         }
-        if (filters.length === 2 && filters[1].kinds?.includes(30315)) {
-          // Byline profiles with the statuses their rows show.
-          const [names, statuses] = filters;
-          expect(names).toEqual({
-            kinds: [0],
-            authors: expect.any(Array),
-            limit: expect.any(Number),
-          });
-          expect(statuses).toEqual({
-            kinds: [30315],
-            "#d": ["general"],
-            authors: expect.any(Array),
-            limit: statuses.authors.length,
-          });
-          expect(statuses.authors.length).toBeLessThanOrEqual(100);
-          expect(
-            statuses.authors.every((id) => names.authors.includes(id)),
-          ).toBe(true);
-          const community = communityOf(url);
-          for (const filter of filters)
-            report.queries.push({ community, filter, at: performance.now() });
-          const result = filters.flatMap((filter) => answer(community, filter));
-          return names.authors.some((id) => heldAuthors.has(id))
-            ? holdProfile(result)
-            : Response.json(result);
-        }
         if (filters.length === 2 && filters[0].kinds?.includes(39000)) {
           // Exact channel authority lookup, distinct from sidebar preferences.
           const ids = filters[0]["#d"];

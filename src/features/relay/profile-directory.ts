@@ -11,8 +11,7 @@ import {
   type VerifiedProfileFilter,
   type VerifiedProfileSink,
 } from "./verified-profile";
-import { isRetryableRead, retryRead } from "./read-retry";
-import { readErrorKind } from "./errors";
+import { retryRead } from "./read-retry";
 import { attestedOwner } from "../agents/owner-attestation";
 import { hasEventProof } from "./events";
 import type { Outbox } from "./outbox";
@@ -34,8 +33,7 @@ export interface ProfileQueries {
   snapshot(): ReadonlyMap<string, Profile>;
   subscribe(listener: () => void): () => void;
   /** Fetch missing profiles; optional enrichment can yield to conversation reads.
-   * A view that shows these people's statuses gets them too: in the same
-   * request as their profiles, or alone when the profiles are already known. */
+   * A view that shows these people's statuses reads them beside the profiles. */
   ensure(
     ids: readonly string[],
     priority?: Priority,
@@ -141,7 +139,6 @@ export function createProfileDirectory(
   type Batch = {
     work: Promise<void>;
     authors: string[];
-    filters: ReadFilter[];
     priority: Priority;
     reading: boolean;
     refresh: boolean;
@@ -468,7 +465,10 @@ export function createProfileDirectory(
           batch.priority = priority;
           if (batch.reading)
             void reader
-              .read(batch.filters, { signal, priority })
+              .read(
+                [{ kinds: [0], authors: batch.authors, limit: PROFILE_PAGE }],
+                { signal, priority },
+              )
               .catch(() => {});
         }
         waiting.add(batch.work);
@@ -488,16 +488,9 @@ export function createProfileDirectory(
     });
     for (let offset = 0; offset < missing.length; offset += PROFILE_PAGE) {
       const authors = missing.slice(offset, offset + PROFILE_PAGE);
-      const status = withStatuses ? statuses?.prefetch(authors) : undefined;
       let answered = false;
-      // Set once a combined read fails, for one more attempt with names alone.
-      let namesAlone = false;
       const batch = {
         authors,
-        filters: [
-          { kinds: [0], authors, limit: PROFILE_PAGE },
-          ...(status ? [status.filter] : []),
-        ],
         priority,
         reading: false,
         refresh,
@@ -511,44 +504,28 @@ export function createProfileDirectory(
           batch.reading = true;
           attempts.set(signal, batch);
           try {
-            const result = await reader.read(batch.filters, {
-              signal,
-              priority: batch.priority,
-            });
+            const result = await reader.read(
+              [{ kinds: [0], authors, limit: PROFILE_PAGE }],
+              { signal, priority: batch.priority },
+            );
             answered = true;
             return result;
-          } catch (error) {
-            // Names never wait on statuses: a relay refusing the status
-            // query still answers names, and rows read their own statuses.
-            if (batch.filters.length > 1) {
-              batch.filters = batch.filters.slice(0, 1);
-              namesAlone = true;
-              status?.settle();
-            }
-            throw error;
           } finally {
             batch.reading = false;
           }
         },
         AbortSignal.any([signal, batch.cancel.signal]),
-        (error) => {
-          const retry = namesAlone && readErrorKind(error) !== "cancelled";
-          namesAlone = false;
-          return retry || isRetryableRead(error);
-        },
       )
         .then((result) => {
-          // Statuses stay valid when a shrink drops these names.
-          status?.settle(result);
           if (signal.aborted || batch.cancel.signal.aborted) return;
           // A foreground reader that joined this read gets its names at once.
           const fold = batch.priority === "background";
-          const profiles = result.filter(
-            (event) => event.kind === 0 && authors.includes(event.pubkey),
+          const profiles = result.filter((event) =>
+            authors.includes(event.pubkey),
           );
           take(profiles, fold);
           // A page at the limit may have left out authors who do have one.
-          if (result.filter((event) => event.kind === 0).length < PROFILE_PAGE)
+          if (result.length < PROFILE_PAGE)
             missed(
               authors,
               new Set(profiles.map((event) => event.pubkey)),
@@ -571,15 +548,13 @@ export function createProfileDirectory(
       for (const id of authors) pending.set(id, batch);
       waiting.add(batch.work);
     }
-    // Names already known need no profile read, but their statuses still do.
-    const reading = new Set(missing);
-    const status = withStatuses
-      ? statuses?.prefetch(unique.filter((id) => !reading.has(id)))
-      : undefined;
-    // Waited on so the caller can warm status images with avatars.
+    // Its own request at the names' priority, so a status answer can never
+    // cost the names; waited on so the caller can warm status images with
+    // avatars.
+    const status = withStatuses ? statuses?.prefetch(unique) : undefined;
     if (status)
       waiting.add(
-        reader.read([status.filter], { signal, priority: "background" }).then(
+        reader.read([status.filter], { signal, priority }).then(
           (events) => status.settle(events),
           () => status.settle(),
         ),

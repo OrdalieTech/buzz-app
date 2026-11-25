@@ -190,12 +190,22 @@ export const isNoticeRead = (filters: readonly ReadFilter[]) =>
   filters.every(
     (filter) => filter.kinds?.length === 1 && filter.kinds[0] === 40099,
   );
+/** A status read alone, such as the one beside each byline profile read. */
+export const isStatusRead = (filters: readonly ReadFilter[]) =>
+  filters.length > 0 &&
+  filters.every(
+    (filter) => filter.kinds?.length === 1 && filter.kinds[0] === 30315,
+  );
 /** A transport whose responses the test releases explicitly, so ordering and cancellation are observable.
- * Membership notice reads answer empty at once unless `notices` scripts them too. */
+ * Membership notice and status reads answer empty at once unless `notices` or
+ * `statuses` scripts them too. */
 export function scriptedTransport(
   viewer: string,
   relayAuthor: string,
-  { notices = false }: { notices?: boolean } = {},
+  {
+    notices = false,
+    statuses = false,
+  }: { notices?: boolean; statuses?: boolean } = {},
 ) {
   const pending: Scripted[] = [];
   const transport: ReadTransport = {
@@ -204,6 +214,7 @@ export function scriptedTransport(
     media: (url) => (/^https:\/\//.test(url) ? url : undefined),
     query(filters, signal) {
       if (!notices && isNoticeRead(filters)) return Promise.resolve([]);
+      if (!statuses && isStatusRead(filters)) return Promise.resolve([]);
       return new Promise<RelayEvent[]>((resolve, reject) => {
         const entry: Scripted = {
           filters,

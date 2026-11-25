@@ -1,6 +1,6 @@
 import { assert, afterEach, expect, it, vi } from "vitest";
 import type { EventTemplate } from "nostr-tools";
-import { eventDto, type ReadFilter, type RelayEvent } from "./events";
+import { eventDto, type RelayEvent } from "./events";
 import { foldMessages } from "./fold";
 import type { LiveCallbacks } from "./live";
 import { createRelaySession } from "./session";
@@ -21,19 +21,12 @@ import {
   scriptedTransport,
   signed,
 } from "./testing";
-import { USER_STATUS_KIND } from "./user-status-policy";
 
 const viewer = keypair(),
   relay = keypair(),
   honey = keypair(),
   namesake = keypair();
 const owners: ReturnType<typeof createRelaySession>[] = [];
-// Bylines read profiles together with statuses.
-const profileRead = (filters: readonly ReadFilter[]) =>
-  filters.every((filter) =>
-    filter.kinds?.every((kind) => kind === 0 || kind === USER_STATUS_KIND),
-  );
-
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => {
@@ -80,7 +73,10 @@ function setup(
                 ? [currentRoster]
                 : [],
           );
-        if ((soloMode || profileEvents.length) && profileRead(filters))
+        if (
+          (soloMode || profileEvents.length) &&
+          filters.every((filter) => filter.kinds?.every((kind) => kind === 0))
+        )
           return Promise.resolve(profileEvents);
         if (soloMode && filters.every((filter) => !!filter.ids))
           return Promise.resolve(publish.mock.calls.map(([event]) => event));
@@ -114,7 +110,11 @@ function setup(
     ]);
     let pending = wire.next();
     while (!pending.filters.some((filter) => filter.kinds?.includes(39002))) {
-      expect(profileRead(pending.filters)).toBe(true);
+      expect(
+        pending.filters.every((filter) =>
+          filter.kinds?.every((kind) => kind === 0),
+        ),
+      ).toBe(true);
       pending.respond([]);
       await flush();
       pending = wire.next();

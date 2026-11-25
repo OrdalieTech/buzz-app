@@ -8,7 +8,6 @@ import { headRecovering } from "./live-recovery";
 import { EMOJI_SET } from "./emoji";
 import type { SidebarPreferences } from "./sidebar-preferences";
 import { readJournal, type ReadJournal } from "./read-state-storage";
-import { USER_STATUS_KIND } from "./user-status-policy";
 // The real host codec, as read-state.test.ts uses it.
 import {
   decodeReadState,
@@ -467,14 +466,12 @@ function reconnectHarness(
     wire.pending.filter(
       (entry) => !entry.signal?.aborted && entry.filters[0]?.top_level === true,
     );
-  /** The one outstanding window read, after answering byline profile and
-   * status reads empty. A notice read of its own stays pending. */
+  /** The one outstanding window read, after answering byline profile reads
+   * empty. A notice read of its own stays pending. */
   const read = (channelId = "c") => {
     for (const entry of wire.pending.splice(0)) {
       if (entry.signal?.aborted) continue;
-      const kinds = entry.filters[0]?.kinds;
-      if (kinds?.includes(0) || kinds?.includes(USER_STATUS_KIND))
-        entry.respond([]);
+      if (entry.filters[0]?.kinds?.includes(0)) entry.respond([]);
       else wire.pending.push(entry);
     }
     const reads = wire.pending.filter((entry) => !isNoticeRead(entry.filters));
@@ -1497,7 +1494,9 @@ it("skips the reads a continuous global replay covers, and keeps them after a cu
   const relay = keypair(),
     viewer = keypair(),
     alice = keypair();
-  const wire = scriptedTransport(viewer.pubkey, relay.pubkey);
+  const wire = scriptedTransport(viewer.pubkey, relay.pubkey, {
+    statuses: true,
+  });
   let live!: LiveCallbacks;
   let journal: ReadJournal | undefined;
   const decodeMarkers = vi.fn(async (events: readonly RelayEvent[]) =>
