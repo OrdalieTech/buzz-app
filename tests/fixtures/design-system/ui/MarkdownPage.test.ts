@@ -57,18 +57,18 @@ it("resolves source-relative documents and preserves viewer section links", () =
     createElement(MarkdownPage, {
       documentPath: "src/shared/design-system/DESIGN.md",
       source:
-        "# Guide\n\n[Maintaining](MAINTAINING_DESIGN_SYSTEM.md) and [system documentation](../../../docs/design-system.md).\n\n[Identity](#identity-shapes) and [specification](https://example.com/type).\n\n## Identity shapes",
+        "# Guide\n\n[Guide](DESIGN.md) and [system documentation](../../../docs/browser-testing.md).\n\n[Identity](#identity-shapes) and [specification](https://example.com/type).\n\n## Identity shapes",
     }),
   );
-  expect(screen.getByRole("link", { name: "Maintaining" })).toHaveAttribute(
+  expect(screen.getByRole("link", { name: "Guide" })).toHaveAttribute(
     "href",
-    "#/design/maintaining",
+    "#/design/design-guide",
   );
   expect(
     screen.getByRole("link", { name: "system documentation" }),
   ).toHaveAttribute(
     "href",
-    "https://github.com/block/buzz-app/blob/main/docs/design-system.md",
+    "https://github.com/block/buzz-app/blob/main/docs/browser-testing.md",
   );
   expect(screen.getByRole("link", { name: "Identity" })).toHaveAttribute(
     "href",

@@ -2,8 +2,8 @@
 //! Cmd+Shift+W only clears the current channel's tabs.
 //! The red button still closes the window directly.
 //! Edit → Paste and Match Style (Cmd+Shift+V) pastes the clipboard as plain text.
-//! Buzz → Settings… runs the app's Open Settings shortcut. It has no native
-//! accelerator, so Cmd+, keeps the web shortcut's rebinding and IME rules.
+//! Buzz → Settings… (Cmd+,) runs the app's Open Settings shortcut.
+//! Buzz → Check for Updates… opens Settings → Software updates and checks.
 //! Ctrl+Tab bypasses macOS menu highlighting latency. Menu commands and the
 //! native key handler both work while a raw guest webview owns keyboard focus.
 use std::{cell::RefCell, ptr::NonNull};
@@ -22,6 +22,7 @@ const NEXT: &str = "buzz-next-tab";
 const PREVIOUS: &str = "buzz-previous-tab";
 const PASTE_PLAIN: &str = "buzz-paste-plain";
 const SETTINGS: &str = "buzz-settings";
+const CHECK_UPDATES: &str = "buzz-check-for-updates";
 // The focused composer marks the paste that follows as raw, whether or not a
 // key fired. A focused guest browser takes the paste itself.
 const PASTE_PLAIN_REQUEST: &str = "if (browserSessionId === null) document.activeElement?.dispatchEvent(new Event(\"buzz:paste-plain\"));";
@@ -77,15 +78,19 @@ pub(crate) fn menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         }
     }
     debug_assert_eq!(replaced, 2, "Tauri default Close menu structure changed");
-    // The app menu opens with About and a separator; Settings follows them, as
-    // in other Mac apps.
+    // The app menu opens with About and a separator. As in other Mac apps,
+    // Check for Updates… follows About and Settings follows the separator.
     if let Some(app_menu) = menu.items()?.first().and_then(|item| item.as_submenu()) {
+        app_menu.insert(
+            &MenuItem::with_id(app, CHECK_UPDATES, "Check for Updates…", true, None::<&str>)?,
+            1,
+        )?;
         app_menu.insert_items(
             &[
-                &MenuItem::with_id(app, SETTINGS, "Settings…", true, None::<&str>)?,
+                &MenuItem::with_id(app, SETTINGS, "Settings…", true, Some("CmdOrCtrl+,"))?,
                 &PredefinedMenuItem::separator(app)?,
             ],
-            2,
+            3,
         )?;
     }
     if let Some(window) = menu.get(WINDOW_SUBMENU_ID) {
@@ -114,7 +119,8 @@ pub(crate) fn handle<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
         // A block keeps the binding out of the page's global scope.
         NEXT => format!("{{ const tabEvent = \"buzz:next-tab\";\n{SWITCH}}}"),
         PREVIOUS => format!("{{ const tabEvent = \"buzz:previous-tab\";\n{SWITCH}}}"),
-        SETTINGS => return open_settings(app),
+        SETTINGS => return show_and_request(app, "buzz:open-settings"),
+        CHECK_UPDATES => return show_and_request(app, "buzz:check-for-updates"),
         PASTE_PLAIN => {
             // On the UI thread the script is sent to the page at once, so it
             // runs before the paste command that follows it.
@@ -126,16 +132,16 @@ pub(crate) fn handle<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEve
     dispatch_request(app, &script, event.id().as_ref());
 }
 
-// Unlike a tab request, Settings brings back a hidden or minimized window, as
-// the red button only hides it.
-fn open_settings<R: Runtime>(app: &AppHandle<R>) {
+// Unlike a tab request, Settings and Check for Updates bring back a hidden or
+// minimized window, as the red button only hides it.
+fn show_and_request<R: Runtime>(app: &AppHandle<R>, event: &str) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
     if let Err(error) = crate::notifications::focus(&window) {
-        eprintln!("Could not show Buzz for Settings: {error}");
+        eprintln!("Could not show Buzz for {event}: {error}");
     }
-    if let Err(error) = window.eval("window.dispatchEvent(new Event(\"buzz:open-settings\"));") {
+    if let Err(error) = window.eval(format!("window.dispatchEvent(new Event(\"{event}\"));")) {
         eprintln!("Could not send Buzz request: {error}");
     }
 }

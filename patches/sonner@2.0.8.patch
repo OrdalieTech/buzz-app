@@ -131,8 +131,8 @@ index 394dbc2272f43b84642b0f9d5cc7eb1eacb0ffb3..0fcb2ea0432847dac77ef6b950139cc3
 -                        lastFocusedElementRef.current = null;
 +                    const previous = lastFocusedElementRef.current;
 +                    lastFocusedElementRef.current = null;
-+                    // Tab, pointer and action-driven focus moves already have a destination.
-+                    if (previous && (!event.relatedTarget || event.relatedTarget === document.body)) {
++                    // Tab, pointer and action-driven focus moves keep their destination unless it is hidden, as behind a modal.
++                    if (previous && (!event.relatedTarget || event.relatedTarget === document.body || event.relatedTarget.closest?.('[aria-hidden="true"]'))) {
 +                        previous.focus?.({ preventScroll: true });
                      }
                  }
@@ -316,8 +316,8 @@ index c124f821a68f7070647a5a04441d0caa53689662..27f2fb1bed2607477a790e5d7c182b6c
 -                        lastFocusedElementRef.current = null;
 +                    const previous = lastFocusedElementRef.current;
 +                    lastFocusedElementRef.current = null;
-+                    // Tab, pointer and action-driven focus moves already have a destination.
-+                    if (previous && (!event.relatedTarget || event.relatedTarget === document.body)) {
++                    // Tab, pointer and action-driven focus moves keep their destination unless it is hidden, as behind a modal.
++                    if (previous && (!event.relatedTarget || event.relatedTarget === document.body || event.relatedTarget.closest?.('[aria-hidden="true"]'))) {
 +                        previous.focus?.({ preventScroll: true });
                      }
                  }

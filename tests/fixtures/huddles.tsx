@@ -314,6 +314,8 @@ const stats = {
   audioClosed: 0,
   audioOpened: 0,
   ringPlays: 0,
+  // Every raw `playing` event, diagnostic only: ringPlays is what tests assert.
+  ringPlayingEvents: 0,
   ringEnds: 0,
   ringPaused: 0,
 };
@@ -405,10 +407,34 @@ const huddles = createHuddles(relay, bridge, async (...args) => {
 });
 const stopRing = createHuddleRing(huddles, () => {
   const audio = new Audio(HUDDLE_RING);
+  // Count clip starts, not `playing` events. `playing` also fires whenever one
+  // clip resumes after its ready state dips (`waiting`), which WebKit's media
+  // pipeline can do while it prerolls on a loaded machine. `play` marks each
+  // new play() from a paused clip, so only its first `playing` counts.
+  //
+  // Restarting a clip that is already playing (seek to zero, then play())
+  // emits no `play`, and WebKit emits no `playing` for it either, so `seeking`
+  // counts that one. Each repeat also seeks to zero, from the ended clip, and
+  // WebKit reports that seek after the repeat's `playing`; `rewinding` skips
+  // it so a repeat still counts once.
+  let started = false;
+  let rewinding = false;
+  audio.addEventListener("play", () => {
+    started = false;
+  });
   audio.addEventListener("playing", () => {
+    stats.ringPlayingEvents++;
+    if (started) return;
+    started = true;
     stats.ringPlays++;
   });
+  audio.addEventListener("seeking", () => {
+    if (rewinding) rewinding = false;
+    else if (started && !audio.paused && audio.currentTime === 0)
+      stats.ringPlays++;
+  });
   audio.addEventListener("ended", () => {
+    rewinding = true;
     stats.ringEnds++;
   });
   audio.addEventListener("pause", () => {

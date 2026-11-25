@@ -10,12 +10,13 @@
 import { absoluteWorkspace } from "../../../bundled/codex/config";
 import type { SessionAction } from "../../agents/service";
 import type { AcpProcess } from "./process";
-import type { AcpSession } from "./session";
-import { codeOf } from "./steps";
+import type { AcpSession, TurnRoute } from "./session";
+import { codeOf, errorMessage } from "./steps";
 import type {
   ActivityReceipt,
   Choice,
   ResolveDirectory,
+  ServeMcp,
   Settled,
   ToolServer,
 } from "./types";
@@ -34,6 +35,12 @@ export const SAVED_SESSIONS = 10;
 export type SavedConversation = Readonly<{
   at: number;
   sessions?: readonly string[];
+  /** What held work saved with its session (`keep`), as stored: read only
+   * through `association`, so damage is never taken for none. */
+  binding?: unknown;
+  /** New session was asked for, until a session replacing the newest one
+   * is saved. */
+  next?: "new";
 }>;
 /** The longest session id kept; longer ones are taken as damaged. */
 const SESSION_ID_LIMIT = 256;
@@ -50,15 +57,48 @@ export function savedConversation(
   value: unknown,
 ): SavedConversation | undefined {
   if (!value || typeof value !== "object") return undefined;
-  const { at, sessions } = value as { at?: unknown; sessions?: unknown };
+  const { at, sessions, next } = value as {
+    at?: unknown;
+    sessions?: unknown;
+    next?: unknown;
+  };
   if (!validTime(at)) return undefined;
-  if (sessions === undefined) return { at };
+  const kept = {
+    at,
+    // Kept as stored, however damaged, for `association` to refuse.
+    ...("binding" in value ? { binding: value.binding } : {}),
+    ...(next === "new" ? { next: "new" as const } : {}),
+  } as const;
+  if (sessions === undefined) return kept;
   if (!Array.isArray(sessions)) return undefined;
   const ids = sessions.filter(
     (id): id is string =>
       typeof id === "string" && id.length > 0 && id.length <= SESSION_ID_LIMIT,
   );
-  return { at, sessions: [...new Set(ids)].slice(0, SAVED_SESSIONS) };
+  return { ...kept, sessions: [...new Set(ids)].slice(0, SAVED_SESSIONS) };
+}
+
+/** The value held work saved with the conversation's newest session:
+ * none when nothing was saved or what was is another session's, and
+ * "malformed" when what is stored can't be read. */
+export function association(
+  saved: SavedConversation | undefined,
+): Readonly<{ value: unknown }> | "malformed" | undefined {
+  if (!saved || !("binding" in saved)) return undefined;
+  const { binding } = saved;
+  if (!binding || typeof binding !== "object" || Array.isArray(binding))
+    return "malformed";
+  const keys = Object.keys(binding);
+  if (keys.length !== 2 || !("session" in binding) || !("value" in binding))
+    return "malformed";
+  const { session, value } = binding;
+  if (
+    typeof session !== "string" ||
+    !session ||
+    session.length > SESSION_ID_LIMIT
+  )
+    return "malformed";
+  return session === saved.sessions?.[0] ? { value } : undefined;
 }
 export type SessionStore = {
   get(key: string): SavedConversation | undefined;
@@ -137,8 +177,9 @@ export type SessionsOptions = Readonly<{
   }>;
   /** The servers its sessions hold: the shared pool unless given. */
   pool?: ServerPool;
-  /** The agent's current settings, for a new session. */
-  launch(): Promise<Launch>;
+  /** The agent's current settings, for a new session or a session's next
+   * turn in `conversation`: none for a one-off turn. */
+  launch(conversation?: string): Promise<Launch>;
   /** The agent's provider, model and thinking level now, which each new
    * turn runs on. */
   choice(): Choice;
@@ -149,12 +190,14 @@ export type SessionsOptions = Readonly<{
   /** Where each conversation's last use is saved. */
   store?: SessionStore;
   /** Told of each session opened, with the prompt and title it was opened
-   * with, and the conversation it opened for: none for a one-off turn. */
+   * with, and the conversation it opened for: none for a one-off turn. A
+   * one-off turn's also gets its label, as `runOnce` was given it. */
   started?(
     sessionId: string,
     systemPrompt: string,
     title?: string,
     conversation?: string,
+    wake?: string,
   ): void;
   /** The tags a session opens with, for the conversation it opens for:
    * none for a one-off turn. */
@@ -163,6 +206,41 @@ export type SessionsOptions = Readonly<{
    * closes. */
   onChange?(): void;
 }>;
+
+/** A conversation `exclusive` holds. */
+type Held = { controller: AbortController; done: Promise<void> };
+
+/** What `exclusive` gives the work it runs. */
+export type Exclusive = Readonly<{
+  /** The conversation's newest saved session, if any, and none once New
+   * session was asked for. */
+  saved: string | undefined;
+  /** New session was asked for since the newest session was saved. */
+  reset: boolean;
+  /** What the work saved with `saved`, read by `association`. */
+  binding: ReturnType<typeof association>;
+  /** Saves `id` as its newest session with `binding`, while the work holds
+   * the conversation: whether the store then reads it back so. */
+  keep(id: string, binding: unknown): boolean;
+  /** Notes what the session it runs in has been shown, as a message's
+   * delivery does, while the work holds the conversation. */
+  shown(seen: number): void;
+  /** Aborts on `interrupt` or `dispose`. */
+  signal: AbortSignal;
+  /** A session the work opened outlives it until `done`, its process's
+   * `exited`: until then the conversation cannot be held again and its
+   * messages wait. Each call adds to the ones before, which are all waited
+   * for. Should any `done` reject, its owner is unknown, and both fail from
+   * then on. Throws once the work has settled. */
+  outlives(done: Promise<unknown>): void;
+}>;
+
+/** A session left running by held work, until its process has exited. */
+type Outliving = {
+  exits: readonly Promise<unknown>[];
+  settled: Promise<void>;
+  failed: boolean;
+};
 
 type Live = {
   session: AcpSession;
@@ -191,6 +269,8 @@ export class AgentSessions {
   private readonly live = new Map<string, Live>();
   /** One-off turns running or starting, by label. */
   private readonly once = new Map<string, Live | undefined>();
+  /** The label each open one-off turn was given. */
+  private readonly onceLabels = new Map<string, string>();
   private onceCount = 0;
   /** Sessions opening, which `shutdown` waits for. */
   private readonly opens = new Set<Promise<Live>>();
@@ -201,6 +281,18 @@ export class AgentSessions {
     string,
     Promise<{ settled?: Promise<Settled> }>
   >();
+  /** Conversations `exclusive` holds, which messages wait for. */
+  private readonly held = new Map<string, Held>();
+  /** Conversations whose idle session a message keeps while its model route
+   * chooses, so one that comes meanwhile does not go first. */
+  private readonly choosing = new Map<string, Promise<void>>();
+  /** Conversations whose last held work left a session not yet retired. */
+  private readonly outliving = new Map<string, Outliving>();
+  /** Holds waiting their turn, by conversation, which `interrupt` ends. */
+  private readonly waiting = new Map<string, Set<AbortController>>();
+  /** Resolves on `dispose`, ending waits on a session left running. */
+  private readonly stopping: Promise<void>;
+  private stop!: () => void;
   /** created_at of the newest event each conversation's session was shown. */
   private readonly shown = new Map<string, number>();
   /** Conversations that have had a session, whose next new one may have been
@@ -210,8 +302,12 @@ export class AgentSessions {
 
   private readonly stopped: Settled;
   private readonly late: Settled;
+  private get unconfirmed() {
+    return `${this.options.label} could not confirm this conversation's session ended`;
+  }
 
   constructor(private readonly options: SessionsOptions) {
+    this.stopping = new Promise((resolve) => (this.stop = resolve));
     this.stopped = { ok: false, error: `${options.label} was stopped` };
     this.late = {
       ok: false,
@@ -225,7 +321,12 @@ export class AgentSessions {
     return this.shown.get(key) ?? 0;
   }
   active(key: string) {
-    return this.opening.has(key) || !!this.live.get(key)?.session.working;
+    return (
+      this.opening.has(key) ||
+      this.held.has(key) ||
+      this.outliving.has(key) ||
+      !!this.live.get(key)?.session.working
+    );
   }
   /** Whether the work conversation or one-off turn `key`'s session runs now
    * still runs, unstopped and in that session, when asked later. */
@@ -261,14 +362,17 @@ export class AgentSessions {
   }
 
   /** Sends `text` into the conversation `key`, and resolves when the session
-   * has answered it. `steer` replaces `text` when the session is mid-turn;
-   * `fresh` builds it again when the session it was built for was closed;
+   * has answered it; the activity's `refresh`, if any, builds it again as
+   * it is handed over, and `fresh` when the session it was built for was
+   * closed;
    * `title` names a session opened for it, except that the conversation's
    * first one is left for the harness to name, if it names sessions, when `named`
    * takes that name;
    * `model`, one of the agent's
    * provider's, and `effort`, one of its thinking levels, are what its turn
-   * runs on, and `kept`, a synced level, one it must run on. Once `signal` aborts, it stops
+   * runs on, and `kept`, a synced level, one it must run on; `route`
+   * chooses them instead for a turn it starts (`Delivery.route`). Once
+   * `signal` aborts, it stops
    * waiting for a session to open, which is then kept for the next message,
    * and sends nothing. */
   async deliver(
@@ -276,7 +380,6 @@ export class AgentSessions {
     text: string,
     seen: number,
     {
-      steer = text,
       current,
       fresh,
       title,
@@ -285,9 +388,9 @@ export class AgentSessions {
       model,
       effort,
       kept,
+      route,
       ...activity
     }: Readonly<{
-      steer?: string;
       current?: () => boolean;
       fresh?: () => Promise<string>;
       title?: string;
@@ -296,54 +399,122 @@ export class AgentSessions {
       model?: string;
       effort?: string;
       kept?: string;
+      route?: TurnRoute;
     }> &
       ActivityReceipt = {},
   ): Promise<Settled> {
-    for (;;) {
-      if (current && !current()) return { ok: true, undelivered: true };
-      if (this.disposed) return { ...this.stopped, undelivered: true };
-      // A message that arrives while its conversation's session opens uses it.
-      const opening = this.opening.get(key);
-      if (opening) {
-        // The session stays shared; only this message gives up on it.
-        try {
-          await abortable(
-            opening.catch(() => undefined),
-            signal,
-          );
-        } catch {
-          return this.late;
-        }
-        continue;
-      }
-      const live = this.live.get(key);
-      if (!live) break;
-      if (
-        !live.session.open ||
-        (!live.session.busy && (this.stale(live) || this.leveled(live, effort)))
-      ) {
-        this.drop(key, live);
-        break;
-      }
-      // A harness that cannot take a new prompt in place needs a new session.
-      if (!live.session.busy && !live.process.repromptable) {
-        const { systemPrompt } = await this.options.launch();
-        if (this.live.get(key) !== live) continue;
-        if (systemPrompt !== live.systemPrompt) {
-          this.drop(key, live);
+    // This message's hold on an idle session while its route chooses: kept
+    // until it sends the turn, opens a session or gives up.
+    let release: (() => void) | undefined;
+    try {
+      for (;;) {
+        if (current && !current()) return { ok: true, undelivered: true };
+        if (this.disposed) return { ...this.stopped, undelivered: true };
+        // One that arrives while `exclusive` holds the conversation waits.
+        const held = this.held.get(key);
+        if (held) {
+          try {
+            await abortable(held.done, signal);
+          } catch {
+            return this.late;
+          }
           continue;
         }
+        // Or while a session held work left running has yet to exit.
+        const outliving = this.outliving.get(key);
+        if (outliving) {
+          if (outliving.failed)
+            return { ok: false, error: this.unconfirmed, undelivered: true };
+          try {
+            await abortable(
+              Promise.race([outliving.settled, this.stopping]),
+              signal,
+            );
+          } catch {
+            return this.late;
+          }
+          continue;
+        }
+        // A message that arrives while its conversation's session opens uses it.
+        const opening = this.opening.get(key);
+        if (opening) {
+          // The session stays shared; only this message gives up on it.
+          try {
+            await abortable(
+              opening.catch(() => undefined),
+              signal,
+            );
+          } catch {
+            return this.late;
+          }
+          continue;
+        }
+        // Or while another message chooses its model for the idle session.
+        const choosing = this.choosing.get(key);
+        if (choosing && !release) {
+          try {
+            await abortable(choosing, signal);
+          } catch {
+            return this.late;
+          }
+          continue;
+        }
+        const live = this.live.get(key);
+        if (!live) break;
+        // A turn on an idle session is chosen now, so its level is checked as
+        // a picked one is; a busy session's queue asks once the turn starts.
+        if (route && live.session.open && !live.session.busy) {
+          if (!release) {
+            let done!: () => void;
+            const held = new Promise<void>((resolve) => {
+              done = resolve;
+            });
+            this.choosing.set(key, held);
+            release = () => {
+              if (this.choosing.get(key) === held) this.choosing.delete(key);
+              done();
+            };
+          }
+          const chosen = await route();
+          if (!chosen) return { ok: true, undelivered: true };
+          ({ model, effort } = chosen);
+          route = undefined;
+          continue;
+        }
+        if (
+          !live.session.open ||
+          (!live.session.busy &&
+            (this.stale(live) || this.leveled(live, effort)))
+        ) {
+          this.drop(key, live);
+          break;
+        }
+        // A harness that cannot take a new prompt in place needs a new session.
+        if (!live.session.busy && !live.process.repromptable) {
+          const { systemPrompt } = await this.options.launch(key);
+          if (this.live.get(key) !== live) continue;
+          if (systemPrompt !== live.systemPrompt) {
+            this.drop(key, live);
+            continue;
+          }
+        }
+        return this.answer(
+          key,
+          live,
+          seen,
+          text,
+          { ...activity, ...(current ? { current } : {}) },
+          model,
+          effort,
+          kept,
+          route,
+        );
       }
-      return this.answer(
-        key,
-        live,
-        seen,
-        live.session.busy ? steer : text,
-        { ...activity, ...(current ? { current } : {}) },
-        model,
-        effort,
-        kept,
-      );
+    } finally {
+      // Sending made the session busy, so a message waiting now queues
+      // behind this one. One that goes on to open a session reserves it
+      // below before a waiting one resumes.
+      release?.();
     }
     // Reserved before anything is awaited, so a message that comes meanwhile
     // waits for this session instead of opening another.
@@ -384,6 +555,7 @@ export class AgentSessions {
           model,
           effort,
           kept,
+          route,
         ),
       };
     })();
@@ -411,30 +583,285 @@ export class AgentSessions {
     return started.settled ?? this.late;
   }
 
+  /** Resolves once each session opening now has taken its message or
+   * failed, so that `snapshot` lists every conversation that has one. */
+  async opened() {
+    await Promise.allSettled([...this.opening.values()]);
+  }
   /** Stops the turn running in conversation `key`, if any, once a session
    * opening for it has taken its message. */
   async interrupt(key: string) {
+    // Held work is told at once, never waited for, as is work waiting to be.
+    for (const waiting of this.waiting.get(key) ?? []) waiting.abort();
+    const held = this.held.get(key);
+    if (held) {
+      held.controller.abort();
+      this.live.get(key)?.session.interrupt();
+      return;
+    }
     await this.opening.get(key)?.catch(() => undefined);
     this.live.get(key)?.session.interrupt();
   }
   /** Includes the model call after a final send has answered the turn. */
   async idle(key: string) {
+    await this.held.get(key)?.done;
     await this.opening.get(key)?.catch(() => undefined);
     await this.live.get(key)?.session.idle();
   }
+
+  /** Runs `work` with conversation `key` to itself: messages wait for it.
+   * It waits its turn behind a session opening, another hold and a session
+   * one left running, until `interrupt`, `signal` or `dispose`, and is
+   * refused, never queued, once a session left running could not be
+   * confirmed ended. Its session finishes its work and is closed first, and
+   * `work` starts only once the harness has acknowledged that close and
+   * every earlier close of the conversation's sessions, or their process has
+   * exited; it never starts after a close that was not, nor once interrupted
+   * or stopped, when it rejects with "<label> was stopped". An interrupt
+   * while it waits for a close takes effect when that close settles, within
+   * REQUEST_TIMEOUT_MS. A close that failed refuses the conversation while
+   * the process runs. Saved sessions are never deleted. `work` retires
+   * whatever session it opens before it settles, or says what it
+   * `outlives`, which messages and holds then wait for. Once `deadline`
+   * aborts, it stops waiting its turn, as `deliver` stops waiting for a
+   * session, and rejects with "<label> did not start in time"; work it has
+   * started runs on. */
+  async exclusive<T>(
+    key: string,
+    work: (exclusive: Exclusive) => Promise<T>,
+    signal?: AbortSignal,
+    deadline?: AbortSignal,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const follow = () => controller.abort(signal?.reason);
+    if (signal?.aborted) follow();
+    signal?.addEventListener("abort", follow, { once: true });
+    try {
+      const { mine, release } = await this.reserve(key, controller, deadline);
+      try {
+        return await this.handOff(key, mine, work);
+      } finally {
+        if (this.held.get(key) === mine) this.held.delete(key);
+        release();
+        this.options.onChange?.();
+      }
+    } finally {
+      signal?.removeEventListener("abort", follow);
+    }
+  }
+
+  /** Holds `key` once no session opens for it, no other work holds it and
+   * no session held work left running is still to exit: reserved with
+   * nothing awaited after the last check. Each wait ends on `controller`'s
+   * abort, which `interrupt` reaches from the start, or on `dispose`; both
+   * reject with "<label> was stopped". A session left running that could
+   * not be confirmed ended refuses it. Once `deadline` aborts, a wait
+   * rejects with "<label> did not start in time". */
+  private async reserve(
+    key: string,
+    controller: AbortController,
+    deadline?: AbortSignal,
+  ) {
+    const { label } = this.options;
+    const waiting = this.waiting.get(key) ?? new Set<AbortController>();
+    waiting.add(controller);
+    this.waiting.set(key, waiting);
+    try {
+      for (;;) {
+        if (this.disposed || controller.signal.aborted)
+          throw new Error(`${label} was stopped`);
+        const outliving = this.outliving.get(key);
+        if (outliving?.failed) throw new Error(this.unconfirmed);
+        const busy =
+          this.opening.get(key) ??
+          this.held.get(key)?.done ??
+          outliving?.settled;
+        if (!busy) break;
+        if (deadline?.aborted) throw new Error(this.late.error);
+        await abortable(
+          Promise.race([busy.then(noop, noop), this.stopping]),
+          deadline
+            ? AbortSignal.any([controller.signal, deadline])
+            : controller.signal,
+        ).catch(noop);
+      }
+    } finally {
+      waiting.delete(controller);
+      if (!waiting.size && this.waiting.get(key) === waiting)
+        this.waiting.delete(key);
+    }
+    let release!: () => void;
+    const mine: Held = {
+      controller,
+      done: new Promise<void>((resolve) => (release = resolve)),
+    };
+    this.held.set(key, mine);
+    this.options.onChange?.();
+    return { mine, release };
+  }
+
+  /** Closes the conversation's session, then runs `work` under hold `mine`
+   * with what is saved for it. */
+  private async handOff<T>(
+    key: string,
+    mine: Held,
+    work: (exclusive: Exclusive) => Promise<T>,
+  ): Promise<T> {
+    const { label, store } = this.options;
+    const { controller } = mine;
+    const live = this.live.get(key);
+    if (live) {
+      await live.session.idle();
+      if (this.live.get(key) === live) this.drop(key, live);
+    }
+    await Promise.all(
+      [...this.closing]
+        .filter((closing) => closing.session.conversation === key)
+        .map((closing) => this.strict(closing)),
+    );
+    if (controller.signal.aborted || this.disposed)
+      throw new Error(`${label} was stopped`);
+    const saved = savedConversation(store?.get(key));
+    // New session wins over whatever is saved, unread, so nothing stored can
+    // stand in the way of the way out of it.
+    const reset = saved?.next === "new";
+    // A later message's session follows this one, as after any other.
+    this.had.add(key);
+    return await work({
+      saved: reset ? undefined : saved?.sessions?.[0],
+      reset,
+      binding: reset ? undefined : association(saved),
+      keep: (id, binding) => {
+        // Stored, none would read back as damage.
+        if (binding === undefined) return false;
+        if (!store || this.held.get(key) !== mine) return false;
+        const sessions = savedConversation(store.get(key))?.sessions ?? [];
+        const kept = { session: id, value: binding };
+        try {
+          store.set(key, {
+            at: Date.now(),
+            sessions: [id, ...sessions.filter((other) => other !== id)].slice(
+              0,
+              SAVED_SESSIONS,
+            ),
+            binding: kept,
+          });
+          // Saved only once it reads back as written.
+          const read = savedConversation(store.get(key));
+          return (
+            read?.sessions?.[0] === id &&
+            read.next === undefined &&
+            JSON.stringify(read.binding) === JSON.stringify(kept)
+          );
+        } catch (error) {
+          console.warn(`${label} could not save a session`, error);
+          return false;
+        }
+      },
+      shown: (seen) => {
+        if (this.held.get(key) === mine)
+          this.shown.set(key, Math.max(seen, this.shown.get(key) ?? 0));
+      },
+      signal: controller.signal,
+      outlives: (done) => {
+        // Too late to block anything: the hold may already be another's.
+        if (this.held.get(key) !== mine)
+          throw new Error(`${label} has released this conversation`);
+        // Every process the work left running is waited for, not just the
+        // last, and a rejection of any keeps the conversation blocked.
+        const prior = this.outliving.get(key);
+        const exits = [...(prior?.exits ?? []), done];
+        const outliving: Outliving = {
+          exits,
+          failed: false,
+          settled: Promise.all(exits).then(
+            () => {
+              if (this.outliving.get(key) !== outliving) return;
+              this.outliving.delete(key);
+              this.options.onChange?.();
+            },
+            (error: unknown) => {
+              // Only an exit retires it: an unknown owner stays blocking.
+              outliving.failed = true;
+              if (this.outliving.get(key) === outliving)
+                console.warn(
+                  `${label} could not confirm a session ended`,
+                  error,
+                );
+            },
+          ),
+        };
+        this.outliving.set(key, outliving);
+      },
+    });
+  }
+
+  /** New session (`new`): closes the conversation's session once it has
+   * finished its work, so the next message opens one, and has held work
+   * open a new one too, keeping every saved session listed. Compaction
+   * compacts the open session; with `forwarded`, one with none whose newest
+   * saved session held work keeps a value for is given to `forwarded`
+   * instead. Either is chosen under a hold of the conversation, and is
+   * refused once a session held work left running could not be confirmed
+   * ended. Without either there is nothing to do. */
+  async reset(
+    key: string,
+    action: SessionAction,
+    forwarded?: (exclusive: Exclusive) => Promise<Settled>,
+  ): Promise<Settled> {
+    if (action !== "new" && !forwarded) return this.compact(key);
+    let reservation: Awaited<ReturnType<typeof this.reserve>>;
+    try {
+      reservation = await this.reserve(key, new AbortController());
+    } catch (error) {
+      return this.disposed
+        ? this.stopped
+        : { ok: false, error: message(error) };
+    }
+    const { mine, release } = reservation;
+    const { signal } = mine.controller;
+    const { store, label } = this.options;
+    try {
+      const live = this.live.get(key);
+      if (action !== "new") {
+        if (live?.session.open) return await this.compact(key, signal);
+        const saved = savedConversation(store?.get(key));
+        if (!forwarded || saved?.next === "new" || !association(saved))
+          return { ok: true };
+        return await this.handOff(key, mine, forwarded);
+      }
+      if (live) await live.session.idle();
+      // Interrupted while it waited: it does nothing more.
+      if (signal.aborted || this.disposed) return this.stopped;
+      // Saved before the session goes, so a failed save leaves it as it was.
+      const saved = savedConversation(store?.get(key));
+      if (store && saved?.sessions?.length) {
+        store.set(key, { ...saved, next: "new" });
+        // Done only once it reads back so: a store that kept the old record
+        // would have the next held work resume what was left.
+        const read = savedConversation(store.get(key));
+        if (read?.next !== "new" || read.sessions?.[0] !== saved.sessions[0])
+          return { ok: false, error: `${label} could not save New session` };
+      }
+      if (live && this.live.get(key) === live) this.drop(key, live);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: message(error) };
+    } finally {
+      if (this.held.get(key) === mine) this.held.delete(key);
+      release();
+      this.options.onChange?.();
+    }
+  }
   /** Waits for the conversation's session to finish its work, then compacts
-   * it or closes it, so the message opens a new one. Without an open session
-   * there is nothing to do. */
-  async reset(key: string, action: SessionAction): Promise<Settled> {
+   * it. Without an open session there is nothing to do. */
+  private async compact(key: string, signal?: AbortSignal): Promise<Settled> {
     const live = this.live.get(key);
     if (!live?.session.open) return { ok: true };
     await live.session.idle();
-    if (this.disposed) return this.stopped;
+    // Interrupted while it waited: nothing is sent.
+    if (signal?.aborted || this.disposed) return this.stopped;
     if (this.live.get(key) !== live || !live.session.open) return { ok: true };
-    if (action === "new") {
-      this.drop(key, live);
-      return { ok: true };
-    }
     const result = await this.answer(
       key,
       live,
@@ -474,6 +901,7 @@ export class AgentSessions {
     if (this.disposed) return this.stopped;
     const key = `${label} #${++this.onceCount}`;
     this.once.set(key, undefined);
+    this.onceLabels.set(key, label);
     this.options.onChange?.();
     const opening = this.open(
       key,
@@ -508,6 +936,7 @@ export class AgentSessions {
       };
     } finally {
       this.once.delete(key);
+      this.onceLabels.delete(key);
       // One that opens after the turn was given up is closed once it has.
       if (live) await this.close(live);
       else void opening.then((late) => this.close(late)).catch(() => undefined);
@@ -526,7 +955,10 @@ export class AgentSessions {
    * opening, is closed or its process has exited; rejects if one cannot be. */
   async shutdown() {
     this.dispose();
-    await Promise.allSettled(this.opens);
+    await Promise.allSettled([
+      ...this.opens,
+      ...[...this.held.values()].map((held) => held.done),
+    ]);
     const closed = await Promise.allSettled(
       [...this.closing].map((live) => this.strict(live)),
     );
@@ -538,12 +970,33 @@ export class AgentSessions {
    * agents. */
   dispose() {
     this.disposed = true;
+    this.stop();
+    for (const held of this.held.values()) held.controller.abort();
     for (const [key, live] of this.live) this.drop(key, live);
     for (const live of this.once.values()) if (live) void this.close(live);
   }
 
   private get pool() {
     return this.options.pool ?? SHARED_POOL;
+  }
+  /** `serve` for a session in a process of its own, outside these: each
+   * server it starts holds a busy slot in the pool, taken before it starts,
+   * making room as a session's does, until it has closed. */
+  pooled(serve: ServeMcp): ServeMcp {
+    return async (handler) => {
+      const { pool } = this;
+      const slot: Slot = { idle: () => false, evict: async () => undefined };
+      const released = () => pool.release(slot);
+      try {
+        await pool.take(slot);
+        const server = await serve(handler);
+        void server.closed.then(released, released);
+        return server;
+      } catch (error) {
+        released();
+        throw error;
+      }
+    };
   }
 
   /** Opened with old settings, which only a new session runs on. */
@@ -587,7 +1040,8 @@ export class AgentSessions {
     const { pool } = this;
     // Read before `launch` reads the settings, so it never describes newer ones.
     const fingerprint = this.options.fingerprint();
-    const launch = await this.options.launch();
+    const conversation = this.once.has(key) ? undefined : key;
+    const launch = await this.options.launch(conversation);
     // Removed meanwhile: a process started now would outlive it.
     if (this.disposed) throw new Error(`${this.options.label} was stopped`);
     const asked = ++this.asked;
@@ -603,7 +1057,7 @@ export class AgentSessions {
     const slot: Slot = { idle: () => false, evict: async () => undefined };
     const room = pool.take(slot);
     let opened: AcpSession | undefined;
-    const tags = this.options.tags?.(this.once.has(key) ? undefined : key);
+    const tags = this.options.tags?.(conversation);
     const start = () =>
       process.open({
         ...(tags ? { tags } : {}),
@@ -653,18 +1107,21 @@ export class AgentSessions {
       at: Date.now(),
     };
     // Each turn runs on the current prompt. The session runs these one at a
-    // time, so an older prompt never lands after a newer one; a failure keeps
-    // the session and is tried again at the next turn.
+    // time, so an older prompt never lands after a newer one. A failure fails
+    // that turn undelivered, as a rule it no longer has would not hold for it,
+    // and keeps the session to try again at the next turn.
     if (process.repromptable)
       session.beforeTurn = async () => {
-        const { systemPrompt } = await this.options.launch();
+        const { systemPrompt } = await this.options.launch(conversation);
         if (systemPrompt === live.systemPrompt) return;
         try {
           await process.reprompt(session, systemPrompt);
-          live.systemPrompt = systemPrompt;
         } catch (error) {
-          console.warn(`${this.options.label} kept its old prompt`, error);
+          throw new Error(
+            `${this.options.label} could not update its instructions: ${errorMessage(error)}`,
+          );
         }
+        live.systemPrompt = systemPrompt;
       };
     if (fingerprint !== this.options.fingerprint() && !this.disposed) {
       // Settings saved while it opened: it would work with the old ones.
@@ -676,6 +1133,7 @@ export class AgentSessions {
       launch.systemPrompt,
       title,
       this.once.has(key) ? undefined : key,
+      this.onceLabels.get(key),
     );
     // Removed meanwhile: the callers are gone, and `shutdown` waits for this.
     if (this.disposed) void this.close(live);
@@ -708,6 +1166,7 @@ export class AgentSessions {
     model: string | undefined,
     effort?: string,
     kept?: string,
+    route?: TurnRoute,
   ) {
     const sent = live.session.send(
       text,
@@ -721,6 +1180,7 @@ export class AgentSessions {
       model,
       effort,
       kept,
+      route,
     );
     // A final Buzz send can answer before the harness finishes its model work.
     void live.session.idle().then(() => {
@@ -739,21 +1199,29 @@ export class AgentSessions {
    * has been shown, and restarts its idle countdown. */
   private touch(key: string, live: Live, seen?: number) {
     live.at = Date.now();
-    const { store } = this.options;
-    if (store) {
-      const { id } = live.session;
-      const sessions = savedConversation(store.get(key))?.sessions ?? [];
-      store.set(key, {
-        at: live.at,
-        sessions: [id, ...sessions.filter((kept) => kept !== id)].slice(
-          0,
-          SAVED_SESSIONS,
-        ),
-      });
-    }
+    this.save(key, live.session.id, live.at);
     this.countdown(key, live);
     if (seen !== undefined)
       this.shown.set(key, Math.max(seen, this.shown.get(key) ?? 0));
+  }
+  /** Saves `id` as the conversation's newest session, used `at`. */
+  private save(key: string, id: string, at: number) {
+    const { store } = this.options;
+    if (!store) return;
+    const saved = savedConversation(store.get(key));
+    const sessions = saved?.sessions ?? [];
+    store.set(key, {
+      at,
+      sessions: [id, ...sessions.filter((kept) => kept !== id)].slice(
+        0,
+        SAVED_SESSIONS,
+      ),
+      ...(saved && "binding" in saved ? { binding: saved.binding } : {}),
+      // New session holds until a session replacing the newest is saved.
+      ...(saved?.next === "new" && id === sessions[0]
+        ? { next: saved.next }
+        : {}),
+    });
   }
   /** Closes the session after IDLE_MS, or waits again while it is busy: a
    * long turn is not new use. */
@@ -845,6 +1313,8 @@ export function abortable<T>(
       .finally(() => signal.removeEventListener("abort", abort));
   });
 }
+
+const noop = () => {};
 
 function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);

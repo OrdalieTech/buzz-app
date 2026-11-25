@@ -2,7 +2,7 @@ import { afterEach, assert, describe, expect, it, vi } from "vitest";
 import { finalizeEvent } from "nostr-tools";
 import {
   browserReadPublisherLock,
-  CapturedReadNotRetainedError,
+  CapturedReadWouldWidenError,
   createReadState,
 } from "./read-state";
 import { effectiveFrontier, READ_RETENTION_SECONDS } from "./read-state-model";
@@ -1118,7 +1118,7 @@ describe("durable read-state owner", () => {
     await restarted.ready;
     expect(restarted.floor()).toBe(floor);
   });
-  it("rejects a captured reply when retention drops its mark despite a retained thread frontier", async () => {
+  it("rejects a captured reply when retention would raise the floor past it under a channel override", async () => {
     const f = fixture();
     const rootId = (READ_RESERVE_KEYS - 1).toString(16).padStart(64, "0");
     const selectedKey = `msg:${"e".repeat(64)}`;
@@ -1176,7 +1176,7 @@ describe("durable read-state owner", () => {
         [selectedKey],
         { preserveCapturedSet: true },
       ),
-    ).rejects.toBeInstanceOf(CapturedReadNotRetainedError);
+    ).rejects.toBeInstanceOf(CapturedReadWouldWidenError);
 
     expect(f.journal()).toEqual(before);
     expect(owner.floor()).toBe(0);
@@ -4011,4 +4011,34 @@ describe("saved expiring unread journal", () => {
     );
     expect(journal.state).toEqual({ frontiers: { room: 5 }, overrides: {} });
   });
+});
+
+it("replaying an admitted peer read after a restart keeps a local reminder", async () => {
+  const f = fixture(1000);
+  f.setJournal({ ...newReadJournal(), floor: 100 });
+  const peer = await signReadState(
+    {
+      slot: "a".repeat(32),
+      createdAt: 900,
+      blob: { v: 1, client_id: "peer", contexts: { room: 80 } },
+    },
+    f.key.secret,
+    900,
+  );
+  const before = f.make();
+  await before.ready;
+  before.accept([peer]);
+  await before.refresh();
+  // Retention dropped the admitted read below the floor.
+  expect(before.state().frontiers.room).toBeUndefined();
+  const key = `msg:${"a".repeat(64)}`;
+  await before.markLocalUnread(key, () => true, undefined, {
+    channelId: "room",
+  });
+  before.dispose();
+  const after = f.make();
+  await after.ready;
+  after.accept([peer]);
+  await after.refresh();
+  expect(f.journal()?.localUnread[key]).toBeDefined();
 });

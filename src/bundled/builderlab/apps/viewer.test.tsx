@@ -25,6 +25,7 @@ function setup(loginAvailable = true, openSignIn?: () => void) {
       email: "first@example.com",
       canUseRemoteAgents: false,
       canUseBuilderlabDecisions: false,
+      canUseHostedTranscription: false,
     },
   }));
   const revoke = vi.fn();
@@ -72,6 +73,7 @@ it("app links and apps_open use the Settings account and replace its guest lifet
       email: "second@example.com",
       canUseRemoteAgents: false,
       canUseBuilderlabDecisions: false,
+      canUseHostedTranscription: false,
     },
   });
   await act(() => session.signIn());
@@ -131,6 +133,7 @@ it("closing an observing app panel does not cancel Settings' pending login", asy
         email: "",
         canUseRemoteAgents: false,
         canUseBuilderlabDecisions: false,
+        canUseHostedTranscription: false,
       },
     });
     await login;

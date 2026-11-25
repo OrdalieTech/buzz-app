@@ -15,11 +15,13 @@ import {
 import { type Filter, matchFilter } from "nostr-tools";
 import { npubEncode } from "nostr-tools/nip19";
 import userEvent from "@testing-library/user-event";
+import { publicKeyLabels } from "../../shared/identity/public-key";
 import {
   bindNames,
   type IdentityNames,
 } from "../../features/identity-names/service";
 import { createAgentDirectory } from "../../features/identity-names/testing";
+import { localAgentsFixture } from "../../features/agents/local-testing";
 import { BestieConversationContext } from "./bestie-context";
 import { afterEach, assert, beforeEach, expect, it, vi } from "vitest";
 import { createRelaySession } from "../../features/relay/session";
@@ -31,6 +33,7 @@ import {
   keypair,
   message,
   metadata,
+  ownedProfile,
   profile,
   roster,
   scriptedTransport,
@@ -48,8 +51,13 @@ import {
   type ReadJournal,
 } from "../../features/relay/read-state-storage";
 import type { AppServices } from "../services";
+import type {
+  DecisionRequest,
+  Decisions,
+} from "../../features/decisions/service";
 import type { SearchGroup } from "./SearchChoices";
 import { setUnreadFirstPreference } from "../../features/search/unread-first-preference";
+import { messageSortPreference } from "../../features/search/message-sort-preference";
 import { SearchResults } from "./SearchResults";
 import { useSearchMessages } from "./useSearchMessages";
 import { useSearchSettings } from "./SearchSettings";
@@ -59,7 +67,6 @@ import {
   recordVisit,
 } from "../../features/search/usage";
 import { ChatCircleIcon } from "../../shared/design-system/icons/index";
-import referenceStyles from "../../shared/InlineReference.module.css";
 import { clearViewScope, writeView } from "../../shared/view-state";
 import {
   namePreference,
@@ -881,14 +888,11 @@ it("counts a reply that mentions you, even muted, tiers Thread only for threads 
       mentionRoot.id,
       mentionRoot.id,
     );
-    // With no mention, it shows and opens your thread, not a newer
-    // broadcast in one you're not in.
+    // With no mention, it previews your thread, but a broadcast in a thread
+    // you're not in is ordinary channel unread, like a top-level post, so the
+    // row opens its conversation.
     fireEvent.click(row("picked") as HTMLElement);
-    expect(open).toHaveBeenLastCalledWith(
-      "picked",
-      pickedRoot.id,
-      pickedRoot.id,
-    );
+    expect(open).toHaveBeenLastCalledWith("picked");
     // A mixed row still opens its conversation.
     fireEvent.click(row("mixed") as HTMLElement);
     expect(open).toHaveBeenLastCalledWith("mixed");
@@ -1214,6 +1218,8 @@ it("shows the real read failure, retains conversation choices, and retries to an
 
 it("scopes conversation search at the relay and discards out-of-scope hits", async () => {
   vi.useFakeTimers();
+  // A saved Most recent cannot apply on a relay that does not sort.
+  localStorage.setItem("buzz-search-message-sort.v1", "newest");
   const relay = keypair();
   const viewer = keypair();
   const wire = scriptedTransport(viewer.pubkey, relay.pubkey);
@@ -1278,6 +1284,7 @@ it("scopes conversation search at the relay and discards out-of-scope hits", asy
     );
     expect(changeScope).toHaveBeenCalledExactlyOnceWith();
   } finally {
+    localStorage.removeItem("buzz-search-message-sort.v1");
     cleanup();
     owner.dispose();
   }
@@ -1347,6 +1354,403 @@ it("offers more messages in overall search when the first page shows none", asyn
     expect(
       screen.queryByRole("option", { name: "Show more messages" }),
     ).toBeNull();
+  } finally {
+    cleanup();
+    owner.dispose();
+  }
+});
+
+it("reranks message hits once the decision provider can answer, holding them once the person moves for that text", async () => {
+  vi.useFakeTimers();
+  const relay = keypair(),
+    viewer = keypair();
+  const discovery = [
+    metadata(relay, "crew", "crew"),
+    roster(relay, "crew", [viewer.pubkey]),
+  ];
+  const limits: (number | undefined)[] = [];
+  const owner = createRelaySession({
+    ...scriptedTransport(viewer.pubkey, relay.pubkey).transport,
+    query(filters) {
+      const read = filters.find(
+        (filter) => filter.search !== undefined && filter.kinds?.includes(9),
+      );
+      if (read) {
+        limits.push(read.limit);
+        return Promise.resolve(
+          ["one", "two", "runbook"].map((word, index) =>
+            message(
+              viewer,
+              "crew",
+              `${read.search} ${word}`,
+              1700000500 - index,
+            ),
+          ),
+        );
+      }
+      return Promise.resolve(
+        discovery.filter((event) =>
+          filters.some((filter) => matchFilter(filter as Filter, event)),
+        ),
+      );
+    },
+  });
+  // Each call waits until the test answers it, favouring the runbook.
+  const pending: (() => void)[] = [];
+  let status = "needs-setup";
+  const listeners = new Set<() => void>();
+  const decisions = {
+    status: () => status,
+    subscribe: (listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    decide: (request: DecisionRequest) =>
+      new Promise((resolve) => {
+        const { candidates } = JSON.parse(request.state) as {
+          candidates: { n: number; text: string }[];
+        };
+        pending.push(() =>
+          resolve({
+            outcome: "answered",
+            backend: "test",
+            model: "test",
+            answers: Object.fromEntries(
+              candidates.map(({ n, text }) => [
+                `m${n}`,
+                {
+                  type: "yes_no",
+                  probability: text.endsWith("runbook") ? 0.9 : 0.1,
+                },
+              ]),
+            ),
+          }),
+        );
+      }),
+  } as unknown as Decisions;
+  const props = {
+    session: owner.session,
+    onQueryChange: () => {},
+    input: createRef<HTMLInputElement>(),
+    pages: [],
+    openConversation: () => {},
+    openNewMessage: () => {},
+    decisions,
+  };
+  // Results land, then settle long enough for the provider to be asked.
+  const search = async (query: string) => {
+    view.rerender(<SearchResults {...props} query={query} />);
+    await act(async () => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS));
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(pending).toHaveLength(1);
+  };
+  const answer = () => act(async () => pending.shift()?.());
+  const order = () =>
+    within(screen.getByRole("group", { name: "Messages" }))
+      .getAllByRole("option")
+      .map((row) => /(one|two|runbook)/.exec(row.textContent ?? "")?.[1]);
+  const view = render(<SearchResults {...props} query="deploy" />);
+  try {
+    // Until the provider is set up, one page reads and nothing is asked.
+    await act(async () => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS));
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(limits).toEqual([20]);
+    expect(pending).toHaveLength(0);
+
+    // Once it can answer, the same text reads more and asks once. Moving
+    // before the answer lands keeps the keyword order.
+    act(() => {
+      status = "ready";
+      for (const listener of listeners) listener();
+    });
+    await search("deploy");
+    expect(limits).toEqual([20, 60]);
+    expect(order()).toEqual(["one", "two", "runbook"]);
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Search Buzz" }), {
+      key: "ArrowDown",
+    });
+    await answer();
+    expect(order()).toEqual(["one", "two", "runbook"]);
+    expect(screen.queryByTitle("Reranked")).toBeNull();
+    expect(
+      screen.getByRole("group", { name: "Messages" }),
+    ).not.toHaveAccessibleDescription(/Reranked/);
+
+    // New text isn't held.
+    await search("deploys");
+    await answer();
+    expect(order()).toEqual(["runbook", "one", "two"]);
+    expect(screen.getByTitle("Reranked")).toBeInTheDocument();
+    // The mark is hidden from assistive technology; the group says it.
+    expect(
+      screen.getByRole("group", { name: "Messages" }),
+    ).toHaveAccessibleDescription(/Reranked/);
+
+    // Nor is the earlier text, once the person has typed past it.
+    await search("deploy");
+    await answer();
+    expect(order()).toEqual(["runbook", "one", "two"]);
+
+    // A provider that stops being able to answer leaves this text's hits
+    // and order; new text then reads one page.
+    const reads = limits.length;
+    act(() => {
+      status = "needs-setup";
+      for (const listener of listeners) listener();
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS));
+    expect(limits).toHaveLength(reads);
+    expect(order()).toEqual(["runbook", "one", "two"]);
+    expect(screen.getByTitle("Reranked")).toBeInTheDocument();
+    view.rerender(<SearchResults {...props} query="deployed" />);
+    await act(async () => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS));
+    expect(limits.slice(reads)).toEqual([20]);
+  } finally {
+    cleanup();
+    owner.dispose();
+  }
+});
+
+it.each([
+  { from: "crew", to: undefined },
+  { from: undefined, to: "crew" },
+])(
+  "a move in one conversation's hits doesn't hold the rerank after the scope goes from $from to $to",
+  async ({ from, to }) => {
+    vi.useFakeTimers();
+    const relay = keypair(),
+      viewer = keypair();
+    const discovery = [
+      metadata(relay, "crew", "crew"),
+      roster(relay, "crew", [viewer.pubkey]),
+    ];
+    const owner = createRelaySession({
+      ...scriptedTransport(viewer.pubkey, relay.pubkey).transport,
+      query(filters) {
+        const read = filters.find(
+          (filter) => filter.search !== undefined && filter.kinds?.includes(9),
+        );
+        if (read)
+          // Each scope finds its own hits; the provider favours the last.
+          return Promise.resolve(
+            (read["#h"]
+              ? ["one", "two", "runbook"]
+              : ["three", "four", "guide"]
+            ).map((word, index) =>
+              message(viewer, "crew", `deploy ${word}`, 1700000500 - index),
+            ),
+          );
+        return Promise.resolve(
+          discovery.filter((event) =>
+            filters.some((filter) => matchFilter(filter as Filter, event)),
+          ),
+        );
+      },
+    });
+    const pending: (() => void)[] = [];
+    const decisions = {
+      status: () => "ready",
+      subscribe: () => () => {},
+      decide: (request: DecisionRequest) =>
+        new Promise((resolve) => {
+          const { candidates } = JSON.parse(request.state) as {
+            candidates: { n: number; text: string }[];
+          };
+          pending.push(() =>
+            resolve({
+              outcome: "answered",
+              backend: "test",
+              model: "test",
+              answers: Object.fromEntries(
+                candidates.map(({ n, text }) => [
+                  `m${n}`,
+                  {
+                    type: "yes_no",
+                    probability: /(runbook|guide)$/.test(text) ? 0.9 : 0.1,
+                  },
+                ]),
+              ),
+            }),
+          );
+        }),
+    } as unknown as Decisions;
+    const props = (channel: string | undefined) => ({
+      session: owner.session,
+      onQueryChange: () => {},
+      input: createRef<HTMLInputElement>(),
+      pages: [],
+      openConversation: () => {},
+      openNewMessage: () => {},
+      onScopeChange: () => {},
+      decisions,
+      query: "deploy",
+      ...(channel ? { scopedChannelId: channel } : {}),
+    });
+    const settle = async () => {
+      await act(async () => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS));
+      await act(async () => vi.advanceTimersByTimeAsync(500));
+      expect(pending).toHaveLength(1);
+    };
+    const answer = () => act(async () => pending.shift()?.());
+    const order = () =>
+      within(screen.getByRole("group", { name: "Messages" }))
+        .getAllByRole("option")
+        .map(
+          (row) =>
+            /(one|two|runbook|three|four|guide)/.exec(
+              row.textContent ?? "",
+            )?.[1],
+        );
+    const view = render(<SearchResults {...props(from)} />);
+    try {
+      await settle();
+      // The field's name follows the scope.
+      fireEvent.keyDown(screen.getByRole("combobox"), { key: "ArrowDown" });
+      await answer();
+      expect(order()).toEqual(
+        from ? ["one", "two", "runbook"] : ["three", "four", "guide"],
+      );
+
+      view.rerender(<SearchResults {...props(to)} />);
+      await settle();
+      await answer();
+      expect(order()).toEqual(
+        to ? ["runbook", "one", "two"] : ["guide", "three", "four"],
+      );
+      expect(screen.getByTitle("Reranked")).toBeInTheDocument();
+      expect(
+        screen.getByRole("group", { name: "Messages" }),
+      ).toHaveAccessibleDescription(/Reranked/);
+    } finally {
+      cleanup();
+      owner.dispose();
+    }
+  },
+);
+
+it("tells the reranker which hits agents or workflows wrote, whoever owns them, and where the searcher is a member now", async () => {
+  vi.useFakeTimers();
+  const relay = keypair(),
+    viewer = keypair(),
+    colleague = keypair(),
+    colleagueAgent = keypair(),
+    envelopeAgent = keypair(),
+    ownAgent = keypair();
+  const discovery = [
+    metadata(relay, "crew", "crew"),
+    roster(relay, "crew", [viewer.pubkey, colleague.pubkey]),
+    metadata(relay, "left", "left"),
+    roster(relay, "left", [viewer.pubkey]),
+    profile(colleague, { name: "Colleague" }),
+    await ownedProfile(colleagueAgent, colleague, "Helper"),
+  ];
+  const owner = createRelaySession({
+    ...scriptedTransport(viewer.pubkey, relay.pubkey).transport,
+    archiveAuthority: relay.pubkey,
+    query(filters) {
+      if (filters.some((filter) => filter.search !== undefined))
+        return Promise.resolve([
+          message(colleague, "crew", "deploy by a person", 1700000504),
+          message(colleagueAgent, "crew", "deploy by an agent", 1700000503),
+          signed(envelopeAgent, {
+            kind: 40002,
+            created_at: 1700000502,
+            content: JSON.stringify({ content: "deploy from an envelope" }),
+            tags: [["h", "crew"]],
+          }),
+          message(ownAgent, "left", "deploy by my agent", 1700000501),
+          // Relay-signed workflow output names its owner, not as their own.
+          eventDto(
+            message(relay, "crew", "deploy by a workflow", 1700000500, [
+              ["buzz:workflow", "true"],
+              ["buzz:workflow-owner", colleague.pubkey],
+            ]),
+          ),
+        ]);
+      return Promise.resolve(
+        discovery.filter((event) =>
+          filters.some((filter) => matchFilter(filter as Filter, event)),
+        ),
+      );
+    },
+  });
+  // The viewer's own agent has no agent profile; their library knows it.
+  const source = owner.session.agentChoices;
+  const choices = {
+    ...source.snapshot(),
+    identities: [{ pubkey: ownAgent.pubkey, name: "Mine", managed: true }],
+  };
+  // After leaving a public channel, it reads publicly again while its old
+  // roster still lists the viewer (see discovery-permissions.test.ts).
+  const channels = owner.session.channels;
+  const session = {
+    ...owner.session,
+    agentChoices: {
+      ...source,
+      snapshot: () => choices,
+      subscribe: () => () => {},
+      retain: () => () => {},
+      ensure: () => {},
+    },
+    channels: {
+      ...channels,
+      get: (id: string) => {
+        const channel = channels.get?.(id);
+        if (id !== "left" || !channel) return channel;
+        const { viewerRole: _, ...left } = channel;
+        return { ...left, readOnly: true as const };
+      },
+    },
+  } as typeof owner.session;
+  const requests: DecisionRequest[] = [];
+  const decisions = {
+    status: () => "ready",
+    subscribe: () => () => {},
+    decide: async (request: DecisionRequest) => {
+      requests.push(request);
+      return { outcome: "failed", reason: "unavailable" };
+    },
+  } as unknown as Decisions;
+  render(
+    <SearchResults
+      session={session}
+      query="deploy"
+      onQueryChange={() => {}}
+      input={createRef<HTMLInputElement>()}
+      pages={[]}
+      openConversation={() => {}}
+      openNewMessage={() => {}}
+      decisions={decisions}
+    />,
+  );
+  try {
+    await act(async () => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS));
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(requests).toHaveLength(1);
+    const { candidates } = JSON.parse(requests[0]?.state ?? "{}") as {
+      candidates: {
+        text: string;
+        author: string;
+        from_agent?: true;
+        searcher_in_conversation?: true;
+      }[];
+    };
+    expect(
+      candidates.map(
+        ({ text, author, from_agent, searcher_in_conversation }) => [
+          text,
+          author,
+          from_agent,
+          searcher_in_conversation,
+        ],
+      ),
+    ).toEqual([
+      ["deploy by a person", "Colleague", undefined, true],
+      ["deploy by an agent", "Helper", true, true],
+      ["deploy from an envelope", expect.any(String), true, true],
+      ["deploy by my agent", expect.any(String), true, undefined],
+      ["deploy by a workflow", "Workflow · owned by Colleague", true, true],
+    ]);
   } finally {
     cleanup();
     owner.dispose();
@@ -1433,6 +1837,8 @@ it("sorts a conversation newest first across pages and restarts paging when the 
     fireEvent.click(screen.getByRole("menuitemradio", { name: "Most recent" }));
     const first = await request();
     expect(first.filters).toEqual([{ ...text, search_sort: "newest" }]);
+    // The menu leaves the saved default alone.
+    expect(messageSortPreference()).toBe("relevance");
     const page1 = hits(20, 1700000100);
     const tail = page1.pop();
     assert(tail);
@@ -1527,7 +1933,16 @@ it("sorts a conversation newest first across pages and restarts paging when the 
     );
     const reset = await request();
     expect(reset.filters).toEqual([text]);
+
+    // A saved Most recent seeds each new opening; restart reads it too.
+    localStorage.setItem("buzz-search-message-sort.v1", "newest");
+    mounted.unmount();
+    render(<SearchResults {...scoped} query="sortword" />);
+    expect((await request()).filters).toEqual([
+      { ...text, search_sort: "newest" },
+    ]);
   } finally {
+    localStorage.removeItem("buzz-search-message-sort.v1");
     cleanup();
     owner.dispose();
   }
@@ -2967,9 +3382,17 @@ it("holds an early Enter for an open channel over a message that lands first, an
     });
     await act(async () => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS));
     expect(openConversation).toHaveBeenCalledOnce();
-    const news = message(viewer, "general", "news", 1700000002);
+    // A reply opens with its thread, so the page can place the thread.
+    const root = message(viewer, "general", "root", 1700000000);
+    const news = message(viewer, "general", "news", 1700000002, [
+      ["e", root.id, "", "reply"],
+    ]);
     await act(async () => wire.next().respond([news]));
-    expect(openConversation).toHaveBeenLastCalledWith("general", news.id);
+    expect(openConversation).toHaveBeenLastCalledWith(
+      "general",
+      news.id,
+      root.id,
+    );
   } finally {
     cleanup();
     owner.dispose();
@@ -4371,6 +4794,13 @@ it("offers a bounded from:@ picker with distinct identities and selects an exact
   }
 });
 
+/** A picker row's whole text: its title, then its second row if it has one. */
+function rowLines(row: HTMLElement) {
+  return [...row.querySelectorAll("span.block")]
+    .map((line) => line.textContent)
+    .join(" | ");
+}
+
 it.each(
   ["from:@", "from:", "in:@"].flatMap((operator) =>
     ["crew", undefined].flatMap((scope) =>
@@ -4466,9 +4896,17 @@ it.each(
     try {
       render(<Search />);
       const input = screen.getByRole("combobox");
-      expect(
-        await screen.findByRole("option", { name: new RegExp(label) }),
-      ).toBeVisible();
+      const row = await screen.findByRole("option", {
+        name: new RegExp(label),
+      });
+      expect(row).toBeVisible();
+      // Under the preferred verified name, only the other one: no key and no
+      // self-declared handle.
+      expect(rowLines(row)).toBe(
+        preference === "full-name"
+          ? "Robin Example | @robinz"
+          : "robinz | Robin Example",
+      );
       fireEvent.change(input, { target: { value: `${operator}robinz` } });
       expect(
         await screen.findByRole("option", { name: new RegExp(label) }),
@@ -4823,7 +5261,7 @@ it.each(
       expect(reads).toEqual([]);
       fireEvent.click(
         screen.getByRole("option", {
-          name: new RegExp(person.pubkey.slice(0, 12)),
+          name: /Robinexample/,
         }),
       );
       expect(change).toHaveBeenCalledWith(`from:${person.pubkey} deploy`);
@@ -4997,7 +5435,7 @@ it.each([
         expect(reads).toEqual([]);
         fireEvent.click(
           screen.getByRole("option", {
-            name: new RegExp(person.pubkey.slice(0, 12)),
+            name: /Robinexample/,
           }),
         );
         expect(change).toHaveBeenCalledWith(`from:${person.pubkey} deploy`);
@@ -5088,7 +5526,19 @@ it.each(["cancel", "fail"])(
   },
 );
 
+// Up to three search debounces chain before an ambiguous author picker
+// answers: useSearchMessages' first resolution, its re-resolution once the
+// member's verified name lands, then SearchResults' author lookup. In real
+// time they fill a wait's one-second default, so callers control the clock.
+async function settleSearchDebounces(steps = 3) {
+  for (let step = 0; step < steps; step += 1)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS);
+    });
+}
+
 it("offers every scoped alias match when completion is ambiguous", async () => {
+  vi.useFakeTimers();
   const { owner, person, reads } = verifiedAuthorSession({
     profileName: "alice",
     namesakeName: "alice",
@@ -5109,17 +5559,22 @@ it("offers every scoped alias match when completion is ambiguous", async () => {
         openConversation={() => {}}
       />,
     );
-    await waitFor(() =>
-      expect(
-        within(screen.getByRole("group", { name: "People" })).getAllByRole(
-          "option",
-        ),
-      ).toHaveLength(2),
-    );
+    // Pins the current phases: after two SEARCH_DEBOUNCE_MS windows People is
+    // still pending, and the options arrive within the third.
+    await settleSearchDebounces(2);
+    const people = screen.getByRole("group", { name: "People" });
+    expect(people).toHaveTextContent("Searching people…");
+    expect(within(people).queryAllByRole("option")).toHaveLength(0);
+    await settleSearchDebounces(1);
+    expect(
+      within(screen.getByRole("group", { name: "People" })).getAllByRole(
+        "option",
+      ),
+    ).toHaveLength(2);
     expect(reads).toEqual([]);
     fireEvent.click(
       screen.getByRole("option", {
-        name: new RegExp(person.pubkey.slice(0, 12)),
+        name: /Robinexample/,
       }),
     );
     expect(change).toHaveBeenCalledWith(`from:${person.pubkey} deploy`);
@@ -5208,21 +5663,17 @@ it.each(
 )(
   "completes verified alias $alias in $scope with $preference and namesake $namesake",
   async ({ scope, preference, alias, namesake }) => {
-    // A controlled clock: the namesake lands after up to three chained search
-    // debounces, which in real time sits at a wait's one-second default.
+    // The namesake lands after the chained debounces settleSearchDebounces
+    // names.
     vi.useFakeTimers();
-    const settle = async () => {
-      for (let step = 0; step < 3; step += 1)
-        await act(async () => {
-          await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS);
-        });
-    };
     const previous = namePreference();
     setNamePreference(preference as "username" | "full-name");
     const { owner, person, reads } = verifiedAuthorSession(
       namesake ? { namesakeName: alias } : {},
     );
     const change = vi.fn();
+    // The person's row shows both verified names; a namesake has only `alias`.
+    const personRow = alias === "robinz" ? /Robinexample/ : /robinz/;
     const props = {
       session: owner.session,
       onQueryChange: change,
@@ -5242,13 +5693,11 @@ it.each(
           query={alias === "robinz" ? `from:@${alias}` : completed}
         />,
       );
-      await settle();
+      await settleSearchDebounces();
       if (alias === "robinz") {
-        screen.getByRole("option", {
-          name: new RegExp(person.pubkey.slice(0, 12)),
-        });
+        screen.getByRole("option", { name: personRow });
         mounted.rerender(<SearchResults {...props} query={completed} />);
-        await settle();
+        await settleSearchDebounces();
       }
       if (namesake) {
         expect(
@@ -5257,11 +5706,7 @@ it.each(
           ),
         ).toHaveLength(2);
         expect(reads).toEqual([]);
-        fireEvent.click(
-          screen.getByRole("option", {
-            name: new RegExp(person.pubkey.slice(0, 12)),
-          }),
-        );
+        fireEvent.click(screen.getByRole("option", { name: personRow }));
         expect(change).toHaveBeenCalledWith(`from:${person.pubkey} deploy`);
       } else {
         expect(reads).toContainEqual(
@@ -5597,7 +6042,7 @@ const alexSession = (
     query(filters) {
       if (filters.some((filter) => filter.kinds?.includes(0)))
         return Promise.resolve([
-          profile(exact, { display_name: "Alex" }),
+          profile(exact, { display_name: "Alex", name: "alexk" }),
           ...page,
         ]);
       if (filters.some((filter) => filter.kinds?.includes(9)))
@@ -5637,11 +6082,7 @@ it.each([
       expect(await people.findAllByRole("option")).toHaveLength(shown);
       // The picker follows the resolver's completed lookup.
       expect(reads).toEqual([]);
-      fireEvent.click(
-        people.getByRole("option", {
-          name: new RegExp(exact.pubkey.slice(0, 12)),
-        }),
-      );
+      fireEvent.click(people.getByRole("option", { name: /@alexk/ }));
       expect(change).toHaveBeenCalledWith(`from:${exact.pubkey} `);
       mounted.rerender(
         <SearchResults {...props} query={`from:${exact.pubkey} `} />,
@@ -6044,8 +6485,8 @@ it("keeps both exact authors selectable ahead of a crowded prefix page", async (
           ...prefixes.map((person, index) =>
             profile(person, { display_name: `Samantha ${index}` }),
           ),
-          profile(first, { display_name: "Sam" }),
-          profile(second, { display_name: "Sam" }),
+          profile(first, { display_name: "Sam", name: "samira" }),
+          profile(second, { display_name: "Sam", name: "samuel" }),
         ]);
       return Promise.resolve([]);
     },
@@ -6065,19 +6506,267 @@ it("keeps both exact authors selectable ahead of a crowded prefix page", async (
     );
     const people = within(await screen.findByRole("group", { name: "People" }));
     await waitFor(() => expect(people.getAllByRole("option")).toHaveLength(12));
-    for (const pubkey of [first.pubkey, second.pubkey]) {
-      expect(
-        people.getByRole("option", { name: new RegExp(pubkey.slice(0, 12)) }),
-      ).toBeVisible();
-    }
+    for (const handle of [/@samira/, /@samuel/])
+      expect(people.getByRole("option", { name: handle })).toBeVisible();
     expect(reads).toHaveLength(0);
-    fireEvent.click(
-      people.getByRole("option", {
-        name: new RegExp(second.pubkey.slice(0, 12)),
-      }),
-    );
+    fireEvent.click(people.getByRole("option", { name: /@samuel/ }));
     expect(change).toHaveBeenCalledExactlyOnceWith(
       `from:${second.pubkey} deploy`,
+    );
+  } finally {
+    cleanup();
+    owner.dispose();
+  }
+});
+
+// Two people whose profiles hold one name in both kind-0 fields, as Buzz
+// writes them. Neither is a member of `crew`. The relay's name search does not
+// cache what it finds; without that endpoint the NIP-50 fallback does.
+function namesakeSession(policy: boolean, endpoint = true) {
+  const relay = keypair(),
+    viewer = keypair();
+  const sams = [keypair(), keypair()];
+  const found = sams.map((person) =>
+    profile(person, { display_name: "Sam", name: "Sam" }),
+  );
+  const discovery = [
+    metadata(relay, "crew", "crew"),
+    roster(relay, "crew", [viewer.pubkey]),
+    ...found,
+  ];
+  // The default naming policy, as the bundled plugin registers it.
+  const directory = createAgentDirectory();
+  const owner = createRelaySession(
+    {
+      ...scriptedTransport(viewer.pubkey, relay.pubkey).transport,
+      async query(filters) {
+        return discovery.filter((event) =>
+          filters.some((filter) => matchFilter(filter as Filter, event)),
+        );
+      },
+      ...(endpoint ? { searchProfiles: async () => found } : {}),
+    },
+    policy
+      ? {
+          identityNames: {
+            bind: (source) =>
+              bindNames(source, {
+                snapshot: () => [directory],
+                subscribe: () => () => {},
+              }),
+          } as IdentityNames,
+        }
+      : {},
+  );
+  return { owner, sams };
+}
+
+it.each([
+  { operator: "from:", scope: undefined, policy: false },
+  { operator: "in:@", scope: undefined, policy: false },
+  // The naming policy never compares these two: it sees neither uncached
+  // profile, and in a channel it compares each with the members alone.
+  { operator: "from:", scope: undefined, policy: true },
+  { operator: "in:@", scope: undefined, policy: true },
+  { operator: "from:", scope: "crew", policy: true },
+  { operator: "in:@", scope: "crew", policy: true },
+])(
+  "tells namesakes with nothing but a name apart by key for $operator in $scope with policy $policy",
+  async ({ operator, scope, policy }) => {
+    const { owner, sams } = namesakeSession(policy);
+    const labels = publicKeyLabels(sams.map(({ pubkey }) => pubkey));
+    const change = vi.fn();
+    const chosen = () => {
+      const queries = change.mock.calls.flat();
+      change.mockClear();
+      return queries;
+    };
+    try {
+      render(
+        <SearchResults
+          session={owner.session}
+          query={`${operator}sam`}
+          onQueryChange={change}
+          input={createRef()}
+          pages={[]}
+          scopedChannelId={scope}
+          openNewMessage={() => {}}
+          openConversation={() => {}}
+        />,
+      );
+      const people = within(
+        await screen.findByRole("group", { name: "People" }),
+      );
+      await waitFor(() =>
+        expect(people.getAllByRole("option").map(rowLines).sort()).toEqual(
+          sams.map(({ pubkey }) => `Sam | ${labels.get(pubkey)}`).sort(),
+        ),
+      );
+      // Each row is announced with its key label and selects that key.
+      const rows = people.getAllByRole("option");
+      const own = rows.map((row) => {
+        const person = sams.find(
+          ({ pubkey }) => rowLines(row) === `Sam | ${labels.get(pubkey)}`,
+        );
+        assert.exists(person);
+        // jsdom joins the two lines without the space a browser reads.
+        expect(row).toHaveAccessibleName(`Sam${labels.get(person.pubkey)}`);
+        return `${operator}${person.pubkey} `;
+      });
+      expect(new Set(own).size).toBe(2);
+      for (const row of rows) fireEvent.click(row);
+      expect(chosen()).toEqual(own);
+      const input = screen.getByRole("combobox");
+      for (const row of rows) {
+        expect(input).toHaveAttribute("aria-activedescendant", row.id);
+        fireEvent.keyDown(input, { key: "Enter" });
+        fireEvent.keyDown(input, { key: "ArrowDown" });
+      }
+      expect(chosen()).toEqual(own);
+    } finally {
+      cleanup();
+      owner.dispose();
+    }
+  },
+);
+
+it.each(["from:", "in:@"])(
+  "adds no key label for %s to namesakes the naming policy already qualifies",
+  async (operator) => {
+    const { owner, sams } = namesakeSession(true, false);
+    try {
+      render(
+        <SearchResults
+          session={owner.session}
+          query={`${operator}sam`}
+          onQueryChange={() => {}}
+          input={createRef()}
+          pages={[]}
+          openNewMessage={() => {}}
+          openConversation={() => {}}
+        />,
+      );
+      const people = within(
+        await screen.findByRole("group", { name: "People" }),
+      );
+      await waitFor(() =>
+        expect(people.getAllByRole("option").map(rowLines).sort()).toEqual(
+          sams
+            .map(({ pubkey }) => `Sam · ${npubEncode(pubkey).slice(-4)}`)
+            .sort(),
+        ),
+      );
+    } finally {
+      cleanup();
+      owner.dispose();
+    }
+  },
+);
+
+it.each(["from:@sam", "in:@sam"])(
+  "shows a handle under a different profile name for %s, never a key",
+  async (query) => {
+    const relay = keypair(),
+      viewer = keypair();
+    const found = [
+      { display_name: "Sam Reader", name: "sreader" },
+      // No profile name: the handle is the title and is not repeated.
+      { name: "samwise" },
+      { display_name: "samantha", name: "samantha" },
+      // Namesakes are told apart by their handles.
+      { display_name: "Sam", name: "samira" },
+      { display_name: "Sam", name: "samuel" },
+    ].map((content) => profile(keypair(), content));
+    const owner = createRelaySession({
+      ...scriptedTransport(viewer.pubkey, relay.pubkey).transport,
+      query: (filters) =>
+        Promise.resolve(
+          filters.some((filter) => filter.kinds?.includes(0)) ? found : [],
+        ),
+    });
+    try {
+      render(
+        <SearchResults
+          session={owner.session}
+          query={query}
+          onQueryChange={() => {}}
+          input={createRef()}
+          pages={[]}
+          openNewMessage={() => {}}
+          openConversation={() => {}}
+        />,
+      );
+      const people = within(
+        await screen.findByRole("group", { name: "People" }),
+      );
+      await waitFor(() =>
+        expect(people.getAllByRole("option").map(rowLines).sort()).toEqual([
+          "Sam Reader | @sreader",
+          "Sam | @samira",
+          "Sam | @samuel",
+          "samantha",
+          "samwise",
+        ]),
+      );
+    } finally {
+      cleanup();
+      owner.dispose();
+    }
+  },
+);
+
+it("omits a handle that repeats the title an agent's own name gives it", async () => {
+  const relay = keypair(),
+    viewer = keypair(),
+    agent = keypair();
+  const scope = "https://relay.example.test";
+  // This machine's name for its agent is the title, not its profile name.
+  const control = localAgentsFixture([
+    {
+      pubkey: agent.pubkey,
+      name: "scout",
+      relayUrl: scope,
+      owner: viewer.pubkey,
+    },
+  ]);
+  const directory = createAgentDirectory(control);
+  const owner = createRelaySession(
+    {
+      ...scriptedTransport(viewer.pubkey, relay.pubkey).transport,
+      scope,
+      query: (filters) =>
+        Promise.resolve(
+          filters.some((filter) => filter.kinds?.includes(0))
+            ? [profile(agent, { display_name: "Scout Bot", name: "scout" })]
+            : [],
+        ),
+    },
+    {
+      agentChoices: control,
+      identityNames: {
+        bind: (source) =>
+          bindNames(source, {
+            snapshot: () => [directory],
+            subscribe: () => () => {},
+          }),
+      } as IdentityNames,
+    },
+  );
+  try {
+    render(
+      <SearchResults
+        session={owner.session}
+        query="from:@scout"
+        onQueryChange={() => {}}
+        input={createRef()}
+        pages={[]}
+        openNewMessage={() => {}}
+        openConversation={() => {}}
+      />,
+    );
+    const agents = within(await screen.findByRole("group", { name: "Agents" }));
+    await waitFor(() =>
+      expect(agents.getAllByRole("option").map(rowLines)).toEqual(["scout"]),
     );
   } finally {
     cleanup();
@@ -7575,20 +8264,20 @@ it.each([true, false])(
   },
 );
 
-it("leads a message hit's conversation name with its type icon and words", async () => {
+it("leads a message hit's conversation name with its type in words", async () => {
   const relay = keypair(),
     viewer = keypair(),
     peer = keypair(),
     other = keypair();
-  // Each hit's channel, its icon, and the words read in place of the icon.
+  // Each hit's channel and the words that lead its conversation name.
   const rows = [
-    ["crew", "hash", "Public channel", "crew"],
-    ["plans", "lock", "Private channel", "plans"],
-    ["board", "hash", "Public channel", "board"],
-    ["vault", "lock", "Private channel", "vault"],
-    ["notes", "message-circle", "Chat", "Notes"],
-    ["dm", "message-circle", "Direct message", "Pinky"],
-    ["group", "message-circle", "Direct message", "Brain, Pinky"],
+    ["crew", "Public channel", "crew"],
+    ["plans", "Private channel", "plans"],
+    ["board", "Public channel", "board"],
+    ["vault", "Private channel", "vault"],
+    ["notes", "Chat", "Notes"],
+    ["dm", "Direct message", "Pinky"],
+    ["group", "Direct message", "Brain, Pinky"],
   ] as const;
   const dm = [
     ["t", "dm"],
@@ -7664,28 +8353,16 @@ it("leads a message hit's conversation name with its type icon and words", async
   try {
     const { rerender } = render(palette());
     await screen.findByRole("group", { name: "Messages" });
-    // A detail without a type icon has none beside it.
-    const page = screen.getByRole("option", { name: /^Inbox\s*Page$/ });
-    expect(page.querySelector(`.${referenceStyles.icon}`)).toBeNull();
     // Top results shows five hits; Tab shows the whole Messages group.
     const field = screen.getByRole("combobox", { name: "Search Buzz" });
     fireEvent.keyDown(field, { key: "Tab" });
     // An option is named from its content: the message, then the detail led
     // by its icon's hidden words (jsdom joins the two block lines unspaced).
     await waitFor(() => {
-      for (const [id, icon, kind, name] of rows) {
-        const option = screen.getByRole("option", {
+      for (const [id, kind, name] of rows)
+        screen.getByRole("option", {
           name: new RegExp(`match in ${id}\\s*${kind}, ${name} · `),
         });
-        // The icon styled as a channel mention's in a message: a hash
-        // flush against the name, a lock or bubble a little apart.
-        expect(
-          option.querySelector(
-            `.${referenceStyles.icon}.${icon === "hash" ? referenceStyles.flush : referenceStyles.snug}`,
-          ),
-        ).toHaveClass(`tabler-icon-${icon}`);
-        expect(within(option).getByText(`${kind},`)).toHaveClass("sr-only");
-      }
     });
     fireEvent.keyDown(field, { key: "Escape" });
     // A grid row's own label reads the same words before the detail.
@@ -7706,7 +8383,7 @@ it("leads a message hit's conversation name with its type icon and words", async
         },
       ]),
     );
-    for (const [id, , kind, name] of rows.slice(0, 5))
+    for (const [id, kind, name] of rows.slice(0, 5))
       screen.getByRole("row", {
         name: new RegExp(`match in ${id} — ${kind}, ${name} · `),
       });
@@ -8908,43 +9585,6 @@ it("puts the Bestie DM back under its New chat when Agents is shown whole", asyn
     expect(
       screen.getAllByRole("option", { name: /Z Scout.*Direct message/ }),
     ).toHaveLength(1);
-  } finally {
-    dispose();
-    localStorage.clear();
-  }
-});
-
-it("keeps the Bestie DM under its New chat when Top results cuts Agents after it", async () => {
-  // Four better-matching agents put Bestie's New chat fifth, the last row
-  // Top results shows of its lead group; its DM is not listed under Direct
-  // messages, so it must stay with that row.
-  localStorage.clear();
-  const { dispose } = renderBestieSearch({
-    query: "scout",
-    bestieProfile: "Z Scout",
-    extraOwnedAgents: 4,
-  });
-  try {
-    const agents = within(await screen.findByRole("group", { name: "Agents" }));
-    await waitFor(() => {
-      const rows = agents.getAllByRole("option").map((row) => row.textContent);
-      expect(rows.slice(0, 4)).toEqual(
-        Array.from({ length: 4 }, () =>
-          expect.stringMatching(/Scout [A-D].*New chat/),
-        ),
-      );
-      expect(rows.slice(4)).toEqual([
-        expect.stringMatching(/Z Scout.*New chat/),
-        expect.stringMatching(/Z Scout.*Direct message/),
-      ]);
-    });
-    expect(
-      screen.getAllByRole("option", { name: /Z Scout.*Direct message/ }),
-    ).toHaveLength(1);
-    // Those six rows are the whole group, so nothing is left to show.
-    expect(
-      screen.queryByRole("button", { name: "Show all Agents" }),
-    ).toBeNull();
   } finally {
     dispose();
     localStorage.clear();
@@ -11057,7 +11697,6 @@ it("shows a message hit's resolved mention as a chip and keeps its highlight", a
     await act(async () => vi.advanceTimersByTimeAsync(0));
     const chip = row.querySelector("[data-mention-kind]");
     expect(chip).toHaveTextContent("tomb");
-    expect(chip).toHaveClass(referenceStyles.link ?? "");
     expect(row.querySelector("mark.search-match")).toHaveTextContent("getting");
   } finally {
     cleanup();

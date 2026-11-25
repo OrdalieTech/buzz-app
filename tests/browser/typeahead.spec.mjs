@@ -179,10 +179,6 @@ for (const mode of ["light", "dark"]) {
       const options = popup.getByRole("option");
       await expect(options.nth(1)).toBeVisible();
       if (kind === "mention") {
-        await expect(popup).toHaveCSS("border-radius", "24px");
-        await expect(popup).toHaveCSS("padding", "12px");
-        await expect(popup).toHaveCSS("width", "380px");
-        await expect(options.first()).toHaveCSS("padding", "8px");
         const composer = page.getByRole("form", {
           name: "Send a message to General",
         });

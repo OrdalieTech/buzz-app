@@ -32,7 +32,9 @@ export function ChannelHeaderMenu({
   menuPanels,
   openMenuPanel,
   finishConversion,
+  leadingAction,
   startChat,
+  afterDetails,
   size = "toolbar",
   label = "Channel actions",
 }: {
@@ -41,7 +43,9 @@ export function ChannelHeaderMenu({
   origin?: AbortSignal | undefined;
   trigger: RefObject<HTMLButtonElement | null>;
   openDetails(): void;
+  leadingAction?: ReactNode;
   startChat?: ReactNode;
+  afterDetails?: (close: () => void) => ReactNode;
   size?: "toolbar" | "compact";
   label?: string;
   finishConversion?: (() => void) | undefined;
@@ -79,6 +83,7 @@ export function ChannelHeaderMenu({
         finalFocus.current ? finalFocus.current() : (trigger.current ?? false)
       }
     >
+      {leadingAction}
       {startChat}
       {finishConversion && (
         <MenuItem onClick={finishConversion}>
@@ -103,6 +108,7 @@ export function ChannelHeaderMenu({
         </MenuIcon>
         View channel details
       </MenuItem>
+      {afterDetails?.(surface.close)}
       {menuPanels?.map((panel) => (
         <MenuItem key={panel.key} onClick={() => openMenuPanel?.(panel)}>
           <MenuIcon>

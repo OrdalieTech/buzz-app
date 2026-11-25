@@ -125,6 +125,16 @@ function serialize(
       : text(copyText, format);
   }
   if (!selectable) return "";
+  // Chrome the DOM marks rather than styles, such as a file card's second
+  // line: left out of a selection that runs into it, kept for one that starts
+  // inside it, as a triple-click on the line does. Only the live DOM is
+  // marked: pasted HTML, walked without a range, keeps all of its text.
+  if (
+    range &&
+    node.hasAttribute("data-copy-skip") &&
+    !node.contains(range.startContainer)
+  )
+    return "";
   // This module's own delimiter markup; the spoiler branch writes it afresh.
   if (node.hasAttribute("data-spoiler-delimiter")) return "";
   // SVG tag names keep their case.

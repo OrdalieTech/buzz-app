@@ -503,29 +503,117 @@ it("preserves ordinary channel admission defaults for an owner", async () => {
     test.owner.dispose();
   }
 });
-it("explains how to recover an expired failed invitation without republishing it", async () => {
+async function expireFailedAddition(
+  test: ReturnType<typeof setup>,
+  channel: string,
+) {
+  test.setDenied(true);
+  vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+  await expect(
+    test.owner.session.channelWrites.addAgents(channel, [test.agent]),
+  ).rejects.toThrow(/Only channel admins/);
+  expect(test.publish).toHaveBeenCalledOnce();
+  vi.mocked(Date.now).mockReturnValue(1_700_000_901_000);
+  test.setDenied(false);
+  return test.publish.mock.calls[0]?.[0];
+}
+it.each(["parent", "child"] as const)(
+  "replaces an expired failed %s invitation with a fresh one",
+  async (target) => {
+    const test = setup("private", "owner");
+    try {
+      await test.ready();
+      const channel = test[target];
+      const expired = await expireFailedAddition(test, channel);
+      await test.owner.session.channelWrites.addAgents(channel, [test.agent]);
+      expect(test.publish).toHaveBeenCalledTimes(2);
+      const fresh = test.publish.mock.calls[1]?.[0];
+      expect(fresh?.id).not.toBe(expired?.id);
+      expect(fresh?.tags).toEqual(
+        expect.arrayContaining([
+          ["h", channel],
+          ["p", test.agent],
+        ]),
+      );
+      expect(
+        test.owner.session.outbox
+          ?.snapshot()
+          .some((item) => item.event.id === expired?.id),
+      ).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+      test.owner.dispose();
+    }
+  },
+);
+it.each([false, true])(
+  "settles an expired unconfirmed invitation from the roster (applied: %s)",
+  async (applied) => {
+    const test = setup("private", "owner");
+    try {
+      await test.ready();
+      vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+      const publishAgent = test.publish.getMockImplementation();
+      test.publish.mockImplementationOnce(async (event) => {
+        if (applied) await publishAgent?.(event);
+        throw new Error("Connection lost");
+      });
+      await expect(
+        test.owner.session.channelWrites.addAgents(test.parent, [test.agent]),
+      ).rejects.toThrow();
+      const original = test.publish.mock.calls[0]?.[0];
+      const outbox = test.owner.session.outbox;
+      expect(
+        outbox?.snapshot().find((item) => item.event.id === original?.id)
+          ?.delivery,
+      ).toBe("unknown");
+      vi.mocked(Date.now).mockReturnValue(1_700_000_901_000);
+      await test.owner.session.channelWrites.addAgents(test.parent, [
+        test.agent,
+      ]);
+      expect(test.publish).toHaveBeenCalledTimes(applied ? 1 : 2);
+      if (!applied)
+        expect(
+          outbox?.snapshot().some((item) => item.event.id === original?.id),
+        ).toBe(false);
+      expect(test.owner.session.channels.get?.(test.parent)?.members).toContain(
+        test.agent,
+      );
+    } finally {
+      vi.restoreAllMocks();
+      test.owner.dispose();
+    }
+  },
+);
+it("rechecks agent eligibility before replacing an expired failed invitation", async () => {
   const test = setup();
   try {
     await test.ready();
-    test.setDenied(true);
-    const now = Date.now;
-    vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
-    try {
-      await expect(
-        test.owner.session.channelWrites.addAgents(test.parent, [test.agent]),
-      ).rejects.toThrow(/Only channel admins/);
-      expect(test.publish).toHaveBeenCalledOnce();
-      vi.mocked(Date.now).mockReturnValue(1_700_000_901_000);
-      test.setDenied(false);
-      await expect(
-        test.owner.session.channelWrites.addAgents(test.parent, [test.agent]),
-      ).rejects.toThrow(/expired.*Outbox.*remove.*add the agent again/i);
-      expect(test.publish).toHaveBeenCalledOnce();
-    } finally {
-      vi.restoreAllMocks();
-      expect(Date.now).toBe(now);
-    }
+    const expired = await expireFailedAddition(test, test.parent);
+    const outbox = test.owner.session.outbox;
+    if (!outbox) throw new Error("Fixture outbox unavailable");
+    let archiving: Promise<void> | undefined;
+    const stop = outbox.subscribe(() => {
+      if (
+        archiving ||
+        outbox.snapshot().some((item) => item.event.id === expired?.id)
+      )
+        return;
+      // Hold the replacement's roster read until the agent is archived.
+      void test.holdRoster();
+      test.archive(test.agent);
+      archiving = test.owner.session.archives
+        .ensure()
+        .finally(test.releaseRoster);
+    });
+    await expect(
+      test.owner.session.channelWrites.addAgents(test.parent, [test.agent]),
+    ).rejects.toThrow(/archived/);
+    stop();
+    expect(archiving).toBeDefined();
+    expect(test.publish).toHaveBeenCalledOnce();
   } finally {
+    vi.restoreAllMocks();
     test.owner.dispose();
   }
 });

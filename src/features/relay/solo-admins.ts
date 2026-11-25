@@ -146,13 +146,13 @@ export async function promoteSoloAdmins(
     if (await recorded()) continue;
     if (Date.now() / 1000 - create.created_at >= 15 * 60)
       throw new Error(
-        "Chat admin setup expired. Abandon setup in Outbox to continue with current roles, or start a new chat.",
+        "Chat admin setup expired. Choose Abandon admin setup in this chat to continue with current roles, or start a new chat.",
       );
     const ownership = await owned?.(admin, admins);
     const checkOwnership = () => {
       if (!ownership?.())
         throw new Error(
-          "An opening agent is not verified as owned by the chat creator. Retry this message or choose Abandon admin setup in Outbox to continue with current roles.",
+          "An opening agent is not verified as owned by the chat creator. Retry this message or choose Abandon admin setup in this chat to continue with current roles.",
         );
     };
     checkOwnership();
@@ -176,7 +176,7 @@ export async function promoteSoloAdmins(
     )?.[3];
     if (!role || !["member", "bot", "admin"].includes(role))
       throw new Error(
-        "An opening agent's access changed. Choose Abandon admin setup in Outbox to continue with current roles.",
+        "An opening agent's access changed. Choose Abandon admin setup in this chat to continue with current roles.",
       );
     checkOwnership();
     const signed = await writer.sign(template, signal);

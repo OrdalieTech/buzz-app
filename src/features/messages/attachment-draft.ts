@@ -18,6 +18,8 @@ export type DraftAttachment = Readonly<{
   status: "queued" | "preparing" | "uploading" | "ready" | "error";
   uploaded?: UploadedAttachment;
   error?: string | undefined;
+  /** The relay refused this file's type, so the same bytes cannot upload. */
+  unsupported?: true | undefined;
   /** Host-reported bytes for the current prepared transfer. */
   transfer?: Readonly<{ sent: number; total: number }> | undefined;
 }>;
@@ -26,8 +28,12 @@ export type AttachmentDraft = {
   subscribe(listener: () => void): () => void;
   /** Admits the files that fit, in order. A lone file that does not fit throws
    * why; otherwise one sentence per reason names the first files left out
-   * and counts the rest. */
-  add(files: readonly File[], recording?: VoiceRecording): readonly string[];
+   * and counts the rest. `folders` are the files a drop found to be folders. */
+  add(
+    files: readonly File[],
+    recording?: VoiceRecording,
+    folders?: ReadonlySet<File>,
+  ): readonly string[];
   addUploaded(attachment: UploadedAttachment): void;
   adopt(files: readonly DraftAttachment[]): boolean;
   prepareForSend(signal: AbortSignal): Promise<readonly UploadedAttachment[]>;
@@ -102,6 +108,14 @@ export const MAX_ATTACHMENT_FILES = 10;
 const MAX_RETAINED_BYTES = 2 * UPLOAD_MAX_BYTES;
 /** A refusal names this many files, then counts the rest. */
 const NAMED_REFUSALS = 3;
+const FOLDER = "Folders can’t be attached.";
+const listed = (names: readonly string[]) =>
+  names.length > NAMED_REFUSALS
+    ? `${names.slice(0, NAMED_REFUSALS).join(", ")} and ${names.length - NAMED_REFUSALS} more`
+    : names.join(", ");
+/** One sentence for the files the relay refused for their type. */
+export const unsupportedTypes = (names: readonly string[]) =>
+  `${listed(names)} ${names.length === 1 ? "isn’t a supported file type" : "aren’t supported file types"}.`;
 
 /** A composer's view scope and key for its uploaded files. */
 type SavedFiles = readonly [scope: string, key: string];
@@ -292,6 +306,9 @@ export function attachmentDraft(
             error instanceof Error
               ? error.message
               : "Upload failed. Retry or remove this file.",
+          unsupported:
+            (error instanceof UploadError && error.code === "type") ||
+            undefined,
         });
       throw error;
     } finally {
@@ -336,7 +353,11 @@ export function attachmentDraft(
         }
       };
     },
-    add(files: readonly File[], recording?: VoiceRecording) {
+    add(
+      files: readonly File[],
+      recording?: VoiceRecording,
+      folders?: ReadonlySet<File>,
+    ) {
       if (recording) {
         validateRecording(recording);
         if (files.length !== 1 || files[0] !== recording.file)
@@ -347,39 +368,42 @@ export function attachmentDraft(
         .flatMap((owner) => owner.snapshot())
         .reduce((sum, item) => sum + item.file.size, 0);
       const admitted: File[] = [];
-      // Reason → the files it left out. Empty files share the "" reason.
+      // Reason → the files it left out. Folders share the FOLDER reason and
+      // empty files the "" reason.
       const refused = new Map<string, string[]>();
       for (const file of files) {
-        const reason = !file.size
-          ? new Error(`${file.name} is empty.`)
-          : items.length + admitted.length >= MAX_ATTACHMENT_FILES
-            ? new Error(
-                `Attach at most ${MAX_ATTACHMENT_FILES} files per message.`,
-              )
-            : file.size > UPLOAD_MAX_BYTES
-              ? new UploadError("size")
-              : retained + file.size > MAX_RETAINED_BYTES
-                ? new Error(
-                    "Attachment drafts are full (1,000 MiB). Send or remove some files first.",
-                  )
-                : undefined;
+        const folder = folders?.has(file);
+        const reason = folder
+          ? new Error(`${file.name} is a folder. ${FOLDER}`)
+          : !file.size
+            ? new Error(`${file.name} is empty.`)
+            : items.length + admitted.length >= MAX_ATTACHMENT_FILES
+              ? new Error(
+                  `Attach at most ${MAX_ATTACHMENT_FILES} files per message.`,
+                )
+              : file.size > UPLOAD_MAX_BYTES
+                ? new UploadError("size")
+                : retained + file.size > MAX_RETAINED_BYTES
+                  ? new Error(
+                      "Attachment drafts are full (1,000 MiB). Send or remove some files first.",
+                    )
+                  : undefined;
         if (!reason) {
           admitted.push(file);
           retained += file.size;
         } else if (files.length === 1) throw reason;
         else {
-          const key = file.size ? reason.message : "";
+          const key = folder ? FOLDER : file.size ? reason.message : "";
           refused.set(key, [...(refused.get(key) ?? []), file.name]);
         }
       }
       const left = Array.from(refused, ([reason, names]) => {
-        const listed =
-          names.length > NAMED_REFUSALS
-            ? `${names.slice(0, NAMED_REFUSALS).join(", ")} and ${names.length - NAMED_REFUSALS} more`
-            : names.join(", ");
-        return reason
-          ? `${listed}: ${reason}`
-          : `${listed} ${names.length === 1 ? "is" : "are"} empty.`;
+        const one = names.length === 1;
+        return reason === FOLDER
+          ? `${listed(names)} ${one ? "is a folder" : "are folders"}. ${FOLDER}`
+          : reason
+            ? `${listed(names)}: ${reason}`
+            : `${listed(names)} ${one ? "is" : "are"} empty.`;
       });
       if (!admitted.length) return left;
       items = [
@@ -461,7 +485,12 @@ export function attachmentDraft(
     retry(id: string) {
       if (!items.some((item) => item.id === id && item.status === "error"))
         return;
-      replace(id, { status: "queued", error: undefined, transfer: undefined });
+      replace(id, {
+        status: "queued",
+        error: undefined,
+        transfer: undefined,
+        unsupported: undefined,
+      });
       paused = false;
       pump();
     },

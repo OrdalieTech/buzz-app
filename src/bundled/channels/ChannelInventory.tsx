@@ -47,12 +47,13 @@ import {
   hasSoloDraft,
   useSoloDraftProjects,
 } from "../../features/solo/draft-projects";
-import { NavigationItem } from "../../shared/design-system/ui/NavigationItem";
+import { SpringLoadedNavigationItem } from "../../features/channel-navigation/SpringLoadedNavigationItem";
 import { workspaceSectionOrder } from "../../features/relay/sidebar-preferences";
 import type { RelayData } from "../../features/relay/service";
 import type { Agents } from "../../features/agents/service";
 import type { RelaySession } from "../../features/relay/session";
 import { useChannelRoster } from "../../features/relay/react";
+import { useMentionArchives } from "../../features/messages/use-mention-archives";
 import type { Navigation } from "../../features/navigation/controller";
 import type { OpenTarget } from "../../features/navigation/targets";
 import type {
@@ -60,13 +61,16 @@ import type {
   SidebarSections,
 } from "../../features/channel-navigation/sidebar-sections-service";
 import {
+  pluginRowSectionKey,
   sidebarRow,
+  sidebarRowMenuItems,
   sidebarRowSortModes,
   sortSidebarRows,
   type SidebarRows,
   type RegisteredSidebarRows,
 } from "../../features/channel-navigation/sidebar-rows-service";
 import { useSidebarRowUnread } from "../../features/channel-navigation/useSidebarRowUnread";
+import type { UnreadSnapshot } from "../../features/relay/unread";
 import type { SidebarSortMode } from "../../features/relay/sidebar-sort";
 import type { SidebarFrame } from "../../features/channel-navigation/SidebarFrame";
 import { Button } from "../../shared/design-system/ui/Button";
@@ -94,7 +98,6 @@ import {
   ChatCircleIcon,
   FolderSimpleIcon,
   MinusIcon,
-  PencilSimpleIcon,
   PlusIcon,
   XIcon,
 } from "../../shared/design-system/icons";
@@ -134,6 +137,7 @@ import {
   sidebarHome,
   sidebarDropRowKinds,
   orderContributedSidebarSections,
+  recentAt,
 } from "./sidebar-sections";
 import { activityTranscript } from "./working-agents";
 import { SidebarContributionSection } from "../../features/channel-navigation/SidebarContributionSection";
@@ -155,6 +159,11 @@ import { splitPartition } from "../../features/relay/partition";
 import styles from "./Channels.module.css";
 import { avatarMedia } from "../../shared/avatar-source";
 import { useBestieConversation } from "../../app/shell/bestie-context";
+
+// Opening a DM quiets its row before read dwell; messages remain unread.
+function conversationUnread(snapshot: UnreadSnapshot) {
+  return snapshot.manual !== "none" || (snapshot.observedCount ?? 0) > 0;
+}
 
 /** The sidebar entry selected by a destination, excluding nested message state. */
 function sidebarEntryLocation(target: OpenTarget) {
@@ -284,10 +293,11 @@ export function ChannelInventory({
   const pluginSorted = appliedSorts.some(
     (mode) => mode !== "alpha" && mode !== "recent",
   );
+  const activeFiltered = Object.values(
+    preferences.data?.filters ?? {},
+  ).includes("active");
   const needsActivity =
-    pluginSorted ||
-    appliedSorts.includes("recent") ||
-    Object.values(preferences.data?.filters ?? {}).includes("active");
+    pluginSorted || appliedSorts.includes("recent") || activeFiltered;
   const soloActivity = useCallback(
     (channel: ChannelSummary) => eligibleSolo(channel, viewer),
     [viewer],
@@ -296,6 +306,9 @@ export function ChannelInventory({
   const list = useChannelRoster(queries.channels, {
     activity: needsActivity || (soloRecent && soloActivity),
     preview: pluginSorted,
+    // Recent order is the only reader of activity then; most messages land in
+    // a chat that already leads, so they leave the sidebar alone.
+    ...(pluginSorted || activeFiltered ? {} : { rank: recentAt }),
   });
   // The session reads activity only for saved sorts; Solo's default needs it
   // too, but only while there are Solo chats to order.
@@ -418,6 +431,38 @@ export function ChannelInventory({
     newMessage(target.route?.params) !== undefined;
   const preparingDm = composingMessage ? handoff?.preparingDm : undefined;
   const regions = useSoloNavigation(queries);
+  const archiveConnected = useSyncExternalStore(
+    queries.live.subscribe,
+    () => queries.live.snapshot().status === "connected",
+  );
+  const archiveDemand =
+    list.status === "ready" &&
+    channels.some(
+      (channel) =>
+        channel.channelType === "dm" &&
+        channel.participants?.length === 1 &&
+        channel.participants[0] !== viewer &&
+        !channel.metadataPending &&
+        !channel.huddle,
+    );
+  const { archived } = useMentionArchives(
+    queries,
+    archiveDemand && archiveConnected && "background",
+  );
+  const archivedKeys = useMemo(() => new Set(archived), [archived]);
+  const archivedDmUnread = useSidebarRowUnread(
+    queries.unread,
+    JSON.stringify(
+      channels
+        .filter(
+          (channel) =>
+            channel.channelType === "dm" &&
+            channel.participants?.length === 1 &&
+            archivedKeys.has(channel.participants[0] ?? ""),
+        )
+        .map((channel) => channel.id),
+    ),
+  );
   const sidebarChannels = useMemo(
     () =>
       channels.filter(
@@ -425,6 +470,20 @@ export function ChannelInventory({
           channel.id !== promotedDm &&
           !channel.huddle &&
           !channel.metadataPending &&
+          // Identity archival changes discovery, never the conversation itself.
+          !(
+            channel.channelType === "dm" &&
+            channel.participants?.length === 1 &&
+            channel.participants[0] !== viewer &&
+            archivedKeys.has(channel.participants[0] ?? "") &&
+            !conversationUnread(
+              archivedDmUnread.get(channel.id) ??
+                queries.unread.snapshot({
+                  kind: "channel",
+                  channelId: channel.id,
+                }),
+            )
+          ) &&
           (channel.channelType !== "solo" ||
             (eligibleSolo(channel, viewer) &&
               !regions.excluded.has(channel.id))) &&
@@ -436,7 +495,16 @@ export function ChannelInventory({
               preparingDm.members.has(member),
             )),
       ),
-    [channels, preparingDm, promotedDm, regions.excluded, viewer],
+    [
+      channels,
+      preparingDm,
+      promotedDm,
+      regions.excluded,
+      viewer,
+      archivedKeys,
+      archivedDmUnread,
+      queries.unread,
+    ],
   );
   const currentDraft =
     target.kind === "page" && target.pluginId === "buzz.channels"
@@ -687,13 +755,14 @@ export function ChannelInventory({
         draft?.linked === currentDraft.linked &&
         draft?.project === currentDraft.project;
       return [
-        <NavigationItem
+        <SpringLoadedNavigationItem
           key={draft?.linked ?? draft?.project ?? "new-chat"}
+          onSpring={() => void navigator.open(destination)}
           label="New chat"
           aria-description="Unsent draft"
           selected={selected}
           aria-current={selected ? "page" : undefined}
-          icon={<PencilSimpleIcon size={16} />}
+          icon={<PlusIcon size={16} />}
           onClick={() => {
             if (selected) soloDraftInput()?.focus();
             else void navigator.open(destination);
@@ -1342,6 +1411,38 @@ export function ChannelInventory({
         </MenuItem>,
       );
     }
+    for (const item of sidebarRowMenuItems(
+      rowContributions,
+      sidebarRow(
+        channel,
+        pluginRowSectionKey(channel, sectionKey),
+        rowUnread.get(channel.id) ??
+          queries.unread.snapshot({ kind: "channel", channelId: channel.id }),
+      ),
+    ))
+      actions.push(
+        <ContributionBoundary
+          key={item.key}
+          fallback={null}
+          resetIdentity={rowContributions}
+        >
+          <MenuItem
+            disabled={surface?.pending ?? readWrite?.pending ?? false}
+            onClick={() => {
+              try {
+                void Promise.resolve(item.onSelect()).catch((error) =>
+                  console.error(`Row menu item failed: ${item.key}`, error),
+                );
+              } catch (error) {
+                console.error(`Row menu item failed: ${item.key}`, error);
+              }
+            }}
+          >
+            <MenuIcon>{item.icon}</MenuIcon>
+            {item.label}
+          </MenuItem>
+        </ContributionBoundary>,
+      );
     if (readable)
       actions.push(
         <ChannelReadMenuItem
@@ -1734,7 +1835,11 @@ export function ChannelInventory({
     },
     [lifecycleCallbacks, openSuccessor],
   );
-  const workspaceNewAction = (workspace: string, name: string) => (
+  const workspaceNewAction: WorkspaceSidebarComposition["newAction"] = (
+    workspace,
+    name,
+    menuAnchor,
+  ) => (
     <WorkspaceNewMenu
       key={`${scope}:${workspace}`}
       scope={scope}
@@ -1742,6 +1847,7 @@ export function ChannelInventory({
       name={name}
       channelAvailable={queries.channelCreation.available}
       dmAvailable={queries.directMessages.available}
+      menuAnchor={menuAnchor}
       choose={(action, trigger) => {
         if (relay.snapshot().session !== queries) return;
         if (action === "chat") newChat(workspace);

@@ -62,7 +62,7 @@ it("shows the first and last ten public-key characters without inventing a profi
   expect(
     screen.queryByRole("button", { name: "Enter your private key" }),
   ).toBeNull();
-  const label = `${npub.slice(0, 10)}...${npub.slice(-10)}`;
+  const label = `${npub.slice(0, 10)}…${npub.slice(-10)}`;
   expect(screen.getByText(label)).toBeVisible();
   expect(screen.getByText(label)).toHaveAttribute("title", npub);
   expect(

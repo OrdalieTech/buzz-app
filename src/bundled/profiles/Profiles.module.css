@@ -8,6 +8,19 @@
   background: var(--surface-panel);
   container-type: inline-size;
 }
+/* Over a conversation the profile is its sheet: no card of its own, and its
+   colours run to the sheet's edges, under the sheet's header. Its tab keeps
+   the card. */
+[data-details-sheet-surface] .root {
+  padding-top: 0;
+  background: transparent;
+}
+[data-details-sheet-surface] .root .hero {
+  margin: 0 calc(-1 * var(--space-5));
+  padding-top: calc(var(--sheet-header-height) + var(--space-8));
+  border-radius: 0;
+  background: transparent;
+}
 .identity {
   display: flex;
   flex-direction: column;

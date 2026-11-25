@@ -12,6 +12,14 @@ import { flush } from "../features/relay/testing";
 import { ToastProvider } from "../shared/design-system/ui/Toast";
 import { readDefaultLifetime } from "../features/solo/default-lifetime";
 
+const mediaUsage = vi.hoisted(() =>
+  vi.fn(async (): Promise<number | undefined> => undefined),
+);
+vi.mock("../features/relay/native", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../features/relay/native")>()),
+  nativeMediaUsage: mediaUsage,
+}));
+
 const viewer = "a".repeat(64);
 const origin = "https://community.example";
 const roots: Context[] = [];
@@ -57,6 +65,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await root.fiber.dispose();
   localStorage.clear();
   vi.restoreAllMocks();
+  mediaUsage.mockReset();
 });
 
 it("saves an explicit device name and resets to the default without changing the community address", async () => {
@@ -155,6 +164,48 @@ it("copies the exact community URL, keeps it selectable on clipboard failure, an
   expect(await screen.findByText("Community URL copied.")).toBeVisible();
   expect(screen.queryByRole("alert")).toBeNull();
   expect(communities.snapshot().selected).toBe(origin);
+});
+
+it("clears this community's cached data, reports a failure inline, and allows retry", async () => {
+  const { user, communities } = await setup();
+  const clear = vi
+    .spyOn(communities.relay, "clearCache")
+    .mockRejectedValueOnce(new Error("busy"));
+  const button = () => screen.getByRole("button", { name: "Clear cache" });
+  await user.click(button());
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Couldn’t clear the cache.",
+  );
+  let finish!: () => void;
+  clear.mockReturnValueOnce(
+    new Promise<void>((resolve) => {
+      finish = resolve;
+    }),
+  );
+  await user.click(button());
+  try {
+    expect(button()).toHaveAttribute("aria-busy", "true");
+    expect(screen.queryByRole("alert")).toBeNull();
+    await user.click(button());
+    expect(clear).toHaveBeenCalledTimes(2);
+  } finally {
+    await act(async () => {
+      finish();
+    });
+  }
+  expect(await screen.findByText("Cache cleared.")).toBeVisible();
+});
+
+it("shows the space this community's saved data uses and measures again after clearing", async () => {
+  const MB = 1024 * 1024;
+  mediaUsage.mockResolvedValueOnce(14 * MB);
+  const { user, communities } = await setup();
+  expect(await screen.findByText(/Uses 14 MB on this device\./)).toBeVisible();
+  expect(mediaUsage).toHaveBeenCalledWith(origin);
+  vi.spyOn(communities.relay, "clearCache").mockResolvedValueOnce();
+  mediaUsage.mockResolvedValueOnce(0);
+  await user.click(screen.getByRole("button", { name: "Clear cache" }));
+  expect(await screen.findByText(/Uses 0 MB on this device\./)).toBeVisible();
 });
 
 it("saves the lifetime new Solo chats start with for this community and account only", async () => {

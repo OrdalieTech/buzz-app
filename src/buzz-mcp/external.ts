@@ -10,6 +10,8 @@ const required = { "buzz/requiredScopes": ["agent"] };
 const instructions =
   "Act as the agent selected by the owner in Buzz, with all of its Buzz tools. There is no current conversation: supply explicit channel or message IDs. Keys stay in Buzz. Use saved approval to restore a closed connection. Revoked or expired approval needs owner consent. Never repeat a post after a lost response. Read its destination first.";
 
+const inflight = new WeakMap<BuzzClient, Map<unknown, AbortController>>();
+
 /** An approved external app acts as the selected agent: it lists and calls
  * the tools that agent's sessions get, plugins' included, through the same
  * dispatcher, without an implicit conversation. Only full-agent approval
@@ -32,7 +34,14 @@ export async function respondExternal(
     method?: string;
     params?: Record<string, unknown>;
   };
-  if (id === undefined || id === null) return undefined;
+  if (id === undefined || id === null) {
+    if (method === "notifications/cancelled")
+      inflight
+        .get(client)
+        ?.get((params as { requestId?: unknown } | null)?.requestId)
+        ?.abort(new Error("The agent cancelled this request"));
+    return undefined;
+  }
   if (!params || typeof params !== "object" || Array.isArray(params))
     throw new Error("params must be an object.");
   const error = (message: string) => ({
@@ -83,5 +92,20 @@ export async function respondExternal(
         },
       },
     };
-  return respond(client, {}, input, added(), { instructions });
+  if (method !== "tools/call")
+    return respond(client, {}, input, added(), { instructions });
+  const calls = inflight.get(client) ?? new Map<unknown, AbortController>();
+  inflight.set(client, calls);
+  const cancelled = new AbortController();
+  calls.set(id, cancelled);
+  const signal = client.signal
+    ? AbortSignal.any([client.signal, cancelled.signal])
+    : cancelled.signal;
+  try {
+    return await respond({ ...client, signal }, {}, input, added(), {
+      instructions,
+    });
+  } finally {
+    if (calls.get(id) === cancelled) calls.delete(id);
+  }
 }

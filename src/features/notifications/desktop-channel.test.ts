@@ -53,16 +53,20 @@ function callback(index = 0) {
   return { call, id, send };
 }
 
-it("Windows/Linux keep system-managed permission without a window.Notification shim or native calls", async () => {
-  vi.stubGlobal("navigator", { platform: "Win32" });
-  const platform = createNotifications();
-  expect(platform.systemManaged).toBe(true);
-  expect(await platform.permission()).toBe("unknown");
-  expect(await platform.requestPermission()).toBe("unknown");
-  expect(invoke).not.toHaveBeenCalled();
-  expect(callbacks.size).toBe(0);
-  platform.dispose();
-});
+it.each(["Win32", "Linux x86_64"])(
+  "%s keeps system-managed permission without a window.Notification shim or native calls",
+  async (os) => {
+    vi.stubGlobal("navigator", { platform: os });
+    const platform = createNotifications();
+    expect(platform.systemManaged).toBe(true);
+    expect(platform.requestsAutomatically).toBe(false);
+    expect(await platform.permission()).toBe("unknown");
+    expect(await platform.requestPermission()).toBe("unknown");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(callbacks.size).toBe(0);
+    platform.dispose();
+  },
+);
 
 it("serializes each pre-registered channel and releases it after ordered native completion", async () => {
   const platform = createNotifications();

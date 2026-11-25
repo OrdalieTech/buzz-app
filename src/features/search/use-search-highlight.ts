@@ -17,9 +17,9 @@ import {
  * reviving the old one. Enter before any row arrives, while results are
  * pending, chooses the first row once they are not, unless an edit, moving
  * the highlight, a choice, Escape, closing or a change of `within` comes
- * first. Enter on an action
- * row waits the same way while no result row has arrived, unless the user
- * highlighted that row. The hook draws nothing; rows keep their own markup. */
+ * first. A change of `within` also leaves the highlight unmoved. Enter on
+ * an action row waits the same way while no result row has arrived, unless
+ * the user highlighted that row. The hook draws nothing; rows keep their own markup. */
 export function useSearchHighlight({
   query,
   keys,
@@ -64,7 +64,8 @@ export function useSearchHighlight({
    * row that was first. Enter chooses the row highlighted on screen. */
   followFirst?: boolean;
   /** What the rows search, such as one conversation. Narrowing it keeps the
-   * text but not a waiting Enter, which was meant for the rows before. */
+   * text but not a waiting Enter or a move, which were meant for the rows
+   * before. */
   within?: string | undefined;
 }) {
   const id = useId();
@@ -112,6 +113,8 @@ export function useSearchHighlight({
   if (awaitedWithin !== within) {
     setAwaitedWithin(within);
     setAwaiting(undefined);
+    // Moving through the rows before doesn't count as moving through these.
+    setSelection((previous) => ({ ...previous, untouched: true }));
   }
   if (awaiting !== undefined && awaiting !== query) setAwaiting(undefined);
   const choose = (key: string | undefined) => {

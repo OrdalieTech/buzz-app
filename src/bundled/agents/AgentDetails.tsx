@@ -80,6 +80,15 @@ import { AgentTabs } from "./AgentTabs";
 import type { HistoryPresentation } from "../../features/agents/history-presentation";
 import { AgentConfigHistoryRow } from "../../features/agents/AgentConfigHistoryRow";
 import { useAgentSettingsHost } from "./AgentSettingsHost";
+import { AgentEnvironment } from "./AgentEnvironment";
+
+/** The bundled harnesses that start an agent with its own variables. */
+const OWN_ENV_TYPES = new Set([
+  "buzz.claude-code",
+  "buzz.codex",
+  "buzz.goose",
+  "buzz.pi",
+]);
 import styles from "./AgentsPage.module.css";
 import { PackedAgentAvatar } from "./PackedAgentAvatar";
 import { ProfileBackdrop } from "../../features/profiles/ProfileBackdrop";
@@ -638,6 +647,16 @@ export function AgentDetails({
                       {copyError}
                     </p>
                   )}
+                  {agent.place === "here" &&
+                    !agent.protection &&
+                    type &&
+                    OWN_ENV_TYPES.has(type.pluginId) && (
+                      <AgentEnvironment
+                        agent={agent.pubkey}
+                        restartAgent={() => agents.restartAgent(agent.pubkey)}
+                        openSettings={openSettings}
+                      />
+                    )}
                 </div>
               }
             />

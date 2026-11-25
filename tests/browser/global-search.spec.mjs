@@ -743,7 +743,7 @@ test("inline search exposes selected grid rows and hands focus to the destinatio
   await input.fill("color mode");
   const grid = dialog.getByRole("grid", { name: "Search results" });
   const row = grid.getByRole("row", {
-    name: "Appearance — Color mode",
+    name: "Color mode — Appearance",
     exact: true,
   });
   await expect(row).toHaveAttribute("aria-selected", "true");
@@ -753,7 +753,7 @@ test("inline search exposes selected grid rows and hands focus to the destinatio
   );
   const snapshot = await grid.ariaSnapshot();
   expect(snapshot).toContain('rowgroup "Settings"');
-  expect(snapshot).toContain('row "Appearance — Color mode" [selected]');
+  expect(snapshot).toContain('row "Color mode — Appearance" [selected]');
   const mode = row.getByRole("combobox", { name: "Color mode" });
   await mode.click();
   await page.getByRole("option", { name: "Dark", exact: true }).click();

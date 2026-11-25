@@ -996,6 +996,128 @@ it("a refused start whose text names only a reference gives the pill's chosen ag
     {},
   );
 });
+for (const [title, pick] of [
+  ["an emptied pill", "remove"],
+  ["a pick the text also tags", "pick"],
+] as const)
+  it(`a refused start gives back ${title}, so the retry reaches only the tagged agent`, async () => {
+    const test = setup(),
+      onStarted = vi.fn(),
+      onFailed = vi.fn(),
+      user = userEvent.setup();
+    const refuse = refusedStart(test);
+    const outside = "b".repeat(64);
+    writeView("test", "solo:new-draft", {
+      text: "Ask @Outside agent",
+      recipients: [
+        { pubkey: outside, name: "Outside agent", start: 4, end: 18 },
+      ],
+    });
+    const view = () => (
+      <SoloDraft
+        session={test.session}
+        scope="test"
+        extensions={withPill}
+        onStarted={onStarted}
+        onFailed={onFailed}
+      />
+    );
+    const first = render(view());
+    await waitFor(() =>
+      expect(sendingTo("Member agent, Outside agent")).toBeInTheDocument(),
+    );
+    if (pick === "remove")
+      await user.click(
+        screen.getByRole("button", {
+          name: `Remove agent Member agent ${"a".repeat(64)}`,
+        }),
+      );
+    else
+      await user.click(
+        screen.getByRole("button", { name: "Send to Outside agent" }),
+      );
+    expect(sendingTo("Outside agent")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(onStarted).toHaveBeenCalledOnce());
+    const id = test.channelWrites.create.mock.calls[0]?.[0];
+    expect(test.messages.send).toHaveBeenLastCalledWith(
+      id,
+      "Ask @Outside agent",
+      [outside],
+    );
+    first.unmount();
+    render(view());
+    await refuse();
+    await waitFor(() =>
+      expect(onFailed).toHaveBeenCalledWith(
+        id,
+        expect.stringMatching(/\. Your message is back in New chat\.$/),
+      ),
+    );
+    expect(screen.getByRole("textbox")).toHaveTextContent("Ask @Outside agent");
+    await waitFor(() => expect(sendingTo("Outside agent")).toBeInTheDocument());
+    test.channelWrites.ready = Promise.resolve();
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(onStarted).toHaveBeenCalledTimes(2));
+    const retry = test.channelWrites.create.mock.calls[1]?.[0];
+    expect(test.messages.send).toHaveBeenLastCalledWith(
+      retry,
+      "Ask @Outside agent",
+      [outside],
+    );
+  });
+it("a refused start keeps an agent picked in New chat while it was starting", async () => {
+  const test = setup(),
+    onStarted = vi.fn(),
+    onFailed = vi.fn(),
+    user = userEvent.setup();
+  const refuse = refusedStart(test);
+  const outside = "b".repeat(64);
+  writeView("test", "solo:new-draft", {
+    text: "Ask @Outside agent",
+    recipients: [{ pubkey: outside, name: "Outside agent", start: 4, end: 18 }],
+  });
+  const view = () => (
+    <SoloDraft
+      session={test.session}
+      scope="test"
+      extensions={withPill}
+      onStarted={onStarted}
+      onFailed={onFailed}
+    />
+  );
+  const first = render(view());
+  await waitFor(() =>
+    expect(sendingTo("Member agent, Outside agent")).toBeInTheDocument(),
+  );
+  await user.click(
+    screen.getByRole("button", {
+      name: `Remove agent Member agent ${"a".repeat(64)}`,
+    }),
+  );
+  await user.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(onStarted).toHaveBeenCalledOnce());
+  first.unmount();
+  // While the start is pending, the cleared New chat gets a new pick.
+  render(view());
+  await waitFor(() => expect(sendingTo("Member agent")).toBeInTheDocument());
+  await user.click(
+    screen.getByRole("button", { name: "Send to Outside agent" }),
+  );
+  expect(sendingTo("Outside agent")).toBeInTheDocument();
+  await refuse();
+  await waitFor(() =>
+    expect(onFailed).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.stringMatching(/\. Your message is back in New chat\.$/),
+    ),
+  );
+  expect(screen.getByRole("textbox")).toHaveTextContent("Ask @Outside agent");
+  // The newer pick stays; the refused start's emptied pill doesn't replace it.
+  expect(readView("test", "solo:new-draft:agents", null)).toEqual([
+    { pubkey: outside, name: "Outside agent" },
+  ]);
+});
 it("a pick after a refused start's agent comes back replaces it across remounts", async () => {
   const test = setup(),
     onStarted = vi.fn(),

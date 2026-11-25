@@ -7,6 +7,7 @@ export type Entry = {
   id: string;
   channelId: string;
   threadRootId?: string;
+  subthreadId?: string;
   text: string;
   /** Sent: relay time. Draft: when this device last saw it change. */
   createdAt?: number;
@@ -120,37 +121,4 @@ export function matches(text: string, label: string, search: string) {
     .trim()
     .split(/\s+/)
     .every((word) => haystack.includes(word));
-}
-
-const day = (date: Date) =>
-  new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
-
-export function clockTime(seconds: number) {
-  return new Date(seconds * 1000).toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
-export function fullTime(seconds: number) {
-  return new Date(seconds * 1000).toLocaleString([], {
-    dateStyle: "full",
-    timeStyle: "short",
-  });
-}
-
-/** Group heading for a sent message: "Today", "Yesterday", or its date. */
-export function dayLabel(seconds: number, now = Date.now()) {
-  const then = new Date(seconds * 1000);
-  const days = Math.round((day(new Date(now)) - day(then)) / 86400000);
-  if (days === 0) return "Today";
-  if (days === 1) return "Yesterday";
-  return then.toLocaleDateString([], {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    ...(then.getFullYear() === new Date(now).getFullYear()
-      ? {}
-      : { year: "numeric" }),
-  });
 }

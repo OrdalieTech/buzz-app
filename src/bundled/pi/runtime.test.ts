@@ -1,4 +1,5 @@
-import { memoryStorage } from "../../features/agents/test-fakes";
+import { workspaceCanvas } from "../../features/solo/workspace";
+import type { SectionChoices } from "../../features/agent-harness/sections/choices";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   promptMessage,
@@ -6,8 +7,15 @@ import {
 } from "../../features/agents/activity-transcript";
 import type { AddedTool } from "../../buzz-mcp/session-tools";
 import { pubkeyOf } from "../../features/agents/membership";
-import { PROMPTS_PREFIX } from "../../features/agents/session-prompts";
-import { type AgentReads, ownerReads } from "../../features/agents/reads";
+import {
+  PROMPTS_PREFIX,
+  sessionPrompts,
+} from "../../features/agents/session-prompts";
+import { STANDALONE_PREFIX } from "../../features/agents/standalone-sessions";
+import { type AgentStore, localStore } from "../../features/agents/store";
+import { memoryStorage } from "../../features/agents/test-fakes";
+import { assignConversationFolder } from "../../features/agents/conversation-folders";
+import { ownerReads } from "../../features/agents/reads";
 import type { MemoryEntry } from "../../features/agents/memory";
 import type {
   Agent,
@@ -16,14 +24,14 @@ import type {
   StandaloneTurn,
 } from "../../features/agents/service";
 import type { EventData, RelayEvent } from "../../features/relay/events";
-import { eventDto } from "../../features/relay/events";
-import { keypair, signed } from "../../features/relay/testing";
 import type { RelayData } from "../../features/relay/service";
 import { VECTOR_PROFILE } from "../../features/agents/gateway/vectors";
 import { turnContext } from "../../features/agents/gateway/turn";
 import { deferred, fakeHost, type Handler, PI_UPSTREAM } from "./pi-testing";
 import { type Config, DEFAULT_CONFIG, PiRuntime } from "./runtime";
 import type { GatewayRoute, GatewaySeam } from "./gateway";
+
+type MemoryStorage = ReturnType<typeof memoryStorage>;
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -122,9 +130,11 @@ function setup(
       ),
     },
   };
+  /** The relay connection's status, which a test changes to drop it. */
+  const link = { status: "ready" };
   const relay = {
     snapshot: () => ({
-      status: "ready",
+      status: link.status,
       session,
       viewer: alice,
       scope: `https://agent.example:${alice}`,
@@ -134,6 +144,9 @@ function setup(
   /** Whether `Agents.handle` gives the agent outside a run. */
   const connection = { live: true };
   const desktop = { spawn: host.spawn };
+  /** Agent storage: the one a test stubbed, or else its own. A copy, as
+   * `localStore` freezes its own, so a test can spy on its methods. */
+  const storage = { ...localStore(globalThis.localStorage ?? memoryStorage()) };
   const runtime = new PiRuntime(
     desktop,
     (key) => ownerReads(relay, pubkeyOf(key)),
@@ -146,8 +159,10 @@ function setup(
         : undefined,
     undefined,
     undefined,
-    memoryStorage(),
+    storage,
     seam,
+    undefined,
+    () => relay.snapshot().scope,
   );
   const published: { kind: number; content: string; tags: string[][] }[] = [];
   const agent = {
@@ -232,9 +247,26 @@ function setup(
     session,
     solo,
     connection,
+    link,
     core,
+    storage,
   };
 }
+
+const folders = (missing = new Set<string>()) =>
+  vi.fn(async (path: string, options?: { create?: boolean }) => {
+    if (options?.create === false && missing.has(path))
+      throw new Error(`Could not find ${path}`);
+    return path.replace(/^~/, "/home/test");
+  });
+const assign = (store: AgentStore, conversation = `${channel}/${root.id}`) =>
+  assignConversationFolder(
+    store,
+    `https://agent.example:${alice}`,
+    self,
+    conversation,
+    "/repos/worktree",
+  );
 
 it("contains delegated file reads with the current Pi handle's policy", async () => {
   const f = setup();
@@ -408,6 +440,9 @@ it("hands an owner's mention to its thread's Pi conversation", async () => {
   expect(promptMessage(promptSections(text)).text).toBe("@Pi can you look?");
   expect(String(delivered?.params.steer)).toContain("@Pi can you look?");
   expect(String(delivered?.params.instructions)).toContain(self);
+  expect(String(delivered?.params.instructions)).toContain(
+    "This session is one thread",
+  );
   expect(turn.workingUntil).toHaveBeenCalledTimes(1);
   expect(published).toEqual([]);
 });
@@ -444,6 +479,355 @@ it("keeps one agent's two communities' storage apart, each under its membership'
       other,
     ]),
   );
+});
+
+it("builds a turn's instructions with the owner's base section choices", async () => {
+  const { host, deliver, agent } = setup();
+  Object.assign(agent, {
+    promptSections: () => ({
+      owner: {
+        etiquette: { mode: "custom", text: "Be brief." },
+        progress: { mode: "off" },
+      },
+    }),
+  });
+  await deliver({ type: "mention", event: reply("2", "@Pi look") }).run;
+  const instructions = String(host.requests("deliver")[0]?.params.instructions);
+  expect(instructions).toContain(
+    '## Etiquette\n<owner-section id="etiquette">\nBe brief.\n</owner-section>',
+  );
+  expect(instructions).not.toContain("## Progress");
+});
+
+it("builds a conversation's instructions with the sections of the plugin that manages it, at each turn", async () => {
+  // Each turn ends, so the next one in its conversation is a new turn.
+  const { host, deliver, agent, settled } = setup({
+    wait: () => ({ status: "done", answer: 1, text: "" }),
+  });
+  let managed: SectionChoices = {
+    plugin: {
+      id: "example.plugin",
+      sections: { "working-location": "Work in the task's folder." },
+    },
+  };
+  Object.assign(agent, {
+    promptSections: (channelId?: string, thread?: string) =>
+      channelId === channel && thread === root.id ? managed : {},
+  });
+  const wrapper =
+    '## Working location\n<plugin-section id="working-location" plugin="example.plugin">\nWork in the task\'s folder.\n</plugin-section>';
+  const instructions = (turn: number) =>
+    String(host.requests("deliver")[turn]?.params.instructions);
+  const first = deliver({ type: "mention", event: reply("2", "@Pi look") });
+  await first.run;
+  await settled(first);
+  // Another conversation of the same agent has the default rule.
+  await deliver({
+    type: "mention",
+    event: message("3", "@Pi hi", {
+      tags: [
+        ["h", channel],
+        ["p", self],
+      ],
+    }),
+  }).run;
+  expect(instructions(0)).toContain(wrapper);
+  expect(instructions(0)).not.toContain("Make file changes on a new branch");
+  expect(instructions(1)).not.toContain("<plugin-section id=");
+  expect(instructions(1)).toContain("Make file changes on a new branch");
+
+  // The plugin clears its sections: the conversation's next turn has the default.
+  managed = {};
+  await deliver({ type: "mention", event: reply("4", "@Pi again") }).run;
+  expect(host.requests("deliver")[2]?.params.key).toBe(
+    host.requests("deliver")[0]?.params.key,
+  );
+  expect(instructions(2)).not.toContain("<plugin-section id=");
+});
+
+it("builds a one-off turn's instructions with no conversation's sections", async () => {
+  const { host, runOnce, agent } = setup({
+    wait: () => ({ status: "done", answer: 1, text: "" }),
+  });
+  const promptSections = vi.fn(() => ({}));
+  Object.assign(agent, { promptSections });
+  await runOnce("watch", "Check the build");
+  expect(promptSections.mock.calls).toEqual([[undefined, undefined]]);
+  expect(String(host.requests("once")[0]?.params.instructions)).toContain(
+    "This run joins no conversation",
+  );
+});
+
+it("tells a Solo chat whose plugin gives the working location to read its Canvas's folders", async () => {
+  const { host, deliver, solo, agent } = setup({}, [], {
+    content: workspaceCanvas({
+      folders: ["~/Development/app"],
+      worktree: { location: "~/Development/trees", baseBranch: "main" },
+      canvas: "Use the design system.",
+    }),
+  });
+  solo.add("solo-1");
+  Object.assign(agent, {
+    // A Solo chat is one conversation, with no thread root.
+    promptSections: (channelId?: string, thread?: string): SectionChoices =>
+      channelId === "solo-1" && !thread
+        ? {
+            plugin: {
+              id: "example.plugin",
+              sections: { "working-location": "Work in the task's folder." },
+            },
+          }
+        : {},
+  });
+  await deliver(
+    {
+      type: "mention",
+      event: message("2", "@Pi", { tags: [["h", "solo-1"]] }),
+    },
+    { channelId: "solo-1" },
+  ).run;
+  const [delivered] = host.requests("deliver");
+  expect(String(delivered?.params.instructions)).toContain(
+    '<plugin-section id="working-location" plugin="example.plugin">',
+  );
+  expect(String(delivered?.params.text)).toContain("They are for reading.");
+  expect(String(delivered?.params.text)).not.toContain("create a new worktree");
+});
+
+it("sets a new run up with the sections chosen once Pi is ready for it, and keeps its run's for a steer", async () => {
+  let managed = false;
+  let steers = false;
+  const prompts: unknown[] = [];
+  const { host, deliver, settled, agent, solo } = setup(
+    {
+      deliver: async (params, process) => {
+        // The plugin takes the working location while the turn waits, and
+        // gives it back while the run it starts works.
+        managed = !steers;
+        prompts.push(
+          (
+            await process.tool(
+              { agent: self, request: params.request, steers },
+              "prompt",
+            )
+          ).result,
+        );
+        managed = false;
+        return { submission: prompts.length, conversation: CONVERSATION };
+      },
+      wait: () => ({ status: "done", answer: 1, text: "Done" }),
+    },
+    [],
+    {
+      content: workspaceCanvas({
+        folders: ["~/Development/app"],
+        worktree: { location: "~/Development/trees", baseBranch: "main" },
+        canvas: "Use the design system.",
+      }),
+    },
+  );
+  solo.add("solo-1");
+  Object.assign(agent, {
+    promptSections: (): SectionChoices =>
+      managed
+        ? {
+            plugin: {
+              id: "example.plugin",
+              sections: { "working-location": "Work in the task's folder." },
+            },
+          }
+        : {},
+  });
+  const send = async (id: string) => {
+    const turn = deliver(
+      {
+        type: "mention",
+        event: message(id, "@Pi", { tags: [["h", "solo-1"]] }),
+      },
+      { channelId: "solo-1" },
+    );
+    await turn.run;
+    await settled(turn);
+  };
+  await send("2");
+  const [delivered] = host.requests("deliver");
+  // What it was handed before the wait had the earlier choices.
+  expect(String(delivered?.params.instructions)).not.toContain(
+    '<plugin-section id="working-location" plugin="example.plugin">',
+  );
+  const [started] = prompts as { text: string; instructions?: string }[];
+  expect(started?.instructions).toContain(
+    '<plugin-section id="working-location" plugin="example.plugin">',
+  );
+  expect(started?.text).toContain("They are for reading.");
+  expect(started?.text).not.toContain("create a new worktree");
+  // A turn that steers that run reads its Canvas as the run has it, and
+  // sets nothing up.
+  steers = true;
+  await send("3");
+  const steered = prompts[1] as { text: string; instructions?: string };
+  expect(steered).not.toHaveProperty("instructions");
+  expect(steered.text).toContain("They are for reading.");
+});
+
+it("leaves the Canvas out of a steer into a run that this app did not set up", async () => {
+  const prompts: { text: string }[] = [];
+  const { deliver, settled, solo } = setup(
+    {
+      // Pi still runs what an earlier app started, so the turn steers it.
+      deliver: async (params, process) => {
+        prompts.push(
+          (
+            await process.tool(
+              { agent: self, request: params.request, steers: true },
+              "prompt",
+            )
+          ).result as { text: string },
+        );
+        return { submission: 1, conversation: CONVERSATION };
+      },
+      wait: () => ({ status: "done", answer: 1, text: "Done" }),
+    },
+    [],
+    {
+      content: workspaceCanvas({
+        folders: ["~/Development/app"],
+        worktree: { location: "~/Development/trees", baseBranch: "main" },
+        canvas: "Use the design system.",
+      }),
+    },
+  );
+  solo.add("solo-1");
+  const turn = deliver(
+    {
+      type: "mention",
+      event: message("2", "@Pi also this", { tags: [["h", "solo-1"]] }),
+    },
+    { channelId: "solo-1" },
+  );
+  await turn.run;
+  await settled(turn);
+  expect(prompts).toHaveLength(1);
+  expect(prompts[0]?.text).toContain("also this");
+  expect(prompts[0]?.text).not.toContain("Use the design system.");
+});
+
+it("sets a new run up again with the sections chosen once Pi is ready, when the host stops first", async () => {
+  let hosts = 0;
+  let managed = false;
+  const prompts: { instructions?: string }[] = [];
+  const { deliver, settled, agent } = setup({
+    deliver: async (params, process) => {
+      // The plugin takes the working location while the turn waits.
+      managed = true;
+      prompts.push(
+        (
+          await process.tool(
+            { agent: self, request: params.request, steers: false },
+            "prompt",
+          )
+        ).result as { instructions?: string },
+      );
+      // The first host stops before it keeps the submission; the next one
+      // is set up from the turn as it was handed over.
+      if (++hosts === 1) {
+        queueMicrotask(() => process.exit(1, "Killed\n"));
+        return new Promise(() => {});
+      }
+      return { submission: 1, conversation: CONVERSATION };
+    },
+    wait: () => ({ status: "done", answer: 1, text: "Done" }),
+  });
+  Object.assign(agent, {
+    promptSections: (): SectionChoices =>
+      managed
+        ? {
+            plugin: {
+              id: "example.plugin",
+              sections: { "working-location": "Work in the task's folder." },
+            },
+          }
+        : {},
+  });
+  const turn = deliver({ type: "mention", event: reply("2", "@Pi look") });
+  await turn.run;
+  await expect(settled(turn)).resolves.toEqual({ ok: true });
+  expect(prompts).toHaveLength(2);
+  for (const prompt of prompts)
+    expect(prompt.instructions).toContain(
+      '<plugin-section id="working-location" plugin="example.plugin">',
+    );
+});
+
+it("checks a guarded turn once its new run's instructions are ready", async () => {
+  let managed = false;
+  let live = true;
+  const prompts: unknown[] = [];
+  const accepted = vi.fn();
+  const { deliver, agent, core } = setup({
+    deliver: async (params, process) => {
+      managed = true;
+      prompts.push(
+        (
+          await process.tool(
+            { agent: self, request: params.request, steers: false },
+            "prompt",
+          )
+        ).result,
+      );
+      return { submission: 1, conversation: CONVERSATION };
+    },
+  });
+  Object.assign(agent, {
+    promptSections: (): SectionChoices =>
+      managed
+        ? {
+            plugin: {
+              id: "example.plugin",
+              sections: { "working-location": "Work in the task's folder." },
+            },
+          }
+        : {},
+  });
+  // Withdrawn while the new instructions read the agent's memory.
+  core.mockImplementation(async () => {
+    if (managed) live = false;
+    return null;
+  });
+  await deliver(
+    { type: "mention", event: reply("2", "@Pi look") },
+    { accepted, current: () => live },
+  ).run;
+  expect(core).toHaveBeenCalledTimes(2);
+  // No prompt, so Pi submits nothing.
+  expect(prompts).toHaveLength(1);
+  expect(prompts[0]).toBeFalsy();
+  expect(accepted).not.toHaveBeenCalled();
+});
+
+it("tells a Solo chat given its own folder to read its Canvas's folders", async () => {
+  const { host, deliver, solo, storage, desktop } = setup({}, [], {
+    content: workspaceCanvas({
+      folders: ["~/Development/app"],
+      worktree: { location: "~/Development/trees", baseBranch: "main" },
+      canvas: "Use the design system.",
+    }),
+  });
+  Object.assign(desktop, { resolveDirectory: folders() });
+  solo.add("solo-1");
+  // A Solo chat is one conversation, with no thread root.
+  await assign(storage, "solo-1");
+  await deliver(
+    {
+      type: "mention",
+      event: message("2", "@Pi", { tags: [["h", "solo-1"]] }),
+    },
+    { channelId: "solo-1" },
+  ).run;
+  const [delivered] = host.requests("deliver");
+  expect(delivered?.params.cwd).toBe("/repos/worktree");
+  expect(String(delivered?.params.text)).toContain("They are for reading.");
+  expect(String(delivered?.params.text)).not.toContain("create a new worktree");
 });
 
 it("hands a conversation its own community repositories without changing its workspace", async () => {
@@ -490,6 +874,136 @@ it("ends a turn's prompt with its conversation's instructions", async () => {
   expect(conversationInstructions).toHaveBeenCalledWith(channel, root.id);
 });
 
+it("gives a turn the notes plugins left for its conversation, taken when Pi builds its prompt", async () => {
+  let refreshed: unknown;
+  const { host, deliver, agent } = setup({
+    deliver: async (params, process) => {
+      // What Pi reads when the run starts has the notes too.
+      refreshed = (
+        await process.tool({ agent: self, request: params.request }, "prompt")
+      ).result;
+      return { submission: 1, conversation: CONVERSATION };
+    },
+  });
+  const notes = vi.fn(() => ["Build 7 is green", "Deploy is paused"]);
+  const restoreNotes = vi.fn();
+  Object.assign(agent, {
+    notes,
+    restoreNotes,
+    conversationInstructions: () => ({ plugin: "acme", text: "Review only." }),
+  });
+  await deliver(pluginWake(root.id), { accepted: vi.fn() }).run;
+  // Keyed as its session is: the wake's thread.
+  expect(notes.mock.calls).toEqual([[channel, root.id]]);
+  const [delivered] = host.requests("deliver");
+  // Only the prompt Pi builds, after it checks for an earlier submission,
+  // has them.
+  expect(String(delivered?.params.text)).not.toContain("Build 7 is green");
+  expect(String((refreshed as { text: string }).text)).toMatch(
+    /CI failed: lint[\s\S]*\n\nBuild 7 is green\n\nDeploy is paused\n\n<owner-instructions/,
+  );
+  expect(restoreNotes).not.toHaveBeenCalled();
+});
+
+it.each([
+  [
+    "a top-level wake",
+    () => ({ ...pluginWake(), topLevel: true as const }),
+    "stream",
+  ],
+  [
+    "a DM",
+    () => ({ type: "mention" as const, event: reply("2", "@Pi look") }),
+    "dm",
+  ],
+])(
+  "keys the notes of %s in the community session as its replies: the channel's",
+  async (_, request, channelType) => {
+    let refreshed: unknown;
+    const f = setup({
+      deliver: async (params, process) => {
+        refreshed = (
+          await process.tool({ agent: self, request: params.request }, "prompt")
+        ).result;
+        return { submission: 1, conversation: CONVERSATION };
+      },
+      wait: () => ({ status: "done", answer: 1, text: "Done" }),
+    });
+    const listed = f.session.channels.list();
+    const first = listed.channels[0];
+    if (!first) throw new Error("missing channel");
+    vi.spyOn(f.session.channels, "list").mockReturnValue({
+      ...listed,
+      channels: [{ ...first, channelType }],
+    });
+    const notes = vi.fn(() => ["Build 7 is green"]);
+    Object.assign(f.agent, { notes, restoreNotes: vi.fn() });
+    const turn = f.deliver(request(), {
+      config: { ...DEFAULT_CONFIG, scope: "community" },
+      accepted: vi.fn(),
+    });
+    await turn.run;
+    expect(await f.settled(turn)).toEqual({ ok: true });
+    expect(notes.mock.calls).toEqual([[channel, undefined]]);
+    expect(String((refreshed as { text: string }).text)).toContain(
+      "Build 7 is green",
+    );
+  },
+);
+
+it("puts a turn's notes back when Pi did not take it, and leaves them when it never reached Pi", async () => {
+  const f = setup({
+    deliver: async (params, process) => {
+      await process.tool({ agent: self, request: params.request }, "prompt");
+      return false;
+    },
+  });
+  const notes = vi.fn(() => ["CI failed: lint"]);
+  const restoreNotes = vi.fn();
+  Object.assign(f.agent, { notes, restoreNotes });
+  await f.deliver({ type: "mention", event: reply("2", "@Pi look") }).run;
+  expect(restoreNotes.mock.calls).toEqual([
+    [channel, ["CI failed: lint"], root.id],
+  ]);
+  // A wake that is no longer current stops before the handover.
+  await f.deliver(pluginWake(root.id), { current: () => false }).run;
+  expect(notes).toHaveBeenCalledTimes(1);
+  expect(f.host.requests("deliver")).toHaveLength(1);
+});
+
+it("leaves notes queued for a turn Pi answers or fails before building its prompt, and keeps those of a turn whose outcome is unknown", async () => {
+  let mode: "held" | "unavailable" | "lost" = "held";
+  const f = setup({
+    deliver: async (params, process) => {
+      // A Retry of a request Pi has already is answered by its submission.
+      if (mode === "held") return { submission: 1, conversation: CONVERSATION };
+      if (mode === "unavailable") throw new Error("No model is available");
+      await process.tool({ agent: self, request: params.request }, "prompt");
+      throw new Error("Storage failed");
+    },
+    wait: () => ({ status: "done", answer: 1, text: "Done" }),
+  });
+  const notes = vi.fn(() => ["CI failed: lint"]);
+  const restoreNotes = vi.fn();
+  Object.assign(f.agent, { notes, restoreNotes });
+  const run = async (id: string) => {
+    const turn = f.deliver({ type: "mention", event: reply(id, "@Pi look") });
+    await turn.run;
+    await f.settled(turn);
+  };
+  await run("2");
+  mode = "unavailable";
+  await run("3");
+  expect(f.host.requests("deliver")).toHaveLength(2);
+  expect(notes).not.toHaveBeenCalled();
+  // Pi may have it: putting them back could give them twice.
+  mode = "lost";
+  await run("4");
+  expect(f.host.requests("deliver")).toHaveLength(3);
+  expect(notes).toHaveBeenCalledTimes(1);
+  expect(restoreNotes).not.toHaveBeenCalled();
+});
+
 it("shows a conversation only the messages it was not shown, nor its own replies", async () => {
   const { host, deliver, session } = setup({ place: () => ({ seen: 105 }) });
   const later = (id: string, content: string, pubkey: string, at: number) => ({
@@ -506,92 +1020,6 @@ it("shows a conversation only the messages it was not shown, nor its own replies
   expect(text).toContain("Bob checked it");
   expect(text).not.toContain("Build is red");
   expect(text).not.toContain("Earlier from Pi");
-});
-
-it("gives the workflow reason for its owner's workflow mention that doesn't name it", async () => {
-  const { host, deliver, session } = setup();
-  const relay = keypair();
-  session.workflowAuthority = relay.pubkey;
-  const turn = deliver({
-    type: "mention",
-    event: eventDto(
-      signed(relay, {
-        kind: 9,
-        content: "@Agent workflow",
-        tags: [
-          ["h", channel],
-          ["p", self],
-          ["buzz:workflow", "true"],
-          ["buzz:workflow-owner", alice],
-        ],
-      }),
-    ),
-  });
-  await turn.run;
-  expect(turn.ignored).toHaveBeenCalledExactlyOnceWith("workflow");
-  expect(host.processes).toEqual([]);
-});
-
-it("waits for a workflow mention's community, not for its owner's", async () => {
-  const { deliver, runtime } = setup();
-  const relay = keypair();
-  const readyReads = vi.fn(async () => runtime["reads"](self));
-  Object.assign(runtime, { readyReads });
-  const event = eventDto(
-    signed(relay, {
-      kind: 9,
-      content: "@Agent workflow",
-      tags: [
-        ["h", channel],
-        ["p", self],
-        ["buzz:workflow", "true"],
-        ["buzz:workflow-owner", alice],
-      ],
-    }),
-  );
-  await deliver({ type: "mention", event }).run;
-  expect(readyReads).toHaveBeenCalledOnce();
-  await deliver({ type: "mention", event: { ...event, pubkey: alice } }).run;
-  expect(readyReads).toHaveBeenCalledOnce();
-});
-
-it.each([
-  ["checks authority with the reads it waited for", true, "workflow"],
-  ["ignores it when the agent was replaced during the wait", false, undefined],
-])("a waited-for workflow mention %s", async (_name, stays, reason) => {
-  const { host, deliver, runtime } = setup();
-  const relay = keypair();
-  const waited = {
-    workflowAuthority: vi.fn(() => relay.pubkey),
-    profiles: async () => {},
-    profile: () => undefined,
-  } as unknown as AgentReads;
-  let live = true;
-  Object.assign(runtime, {
-    readyReads: async () => {
-      live = stays;
-      return waited;
-    },
-  });
-  const event = eventDto(
-    signed(relay, {
-      kind: 9,
-      content: "@Agent workflow",
-      tags: [
-        ["h", channel],
-        ["p", self],
-        ["buzz:workflow", "true"],
-        ["buzz:workflow-owner", alice],
-      ],
-    }),
-  );
-  const turn = deliver({ type: "mention", event }, { current: () => live });
-  await turn.run;
-  if (reason) expect(waited.workflowAuthority).toHaveBeenCalled();
-  expect(turn.ignored).toHaveBeenCalledExactlyOnceWith(
-    ...(reason ? [reason] : []),
-  );
-  expect(host.processes).toEqual([]);
 });
 
 it("keeps steering a busy run's effort through a follow-up without a pick", async () => {
@@ -1115,9 +1543,8 @@ it("takes a plugin's wake in its thread's conversation as the plugin's, and repo
     context: { channel, root: root.id },
     request: `plugin/${WAKE_ID}`,
   });
-  // Only an Attention wake saves its destination and refreshes its prompt.
+  // Only an Attention wake saves its destination.
   expect(delivered?.params).not.toHaveProperty("reply");
-  expect(delivered?.params).not.toHaveProperty("refresh");
   const text = String(delivered?.params.text);
   expect(text).toContain('<plugin-wake plugin="github">');
   expect(text).toContain("neither your owner nor anyone in the channel");
@@ -1134,29 +1561,6 @@ it("takes a plugin's wake in its thread's conversation as the plugin's, and repo
     ["p", alice],
   ]);
   expect(JSON.stringify(published)).not.toContain(WAKE_ID);
-});
-
-it("takes a wake with no thread only in a Solo chat", async () => {
-  const { host, deliver, solo } = setup();
-  const stream = deliver(pluginWake());
-  await stream.run;
-  expect(stream.ignored).toHaveBeenCalled();
-  expect(host.requests("deliver")).toEqual([]);
-  solo.add("solo-1");
-  const chat = deliver(pluginWake(undefined, "solo-1"), {
-    channelId: "solo-1",
-  });
-  await chat.run;
-  expect(chat.ignored).not.toHaveBeenCalled();
-  const [delivered] = host.requests("deliver");
-  expect(delivered?.params).toMatchObject({
-    key: "solo-1",
-    context: { channel: "solo-1", topLevel: true },
-  });
-  expect(String(delivered?.params.text)).toContain(
-    '<plugin-wake plugin="github">',
-  );
-  expect(String(delivered?.params.text)).not.toContain(WAKE_ID);
 });
 
 it("hands a Solo chat's Canvas to each turn, and no one else's", async () => {
@@ -1447,6 +1851,276 @@ it("takes on a run an earlier app left before compacting, with no mention since"
   expect(published[0]?.tags).toContainEqual(["e", "other-root", "", "reply"]);
 });
 
+it("runs a conversation given its own folder there and names the agent's workspace, and leaves other conversations in the workspace", async () => {
+  const resolveDirectory = folders();
+  const { deliver, host, storage, published, desktop } = setup();
+  Object.assign(desktop, { resolveDirectory });
+  await assign(storage);
+  await deliver({ type: "mention", event: reply("2", "@Pi look") }).run;
+  await deliver({ type: "mention", event: message("3", "@Pi hi") }).run;
+  const [there, elsewhere] = host
+    .requests("deliver")
+    .map(({ params }) => params);
+  expect(there?.cwd).toBe("/repos/worktree");
+  expect(resolveDirectory).toHaveBeenCalledWith("/repos/worktree", {
+    create: false,
+  });
+  expect(there?.instructions).toContain(
+    "<workspace>\nCurrent working directory: /repos/worktree\n</workspace>",
+  );
+  expect(there?.instructions).toContain(
+    "Your persistent workspace is at `/home/test/.buzz`, not in your working directory",
+  );
+  expect(there?.instructions).toContain("This conversation has its own folder");
+  expect(elsewhere?.cwd).toBe(DEFAULT_CONFIG.workspace);
+  expect(elsewhere?.instructions).not.toContain(
+    "This conversation has its own folder",
+  );
+  expect(published).toEqual([]);
+});
+
+it("refuses a folder once the conversation's first turn started in the workspace", async () => {
+  const { deliver, host, storage } = setup();
+  await deliver({ type: "mention", event: reply("2", "@Pi look") }).run;
+  expect(host.requests("deliver")).toHaveLength(1);
+  await expect(assign(storage)).rejects.toThrow(
+    "already started in the agent's workspace",
+  );
+});
+
+it("refuses the turn of a conversation whose folder is gone, naming the folder", async () => {
+  const missing = new Set<string>();
+  const { deliver, settled, host, storage, published, desktop } = setup();
+  Object.assign(desktop, { resolveDirectory: folders(missing) });
+  await assign(storage);
+  missing.add("/repos/worktree");
+  const turn = deliver({ type: "mention", event: reply("2", "@Pi look") });
+  await turn.run;
+  expect(await settled(turn)).toMatchObject({
+    ok: false,
+    error: expect.stringContaining(
+      "This conversation's folder /repos/worktree no longer exists",
+    ),
+  });
+  // It never falls back to the workspace.
+  expect(host.requests("deliver")).toEqual([]);
+  expect(published.at(-1)?.content).toContain("/repos/worktree");
+});
+
+/** Reads that wait for Buzz to be back, as `readyOwnerReads` does. */
+function waitingReads(runtime: PiRuntime) {
+  const back = deferred<void>();
+  const readyReads = vi.fn(
+    async (
+      _agent: unknown,
+      _signal: AbortSignal,
+      _channel: string | undefined,
+      _what?: string,
+    ) => {
+      await back.promise;
+      return runtime["reads"](self);
+    },
+  );
+  Object.assign(runtime, { readyReads });
+  return { readyReads, back: () => back.resolve() };
+}
+
+it("starts a turn while Buzz reconnects in its folder, and routes one that comes then once it is back", async () => {
+  const placed = deferred<{ seen: number }>();
+  const { deliver, host, storage, published, desktop, link, runtime } = setup({
+    place: () => placed.promise,
+  });
+  Object.assign(desktop, { resolveDirectory: folders() });
+  await assign(storage);
+  // Taken in while Buzz is connected; it starts while Buzz reconnects.
+  const first = deliver({ type: "mention", event: reply("2", "@Pi look") });
+  await vi.waitFor(() => expect(host.requests("place")).toHaveLength(1));
+  const { readyReads, back } = waitingReads(runtime);
+  link.status = "connecting";
+  placed.resolve({ seen: 0 });
+  await first.run;
+  // Where one that comes now answers is not known until Buzz is back.
+  const later = deliver({ type: "mention", event: message("3", "@Pi hi") });
+  await vi.waitFor(() =>
+    expect(readyReads).toHaveBeenCalledExactlyOnceWith(
+      expect.anything(),
+      expect.anything(),
+      channel,
+      "This turn",
+    ),
+  );
+  expect(host.requests("deliver")).toHaveLength(1);
+  link.status = "ready";
+  back();
+  await later.run;
+  expect(host.requests("deliver").map(({ params }) => params.cwd)).toEqual([
+    "/repos/worktree",
+    DEFAULT_CONFIG.workspace,
+  ]);
+  expect(published).toEqual([]);
+});
+
+it("answers a Solo chat that writes while Buzz reconnects in its own conversation", async () => {
+  const { deliver, host, storage, desktop, link, runtime, solo } = setup();
+  Object.assign(desktop, { resolveDirectory: folders() });
+  solo.add("solo-1");
+  await assign(storage, "solo-1");
+  const { readyReads, back } = waitingReads(runtime);
+  link.status = "connecting";
+  const turn = deliver(
+    {
+      type: "mention",
+      event: message("2", "@Pi", { tags: [["h", "solo-1"]] }),
+    },
+    { channelId: "solo-1" },
+  );
+  await vi.waitFor(() => expect(readyReads).toHaveBeenCalledOnce());
+  expect(host.requests("deliver")).toEqual([]);
+  link.status = "ready";
+  back();
+  await turn.run;
+  const [delivered] = host.requests("deliver");
+  expect(delivered?.params.key).toBe("solo-1");
+  expect(delivered?.params.cwd).toBe("/repos/worktree");
+});
+
+it("reads a file a tool names from the conversation's folder, also while Buzz reconnects", async () => {
+  const f = setup();
+  const readFile = vi.fn(async () => new TextEncoder().encode("From a file"));
+  Object.assign(f.desktop, { readFile, resolveDirectory: folders() });
+  await assign(f.storage);
+  await f.deliver({ type: "mention", event: reply("2", "@Pi look") }).run;
+  const send = () =>
+    f.runtime.tool({
+      agent: self,
+      conversation: CONVERSATION,
+      context: { channel, root: root.id },
+      name: "send",
+      arguments: { path: "report.md", audience: "everyone" },
+    });
+  expect((await send()).isError).not.toBe(true);
+  f.link.status = "connecting";
+  await send();
+  expect(readFile.mock.calls).toEqual([
+    ["report.md", { cwd: "/repos/worktree" }],
+    ["report.md", { cwd: "/repos/worktree" }],
+  ]);
+});
+
+it("lists a conversation whose first turn is on its way to Pi before it says its sessions are listed", async () => {
+  const taken = deferred<unknown>();
+  // Pi's storage has the conversation once Pi took its first turn.
+  let places: { key: string; conversation: number; seen: number }[] = [];
+  const { runtime, deliver, host, agent } = setup({
+    deliver: () => taken.promise,
+    places: () => ({ places }),
+  });
+  runtime.sync([{ ...agent, config: DEFAULT_CONFIG } as unknown as Agent]);
+  const turn = deliver({ type: "mention", event: reply("2", "@Pi look") });
+  await vi.waitFor(() => expect(host.requests("deliver")).toHaveLength(1));
+  let listed = false;
+  const ready = runtime.listed(self, `${channel}/${root.id}`).then(() => {
+    listed = true;
+  });
+  // Every microtask has run, so only Pi's answer is still waited for.
+  await new Promise((resolve) => setTimeout(resolve));
+  // Pi has not made the conversation yet, so its storage is not read yet:
+  // a folder given now would come too late.
+  expect(listed).toBe(false);
+  expect(host.requests("places")).toEqual([]);
+  places = [
+    { key: `${channel}/${root.id}`, conversation: CONVERSATION, seen: 110 },
+  ];
+  taken.resolve({ submission: 1, conversation: CONVERSATION });
+  await ready;
+  expect(runtime.sessions(self)).toMatchObject([
+    { channelId: channel, root: root.id },
+  ]);
+  await turn.run;
+});
+
+it("says when its sessions are all listed, for an agent that runs here", async () => {
+  const key = `${channel}/${root.id}`;
+  const { runtime, agent } = setup({
+    places: () => ({
+      places: [{ key, conversation: CONVERSATION, seen: 105 }],
+    }),
+  });
+  // Its storage stays closed, so what it holds is unknown.
+  await expect(runtime.listed(self, key)).rejects.toThrow(
+    "The agent is not running",
+  );
+  runtime.sync([{ ...agent, config: DEFAULT_CONFIG } as unknown as Agent]);
+  await runtime.listed(self, key);
+  expect(runtime.sessions(self)).toEqual([
+    { channelId: channel, root: root.id, at: 105_000 },
+  ]);
+});
+
+it("does not wait for a turn that waits for the asking turn, as after a Solo chat became a channel", async () => {
+  const finished = deferred<unknown>();
+  const { runtime, deliver, host, agent, solo, session } = setup({
+    wait: () => finished.promise,
+    places: () => ({ places: [] }),
+  });
+  const config = { ...DEFAULT_CONFIG, scope: "channel" as const };
+  runtime.sync([{ ...agent, config } as unknown as Agent]);
+  solo.add("solo-1");
+  const mention = (id: string) => ({
+    type: "mention" as const,
+    event: message(id, "@Pi look", { tags: [["h", "solo-1"]] }),
+  });
+  await deliver(mention("2"), { config, channelId: "solo-1" }).run;
+  await vi.waitFor(() => expect(host.requests("deliver")).toHaveLength(1));
+  // Converted to a channel, it keeps its conversation but not its posting
+  // policy, so the next turn waits for the running one to settle.
+  const listed = session.channels.list();
+  vi.spyOn(session.channels, "list").mockReturnValue({
+    ...listed,
+    channels: listed.channels.map((item) =>
+      item.id === "solo-1" ? { ...item, channelType: "stream" } : item,
+    ),
+  });
+  await deliver(mention("3"), { config, channelId: "solo-1" }).run;
+  // The running turn's tool asks, for its own conversation and another.
+  await runtime.listed(self, "solo-1");
+  await runtime.listed(self, "other-chat");
+  expect(host.requests("deliver")).toHaveLength(1);
+  finished.resolve(undefined);
+});
+
+it("reads a file a tool names where its run works, not in a folder its chat kept from another scope", async () => {
+  const f = setup();
+  const readFile = vi.fn(async () => new TextEncoder().encode("From a file"));
+  Object.assign(f.desktop, { readFile, resolveDirectory: folders() });
+  await assign(f.storage);
+  const config = { ...DEFAULT_CONFIG, scope: "community" as const };
+  const mention = reply("2", "@Pi look");
+  await f.deliver({ type: "mention", event: mention }, { config }).run;
+  await vi.waitFor(() => expect(f.host.requests("deliver")).toHaveLength(1));
+  expect(f.host.requests("deliver")[0]?.params.cwd).toBe(
+    DEFAULT_CONFIG.workspace,
+  );
+  f.runtime.event({
+    agent: self,
+    conversation: CONVERSATION,
+    type: "placed",
+    request: mention.id,
+    entry: 1,
+  });
+  const sent = await f.runtime.tool({
+    agent: self,
+    conversation: CONVERSATION,
+    context: { channel, root: root.id },
+    name: "send",
+    arguments: { path: "report.md", audience: "everyone" },
+  });
+  expect(sent.isError).not.toBe(true);
+  expect(readFile.mock.calls).toEqual([
+    ["report.md", { cwd: DEFAULT_CONFIG.workspace }],
+  ]);
+});
+
 it("lists the agent's sessions from Pi's storage, and whether each works", async () => {
   const answered = deferred<unknown>();
   const key = `${channel}/${root.id}`;
@@ -1566,6 +2240,46 @@ it("reports the failure of a run an earlier app left unfinished in its thread, o
   );
   expect(host.requests("unfinished")).toHaveLength(1);
   expect(runtime.working(self)).not.toContain(left.conversation);
+});
+
+it("reads a file a run an earlier app left names from its folder while Buzz reconnects", async () => {
+  const left = { submission: 41, conversation: 5, request: "d".repeat(64) };
+  const f = setup({
+    unfinished: () => ({
+      submissions: [
+        {
+          ...left,
+          key: `${channel}/${root.id}`,
+          context: { channel, root: root.id },
+        },
+      ],
+    }),
+    wait: () => new Promise(() => {}),
+  });
+  const readFile = vi.fn(async () => new TextEncoder().encode("From a file"));
+  Object.assign(f.desktop, { readFile, resolveDirectory: folders() });
+  await assign(f.storage);
+  // Another thread's delivery continues the run in the folder's thread.
+  await f.deliver({
+    type: "mention",
+    event: message("5", "@Pi elsewhere", {
+      tags: [
+        ["h", channel],
+        ["p", self],
+      ],
+    }),
+  }).run;
+  f.link.status = "connecting";
+  await f.runtime.tool({
+    agent: self,
+    conversation: left.conversation,
+    context: { channel, root: root.id },
+    name: "send",
+    arguments: { path: "report.md", audience: "everyone" },
+  });
+  expect(readFile.mock.calls).toEqual([
+    ["report.md", { cwd: "/repos/worktree" }],
+  ]);
 });
 
 it("reports a run an earlier app left unfinished that fails, and stays silent for one stopped", async () => {
@@ -2258,6 +2972,7 @@ it("runs a standalone turn in a one-off conversation", async () => {
 async function standaloneUsage(
   answered: (started: number) => number,
   since: (started: number) => number,
+  usageOn = true,
 ) {
   const started = Date.now();
   const answer = {
@@ -2274,16 +2989,6 @@ async function standaloneUsage(
       },
     ],
   };
-  const kept = new Map<string, string>();
-  vi.stubGlobal("localStorage", {
-    getItem: (key: string) => kept.get(key) ?? null,
-    setItem: (key: string, value: string) => void kept.set(key, value),
-    removeItem: (key: string) => void kept.delete(key),
-    key: (index: number) => [...kept.keys()][index] ?? null,
-    get length() {
-      return kept.size;
-    },
-  });
   const { runtime, runOnce } = setup({
     wait: () => ({ status: "done", answer: 5, text: "" }),
     places: () => ({ places: [] }),
@@ -2292,22 +2997,28 @@ async function standaloneUsage(
       entries: conversation === 99 ? [answer] : [],
     }),
   });
-  try {
-    runtime.sync([
-      { key: self, pubkey: self, config: DEFAULT_CONFIG },
-    ] as never);
-    await runOnce("timer/t1", "Run t1");
-    // Later sessions push every saved prompt out; the turn stays the agent's.
-    for (const key of [...kept.keys()])
-      if (key.startsWith(PROMPTS_PREFIX)) kept.delete(key);
-    return await runtime.usage(
-      self,
-      since(started),
-      new AbortController().signal,
-    );
-  } finally {
-    vi.unstubAllGlobals();
-  }
+  runtime.usageOn = () => usageOn;
+  const kept = (runtime as unknown as { storage: MemoryStorage }).storage;
+  runtime.sync([{ key: self, pubkey: self, config: DEFAULT_CONFIG }] as never);
+  await runOnce("timer/t1", "Run t1");
+  // Pi keeps no prompt for a one-off turn, so one is kept here as a session
+  // started by the agent would be, for the step below to push out.
+  const prompts = sessionPrompts(kept, "pi", self);
+  await prompts.save("99", [{ label: "", text: "Run t1" }], {
+    at: started,
+    title: "",
+    conversation: null,
+  });
+  expect(prompts.sessions().map(({ id }) => id)).toEqual(["99"]);
+  // Later sessions push every saved prompt out; the turn stays the agent's.
+  for (const key of kept.keys())
+    if (key.startsWith(PROMPTS_PREFIX)) await kept.set(key, null);
+  expect(prompts.sessions()).toEqual([]);
+  return await runtime.usage(
+    self,
+    since(started),
+    new AbortController().signal,
+  );
 }
 
 it("reads a standalone turn's conversation as the agent's usage, with no channel", async () => {
@@ -2317,7 +3028,44 @@ it("reads a standalone turn's conversation as the agent's usage, with no channel
   );
   expect(sessions.map((session) => session.id)).toEqual(["99"]);
   expect(sessions[0]).not.toHaveProperty("channelId");
+  expect(sessions[0]?.wake).toBe("timer/t1");
   expect(sessions[0]?.observations).toHaveLength(1);
+});
+
+it("reads a standalone turn run while Usage was off as the agent's, without its timer", async () => {
+  // Kept as on main, so once Usage is on, it counts the turn, under no routine.
+  const sessions = await standaloneUsage(
+    (started) => started,
+    () => 0,
+    false,
+  );
+  expect(sessions.map((session) => session.id)).toEqual(["99"]);
+  expect(sessions[0]).not.toHaveProperty("wake");
+  expect(sessions[0]?.observations).toHaveLength(1);
+});
+
+it("removes what was kept past keeping at a standalone turn while Usage is off", async () => {
+  const old = `${STANDALONE_PREFIX}pi:${self}:0`;
+  const { runtime, runOnce } = setup({
+    wait: () => ({ status: "done", answer: 5, text: "" }),
+  });
+  const kept = (runtime as unknown as { storage: MemoryStorage }).storage;
+  await kept.set(
+    old,
+    JSON.stringify({ version: 1, sessions: [["7", 1, "timer/t1"]] }),
+  );
+  runtime.sync([{ key: self, pubkey: self, config: DEFAULT_CONFIG }] as never);
+  await runOnce("timer/t1", "Run t1");
+  // The old day goes; this turn is kept, without its timer.
+  await vi.waitFor(() =>
+    expect(
+      kept
+        .keys()
+        .filter((key) => key.startsWith(STANDALONE_PREFIX))
+        .flatMap((key) => JSON.parse(kept.get(key) ?? "").sessions),
+    ).toEqual([["99", expect.any(Number)]]),
+  );
+  expect(kept.get(old)).toBeNull();
 });
 
 it("reads a standalone turn begun before the cutoff by when it answered", async () => {

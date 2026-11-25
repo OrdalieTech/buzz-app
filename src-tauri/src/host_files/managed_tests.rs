@@ -67,6 +67,8 @@ impl Fixture {
         let app = mock_builder()
             .manage(PluginManager(Ok(manager.clone())))
             .manage(crate::host_process::HostProcesses::default())
+            .manage(crate::agent_env::AgentEnvs::new())
+            .manage(crate::claude_key::ClaudeKey::new())
             .manage(registry)
             .manage(identity)
             .invoke_handler(move |invoke| {
@@ -923,6 +925,7 @@ fn process_attachment_reader_blocks_delete_until_output_and_killed_child_complet
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1579,7 +1582,7 @@ fn host_release_stalled_hash_has_one_budget_and_prompt_direct_and_process_read_r
                 let reader = crate::host_process::plugin_host_process_spawn(
                     f.app.handle().clone(), f.app.state::<PluginManager>(), f.app.state::<crate::host_process::HostProcesses>(),
                     "example.bytes".into(), f.revision.clone(), process.into(), vec![path.clone()], None, None,
-                    tauri::ipc::Channel::new(|_| panic!("refused process emitted output")), None, None, None, None, None,
+                    tauri::ipc::Channel::new(|_| panic!("refused process emitted output")), None, None, None, None, None, None,
                 );
                 assert!(matches!(futures_util::poll!(Box::pin(reader)), std::task::Poll::Ready(Err(error)) if error == "File reads are busy; try again later"));
             }

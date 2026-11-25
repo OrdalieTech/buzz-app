@@ -9,7 +9,7 @@ import { hoverMessage } from "../message-actions.mjs";
 import { settle } from "../timeline.mjs";
 
 // Browser-only: scrolling the thread history once every reply the strict window
-// holds is loaded (docs/channels.md#scrolling-long-threads). Rendering and
+// holds is loaded. Rendering and
 // scroll cost at that scale need a real engine; frame intervals reproduce the
 // compositing stalls only in WebKit (docs/performance.md#thread-scrolling).
 test.use({

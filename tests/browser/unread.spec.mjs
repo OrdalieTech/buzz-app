@@ -9,6 +9,9 @@ import {
 } from "./reading.mjs";
 import { channelUnread } from "./unread-state.mjs";
 
+// Each journey owns its app, relay state and browser context.
+test.describe.configure({ mode: "parallel" });
+
 /** A synced whole-channel mark unread on Alpha is live (NIP-RS override group). */
 const marked = (stored) => {
   const group = stored?.state.overrides[alphaId];
@@ -141,7 +144,7 @@ test("built sidebar → visible dwell → durable journal → encrypted broker p
   // On a slow runner that dwell can read Alpha before the search palette takes
   // focus, so hold reading focus until the unread baseline is observed.
   await holdReadingFocus(page);
-  await open(page, app);
+  await open(page, app, { cold: true });
   await expect
     .poll(() =>
       app.report.queries.some(({ filter }) => filter.read_state_snapshot === 1),
@@ -224,7 +227,7 @@ test("focus cancellation and local manual-unread survive reload until explicit m
     await route.continue();
   });
   try {
-    await open(page, app);
+    await open(page, app, { cold: true });
     await markerRequested;
     // Mounted history is not proof that the serial durable owner is ready.
     expect(
@@ -338,7 +341,7 @@ test("a surviving window publishes a closed window's durable read intent", async
   app,
 }) => {
   await holdReadingFocus(page);
-  await open(page, app);
+  await open(page, app, { cold: true });
   await park(page);
   const survivor = await context.newPage();
   app.watchPageErrors(survivor);
@@ -348,7 +351,7 @@ test("a surviving window publishes a closed window's durable read intent", async
   });
   try {
     await holdReadingFocus(survivor);
-    await open(survivor, app);
+    await open(survivor, app, { cold: true });
     await park(survivor);
     await options(survivor);
     await survivor.getByText("Unread status", { exact: true }).click();
@@ -422,7 +425,7 @@ test.describe("explicit mark-through with membership activity", () => {
         const lastChat = loaded.findLast((event) => event.kind === 9);
         // Startup composer focus must not read the unread baseline.
         await holdReadingFocus(page);
-        await open(page, app);
+        await open(page, app, { cold: true });
         await park(page);
         // Startup sidebar layout can report WebKit's ResizeObserver loop, which
         // page-errors.mjs classifies as an engine report. Hold the raw check to
@@ -489,7 +492,7 @@ test.describe("automatic catch-up after membership rows", () => {
     page,
     app,
   }) => {
-    await open(page, app);
+    await open(page, app, { cold: true });
     await expect(
       history(page).locator("[data-membership-row]"),
     ).toBeInViewport();
@@ -517,7 +520,7 @@ test.describe("a join burst longer than a history page", () => {
   }) => {
     // Startup focus would read Alpha before the unread baseline is observed.
     await holdReadingFocus(page);
-    await open(page, app);
+    await open(page, app, { cold: true });
     // The open channel's row is quiet; the engine keeps the unread.
     await expect
       .poll(async () => (await channelUnread(page, alphaId)).observedCount)
@@ -546,7 +549,7 @@ test.describe("local receipt reserve", () => {
   }) => {
     // Startup and reload must not earn bottom catch-up before the isolated read.
     await holdReadingFocus(page);
-    await open(page, app);
+    await open(page, app, { cold: true });
     const ids = await visible(page);
     expect(ids.length).toBeGreaterThan(0);
     const key = `msg:${ids[0]}`;

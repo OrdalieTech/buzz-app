@@ -1,0 +1,10 @@
+{
+  "id": "com.squareup.docs",
+  "name": "Docs",
+  "apiVersion": 1,
+  "description": "Create and share live Markdown documents with people and agents, with drafts, revisions and recoverable deletion.",
+  "discovery": {
+    "category": "productivity",
+    "tags": []
+  }
+}

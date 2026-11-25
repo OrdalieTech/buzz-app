@@ -788,7 +788,7 @@ it.each([{ olderUnread: false }, { olderUnread: true }])(
     } else {
       // Catch-up read every ordinary row above the read one, but a sample
       // that stopped short could still miss an unread mention, broadcast or
-      // marked message there; docs/unread.md records that residual.
+      // marked message there.
       expect(precedes(divider(), screen.getByText("First loaded unread"))).toBe(
         true,
       );
@@ -2144,6 +2144,26 @@ it.each(
     }
   },
 );
+it.each([
+  [true, false],
+  [false, true],
+])(
+  "measures the held row's inset before commit only for a reader off the end (follow: %s)",
+  async (bottom, measured) => {
+    const h = mount(bottom);
+    await frame();
+    const rowReads: HTMLElement[] = [];
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        if (this.closest("[data-message-id]")) rowReads.push(this);
+        return new DOMRect(0, 0, 800, 100);
+      },
+    );
+    h.promote();
+    expect(rowReads.length > 0).toBe(measured);
+  },
+);
+
 it("keeps the message's place when older rows move its date separator to another item", async () => {
   const h = mount(true);
   await frame();

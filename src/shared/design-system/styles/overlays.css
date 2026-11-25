@@ -597,9 +597,50 @@
 }
 .buzz-toast-viewport
   [data-sonner-toast][data-removed="true"][data-swipe-out="false"] {
-  /* Sonner removes the DOM node after 200ms. Finish the exit before then. */
   transition-duration: 180ms;
   transition-timing-function: ease-out;
+}
+@media (hover: hover) and (pointer: fine) and (
+    prefers-reduced-motion: no-preference
+  ) {
+  .buzz-toast-no-blur {
+    --toast-motion-filter: none;
+  }
+
+  .buzz-toast-viewport
+    [data-sonner-toast][data-front="true"][data-swiping="false"][data-swipe-out="false"] {
+    transition-property: transform, opacity;
+    transition-duration: var(--toast-motion-duration, 350ms);
+    transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .buzz-toast-viewport [data-sonner-toast][data-front="true"] .buzz-toast {
+    transform-origin: top center;
+    transition:
+      transform var(--toast-motion-duration, 350ms)
+      cubic-bezier(0.22, 1, 0.36, 1),
+      filter var(--toast-motion-duration, 350ms) cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .buzz-toast-viewport
+    [data-sonner-toast][data-front="true"]:is(
+      [data-mounted="false"],
+      [data-removed="true"][data-swipe-out="false"]
+    ) {
+    transform: translateY(-16px);
+    opacity: 0;
+    --toast-motion-duration: 175ms;
+  }
+
+  .buzz-toast-viewport
+    [data-sonner-toast][data-front="true"]:is(
+      [data-mounted="false"],
+      [data-removed="true"][data-swipe-out="false"]
+    )
+    .buzz-toast {
+    transform: scale(0.97);
+    filter: var(--toast-motion-filter, blur(2px));
+  }
 }
 /* Keep every recovery reachable when expanded, including short windows. */
 @media (hover: hover) and (pointer: fine) {
@@ -661,6 +702,15 @@
 }
 .buzz-toast-viewport [data-sonner-toast][data-removed="true"] {
   pointer-events: none;
+}
+/* Pressing inside a notice, for example on an action's label, starts a Sonner
+   swipe whose ::before hit area is three notices wide. It overflows the
+   expanded, scrolling stack and shows a horizontal scrollbar while held.
+   Pointer capture already keeps a swipe on its notice. data-y-position
+   outranks every Sonner ::before rule. */
+.buzz-toast-viewport[data-sonner-toaster]
+[data-sonner-toast][data-y-position]::before {
+  content: none;
 }
 .buzz-toast-viewport [data-sonner-toast]:focus-visible {
   box-shadow: none;

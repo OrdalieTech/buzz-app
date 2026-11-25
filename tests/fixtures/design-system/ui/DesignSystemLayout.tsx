@@ -64,8 +64,6 @@ const SECTIONS: NavSection[] = [
     heading: "Guides",
     items: [
       ["Design guide", "/design/design-guide"],
-      ["Agent guide", "/design/agents-guide"],
-      ["Maintaining the system", "/design/maintaining"],
       ["Base UI backing", "/design/components/base-ui"],
     ],
   },

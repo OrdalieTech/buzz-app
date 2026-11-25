@@ -192,7 +192,7 @@ async function run(seed: number, channelCount: number, steps: number) {
   let proven = 0;
   /** Channels whose replay carried a reply since their last report: the
    * relay never stores the thread summary a reply changes, so no replay
-   * carries it (see docs/relay-queries.md). */
+   * carries it. */
   const replayedReply = new Set<string>();
   /** Channels whose grant the relay stored but has not delivered yet. Until
    * it arrives the broker cannot know the relay left the channel out. */

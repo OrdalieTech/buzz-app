@@ -289,7 +289,12 @@ impl AppAgentHost {
     /// will ever have. The row stays, marked deleted, until the WebView has
     /// cleaned up the community and calls `app_agent_forget`. This copy of the
     /// app stops running the agent once it is in no community.
-    async fn delete(&self, pubkey: String, relay: String) -> Result<(), String> {
+    async fn delete(
+        &self,
+        pubkey: String,
+        relay: String,
+        envs: &crate::agent_env::AgentEnvs,
+    ) -> Result<(), String> {
         let page = self.removals().page;
         let turn = self.profile_turn(&pubkey);
         let _turn = turn.lock().await;
@@ -299,6 +304,15 @@ impl AppAgentHost {
             self.tokens.forget_row(&pubkey, &relay)?;
             if let Some(owner) = self.last_community(&pubkey, &relay).await? {
                 self.tokens.forget(&owner, &pubkey).await?;
+            }
+            // Its own environment variables go with its last community too,
+            // before its row does, so a failure leaves the row and retrying
+            // the removal retries this. Its started Delete already refuses any
+            // further save (`agent_env::eligible`).
+            let agents = self.agents.clone()?;
+            let (key, community) = (pubkey.clone(), relay.clone());
+            if blocking(move || agents.is_last_membership(&key, &community)).await? {
+                envs.forget(&pubkey).await?;
             }
         }
         let host = self.clone();
@@ -880,10 +894,11 @@ pub(crate) async fn app_agent_join(
 #[tauri::command]
 pub(crate) async fn app_agent_delete(
     state: tauri::State<'_, AppAgentHost>,
+    envs: tauri::State<'_, crate::agent_env::AgentEnvs>,
     pubkey: String,
     relay: String,
 ) -> Result<(), String> {
-    state.delete(pubkey, relay).await
+    state.delete(pubkey, relay, &envs).await
 }
 
 #[tauri::command]
@@ -1859,7 +1874,8 @@ mod tests {
         );
         let turn = host.profile_turn(&agent.pubkey);
         let publishing = turn.lock().await;
-        let mut deleting = Box::pin(host.delete(agent.pubkey.clone(), agent.relay.clone()));
+        let (envs, _) = crate::agent_env::tests::envs();
+        let mut deleting = Box::pin(host.delete(agent.pubkey.clone(), agent.relay.clone(), &envs));
         // Poll through the generation capture into the held publication lock.
         assert!(matches!(
             futures_util::poll!(&mut deleting),
@@ -1880,9 +1896,13 @@ mod tests {
         assert!(host.keys().contains_key(&agent.pubkey));
         assert!(host.removals().held.contains_key(&agent.pubkey));
         // Only the current page may finish cleanup using its own hold.
-        host.delete(agent.pubkey.clone(), agent.relay.clone())
-            .await
-            .unwrap();
+        host.delete(
+            agent.pubkey.clone(),
+            agent.relay.clone(),
+            &crate::agent_env::tests::envs().0,
+        )
+        .await
+        .unwrap();
         assert!(agents.list().unwrap()[0].deleted);
         assert!(agent.read_key(host.credentials.as_ref()).is_err());
         assert!(!host.keys().contains_key(&agent.pubkey));
@@ -2017,7 +2037,10 @@ mod tests {
         let deleting = tokio::spawn({
             let host = host.clone();
             let (pubkey, relay) = (agent.pubkey.clone(), agent.relay.clone());
-            async move { host.delete(pubkey, relay).await }
+            async move {
+                host.delete(pubkey, relay, &crate::agent_env::tests::envs().0)
+                    .await
+            }
         });
         crate::federated_identity::agent::tests::bounded(async {
             while !host.tokens.closed(&agent.pubkey) {
@@ -2058,6 +2081,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removal_deletes_its_own_env_only_when_held_and_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identities.json");
+        let key = Secret::generate().unwrap();
+        let home = agent_at("wss://home.example".into(), &key);
+        let other = agent_at("wss://other.example".into(), &key);
+        std::fs::write(&path, serde_json::to_vec(&[&home, &other]).unwrap()).unwrap();
+        let mut host = AppAgentHost::new(
+            Ok(path),
+            Err("unused".into()),
+            true,
+            AgentTokens::unconfigured(),
+        );
+        host.credentials = Arc::new(Gated::default());
+        let agents = host.agents().unwrap();
+        let (envs, stores) = crate::agent_env::tests::envs();
+        let rows = vec![crate::agent_env::tests::set("FOO", "bar")];
+        envs.set(&home.pubkey, rows, || Ok(true)).await.unwrap();
+        let saved = || {
+            stores.lock().unwrap()[&home.pubkey]
+                .text
+                .lock()
+                .unwrap()
+                .is_some()
+        };
+        // A removal this page doesn't hold is refused and keeps the list.
+        assert!(host
+            .delete(home.pubkey.clone(), home.relay.clone(), &envs)
+            .await
+            .is_err());
+        assert!(saved());
+        // Leaving one of two communities keeps it.
+        agents.begin_leave(&other.pubkey, &other.relay).unwrap();
+        let removal = agents.hold_removal(&other.pubkey, &other.relay).unwrap();
+        host.removals().held.insert(other.pubkey.clone(), removal);
+        host.delete(other.pubkey.clone(), other.relay.clone(), &envs)
+            .await
+            .unwrap();
+        host.removals().held.remove(&other.pubkey);
+        assert!(saved());
+        // The last: a failed cleanup keeps the row, and a retry finishes both.
+        hold_removal(&host, &home);
+        *stores.lock().unwrap()[&home.pubkey]
+            .unwritable
+            .lock()
+            .unwrap() = true;
+        assert!(host
+            .delete(home.pubkey.clone(), home.relay.clone(), &envs)
+            .await
+            .is_err());
+        assert!(saved());
+        assert!(agents
+            .list()
+            .unwrap()
+            .iter()
+            .any(|agent| agent.relay == home.relay && !agent.deleted));
+        *stores.lock().unwrap()[&home.pubkey]
+            .unwritable
+            .lock()
+            .unwrap() = false;
+        host.delete(home.pubkey.clone(), home.relay.clone(), &envs)
+            .await
+            .unwrap();
+        assert!(!saved());
+        assert!(agents.list().unwrap().iter().all(|agent| agent.deleted));
+    }
+
+    #[tokio::test]
     async fn leaving_one_community_keeps_the_grant_until_the_last_goes() {
         let f = crate::federated_identity::agent::tests::fixture("http://unused".into());
         let dir = tempfile::tempdir().unwrap();
@@ -2082,16 +2173,24 @@ mod tests {
         agents.begin_leave(&other.pubkey, &other.relay).unwrap();
         let removal = agents.hold_removal(&other.pubkey, &other.relay).unwrap();
         host.removals().held.insert(other.pubkey.clone(), removal);
-        host.delete(other.pubkey.clone(), other.relay.clone())
-            .await
-            .unwrap();
+        host.delete(
+            other.pubkey.clone(),
+            other.relay.clone(),
+            &crate::agent_env::tests::envs().0,
+        )
+        .await
+        .unwrap();
         assert!(!host.tokens.closed(&home.pubkey), "still in its home");
         host.removals().held.remove(&other.pubkey);
 
         hold_removal(&host, &home);
-        host.delete(home.pubkey.clone(), home.relay.clone())
-            .await
-            .unwrap();
+        host.delete(
+            home.pubkey.clone(),
+            home.relay.clone(),
+            &crate::agent_env::tests::envs().0,
+        )
+        .await
+        .unwrap();
         assert!(host.tokens.closed(&home.pubkey));
     }
 
@@ -2143,9 +2242,13 @@ mod tests {
         // deleted and the same key is imported again as import II.
         let (old_agent, old_key, old_incarnation) = import().await;
         hold_removal(&host, &old_agent);
-        host.delete(old_agent.pubkey.clone(), old_agent.relay.clone())
-            .await
-            .unwrap();
+        host.delete(
+            old_agent.pubkey.clone(),
+            old_agent.relay.clone(),
+            &crate::agent_env::tests::envs().0,
+        )
+        .await
+        .unwrap();
         let (agent, _, _) = import().await;
         let (_, _, evidence) = host
             .signer(agent.pubkey.clone(), agent.relay.clone())
@@ -2639,9 +2742,13 @@ mod tests {
             agents.begin_leave(&old.pubkey, &old.relay).unwrap();
             let removal = agents.hold_removal(&old.pubkey, &old.relay).unwrap();
             host.removals().held.insert(old.pubkey.clone(), removal);
-            host.delete(old.pubkey.clone(), old.relay.clone())
-                .await
-                .unwrap();
+            host.delete(
+                old.pubkey.clone(),
+                old.relay.clone(),
+                &crate::agent_env::tests::envs().0,
+            )
+            .await
+            .unwrap();
             host.removals().held.remove(&old.pubkey);
             let new = host
                 .agents()

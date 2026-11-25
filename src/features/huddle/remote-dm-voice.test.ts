@@ -81,6 +81,7 @@ function fixture() {
     snapshot: () => ({ status: "ready", running: [agent] }),
     subscribe: subscribe(channels),
     types: () => [{ key: agent.type, voice }],
+    reserveVoice: () => () => {},
   } as unknown as Agents;
   const view = {
     snapshot: () => ({ events, status: "ready" }),

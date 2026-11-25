@@ -698,37 +698,92 @@ async fn a_new_account_retires_the_cached_assertion() {
 }
 
 #[tokio::test]
-async fn expiry_and_same_account_refresh_keep_the_grant_and_assertion() {
+async fn expiry_keeps_the_assertion_and_a_same_account_sign_in_remints_it() {
     let owner = "b".repeat(64);
     let (key, probe) = keyed(&owner);
     let (base, served) = issuer(vec![
         (200, enrolled(&owner)),
-        (200, issued(&probe, serde_json::json!({}))),
+        (200, issued(&probe, serde_json::json!({"jti": "before"}))),
+        (200, issued(&probe, serde_json::json!({"jti": "after"}))),
     ])
     .await;
     let mut f = fixture(base);
     (f.agent, f.key) = (probe.clone(), key);
     listing(&f);
-    assert!(f
+    let first = f
         .tokens
         .evidence(&f.agent, &f.key, 0)
         .await
         .unwrap()
-        .is_some());
+        .unwrap();
     let identity = &f.tokens.0.identity;
     identity.retire(
         crate::federated_identity::Status::ReauthenticationRequired,
         None,
     );
     identity.signal(SessionChange::Expired);
-    signed_in_again(&f, "a@example.com");
-    assert!(f
+    let expired = f
         .tokens
         .evidence(&f.agent, &f.key, 0)
         .await
         .unwrap()
-        .is_some());
-    assert_eq!(settled(served).await.len(), 2);
+        .unwrap();
+    assert_eq!(*expired, *first, "expiry alone keeps the assertion");
+    signed_in_again(&f, "a@example.com");
+    let fresh = f
+        .tokens
+        .evidence(&f.agent, &f.key, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(*fresh, *first, "a sign-in remints the assertion");
+    let reused = f
+        .tokens
+        .evidence(&f.agent, &f.key, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*reused, *fresh);
+    assert_eq!(settled(served).await.len(), 3);
+    assert_eq!(f.grants.0.lock().unwrap().len(), 1, "the grant is kept");
+}
+
+#[tokio::test]
+async fn a_mint_in_flight_across_a_sign_in_is_not_reused_after_it() {
+    let owner = "b".repeat(64);
+    let (key, probe) = keyed(&owner);
+    let (held_tx, held) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    let (base, served) = issuer_gated(
+        vec![
+            (200, enrolled(&owner)),
+            (200, issued(&probe, serde_json::json!({"jti": "before"}))),
+            (200, issued(&probe, serde_json::json!({"jti": "after"}))),
+        ],
+        1,
+        Some((held_tx, release_rx)),
+    )
+    .await;
+    let mut f = fixture(base);
+    (f.agent, f.key) = (probe.clone(), key);
+    listing(&f);
+    let f = Arc::new(f);
+    let call = {
+        let f = f.clone();
+        tokio::spawn(async move { f.tokens.evidence(&f.agent, &f.key, 0).await })
+    };
+    bounded(held).await.unwrap();
+    signed_in_again(&f, "a@example.com");
+    release.send(()).unwrap();
+    let overlapped = call.await.unwrap().unwrap().unwrap();
+    let next = f
+        .tokens
+        .evidence(&f.agent, &f.key, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(*next, *overlapped, "the next acquisition mints again");
+    assert_eq!(settled(served).await.len(), 3);
     assert_eq!(f.grants.0.lock().unwrap().len(), 1);
 }
 
@@ -1202,7 +1257,11 @@ async fn another_first_sign_in_retires_the_grant_even_once_that_session_has_expi
 async fn the_same_account_as_the_first_sign_in_after_restart_keeps_the_grant() {
     let owner = "b".repeat(64);
     let (key, probe) = keyed(&owner);
-    let (base, served) = issuer(vec![(200, issued(&probe, serde_json::json!({})))]).await;
+    let (base, served) = issuer(vec![
+        (200, issued(&probe, serde_json::json!({}))),
+        (200, issued(&probe, serde_json::json!({}))),
+    ])
+    .await;
     let mut f = fixture(base.clone());
     (f.agent, f.key) = (probe.clone(), key);
     stored(&f, "a@example.com");
@@ -1212,7 +1271,8 @@ async fn the_same_account_as_the_first_sign_in_after_restart_keeps_the_grant() {
         .await
         .unwrap()
         .is_some());
-    // Without a session, and then signed in as A, the assertion is reused.
+    // Without a session the assertion is reused; signing in as A remints it
+    // on the same grant.
     assert!(tokens
         .evidence(&f.agent, &f.key, 0)
         .await
@@ -1226,7 +1286,7 @@ async fn the_same_account_as_the_first_sign_in_after_restart_keeps_the_grant() {
         .await
         .unwrap()
         .is_some());
-    assert_eq!(settled(served).await.len(), 1);
+    assert_eq!(settled(served).await.len(), 2);
     assert!(f
         .grants
         .0

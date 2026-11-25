@@ -97,6 +97,8 @@ export function applyApps(
   ctx.panels.register({
     id: "app",
     title: "App",
+    // A running app: it stays a tab until it survives a dialog closing.
+    inline: false,
     keepOpen: true,
     matches: (target) => ctx.browser.available && isAppUrl(target),
     component: AppView,

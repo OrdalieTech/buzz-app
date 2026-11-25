@@ -4,7 +4,7 @@
 // desktop app's native side reads it too, so both agree on what is bundled
 // and which network origins each may reach. This file gives each one's code,
 // keyed by manifest id, so a whole plugin fits in these two files and needs
-// no README. See docs/plugin-architecture.md, "Organization plugins".
+// no README.
 import type { PluginManifest, PluginModule } from "../plugins/api";
 import type { BundledPlugin } from "../plugins/manager";
 import listed from "./org.json";

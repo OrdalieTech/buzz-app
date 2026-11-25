@@ -4,6 +4,13 @@ import { nativeMcpInstance } from "./desktop-config.mjs";
 
 // Launch this worktree's native MCP test instance; arguments pass to `just desktop`.
 // `--print` prints the instance's identifier and base port without launching.
+//
+// The bridge can run JavaScript and native commands with the app's authority,
+// and the instance signs with the shared debug Keychain identity: whatever an
+// agent does through it publishes as that key, in that key's communities. A
+// separate identifier, port or profile does not isolate it. Never sign out
+// through it: sign out deletes the shared debug identity for every debug build.
+// For unattended automation, use a disposable macOS account with test keys.
 const root = fileURLToPath(new URL("../", import.meta.url));
 const { identifier, port } = nativeMcpInstance(root);
 console.log(

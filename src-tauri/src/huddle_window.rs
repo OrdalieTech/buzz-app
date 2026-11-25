@@ -163,14 +163,31 @@ pub(crate) struct Control {
     action: Action,
     text: Option<String>,
 }
+/// What the companion's watch channel carries. The companion may not listen
+/// for app events, so a change to the saved downloads reaches it here.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum Update {
+    View(Box<View>),
+    SavedDownloads,
+}
 struct Session {
     view: View,
     actions: Channel<Control>,
-    updates: Option<Channel<View>>,
+    updates: Option<Channel<Update>>,
 }
 #[derive(Default)]
 pub(crate) struct HuddleWindow(Mutex<Option<Session>>);
 impl HuddleWindow {
+    /// Tells the companion to ask again which attachments have a saved copy.
+    /// Sending evaluates JavaScript: call this off the event thread.
+    pub(crate) fn saved_downloads_changed(&self) {
+        if let Ok(slot) = self.0.lock() {
+            if let Some(updates) = slot.as_ref().and_then(|session| session.updates.as_ref()) {
+                let _ = updates.send(Update::SavedDownloads);
+            }
+        }
+    }
     /// Downloads are restricted to attachment sources supplied by the main owner.
     pub(crate) fn permits_download(&self, source: &str, name: &str) -> bool {
         self.0.lock().ok().is_some_and(|slot| {
@@ -314,7 +331,7 @@ pub(crate) async fn huddle_window_open<R: tauri::Runtime>(
         let mut slot = host.0.lock().map_err(|_| "Huddle window unavailable")?;
         let updates = slot.as_mut().and_then(|s| s.updates.take());
         if let Some(updates) = &updates {
-            let _ = updates.send(view.clone());
+            let _ = updates.send(Update::View(Box::new(view.clone())));
         }
         *slot = Some(Session {
             view,
@@ -402,7 +419,7 @@ pub(crate) fn huddle_window_update<R: tauri::Runtime>(
             }
         }
         if let Some(updates) = &session.updates {
-            let _ = updates.send(patch);
+            let _ = updates.send(Update::View(Box::new(patch)));
         }
         session.view = view;
     } else {
@@ -418,13 +435,13 @@ pub(crate) fn huddle_window_update<R: tauri::Runtime>(
 pub(crate) fn huddle_window_watch<R: tauri::Runtime>(
     window: WebviewWindow<R>,
     host: tauri::State<'_, HuddleWindow>,
-    updates: Channel<View>,
+    updates: Channel<Update>,
 ) -> Result<()> {
     require(&window, LABEL)?;
     let mut slot = host.0.lock().map_err(|_| "Huddle window unavailable")?;
     let session = slot.as_mut().ok_or("This Huddle has ended")?;
     updates
-        .send(session.view.clone())
+        .send(Update::View(Box::new(session.view.clone())))
         .map_err(|e| e.to_string())?;
     session.updates = Some(updates);
     Ok(())
@@ -743,6 +760,35 @@ mod tests {
         }
     }
     #[test]
+    fn saved_download_changes_reach_the_companion_on_its_watch_channel() {
+        let app = tauri::test::mock_builder()
+            .manage(HuddleWindow::default())
+            .build(crate::app_context())
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let updates = Channel::new(move |body| {
+            let tauri::ipc::InvokeResponseBody::Json(update) = body else {
+                panic!("updates are JSON");
+            };
+            sender.send(update).unwrap();
+            Ok(())
+        });
+        // Before the companion watches, there is no one to tell.
+        crate::saved_downloads::changed(app.handle());
+        let id = "00000000-0000-4000-8000-000000000001";
+        *app.state::<HuddleWindow>().0.lock().unwrap() = Some(Session {
+            view: view(id),
+            actions: Channel::new(|_| Ok(())),
+            updates: Some(updates),
+        });
+        crate::saved_downloads::changed(app.handle());
+        assert_eq!(receiver.try_recv().unwrap(), r#""savedDownloads""#);
+        assert!(receiver.try_recv().is_err());
+        // A presentation on the same channel cannot be mistaken for it.
+        let presentation = serde_json::to_value(Update::View(Box::new(view(id)))).unwrap();
+        assert_eq!(presentation["view"]["id"], id);
+    }
+    #[test]
     fn composer_capability_is_optional_and_requires_a_uuid() {
         let id = "00000000-0000-4000-8000-000000000001";
         let mut value = serde_json::to_value(view(id)).unwrap();
@@ -768,6 +814,8 @@ mod tests {
                 "allow-huddle-window-watch",
                 "allow-huddle-window-action",
                 "allow-media-download",
+                "allow-media-download-status",
+                "allow-media-download-open",
                 "allow-clipboard-write-text",
                 { "identifier": "opener:allow-open-url", "allow": [{ "url": "https://*" }, { "url": "http://*" }] }
             ])

@@ -58,17 +58,18 @@
   position: relative;
   container: solo-workspace-header / inline-size;
 }
-@container solo-workspace-header (max-width: 9rem) {
-  .workspaceHeader > [class~="navigation-section-heading"] {
-    flex-wrap: wrap;
-  }
-  .workspaceHeader [class~="navigation-section-heading-label"] {
-    flex-basis: 100%;
-  }
-}
-@container solo-workspace-header (max-width: 9rem) {
+@media (hover: none) {
   .workspaceHeader [data-solo-workspace-new-task] {
     display: none;
+  }
+}
+@container solo-workspace-header (max-width: 12rem) {
+  .workspaceHeader [data-solo-workspace-new-task]:not(:focus) {
+    display: none;
+  }
+
+  .workspaceHeader [data-solo-workspace-accessory] > * {
+    min-inline-size: 0;
   }
 }
 .organizedRow {
@@ -141,12 +142,12 @@
   margin-inline-end: var(--session-trailing-end);
 }
 .organizedRow:is(
-    :hover,
     [data-context-menu-present],
     :has(:focus-visible),
     :has([aria-expanded="true"][aria-haspopup="menu"])
   )
-  [data-solo-row-action] {
+  > [data-solo-row-action],
+.organizedRow > [data-solo-row-action]:hover {
   opacity: 1;
   pointer-events: auto;
 }
@@ -178,11 +179,16 @@
   [data-context-menu-present],
   :has(:focus-visible),
   :has([aria-expanded="true"][aria-haspopup="menu"])
-):not(:has([aria-current="page"]))::before {
+):not(:has([aria-current="page"], [data-spring-loaded="on"]))::before {
   background: var(--affordance-panel-hover);
 }
-.organizedRow:has([aria-current="page"])::before {
+/* A spring-loaded file drag selects the row until it opens or blinks off. */
+.organizedRow:has([aria-current="page"], [data-spring-loaded="on"])::before {
   background: var(--surface-sidebar-selected);
+}
+/* A composed chat has no row fill, so its button keeps the drag's fill. */
+.organizedRow:not(.composedChat *) [data-spring-loaded] {
+  background-color: transparent;
 }
 /* Composed workspace chats share the task card's complete interaction surface. */
 .composedChat .organizedRow::before {
@@ -249,7 +255,7 @@
   pointer-events: none;
 }
 .organizedRow:is(
-    :hover,
+    :has(> :is([data-solo-row-action], [data-solo-shared]):hover),
     [data-context-menu-present],
     :has(:focus-visible),
     :has([aria-expanded="true"][aria-haspopup="menu"])
@@ -288,7 +294,7 @@
 }
 
 /* Pointer rows show one trailing occupant at rest: working, then thread
-   activity, then Shared. On hover, focus or open, Shared stays in place as the
+   activity, then Shared. With the action revealed, Shared stays in place as the
    access control and the menu takes the slot before it. Nothing reserves
    title width unless it is visible. Touch keeps status and the menu side by
    side in the flow above. */
@@ -319,7 +325,7 @@
   }
   /* Shared never moves under the pointer; the menu opens beside it. */
   .organizedRow:is(
-    :hover,
+    :has(> :is([data-solo-row-action], [data-solo-shared]):hover),
     [data-context-menu-present],
     :has(:focus-visible),
     :has([aria-expanded="true"][aria-haspopup="menu"])
@@ -354,7 +360,7 @@
   }
   .sidebarContents
     .organizedRow:is(
-      :hover,
+      :has(> :is([data-solo-row-action], [data-solo-shared]):hover),
       [data-context-menu-present],
       :has(:focus-visible),
       :has([aria-expanded="true"][aria-haspopup="menu"])
@@ -368,7 +374,7 @@
   }
   .sidebarContents
     .organizedRow:has([data-solo-shared]):is(
-      :hover,
+      :has(> :is([data-solo-row-action], [data-solo-shared]):hover),
       [data-context-menu-present],
       :has(:focus-visible),
       :has([aria-expanded="true"][aria-haspopup="menu"])
@@ -382,7 +388,7 @@
     );
   }
   .organizedRow:is(
-      :hover,
+      :has(> :is([data-solo-row-action], [data-solo-shared]):hover),
       [data-context-menu-present],
       :has(:focus-visible),
       :has([aria-expanded="true"][aria-haspopup="menu"])

@@ -137,6 +137,20 @@ export async function threadSample(
         !filter.depth_limit &&
         (filter.authors || (filter.ids && !filter["#h"])),
     );
+  // Rows and the status reads beside bylines' profile reads share coverage,
+  // so no open asks for an author's status twice.
+  const statusAuthors = new Set<string>();
+  const statusRead = (filter: ReadFilter | undefined) => {
+    if (!filter) return;
+    assert.deepEqual(filter.kinds, [30315]);
+    assert.deepEqual(filter["#d"], ["general"]);
+    assert.equal(filter.limit, filter.authors?.length);
+    assert.ok(filter.limit && filter.limit <= 100);
+    for (const id of filter.authors ?? []) {
+      assert.ok(!statusAuthors.has(id), "status read twice");
+      statusAuthors.add(id);
+    }
+  };
   let fixtureError: unknown;
   const server = createServer(async (request, response) => {
     try {
@@ -166,11 +180,13 @@ export async function threadSample(
         assert.deepEqual(first["#h"], ["a"]);
         assert.equal(first.limit, data.headRows.length);
         events = [...data.headRows, data.head];
+      } else if (first?.kinds?.includes(30623)) {
+        // The channel pin list: none here.
+        assert.deepEqual(first["#h"], ["a"]);
+        events = [];
       } else if (first?.kinds?.includes(30315)) {
         assert.equal(filters.length, 1);
-        assert.deepEqual(first["#d"], ["general"]);
-        assert.equal(first.limit, first.authors?.length);
-        assert.ok(first.limit && first.limit <= 100);
+        statusRead(first);
         events = [];
       } else if (first?.kinds?.includes(0)) {
         assert.equal(filters.length, 1);
@@ -303,7 +319,8 @@ export async function threadSample(
     await deadline(warmed.promise);
     const setupMs = performance.now() - setupStart;
     const setupRequests = requests.splice(0);
-    assert.equal(setupRequests.length, 3);
+    // Discovery, the head, and its author's profile and status.
+    assert.equal(setupRequests.length, 4);
     assert.ok(
       owner.session.profiling.snapshot().every((span) => span.outcome === "ok"),
       "setup still has pending work",
@@ -321,6 +338,7 @@ export async function threadSample(
 
     async function open(mode: "cold" | "warm") {
       owner.session.profiling.clear();
+      statusAuthors.clear();
       const start = performance.now();
       const cpu = process.cpuUsage();
       const mounted = mount(owner.session, "a", data.root.id);

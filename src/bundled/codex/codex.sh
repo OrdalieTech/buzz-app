@@ -268,16 +268,45 @@ login | review)
     printf '%s\n' "$workspace"
   fi
   ;;
-read-from)
-  # A session file from byte "$2", counting from 1, in base64; it fails
-  # saying so when the file is now shorter than what was read before.
-  set -o pipefail
-  size=$(wc -c <"$1") || exit 1
-  if [ "$size" -lt "$(($2 - 1))" ]; then
-    echo "$1 shrank" >&2
-    exit 3
+rollout-stat)
+  if [ "$(uname)" = Darwin ]; then
+    exec /usr/bin/stat -Lf '%z %d:%i %Fm %Fc' -- "$1"
   fi
-  tail -c "+$2" -- "$1" | base64
+  exec stat -Lc '%s %d:%i %y %z' -- "$1"
+  ;;
+read-window)
+  # Copy the snapshot prefix even when a working thread has appended since.
+  [ "$3" -gt 0 ] || exit 0
+  copy_range() {
+    tail -c "+$2" -- "$1" | head "$3" "$4"
+    codes=("${PIPESTATUS[@]}")
+    [ "${codes[1]}" -eq 0 ] || exit "${codes[1]}"
+    [ "${codes[0]}" -eq 0 ] || [ "${codes[0]}" -eq 141 ] || exit "${codes[0]}"
+  }
+  path=$1 start=$2 count=$3
+  end=$((start - 1 + count))
+  shift 3
+  if [ "${1:-}" = align ]; then
+    # Keep a clipped UTF-8 character out of the host decoder. Report the
+    # discarded byte count so an append resumes at the last complete line.
+    skipped=$(set -o pipefail; copy_range "$path" "$start" -n 1 | wc -c)
+    [ "$skipped" -le "$count" ] || skipped=$count
+    echo "$((skipped))" >&2
+    start=$((start + skipped))
+    count=$((count - skipped))
+    shift
+  fi
+  if [ "$count" -gt 0 ]; then
+    # The boundary probe owns the record containing its last byte.
+    if [ "${1:-}" = through-line ]; then
+      [ "$count" -le 1 ] || copy_range "$path" "$start" -c "$((count - 1))"
+      copy_range "$path" "$end" -n 1
+    else
+      copy_range "$path" "$start" -c "$count"
+    fi
+  fi
+  size=$(wc -c <"$path")
+  [ "$size" -ge "$end" ] || { echo "$path shrank" >&2; exit 3; }
   ;;
 *)
   echo "Unknown command: $command" >&2

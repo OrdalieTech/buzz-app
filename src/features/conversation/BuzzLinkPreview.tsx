@@ -19,7 +19,10 @@ import styles from "./LinkPreview.module.css";
 import { messagePreviewText } from "./message-preview-text";
 import { linkedMessage } from "./linked-message";
 import { avatarMedia } from "../../shared/avatar-source";
-import { sortParticipantNames } from "../identity-names/participant-order";
+import {
+  dmNamedParticipants,
+  sortParticipantNames,
+} from "../identity-names/participant-order";
 import { namedChannel, useChannelReference } from "./channel-reference";
 
 /** Why a message link's preview can't be shown. Surfaces that report a failed
@@ -159,7 +162,7 @@ function PreviewContent({
   const channelName =
     channel?.channelType === "dm" && channel.participants
       ? sortParticipantNames(
-          channel.participants.map((id) =>
+          dmNamedParticipants(channel.participants, profiles).map((id) =>
             identityName(
               id,
               profiles.get(id)?.name ?? id.slice(0, 10),

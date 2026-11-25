@@ -7,12 +7,21 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const stage = spawnSync(
-  process.execPath,
-  [join(root, "scripts/build-buzz-cli.mjs"), "--dev"],
-  { stdio: "inherit" },
+// CI stages the CLI and runs the complete workspace tests first. Standalone
+// invocation retains both build steps so local callers need no preparation.
+const prebuilt = process.argv.length === 3 && process.argv[2] === "--prebuilt";
+assert(
+  process.argv.length === 2 || prebuilt,
+  "Usage: test-buzz-cli.mjs [--prebuilt]",
 );
-if (stage.status !== 0) process.exit(stage.status ?? 1);
+if (!prebuilt) {
+  const stage = spawnSync(
+    process.execPath,
+    [join(root, "scripts/build-buzz-cli.mjs"), "--dev"],
+    { stdio: "inherit" },
+  );
+  if (stage.status !== 0) process.exit(stage.status ?? 1);
+}
 const binary = join(
   root,
   "src-tauri/resources/bin",
@@ -48,16 +57,15 @@ const invocations = [
   ...commands,
   ...options.flatMap((option) => [option, `${option}=contract-test`]),
 ];
-// Integration tests build the real executable with the workspace test feature
-// graph. CI's following test run reuses this build instead of compiling another
-// dependency graph with cargo build.
-const build = spawnSync(
-  "cargo",
-  ["test", "--workspace", "--locked", "--no-run"],
-  { cwd: root, stdio: "inherit" },
-);
-if (build.error) throw build.error;
-assert.equal(build.status, 0, "Could not build the desktop executable");
+if (!prebuilt) {
+  const build = spawnSync(
+    "cargo",
+    ["test", "--workspace", "--locked", "--no-run"],
+    { cwd: root, stdio: "inherit" },
+  );
+  if (build.error) throw build.error;
+  assert.equal(build.status, 0, "Could not build the desktop executable");
+}
 const desktop = resolve(
   root,
   process.env.CARGO_TARGET_DIR || "target",

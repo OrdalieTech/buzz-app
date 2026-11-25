@@ -343,12 +343,22 @@
     color: var(--text-subtle);
     font-size: var(--text-caption);
   }
-  .search-palette-group .navigation-section-heading[data-search-action] {
-    padding-inline: var(--space-2);
+  .search-peek-reranked {
+    flex: none;
+    color: var(--text-subtle);
   }
-  .navigation-section-heading[data-search-action] .buzz-button {
-    width: 100%;
-    justify-content: flex-start;
+  .search-palette-group .navigation-section-heading[data-search-cut] {
+    position: sticky;
+    /* Over the scroller's top padding, so no row shows above it. */
+    top: calc(-1 * var(--space-1));
+    z-index: 1;
+    background: var(--surface-panel);
+  }
+  /* A row the keyboard reveals stops below its pinned heading. */
+  .navigation-section-heading[data-search-cut]
+    + .navigation-section-rows
+    :is([data-search-result], .search-control-row) {
+    scroll-margin-top: var(--size-row);
   }
 
   /* virtua places each drawn row itself, outside the rows' flex gap, so

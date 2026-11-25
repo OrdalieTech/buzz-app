@@ -2,6 +2,10 @@ import { test, expect } from "./playwright-test.mjs";
 import react from "@vitejs/plugin-react";
 import { createServer } from "./vite-server.mjs";
 import { readFile } from "node:fs/promises";
+import { seedThreadPlacement } from "./thread-placement.mjs";
+
+// The fullscreen viewer: inline media reads in a sheet (inline-media.spec).
+test.beforeEach(({ context }) => seedThreadPlacement(context));
 
 function insideHistory(el) {
   const history = el.closest('[aria-label="Channel message history"]');

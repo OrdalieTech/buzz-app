@@ -247,7 +247,7 @@ const PAIRS = [
 /**
  * Tint surfaces and the coloured text that sits on them, as steps.
  *
- * DESIGN.md: "tint carries a meaning and takes coloured text". The accent tint
+ * A tint carries a meaning and takes coloured text. The accent tint
  * and its hover are both real surfaces — a chip at rest and a chip under the
  * cursor — and the hover is the harder one, which is where the gap was.
  */

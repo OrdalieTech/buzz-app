@@ -181,6 +181,9 @@ export function TextareaExamples() {
     placeholder="A place to explore and share ideas."
   />
 </Field>
+<Field label="Document title" labelVisibility="hidden">
+  <Textarea appearance="heading" rows={2} defaultValue="A title that can wrap" />
+</Field>
 <Field label="On a floating surface">
   <Textarea surface="panel" rows={3} placeholder="Describe what I should do" />
 </Field>
@@ -214,6 +217,13 @@ export function TextareaExamples() {
             appearance="outlined"
             rows={3}
             placeholder="Describe what I should do"
+          />
+        </Field>
+        <Field label="Document title" labelVisibility="hidden">
+          <Textarea
+            appearance="heading"
+            rows={2}
+            defaultValue="A title that can wrap"
           />
         </Field>
         <Field label="On a floating surface">
@@ -458,6 +468,14 @@ export function SelectExamples() {
           label="Filled workspace"
           variant="compact"
           appearance="inverted"
+          value={value}
+          onValueChange={setValue}
+          groups={workspaceGroups}
+        />
+        <Select
+          label="Subtle workspace"
+          variant="compact"
+          appearance="subtle"
           value={value}
           onValueChange={setValue}
           groups={workspaceGroups}

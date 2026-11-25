@@ -21,6 +21,16 @@ it("loads formatting into the existing editor and retains its meaning on save", 
 });
 
 it.each([
+  ["**outer __inner__ text**", "**outer inner text**"],
+  ["*outer _inner_ text*", "_outer inner text_"],
+  ["~~outer ~inner~ text~~", "~~outer inner text~~"],
+])("loads nested inline formatting: %s", (markdown, normalized) => {
+  expect(documentEditorMarkdown(documentEditorDraft(markdown))).toBe(
+    normalized,
+  );
+});
+
+it.each([
   ["-", "bullet_list"],
   ["- First\n-", "bullet_list"],
   ["1. First\n2.", "ordered_list"],

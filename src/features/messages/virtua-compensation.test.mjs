@@ -209,7 +209,7 @@ it("preserves absolute edge correction and RTL axis normalization", () => {
 });
 
 it.each(["MacIntel", "Linux x86_64"])(
-  "rounds fractional end corrections outward on %s, including RTL",
+  "passes fractional end corrections directly on %s, including RTL",
   (platform) => {
     for (const horizontal of [false, true]) {
       const c = setup({
@@ -223,7 +223,7 @@ it.each(["MacIntel", "Linux x86_64"])(
       expect(c.calls.at(-1)).toMatchObject({
         method: "scrollTo",
         options: {
-          [horizontal ? "left" : "top"]: horizontal ? -1501 : 1501,
+          [horizontal ? "left" : "top"]: horizontal ? -1500.75 : 1500.75,
           behavior: "instant",
         },
       });
@@ -232,7 +232,7 @@ it.each(["MacIntel", "Linux x86_64"])(
   },
 );
 
-it("rounds imperative end targets without rounding interior reading positions", async () => {
+it("passes imperative interior and end targets directly without rounding", async () => {
   const c = setup({ platform: "Linux x86_64", offset: 0 });
   c.store.h(
     3,
@@ -240,7 +240,7 @@ it("rounds imperative end targets without rounding interior reading positions", 
   );
   for (const [target, expected] of [
     [900.25, 900.25],
-    [1500.75, 1501],
+    [1500.75, 1500.75],
   ]) {
     await c.driver.ee(null, { offset: target });
     await vi.advanceTimersByTimeAsync(0);
@@ -334,8 +334,8 @@ it("takes the absolute path for an integer offset at a fractional end when rows 
   c.driver.te();
   expect(c.calls).toHaveLength(0);
   // Two rows above the viewport shrink by 80 in total. The browser's integer
-  // range ends at 1420; Virtua's fractional end is 1420.17, and the stale
-  // 1500 minus 80 falls 0.17 short of it.
+  // range ends at 1420; Virtua's fractional end is 1420.17, and r (1500) >= i
+  // (1420.17) already takes the absolute path to 1420 without a double shrink.
   c.viewport.max = 1420;
   c.store.h(3, [
     [1, 60],
@@ -345,12 +345,51 @@ it("takes the absolute path for an integer offset at a fractional end when rows 
   expect(c.calls).toEqual([
     {
       method: "scrollTo",
-      options: { top: 1421, behavior: "instant" },
+      options: { top: 1420, behavior: "instant" },
       overflow: "",
       priority: "",
     },
   ]);
   expect(c.viewport.scrollTop).toBe(1420); // not the clamp plus the shrink again
+  c.driver.R();
+});
+
+it("lands at exact top when total scroll range is 1px instead of overriding to the end", () => {
+  const c = setup({ platform: "Linux x86_64", offset: 40 });
+  // 20 * 100 - 1959 = 41px scroll range before the straddling top row shrinks.
+  c.store.h(4, 1959);
+  c.store.h(3, [[0, 60]]); // r = 40, t = -40 -> s = 0, i = 1
+  c.driver.te();
+  expect(c.calls).toEqual([
+    {
+      method: "scrollTo",
+      options: { top: 0, behavior: "instant" },
+      overflow: "",
+      priority: "",
+    },
+  ]);
+  expect(c.viewport.scrollTop).toBe(0);
+  c.driver.R();
+});
+
+it("keeps relative shrink compensation within 1px of the modeled end instead of snapping down", () => {
+  const c = setup({ platform: "Linux x86_64", offset: 1499.5 });
+  // Row 19 measures 100.4 so total height is 2000.4 (modeled end i = 1500.4).
+  c.store.h(3, [[19, 100.4]]);
+  c.driver.te();
+  expect(c.calls).toHaveLength(0);
+  // Row 0 above shrinks by 0.4: r = 1499.5, s = 1499.1, i = 1500 (s >= i - 1).
+  c.store.h(3, [[0, 99.6]]);
+  c.driver.te();
+  expect(c.calls).toHaveLength(1);
+  expect(c.calls[0]).toMatchObject({
+    method: "scrollBy",
+    overflow: "",
+    priority: "",
+    options: { behavior: "instant" },
+  });
+  expect(c.calls[0].options.top).toBeCloseTo(-0.4, 10);
+  expect(c.viewport.scrollTop).toBeCloseTo(1499.1, 10);
   c.driver.R();
 });
 

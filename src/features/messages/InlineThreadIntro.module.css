@@ -1,0 +1,64 @@
+.step {
+  margin: 0 0 var(--space-1);
+  color: var(--text-subtle);
+  text-transform: uppercase;
+}
+
+.next {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--space-3);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-standard);
+}
+
+.spotlight {
+  position: relative;
+  display: inline-flex;
+  border-radius: var(--radius-pill);
+}
+
+/* Step 1: the title sits on a soft accent pill, the tint of the viewer's own
+   messages (the accent affordance is neutral in several themes). */
+.spotlight[data-shape="pill"][data-active] {
+  margin: calc(-1 * var(--space-1)) calc(-1 * var(--space-2));
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-capsule);
+  background: var(--surface-message-own);
+}
+
+/* Step 2: a ring pulses around the pop-out button a few times, then stays. */
+.spotlight[data-shape="ring"][data-active]::after {
+  position: absolute;
+  inset: calc(-1 * var(--space-1));
+  border: 2px solid var(--border-accent);
+  border-radius: inherit;
+  content: "";
+  pointer-events: none;
+  animation: intro-spotlight 1.6s var(--ease-state) 3;
+}
+
+@keyframes intro-spotlight {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spotlight[data-shape="ring"][data-active]::after {
+    animation: none;
+  }
+}

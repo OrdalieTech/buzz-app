@@ -133,6 +133,7 @@ function setup({
   continuityKey = undefined as string | undefined,
   historyControl = "button" as "button" | "scroll",
   hasMore = false,
+  hasNewer = false,
   loadingOlder = false,
   historyLimited = false,
   error = undefined as string | undefined,
@@ -169,6 +170,12 @@ function setup({
     return frameId;
   });
   vi.stubGlobal("cancelAnimationFrame", (id: number) => frames.delete(id));
+  // Idle callbacks run with the frames.
+  vi.stubGlobal("requestIdleCallback", (callback: () => void) => {
+    frames.set(++frameId, callback);
+    return frameId;
+  });
+  vi.stubGlobal("cancelIdleCallback", (id: number) => frames.delete(id));
   const observers = new Map<() => void, Set<unknown>>();
   vi.stubGlobal(
     "ResizeObserver",
@@ -258,6 +265,7 @@ function setup({
     freshness,
     rows,
     hasMore,
+    ...(hasNewer ? { hasNewer } : {}),
     loadingOlder: loadingOlder || accepted,
     historyLimited,
     error,
@@ -268,10 +276,12 @@ function setup({
       olderReads();
     }
   });
+  const loadNewer = vi.fn();
+  const attach = vi.fn();
   let queries =
     session ??
     ({
-      channels: { loadOlder, window: snapshot },
+      channels: { loadOlder, loadNewer, attach, window: snapshot },
       profiles: {},
       agentChoices: createAgentLibrary(undefined).queries,
       // Geometry fixtures are read-only; reading behavior has its own boundary tests.
@@ -325,6 +335,7 @@ function setup({
         error,
         rows,
         hasMore,
+        ...(hasNewer ? { hasNewer } : {}),
         loadingOlder,
         historyLimited,
       },
@@ -342,12 +353,14 @@ function setup({
       });
     }
     key = scoped.key;
-    // The feed renders inside the list's message context menu host.
-    section = (
-      scoped.type as (
-        props: typeof scoped.props,
-      ) => ReactElement<{ children: Section }>
+    // The feed renders inside the list's message context menu host, before
+    // the trailing sheet.
+    const [menus] = (
+      scoped.type as (props: typeof scoped.props) => ReactElement<{
+        children: [ReactElement<{ children: Section }>, unknown];
+      }>
     )(scoped.props).props.children;
+    section = menus.props.children;
     section.props.ref.current = element;
     const edge = section.props.children[0] as ReactElement<{
       ref: { current: unknown };
@@ -398,6 +411,8 @@ function setup({
       return virtualizer.props.keepMounted;
     },
     loadOlder,
+    loadNewer,
+    attach,
     olderReads,
     flush,
     render,
@@ -421,6 +436,7 @@ function setup({
       if ("error" in patch) error = patch.error;
       if ("loadingOlder" in patch) loadingOlder = !!patch.loadingOlder;
       if ("hasMore" in patch) hasMore = !!patch.hasMore;
+      if ("hasNewer" in patch) hasNewer = !!patch.hasNewer;
       if ("historyLimited" in patch) historyLimited = !!patch.historyLimited;
       render();
     },
@@ -543,6 +559,17 @@ function setup({
       // The feed carries the same state for the composer-context edge.
       expect(section.props["data-jump-visible"]).toBe(visible || undefined);
       return visible;
+    },
+    /** The new-message count Jump to latest shows. */
+    jumpCount() {
+      const button = section.props.children.find(
+        (child) =>
+          !!child &&
+          typeof child === "object" &&
+          "type" in child &&
+          child.type === JumpToLatestButton,
+      ) as ReactElement<{ newMessageCount: number }> | undefined;
+      return button?.props.newMessageCount;
     },
     unmount() {
       for (const effect of hooks.effects) effect.cleanup?.();
@@ -685,12 +712,137 @@ it("reader input retires a pending jump so a live append cannot pull the reader 
   expect(h.hasJumpToLatest()).toBe(true);
   h.unmount();
 });
+it("a detached window's end is not followed, and Jump to latest attaches it", () => {
+  const h = setup({ hasNewer: true });
+  // The reader at the window's end reads the rows above it.
+  h.element.scrollTop = 3038;
+  h.scroll();
+  expect(h.loadNewer).toHaveBeenCalledExactlyOnceWith("channel");
+  h.handle.scrollToIndex.mockClear();
+  h.append();
+  h.render();
+  expect(h.handle.scrollToIndex).not.toHaveBeenCalled();
+  expect(h.hasJumpToLatest()).toBe(true);
+  // The rows read in are history, not new messages.
+  expect(h.jumpCount()).toBe(0);
+  h.jumpToLatest();
+  expect(h.attach).toHaveBeenCalledExactlyOnceWith("channel");
+  h.unmount();
+});
+it("a detached window reads newer rows only near its end", () => {
+  const h = setup({ hasNewer: true });
+  h.element.scrollHeight = 20_000;
+  h.element.scrollTop = 10_000;
+  h.scroll();
+  expect(h.loadNewer).not.toHaveBeenCalled();
+  h.element.scrollTop = 17_000;
+  h.scroll();
+  expect(h.loadNewer).toHaveBeenCalledExactlyOnceWith("channel");
+  h.unmount();
+});
 it("loads older rows at the current DOM threshold despite a stale far-away virtualizer offset", () => {
   const h = setup({ hasMore: true });
   h.handle.scrollOffset = 3300;
   h.scroll();
-  expect(h.loadOlder).toHaveBeenCalledExactlyOnceWith("channel");
+  expect(h.loadOlder).toHaveBeenCalledExactlyOnceWith(
+    "channel",
+    expect.any(Number),
+  );
   h.unmount();
+});
+it.each([
+  { height: 2000, rows: 34 },
+  { height: 4675, rows: 20 },
+  { height: 4676, rows: undefined },
+])(
+  "reads ahead for a reader settled at the bottom of $height px",
+  ({ height, rows }) => {
+    const h = setup({ hasMore: true });
+    // 40 rows of `height / 40` px, at the bottom of a 668px viewport.
+    Object.assign(h.element, { scrollHeight: height, scrollTop: height - 668 });
+    h.setRows(
+      Array.from({ length: 40 }, (_, i) => timelineMessage(`row ${i}`)),
+    );
+    // A first page sized to the prefetch distance until 6 screens (4008px)
+    // sit above the reader, then no more.
+    if (rows)
+      expect(h.loadOlder).toHaveBeenCalledExactlyOnceWith(
+        "channel",
+        rows,
+        true,
+      );
+    else expect(h.loadOlder).not.toHaveBeenCalled();
+    h.unmount();
+  },
+);
+it("sizes the older page to a fast upward scroll", () => {
+  const now = vi.spyOn(performance, "now").mockReturnValue(10_000);
+  try {
+    const h = setup({ hasMore: true });
+    // 400 rows of 100px.
+    h.setRows(
+      Array.from({ length: 400 }, (_, i) => timelineMessage(`row ${i}`)),
+    );
+    h.element.scrollHeight = 40_000;
+    h.element.scrollTop = 30_000;
+    h.dispatchScroll();
+    h.gesture(true);
+    h.element.scrollTop = 20_000;
+    h.dispatchScroll();
+    expect(h.loadOlder).not.toHaveBeenCalled();
+    // 18,000px upward in 100ms reaches the top within one round trip.
+    now.mockReturnValue(10_100);
+    h.element.scrollTop = 2000;
+    h.dispatchScroll();
+    expect(h.loadOlder).toHaveBeenCalledExactlyOnceWith("channel", 200);
+    h.unmount();
+  } finally {
+    now.mockRestore();
+  }
+});
+it("sizes the next older page to the last page's round trip", () => {
+  const now = vi.spyOn(performance, "now");
+  // After a page that took `ms` to land, the same scroll asks for `rows`.
+  const nextRead = (ms: number, rows: number) => {
+    now.mockReturnValue(10_000);
+    const h = setup({ hasMore: true });
+    // 400 rows of 100px; a slow reader near the top reads the base page.
+    h.setRows(
+      Array.from({ length: 400 }, (_, i) => timelineMessage(`row ${i}`)),
+    );
+    h.element.scrollHeight = 40_000;
+    h.element.scrollTop = 30_000;
+    h.dispatchScroll();
+    h.gesture(true);
+    h.element.scrollTop = 2000;
+    h.dispatchScroll();
+    expect(h.loadOlder).toHaveBeenLastCalledWith("channel", 20);
+    h.update({ loadingOlder: true });
+    now.mockReturnValue(10_000 + ms);
+    h.setRows(
+      Array.from({ length: 600 }, (_, i) => timelineMessage(`row ${i}`)),
+    );
+    h.element.scrollHeight = 60_000;
+    h.element.scrollTop = 22_000;
+    h.update({ loadingOlder: false });
+    // Then 1000px upward in 100ms.
+    now.mockReturnValue(20_000);
+    h.element.scrollTop = 4000;
+    h.dispatchScroll();
+    now.mockReturnValue(20_100);
+    h.element.scrollTop = 3000;
+    h.dispatchScroll();
+    expect(h.loadOlder).toHaveBeenCalledTimes(2);
+    expect(h.loadOlder).toHaveBeenLastCalledWith("channel", rows);
+    h.unmount();
+  };
+  try {
+    // Smoothed round trips of 260ms and 1000ms: 2 × 10px/ms of reach each.
+    nextRead(20, 74);
+    nextRead(1500, 200);
+  } finally {
+    now.mockRestore();
+  }
 });
 it("does not load older rows when only the old virtualizer position is inside the threshold", () => {
   const h = setup({ hasMore: true });
@@ -1011,7 +1163,10 @@ it("a user gesture at a restored top pages without needing a DOM scroll event", 
   h.element.scrollTop = 0;
   expect(h.loadOlder).not.toHaveBeenCalled();
   h.gesture();
-  expect(h.loadOlder).toHaveBeenCalledExactlyOnceWith("channel");
+  expect(h.loadOlder).toHaveBeenCalledExactlyOnceWith(
+    "channel",
+    expect.any(Number),
+  );
   h.unmount();
 });
 
@@ -1279,7 +1434,8 @@ it("rechecks current geometry before honoring the cached gesture", () => {
   const h = setup({ hasMore: true, freshness: "cached" });
   h.element.scrollTop = 0;
   h.gesture();
-  h.element.scrollTop = 4000;
+  // Past the read-ahead's reach as well as the paging boundary.
+  h.element.scrollTop = 9000;
   h.update({ freshness: "verified" });
   h.element.scrollTop = 0;
   h.update({ freshness: "verified" });
@@ -2098,7 +2254,10 @@ it("pages Solo chat history on scroll without an initial button and keeps error 
   const h = setup({ hasMore: true, historyControl: "scroll" });
   expect(h.hasHistoryButton()).toBe(false);
   h.scroll();
-  expect(h.loadOlder).toHaveBeenCalledExactlyOnceWith("channel");
+  expect(h.loadOlder).toHaveBeenCalledExactlyOnceWith(
+    "channel",
+    expect.any(Number),
+  );
   h.unmount();
   const failed = setup({
     hasMore: true,

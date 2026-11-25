@@ -92,12 +92,43 @@ export type PluginDialogProps = Readonly<{
   preventClose?: boolean | undefined;
 }>;
 
+export type PluginMenuItem = Readonly<{
+  /** Unique within the menu. Typeahead matches it. */
+  label: string;
+  /** Called with no arguments. The menu closes, so it can open a `Dialog`. */
+  onSelect: () => void;
+  /** Default `default`. `destructive` is for an item that deletes or discards. */
+  tone?: "default" | "destructive" | undefined;
+  disabled?: boolean | undefined;
+}>;
+
+/**
+ * An action menu on its own trigger. The host owns the popup above clipping
+ * containers, highlight, arrow keys, typeahead, Escape and focus return.
+ */
+export type PluginMenuProps = Readonly<
+  {
+    items: readonly PluginMenuItem[];
+    /** Shown before `label`, or alone. Default the host's More icon. */
+    icon?: ReactElement | undefined;
+    disabled?: boolean | undefined;
+    /** Default `start`. `end` lines the menu up with the trigger's end edge. */
+    align?: "start" | "end" | undefined;
+  } & (
+    | { label: string; "aria-label"?: string | undefined }
+    /** Without a visible `label`, the trigger is an icon button with this name and hint. */
+    | { label?: undefined; "aria-label": string }
+  )
+>;
+
 export type PluginUi = Readonly<{
   Button: (props: PluginButtonProps) => ReactElement;
   Input: (props: PluginInputProps) => ReactElement;
   Field: (props: PluginFieldProps) => ReactElement;
   Switch: (props: PluginSwitchProps) => ReactElement;
   Dialog: (props: PluginDialogProps) => ReactElement;
+  /** Absent on hosts from before it was added; fall back when it is missing. */
+  Menu?: ((props: PluginMenuProps) => ReactElement) | undefined;
 }>;
 
 declare module "@deepseek-ai/cordis" {

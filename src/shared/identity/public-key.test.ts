@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { noteEncode, npubEncode, nsecEncode } from "nostr-tools/nip19";
 import { hexToBytes } from "nostr-tools/utils";
 import {
+  abbreviatedPublicKey,
   canonicalPublicKey,
   formatPublicKey,
   publicKeyLabels,
@@ -32,6 +33,7 @@ describe("public-key display", () => {
     "npub1broken",
   ])("does not echo invalid input: %s", (input) => {
     expect(formatPublicKey(input)).toBeUndefined();
+    expect(abbreviatedPublicKey(input)).toBeUndefined();
     expect(publicKeyLabels([input]).size).toBe(0);
   });
 
@@ -39,6 +41,13 @@ describe("public-key display", () => {
     for (const length of [-1, 0, 2, NaN, Infinity, 3.5])
       expect(formatPublicKey(first, length)).toBe("npub…caj");
     expect(formatPublicKey(first, 999)).toMatch(/^npub…[a-z0-9]{58}$/);
+  });
+
+  it("abbreviates to the first and last ten npub characters around an ellipsis", () => {
+    expect(abbreviatedPublicKey(first)).toBe("npub142424…424qamrcaj");
+    expect(abbreviatedPublicKey(first.toUpperCase())).toBe(
+      "npub142424…424qamrcaj",
+    );
   });
 
   it("encodes each key once across repeated roster labels, within a bound", () => {

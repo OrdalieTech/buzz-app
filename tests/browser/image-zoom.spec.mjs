@@ -2,6 +2,10 @@ import { test, expect } from "./playwright-test.mjs";
 import react from "@vitejs/plugin-react";
 import { crc32, deflateSync } from "node:zlib";
 import { createServer } from "./vite-server.mjs";
+import { seedThreadPlacement } from "./thread-placement.mjs";
+
+// The fullscreen viewer: inline media reads in a sheet (inline-media.spec).
+test.beforeEach(({ context }) => seedThreadPlacement(context));
 
 // Solid raster PNGs: native builds download SVG attachments instead of
 // rendering them, so the viewer must be exercised with a supported format.

@@ -223,7 +223,10 @@ export const signedEventBytes = (event: RelayEvent) =>
  * stand in for it. */
 export type SnapshotRead = (
   filters: readonly ReadFilter[],
-  options: { signal?: AbortSignal | undefined },
+  options: {
+    signal?: AbortSignal | undefined;
+    priority?: "foreground" | "background";
+  },
 ) => Promise<readonly RelayEvent[]>;
 
 /** The explicit current-heads query. The relay's artifact parser takes only

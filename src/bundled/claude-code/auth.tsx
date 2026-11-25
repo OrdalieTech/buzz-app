@@ -14,6 +14,7 @@ import { type ComponentType, type ReactNode, useEffect, useState } from "react";
 import { ClaudeSettings, type ClaudeConnection } from "./ClaudeSettings";
 import { ApiKeyForm } from "../../features/settings/ApiKeyForm";
 import inlineStyles from "../../shared/InlineReference.module.css";
+import { deviceEnvNames, ownEnvNames } from "../agents/agent-env";
 import { ENV, type Spawn } from "./claude";
 import { PROCESS_LIMIT } from "./sessions";
 import type { ClaudeSetup } from "./setup";
@@ -115,6 +116,10 @@ const nativeStore = ():
  * friction can put it first. */
 export const leadsHarnesses = false;
 
+/** Why a new protected Claude agent can't be made yet. */
+export const PROTECTED_NEEDS =
+  "Protected Claude agents need your own Claude sign-in or a saved API key. Keys on the device list don't count.";
+
 /** Claude's credentials on this computer. */
 export class ClaudeAuth {
   /** Which way this build authenticates. */
@@ -172,8 +177,14 @@ export class ClaudeAuth {
   /** Whether a key was saved, as last asked: protected launches use it even
    * beside the person's own setup. */
   private keySaved = false;
+  /** Whether `owned` is the latest probe's answer, not one before a probe
+   * that failed. */
+  private ownCurrent = false;
+  /** Whether `keySaved` is an answer yet, not its starting value. */
+  private keyKnown = false;
 
-  private has() {
+  /** Whether a key is saved: the only key reviews run with. */
+  has() {
     const store = this.store;
     if (!store) return Promise.resolve(false);
     if (this.saved) return this.saved;
@@ -185,6 +196,7 @@ export class ClaudeAuth {
     };
     asking.then((saved) => {
       this.keySaved = saved;
+      this.keyKnown = true;
       if (!saved) forget();
     }, forget);
     return asking;
@@ -210,12 +222,18 @@ export class ClaudeAuth {
         if (this.own === asking) {
           const changed = this.owned !== undefined && this.owned !== !!own;
           this.owned = !!own;
+          this.ownCurrent = true;
           if (changed) for (const listener of this.listeners) listener();
         }
         return own;
       },
       (error: unknown) => {
-        if (this.own === asking) this.own = undefined;
+        if (this.own === asking) {
+          this.own = undefined;
+          // `owned` keeps the last answer for ordinary agents, but it is no
+          // longer current, so it can't admit a protected one.
+          this.ownCurrent = false;
+        }
         // A full host is not a missing setup: the turn makes room and asks
         // again.
         if (error === PROCESS_LIMIT) throw error;
@@ -233,13 +251,48 @@ export class ClaudeAuth {
   }
 
   /** Whether Claude can run turns: an account to show, or undefined. The
-   * person's own setup comes first, so a saved key never overrides it. */
+   * person's own setup comes first, so a key never overrides it; then the
+   * saved key, or the device list's, which ordinary agents start with. */
   async check(): Promise<Connection | undefined> {
     this.saved = undefined;
     this.own = undefined;
     const own = await this.settled();
     if (own) return own;
-    return (await this.has()) ? {} : undefined;
+    // Asked together, so the device list adds no wait to the check.
+    const [key, device] = await Promise.all([this.has(), deviceSetsKey()]);
+    return key || device ? {} : undefined;
+  }
+
+  /** Whether a protected agent can run, as last sampled: the person's own
+   * setup or a saved key. Protected launches never get the device list, so
+   * it never counts. Undefined while either answer is unknown. */
+  get protectedEligible(): boolean | undefined {
+    if (this.keyKnown && this.keySaved) return true;
+    if (!this.ownCurrent) return undefined;
+    if (this.owned) return true;
+    return this.keyKnown ? false : undefined;
+  }
+
+  /** `protectedEligible`, asked only for answers not yet sampled, so it
+   * never starts a check over. */
+  async protectedReady() {
+    const known = this.protectedEligible;
+    if (known !== undefined) return known;
+    const quiet = () => undefined;
+    let asking = this.connection();
+    await Promise.all([asking.catch(quiet), this.has()]);
+    // A newer check under way replaced that probe: its answer is the current one.
+    while (this.own && this.own !== asking) {
+      asking = this.own;
+      await asking.catch(quiet);
+    }
+    // The current answer, never an older probe's: one a newer check replaced
+    // may have answered yes after the newer one failed.
+    const current = this.protectedEligible;
+    // An answer Claude couldn't give is unknown, never a no.
+    if (current === undefined)
+      throw new Error("Claude couldn't say whether it is set up");
+    return current;
   }
 
   /** What Settings needs, asked again: whether the person has a setup of
@@ -262,6 +315,7 @@ export class ClaudeAuth {
     try {
       await store.save(key);
       this.keySaved = true;
+      this.keyKnown = true;
     } finally {
       // A refused save leaves the key as it was; anything else may not.
       this.saved = undefined;
@@ -278,6 +332,7 @@ export class ClaudeAuth {
     try {
       await store.clear();
       this.keySaved = false;
+      this.keyKnown = true;
     } finally {
       this.saved = undefined;
     }
@@ -306,7 +361,8 @@ export class ClaudeAuth {
         (!args.includes("--setting-sources") || !(await this.has()));
       if (ownSetupUsable && (await this.connection()))
         return spawn(id, options);
-      if (required && !(await this.has())) throw new Error(NO_KEY);
+      if (required && !(await this.has()) && !(await agentSetsKey(options)))
+        throw new Error(NO_KEY);
       return spawn(id, {
         ...options,
         secrets: [...(options?.secrets ?? []), "anthropic-api-key"],
@@ -349,6 +405,21 @@ export class ClaudeAuth {
       : error;
   }
 }
+
+/** Whether the device's variables set an Anthropic API key. */
+const deviceSetsKey = async () =>
+  !!(await deviceEnvNames())?.includes("ANTHROPIC_API_KEY");
+
+/** Whether the device's variables or the local agent's own set an Anthropic
+ * API key, which native code gives its `claude` in place of the saved one. */
+const agentSetsKey = async (options: Parameters<Spawn>[1]) =>
+  !!options?.secrets?.includes("agent-env") &&
+  (
+    await Promise.all([
+      deviceEnvNames(),
+      ...(options.envAgent ? [ownEnvNames(options.envAgent)] : []),
+    ])
+  ).some((names) => names?.includes("ANTHROPIC_API_KEY"));
 
 /** Whether a turn's error is Buzz's own refusal to start Claude without a
  * key, rather than anything Claude said. */

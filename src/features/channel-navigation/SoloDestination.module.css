@@ -27,21 +27,27 @@
   [data-context-menu-present],
   :has(:focus-visible),
   :has([aria-expanded="true"][aria-haspopup="menu"])
-):not(:has([aria-current="page"]))::before {
+):not(:has([aria-current="page"], [data-spring-loaded="on"]))::before {
   background: var(--affordance-panel-hover);
 }
-.menu:has([aria-current="page"])::before {
+/* A spring-loaded file drag selects the row until it opens or blinks off. */
+.menu:has([aria-current="page"], [data-spring-loaded="on"])::before {
   background: var(--surface-sidebar-selected);
+}
+/* Inside a card there is no row fill, so the button keeps the drag's fill. */
+.menu:not([data-navigation-card] *) [data-spring-loaded] {
+  background-color: transparent;
 }
 [data-navigation-card] .menu::before {
   display: none;
 }
 
-/* Menu activity reveals the overflow menu and swaps the source's Reveal content. */
+/* The source places the action and keeps its own Reveal content. */
 .menu [data-solo-row-action] {
   width: var(--session-action-size);
   height: var(--session-action-size);
   margin: 0;
+  pointer-events: auto;
 }
 .active {
   opacity: 0;
@@ -49,6 +55,11 @@
 @media (hover: hover) {
   .menu [data-solo-row-action] {
     opacity: 0;
+  }
+  .menu [data-solo-row-action]:is(:hover, [aria-expanded="true"]),
+  .menu:is([data-context-menu-present], :has(:focus-visible))
+    [data-solo-row-action] {
+    opacity: 1;
   }
 }
 .menu:is(
@@ -60,8 +71,7 @@
   .rest {
     opacity: 0;
   }
-  .active,
-  [data-solo-row-action] {
+  .active {
     opacity: 1;
   }
 }
@@ -74,4 +84,55 @@
 }
 [data-solo-disclosure][aria-expanded="false"] svg {
   transform: rotate(-90deg);
+}
+
+.leading {
+  position: relative;
+  z-index: 1;
+  display: inline-grid;
+  grid-auto-flow: column;
+  flex: none;
+  margin-inline-start: var(--space-1);
+}
+
+.leading > button {
+  justify-content: center;
+  inline-size: var(--space-6);
+  block-size: var(--space-6);
+}
+
+/* The pointer reaches the caret as it appears. Keep the caret visible when a
+   move restores focus to it with the pointer outside the heading. */
+@media (hover: hover) and (pointer: fine) {
+  .leading > button {
+    grid-area: 1 / 1;
+  }
+
+  .leading > [data-solo-leading-action] {
+    pointer-events: none;
+  }
+
+  .leading > [data-solo-disclosure] {
+    opacity: 0;
+  }
+
+  .leading:has(> [data-solo-leading-action]:focus-visible) {
+    > [data-solo-leading-action] {
+      pointer-events: auto;
+    }
+    > [data-solo-disclosure] {
+      pointer-events: none;
+    }
+  }
+
+  .leading:has(> [data-solo-disclosure]:focus),
+  [class~="navigation-section-heading"]:is(:hover, :has(:focus-visible))
+    .leading:not(:has(> [data-solo-leading-action]:focus-visible)) {
+    > [data-solo-leading-action] {
+      opacity: 0;
+    }
+    > [data-solo-disclosure] {
+      opacity: 1;
+    }
+  }
 }

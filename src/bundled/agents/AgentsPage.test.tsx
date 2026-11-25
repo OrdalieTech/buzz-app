@@ -181,6 +181,7 @@ function setup(
     status = "ready" as AgentsSnapshot["status"],
     more = [] as RegisteredAgentType[],
     dirtySettings = false,
+    busyRun = undefined as (() => Promise<void>) | undefined,
     found = portable as readonly PortableAgent[],
     warnings = [] as readonly string[],
     discover = async (): Promise<FoundAgents> => ({
@@ -250,16 +251,49 @@ function setup(
       <p>Provider settings</p>
     );
   };
-  const tabs = dirtySettings
+  // Runs work as Restart agent does, holding the panel while it runs.
+  const BusySettings = () => {
+    const [running, setRunning] = useState(false);
+    const [error, setError] = useState("");
+    useAgentSaveState(false, running);
+    return (
+      <>
+        {error && <p role="alert">{error}</p>}
+        <button
+          type="button"
+          disabled={running}
+          onClick={() => {
+            setError("");
+            setRunning(true);
+            busyRun?.()
+              .catch((reason: unknown) => setError(String(reason)))
+              .finally(() => setRunning(false));
+          }}
+        >
+          Run
+        </button>
+      </>
+    );
+  };
+  const tabs = busyRun
     ? [
         {
           id: "settings",
           title: "Settings",
           role: "settings" as const,
-          component: DirtySettings,
+          component: BusySettings,
         },
       ]
-    : [{ id: "reply", title: "Reply", component: () => <p>Reply tab</p> }];
+    : dirtySettings
+      ? [
+          {
+            id: "settings",
+            title: "Settings",
+            role: "settings" as const,
+            component: DirtySettings,
+          },
+        ]
+      : [{ id: "reply", title: "Reply", component: () => <p>Reply tab</p> }];
   const type = {
     key: "test/echo",
     pluginId: "test",
@@ -393,6 +427,8 @@ function setup(
     conversationFolder: () => undefined,
     setConversationInstructions: vi.fn(async () => {}),
     conversationInstructions: async () => undefined,
+    setConversationSections: vi.fn(async () => {}),
+    conversationSections: async () => undefined,
     note: () => false,
     classifier: () => "unavailable",
     saveTeam: vi.fn(async (change: TeamChange) => {
@@ -489,11 +525,14 @@ function setup(
     registerTab: () => {},
     controlAttention: () => {},
     recommend: () => {},
+    gatewayHarnesses: () => {},
+    registerModelRouter: () => {},
     registerSessionRouter: () => {},
     registerExecution: () => {},
     bindExecution: async () => {},
     executionBinding: () => undefined,
     inspectExecution: async () => undefined,
+    startsProtected: async () => false,
     execution: async () => undefined,
     harness: {} as Agents["harness"],
     subscribeSteps: () => () => {},
@@ -502,6 +541,8 @@ function setup(
     switchable: () => false,
     switchableAgents: () => [],
     switchToAutomatic: async () => ({ previous: {} }),
+    restartAgent: async () => {},
+    reserveVoice: () => () => {},
     restoreSettings: async () => {},
     readNote: () => undefined,
     setNote: async () => {},
@@ -5153,6 +5194,68 @@ it("leaves an agent a link opened while an unfinished agent's Delete was finishi
     "aria-selected",
     "true",
   );
+});
+
+it("leaves a running save or restart open when another agent is visited, so its error stays", async () => {
+  const user = userEvent.setup();
+  const ada = agent("Ada", 1);
+  const bo = agent("Bo", 2);
+  let fail!: (reason: string) => void;
+  const busyRun = vi
+    .fn<() => Promise<void>>()
+    .mockImplementationOnce(
+      () => new Promise<void>((_, reject) => (fail = reject)),
+    )
+    .mockResolvedValue(undefined);
+  const { agents, relay, rerender } = setup([ada, bo], { busyRun });
+  await user.click(
+    within(screen.getByRole("grid", { name: "Agents" })).getByText("Ada"),
+  );
+  await user.click(screen.getByRole("button", { name: "Run" }));
+
+  const target = {
+    version: 1,
+    kind: "page",
+    pluginId: "buzz.agents",
+    pageId: "agents",
+    scope: null,
+    route: { version: 1, params: { agent: bo.pubkey } },
+  } as const;
+  const navigator = {
+    snapshot: () => ({ entry: { id: "bo", target } }),
+    open: vi.fn(async () => ({ status: "opened" as const })),
+  } as unknown as Navigation;
+  const navigation: PageNavigation = {
+    entryId: "bo",
+    target,
+    signal: new AbortController().signal,
+    focus: "content",
+    position: () => undefined,
+    savePosition() {},
+    passThrough: () => () => {},
+    forSession: () => navigation,
+    resolve: () => true,
+    complete: () => true,
+  };
+  const page = (
+    <AgentsPage
+      agents={agents}
+      relay={relay}
+      navigator={navigator}
+      navigation={navigation}
+    />
+  );
+  try {
+    rerender(page);
+    expect(screen.getByRole("heading", { name: "Ada" })).toBeInTheDocument();
+  } finally {
+    await act(async () => fail("Restart failed"));
+  }
+  expect(await screen.findByRole("alert")).toHaveTextContent("Restart failed");
+  expect(screen.getByRole("heading", { name: "Ada" })).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Run" }));
+  expect(busyRun).toHaveBeenCalledTimes(2);
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
 });
 
 it("keeps a draft open behind Import without asking, and deleting the open agent closes it without asking", async () => {

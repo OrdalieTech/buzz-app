@@ -1,9 +1,12 @@
+import { viewerMember } from "../relay/membership";
 import {
   BellIcon,
   BellSlashIcon,
   EnvelopeIcon,
   EnvelopeOpenIcon,
   PencilSimpleIcon,
+  PinIcon,
+  PinOffIcon,
   TrashIcon,
 } from "../../shared/design-system/icons";
 import {
@@ -29,7 +32,10 @@ import type { RelaySession } from "../relay/session";
 import type { MessageAttention } from "../relay/unread";
 import type { AgentOwnerAuthorization } from "../relay/messages";
 import type { OutgoingEvent } from "../relay/outbox";
+import { PIN_KIND, refusedPinCommand, UNPIN_KIND } from "../relay/pins";
+import { RefusedPin } from "./RefusedPin";
 import { followUpQueue } from "./follow-up-queue";
+import { usePinnedMessages } from "./use-pins";
 import { MessageEditScope, useMessageEditScope } from "./MessageEditScope";
 import { useAfterMessageMenuClose } from "./MessageActionBar";
 import { lastEditableMessage, useCloseAfterPaint } from "./useMessageEdit";
@@ -265,7 +271,7 @@ export function MessageManagement({
       channel &&
       !channel.cached &&
       session.viewer &&
-      channel.members?.includes(session.viewer)
+      viewerMember(channel, session.viewer)
         ? channel.id
         : undefined,
   );
@@ -592,6 +598,12 @@ function ManagedMessageItems({
     row.channelId,
     (channel) => !!channel && !channel.readOnly && !channel.cached,
   );
+  // A Solo chat has one person, so it offers no pins.
+  const solo = useListedChannel(
+    session.channels,
+    row.channelId,
+    (channel) => channel?.channelType === "solo",
+  );
   const threadRootId = row.threadRootId ?? row.id;
   const following = useSyncExternalStore(session.unread.subscribeSync, () =>
     session.unread.following(row.channelId, threadRootId),
@@ -602,6 +614,13 @@ function ManagedMessageItems({
       ? row.authorId
       : undefined,
   );
+  const canPin =
+    !!management &&
+    writable &&
+    !archived &&
+    !solo &&
+    !!session.outbox?.supports(PIN_KIND);
+  const pins = usePinnedMessages(session, canPin ? row.channelId : undefined);
   if (!management) return null;
   const busy = management.operations.some(
     (item) =>
@@ -625,6 +644,39 @@ function ManagedMessageItems({
     afterClose ? afterClose(action) : action();
   return (
     <>
+      {canPin && pins.status === "ready" && (
+        <MenuItem
+          disabled={management.operations.some(
+            (item) =>
+              ["sending", "accepted"].includes(item.delivery) &&
+              [PIN_KIND, UNPIN_KIND].includes(item.event.kind) &&
+              item.event.tags.some(
+                ([name, id]) => name === "e" && id === row.id,
+              ),
+          )}
+          onClick={() => {
+            management.report(undefined);
+            try {
+              session.messages.pin(
+                row.channelId,
+                row.id,
+                !pins.set.has(row.id),
+              );
+            } catch (cause) {
+              management.report(
+                cause instanceof Error
+                  ? cause.message
+                  : "Could not update the pin. Try again.",
+              );
+            }
+          }}
+        >
+          <MenuIcon>
+            {pins.set.has(row.id) ? <PinOffIcon /> : <PinIcon />}
+          </MenuIcon>
+          {`${pins.set.has(row.id) ? "Unpin from" : "Pin to"} ${dm ? "DM" : "channel"}`}
+        </MenuItem>
+      )}
       {canEdit && (
         <MenuItem
           disabled={
@@ -840,6 +892,8 @@ export function MessageManagementStatus() {
   const pending = operations.filter(
     (item) =>
       (item.event.kind === 40003 ||
+        item.event.kind === PIN_KIND ||
+        item.event.kind === UNPIN_KIND ||
         (item.event.kind === 5 &&
           item.event.tags.some(
             ([name, kind]) =>
@@ -857,17 +911,31 @@ export function MessageManagementStatus() {
           role="status"
         >
           <p>
-            {item.event.kind === 40003 ? "Message edit" : "Message deletion"}:{" "}
-            {item.error ?? "Delivery could not be confirmed."}
+            {item.event.kind === 40003
+              ? "Message edit"
+              : item.event.kind === PIN_KIND
+                ? "Pin"
+                : item.event.kind === UNPIN_KIND
+                  ? "Unpin"
+                  : "Message deletion"}
+            : {item.error ?? "Delivery could not be confirmed."}
           </p>
           {item.event.kind === 40003 && <p>{item.event.content}</p>}
-          {item.delivery === "unknown" && (
+          {refusedPinCommand(item) ? (
             <p>
-              This may already have reached the conversation. Retry sends the
-              same operation; dismissing does not undo it.
+              <RefusedPin source={session} item={item} />
             </p>
+          ) : (
+            <>
+              {item.delivery === "unknown" && (
+                <p>
+                  This may already have reached the conversation. Retry sends
+                  the same operation; dismissing does not undo it.
+                </p>
+              )}
+              <RetryMessageUpdate session={session} event={item.event} />
+            </>
           )}
-          <RetryMessageUpdate session={session} event={item.event} />
           <Button
             onClick={async () => {
               try {

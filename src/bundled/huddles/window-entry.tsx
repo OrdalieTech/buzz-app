@@ -10,9 +10,13 @@ import type { HuddleAction, HuddleView } from "../../features/huddle/window";
 import { HuddleWindowView } from "./HuddleWindowView";
 import { useKeyboardFocusVisibility } from "../../shared/design-system/useKeyboardFocusVisibility";
 import { clearReactDevMeasures } from "../../features/developer/react-dev-timing";
+import { savedDownloadsFromChannel } from "../../features/messages/native-download";
 
 // React dev builds otherwise fill the User Timing buffer without limit.
 if (import.meta.env.DEV) clearReactDevMeasures();
+
+// This window may not listen for host events; its watch channel reports them.
+const savedDownloadsChanged = savedDownloadsFromChannel();
 
 function Companion() {
   useKeyboardFocusVisibility();
@@ -20,9 +24,13 @@ function Companion() {
   const [error, setError] = useState<string>();
   useEffect(() => {
     let mounted = true;
-    const updates = new Channel<HuddleView & { discussionOpen: boolean }>();
-    updates.onmessage = (next) => {
+    const updates = new Channel<
+      { view: HuddleView & { discussionOpen: boolean } } | "savedDownloads"
+    >();
+    updates.onmessage = (update) => {
       if (!mounted) return;
+      if (update === "savedDownloads") return savedDownloadsChanged();
+      const next = update.view;
       document.documentElement.classList.toggle("dark", next.dark);
       setView((previous) => ({
         ...next,

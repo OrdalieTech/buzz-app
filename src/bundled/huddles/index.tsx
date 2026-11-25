@@ -106,6 +106,8 @@ export const apply: PluginModule["apply"] = (ctx) => {
   ctx.panels.register({
     id: "huddles",
     title: "Huddles",
+    // A live call: it stays a tab until it survives a dialog closing.
+    inline: false,
     matches: (target) => !!parseHuddleTarget(target),
     toolbar: () => (
       <HuddleCapsule

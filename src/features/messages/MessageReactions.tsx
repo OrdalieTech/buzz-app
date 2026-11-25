@@ -11,6 +11,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { SmileyIcon } from "../../shared/design-system/icons";
+import { useReadyImage } from "../../shared/design-system/useReadyImage";
 import { Button } from "../../shared/design-system/ui/Button";
 import { PreviewCard } from "../../shared/design-system/ui/PreviewCard";
 import { ReactionDelivery, ReactionTool } from "../conversation/ReactionTool";
@@ -66,18 +67,19 @@ function useReactionAction({ row, session, disabled }: Props) {
     ["sending", "failed", "unknown"].includes(item.delivery) &&
     session.messages.reactionTarget(item.event) === row.id;
   const busy = operations.some(blocksToggle);
+  const mine = (content: string, emoji?: CustomEmoji) =>
+    row.reactions
+      .find(
+        (reaction) =>
+          reaction.content === content && reaction.emoji?.url === emoji?.url,
+      )
+      ?.events.filter((event) => event.authorId === session.viewer) ?? [];
   const toggle = (content: string, emoji?: CustomEmoji) => {
     if (!active.current || session.outbox?.snapshot().some(blocksToggle))
       return false;
     try {
-      const group = row.reactions.find(
-        (reaction) =>
-          reaction.content === content && reaction.emoji?.url === emoji?.url,
-      );
-      const mine =
-        group?.events.filter((event) => event.authorId === session.viewer) ??
-        [];
-      if (mine.length) session.messages.remove(mine.map((event) => event.id));
+      const own = mine(content, emoji);
+      if (own.length) session.messages.remove(own.map((event) => event.id));
       else {
         session.messages.react(row.id, content, emoji);
       }
@@ -92,7 +94,7 @@ function useReactionAction({ row, session, disabled }: Props) {
       return false;
     }
   };
-  return { toggle, disabled: disabled || busy, busy, error };
+  return { toggle, mine, disabled: disabled || busy, busy, error };
 }
 
 /** The emoji contribution owns the single reaction-picker action. */
@@ -106,6 +108,8 @@ export function MessageReactionControls(props: Props) {
   const action = useReactionAction(props);
   const select = (content: string) =>
     action.toggle(content, catalogEmoji(catalog.entries, content));
+  const reacted = (content: string) =>
+    action.mine(content, catalogEmoji(catalog.entries, content)).length > 0;
   return (
     <>
       <ReactionTool
@@ -115,6 +119,7 @@ export function MessageReactionControls(props: Props) {
         messageId={row.id}
         disabled={action.disabled}
         select={select}
+        reacted={reacted}
         showDelivery={false}
       />
       {action.error && <span role="alert">{action.error}</span>}
@@ -131,17 +136,40 @@ function ReactionGlyph({
 }) {
   const emoji = useReactionEmoji(reaction, session);
   const source = emoji ? session.media(emoji.url) : undefined;
-  const [failed, setFailed] = useState<string>();
-  if (source && source !== failed)
-    return (
-      <img
-        className={styles.reactionCustomEmoji}
-        src={source}
-        alt=""
-        draggable={false}
-        onError={() => setFailed(source)}
-      />
-    );
+  return source ? (
+    <ReactionImage key={source} source={source} reaction={reaction} />
+  ) : (
+    <ReactionText reaction={reaction} />
+  );
+}
+
+function ReactionImage({
+  source,
+  reaction,
+}: {
+  source: string;
+  reaction: MessageReaction;
+}) {
+  const { status, failing, image } = useReadyImage(source, "eager");
+  // A source that failed keeps the placeholder until a retry loads.
+  const placeholder = failing && status !== "loaded";
+  return (
+    <>
+      {placeholder && <ReactionText reaction={reaction} />}
+      {status !== "failed" && (
+        <img
+          {...image}
+          className={styles.reactionCustomEmoji}
+          alt=""
+          draggable={false}
+          hidden={placeholder}
+        />
+      )}
+    </>
+  );
+}
+
+function ReactionText({ reaction }: { reaction: MessageReaction }) {
   // A shortcode is never a reaction's visible content: refused, failed and
   // unknown images get a neutral glyph, and the shortcode stays in the label.
   if (isReactionShortcode(reaction.content))
@@ -457,6 +485,8 @@ export function MessageReactions(
   const select = (content: string) => {
     return action.toggle(content, catalogEmoji(catalog.entries, content));
   };
+  const reacted = (content: string) =>
+    action.mine(content, catalogEmoji(catalog.entries, content)).length > 0;
   // Count people, not duplicate events. Each emoji shares one control and preview.
   const reactions = useMemo(
     () =>
@@ -560,6 +590,7 @@ export function MessageReactions(
               messageId={row.id}
               disabled={action.disabled}
               select={select}
+              reacted={reacted}
               showDelivery={false}
             />
           </span>

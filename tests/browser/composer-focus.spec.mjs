@@ -1,6 +1,6 @@
 import { openChannelDetails } from "./channel-details.mjs";
 import { test, expect } from "./fixture.mjs";
-import { openPage } from "./navigation.mjs";
+import { clickSidebarHeadingAction, openPage } from "./navigation.mjs";
 import { open } from "./timeline.mjs";
 import { createHash } from "node:crypto";
 
@@ -328,10 +328,11 @@ test.describe("text field focus appearance", () => {
       await page.setViewportSize({ width: 1440, height: 950 });
 
       // The same shared recipe must reach ordinary fields, not just composers.
-      await page
-        .locator('[data-sidebar-section="channels"]')
-        .getByRole("button", { name: "Create channel", exact: true })
-        .click();
+      await clickSidebarHeadingAction(
+        page
+          .locator('[data-sidebar-section="channels"]')
+          .getByRole("button", { name: "Create channel", exact: true }),
+      );
       const dialog = page.getByRole("dialog");
       const name = dialog.getByRole("textbox", { name: "Name", exact: true });
       const description = dialog.getByRole("textbox", {

@@ -78,7 +78,7 @@ export type SessionsOptions = Readonly<{
   room?(): Promise<boolean>;
   strictResume?: boolean;
   /** Where a new conversation looks for a process already started. */
-  spare?: Spare;
+  spare?: Pick<Spare, "take">;
   store: SessionStore;
   /** How to start a process with the agent's current settings, for the
    * conversation `key` when given. */
@@ -86,11 +86,19 @@ export type SessionsOptions = Readonly<{
   /** Changes when a setting that a running process fixed has changed, for the
    * conversation `key` when given. */
   fingerprint(key?: string): string;
+  /** Changes when the base prompt's sections for the conversation `key`
+   * change. A plugin can change them at any time, so a process with
+   * background work stops for them only for a new turn, which must run on
+   * them. */
+  sections?(key?: string): string;
   now?(): number;
   newId?(): string;
   /** Told of each new session, never a resumed one, with the prompt it was
    * started with, and the label of the one-off turn it was started for. */
   started?(sessionId: string, systemPrompt: string, once?: string): void;
+  /** Told of each session a new process resumes, with the prompt it now
+   * runs on. */
+  resumed?(sessionId: string, systemPrompt: string): void;
   /** Called when a conversation's process starts, is sent a message, or
    * stops. */
   onChange?(): void;
@@ -102,6 +110,10 @@ type DeliveryOptions = Readonly<{
   refresh?: (fresh?: boolean) => Promise<string>;
   fresh?: () => Promise<string>;
   pick?: TurnPick;
+  /** Chooses `pick` for a turn this message starts, asked once a process
+   * would take it as a new turn (`Delivery.route`); a steer asks nothing.
+   * Undefined sends nothing. */
+  route?: () => Promise<TurnPick | undefined>;
   /** The thread whose history was supplied to a shared channel session. */
   contextRoot?: string;
   /** Rejects a turn the current settings can't start, asked after every
@@ -127,6 +139,7 @@ type Live = {
   process: ClaudeProcess;
   submitted?: boolean;
   fingerprint: string;
+  sections?: string | undefined;
   used: number;
   timer?: ReturnType<typeof setTimeout>;
   /** The binding its latest attributed turn ran with. */
@@ -353,6 +366,7 @@ export class AgentSessions {
       refresh,
       fresh,
       pick = {},
+      route,
       contextRoot,
       admit,
       attribute,
@@ -373,12 +387,7 @@ export class AgentSessions {
       if (opening) await opening;
       if (current && !current()) return { ok: true, undelivered: true };
       let live = this.live.get(key);
-      if (
-        live &&
-        (!live.process.running ||
-          (live.fingerprint !== this.options.fingerprint(key) &&
-            !live.process.busy))
-      ) {
+      if (live && (!live.process.running || this.stale(key, live, true))) {
         this.drop(key, live);
         live = undefined;
       }
@@ -410,6 +419,12 @@ export class AgentSessions {
         }
       if (attribute && !live.process.busy)
         await this.attribute(key, live, attribute);
+      // Its model route chooses for a new turn only.
+      if (route && !live.process.busy) {
+        const chosen = await route();
+        if (!chosen) return { ok: true, undelivered: true };
+        pick = chosen;
+      }
       if (current && !current()) return { ok: true, undelivered: true };
       if (this.disposed)
         return { ok: false, error: "Claude was stopped", undelivered: true };
@@ -417,8 +432,7 @@ export class AgentSessions {
       if (
         this.live.get(key) !== live ||
         !live.process.running ||
-        (live.fingerprint !== this.options.fingerprint(key) &&
-          !live.process.busy)
+        this.stale(key, live, true)
       )
         continue;
       if (this.options.strictResume) live.submitted = true;
@@ -431,8 +445,7 @@ export class AgentSessions {
         if (
           this.live.get(key) !== live ||
           !live.process.running ||
-          (live.fingerprint !== this.options.fingerprint(key) &&
-            !live.process.busy)
+          this.stale(key, live, true)
         )
           continue;
       }
@@ -648,11 +661,7 @@ export class AgentSessions {
   reconfigure() {
     this.clearDiscovery();
     for (const [key, live] of this.live)
-      if (
-        live.fingerprint !== this.options.fingerprint(key) &&
-        !live.process.busy
-      )
-        this.drop(key, live);
+      if (this.stale(key, live)) this.drop(key, live);
   }
 
   async shutdown() {
@@ -731,15 +740,21 @@ export class AgentSessions {
   ): Promise<Live> {
     // Read before `launch` reads the settings, so it never describes newer ones.
     const fingerprint = this.options.fingerprint(key);
+    const sections = this.options.sections?.(key);
     const launch = await this.options.launch(key);
     const spawn = this.roomy(wanted);
     const process = resume
       ? await ClaudeProcess.start(spawn, { ...launch, resume })
       : await this.fresh(launch, spawn, spawned);
-    if (fingerprint === this.options.fingerprint(key) || this.disposed) {
-      if (!resume && process.sessionId)
+    if (
+      (fingerprint === this.options.fingerprint(key) &&
+        sections === this.options.sections?.(key)) ||
+      this.disposed
+    ) {
+      if (resume) this.options.resumed?.(resume, launch.systemPrompt);
+      else if (process.sessionId)
         this.options.started?.(process.sessionId, launch.systemPrompt, once);
-      return { process, fingerprint, used: this.now() };
+      return { process, fingerprint, sections, used: this.now() };
     }
     // Settings saved while it started: it would work with the old ones.
     void process.kill();
@@ -830,11 +845,7 @@ export class AgentSessions {
       } catch (error) {
         return { ok: false, error: message(error) };
       }
-      if (
-        live.fingerprint !== this.options.fingerprint(key) &&
-        !live.process.busy
-      )
-        this.drop(key, live);
+      if (this.stale(key, live)) this.drop(key, live);
     }
     return settled;
   }
@@ -881,6 +892,17 @@ export class AgentSessions {
       if (live.process.active) this.countdown(key, live);
       else if (this.live.get(key) === live) this.drop(key, live);
     }, IDLE_MS);
+  }
+  /** Whether the process runs on settings that changed, and can stop for
+   * them now: once no reply runs. For the sections only, a process with
+   * background work goes on, unless it is `delivering` a new turn. */
+  private stale(key: string, live: Live, delivering = false) {
+    if (live.process.busy) return false;
+    return (
+      live.fingerprint !== this.options.fingerprint(key) ||
+      (live.sections !== this.options.sections?.(key) &&
+        (delivering || !live.process.active))
+    );
   }
   private drop(key: string, live: Live) {
     clearTimeout(live.timer);

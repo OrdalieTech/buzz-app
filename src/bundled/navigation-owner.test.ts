@@ -23,6 +23,7 @@ async function bundledPages() {
           pluginId: manifest.id,
           revision: "bundled",
         }),
+      registerOverlay: () => {},
     };
     const ctx = new Proxy(
       {},
@@ -52,7 +53,6 @@ it("gives every bundled page to the app whose navigation lists it", async () => 
     "buzz.reminders/reminders": "buzz.reminders/reminders",
     "buzz.agents/agents": "buzz.agents/agents",
     "buzz.workflows/workflows": "buzz.workflows/workflows",
-    "buzz.relay-notes/notes": "buzz.relay-notes/notes",
     // An unlisted destination selects nothing in the dock.
     "buzz.repos/repos": "buzz.repos/repos",
   });

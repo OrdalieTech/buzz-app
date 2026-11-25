@@ -22,6 +22,8 @@ export function imageType(bytes: Uint8Array): string | undefined {
 // Relay content rejections carry only error text (block/buzz
 // crates/buzz-media/src/error.rs); name the rule instead of a generic failure.
 const RELAY_REJECTIONS = [
+  // The relay sniffs the bytes and refuses the type it finds.
+  [/(unknown|disallowed) content type|unsupported container/i, "type"],
   [/metadata/i, "metadata"],
   [/resolution too high/i, "resolution"],
   [/video too long/i, "duration"],

@@ -148,7 +148,8 @@ test.describe("with the thread's root beyond the channel's newest page", () => {
     app,
   }) => {
     await page.setViewportSize({ width: 1280, height: 900 });
-    await open(page, app);
+    // Straight to Activity: #Alpha has read nothing beyond its head.
+    await page.goto(app.origin);
     await openPage(page, "Activity");
     const inbox = page.getByRole("region", { name: "Activity", exact: true });
     await expect(inbox.getByText("Checking recent activity…")).toHaveCount(0);
@@ -211,7 +212,15 @@ test.describe("with the thread's root beyond the channel's newest page", () => {
     await expect(tab).toBeFocused();
     // Beside it, the channel waits to show its list at the thread's root,
     // reading the older page the fixture holds.
-    await expect.poll(() => app.pending.length).toBe(1);
+    // Reopening the channel at the root cancels its read-ahead.
+    await expect
+      .poll(() => app.pending.filter((read) => !read.closed).length)
+      .toBe(1);
+    app.pending.splice(
+      0,
+      app.pending.length,
+      ...app.pending.filter((read) => !read.closed),
+    );
     expect(app.pending[0].channel).toBe("alpha");
     await expect(channel.getByRole("status")).toHaveText("Loading messages…");
     await expect(tab).toBeFocused();

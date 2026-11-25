@@ -25,6 +25,7 @@ import {
   upper,
   expectAnchor,
   keyScroll,
+  readAhead,
 } from "./timeline.mjs";
 
 // These layout/navigation journeys exercise opt-in page surfaces.
@@ -40,7 +41,9 @@ const readingTest = test.extend({
   // Keep the old restored row visible when wheel input selects another row.
   historyCounts: { alpha: 24, beta: 1 },
 });
-async function expectNonPaging(page, app) {
+/** `ahead`: the reads released to read ahead on opening, which are not paging,
+ * nor is the aux closure read for a page's rows. */
+async function expectNonPaging(page, app, ahead = []) {
   expect(
     await page
       .getByRole("region", { name: "Channel message history" })
@@ -48,7 +51,12 @@ async function expectNonPaging(page, app) {
     "resize reading position stays outside older-page prefetch",
   ).toBeGreaterThan(0);
   expect(
-    app.report.queries.filter(({ filter }) => filter.until !== undefined),
+    app.report.queries.filter(
+      ({ filter }) =>
+        filter.until !== undefined &&
+        !(filter.include_aux && !filter.include_summaries) &&
+        !ahead.some((read) => read.filter === filter),
+    ),
   ).toHaveLength(0);
 }
 
@@ -668,6 +676,7 @@ readingTest(
   async ({ page, app }) => {
     await open(page, app);
     await settle(page);
+    const ahead = await readAhead(page, app);
     await link(page, app, "https://github.com/block/buzz/pull/4");
     const history = page.getByRole("region", {
       name: "Channel message history",
@@ -720,7 +729,7 @@ readingTest(
     await history.hover();
     await wheel(page, -200);
     const saved = await anchor(page);
-    await expectNonPaging(page, app);
+    await expectNonPaging(page, app, ahead);
     await opener(page, target).evaluate((el) =>
       el.focus({ preventScroll: true }),
     );
@@ -775,7 +784,7 @@ readingTest(
     await page.setViewportSize({ width: 1200, height: 700 });
     await settle(page);
     await expectAnchor(page, saved);
-    await expectNonPaging(page, app);
+    await expectNonPaging(page, app, ahead);
   },
 );
 
@@ -1116,6 +1125,10 @@ sidePanelOverlapTest(
       const root = app.histories
         .get("primary/alpha")
         .find((event) => event.content === "Thread root 0");
+      // Opening or closing a panel slides the timeline sideways. Playwright
+      // checks the hit target only on mousedown; a mouseup after the slide
+      // lands beside the button and the click retargets to the message row.
+      await settlePanelMotion(page);
       await page
         .locator(`[data-channel-timeline] [data-message-id="${root.id}"]`)
         .getByRole("button", { name: /^View thread:/ })
@@ -1136,7 +1149,11 @@ sidePanelOverlapTest(
       near(threadHeader.y, channelHeader.y);
     };
 
+    // settlePanelMotion sees only animations already running, so wait for
+    // each trigger's end state first: a dock not yet mounted or unmounted
+    // would let the settle resolve before the slide begins.
     await toggle.click();
+    await expect(sidePanel).toBeVisible();
     await openThread();
     await stacked(thread);
     await page
@@ -1145,6 +1162,7 @@ sidePanelOverlapTest(
       )
       .click();
     await button(page, "Hide side panel fixture").click();
+    await expect(sidePanel).toBeHidden();
     await openThread();
     await toggle.click();
     await stacked(thread);
@@ -1188,14 +1206,17 @@ companionReadingTest(
   async ({ page, app }) => {
     await open(page, app);
     await settle(page);
+    await readAhead(page, app);
     const saved = await upper(page);
-    await expectNonPaging(page, app);
+    // The reader's own wheel can read ahead at its pace; the panel must not.
+    const read = [...app.report.queries];
     await companionLauncher(page, "Companion fixture").click();
     await settle(page);
     await expectAnchor(page, saved);
     await button(page, "Close Companion fixture panel").click();
     await settle(page);
     await expectAnchor(page, saved);
+    await expectNonPaging(page, app, read);
     await link(page, app, "https://github.com/block/buzz/pull/6");
     await companionLauncher(page, "Companion fixture").click();
     for (const [width, height] of [
@@ -1259,6 +1280,7 @@ companionReadingTest(
   async ({ page, app }) => {
     await open(page, app);
     await settle(page);
+    await readAhead(page, app);
     const original = await upper(page);
     await companionLauncher(page, "Companion fixture").click();
     await settle(page);
@@ -1302,10 +1324,12 @@ companionReadingTest(
     await expect(
       history.locator(`[data-message-id="${original.id}"]`),
     ).toBeInViewport();
+    // The wheel can read ahead at its pace; restoring the panel must not.
+    const read = [...app.report.queries];
     await button(page, "Close Companion fixture panel").click();
     await settle(page);
     await expectAnchor(page, reading);
-    await expectNonPaging(page, app);
+    await expectNonPaging(page, app, read);
   },
 );
 

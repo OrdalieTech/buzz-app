@@ -175,6 +175,8 @@ test("a unified Solo row describes and opens shared access", async ({
       .toMatchObject({ sharedEndGap: 0, badgeInset: 0.625 });
     const { titleWidth } = await geometry();
     await shared.hover();
+    await expect(action).toHaveCSS("opacity", "0");
+    await action.hover();
     await expect(action).toHaveCSS("opacity", "1");
     await expect.poll(geometry).toMatchObject({ sharedEndGap: 0, titleWidth });
     await expect
@@ -439,16 +441,16 @@ test("Solo sidebar shares working activity, keyboard preview and local panel nav
   await page
     .locator(`[data-solo-menu-id="${id}"]`)
     .screenshot({ path: info.outputPath("solo-working-selected.png") });
-  // This point belongs to the visible status at rest and the action on hover.
-  // It must stay actionable rather than becoming a clipped/dead trailing area.
-  const marker = await badge.boundingBox();
-  const x = marker.x + marker.width / 2,
-    y = marker.y + marker.height / 2;
-  await page.mouse.move(x, y);
   const action = page.locator(
     `[data-solo-menu-id="${id}"] [data-solo-row-action]`,
   );
+  await alpha.hover({ position: { x: 24, y: 14 } });
+  await expect(action).toHaveCSS("opacity", "0");
+  await expect(badge).toBeVisible();
+  await expect(shared).toBeHidden();
+  await action.hover();
   await expect(action).toHaveCSS("opacity", "1");
+  await expect(badge).toBeHidden();
   // Bare row actions keep standard artwork, unlike glyph-state toggles.
   await expect(action.locator("svg")).toHaveCSS("width", "16px");
   await expect(action.locator("svg")).toHaveCSS("height", "16px");

@@ -69,6 +69,9 @@ export function createPluginManager(
     error: null,
   }));
   const builtInIds = new Set(builtIn.map(({ manifest }) => manifest.id));
+  const hostOwned: readonly PluginManifest[] = builtIn.map(
+    ({ manifest }) => manifest,
+  );
   let configuration: ConfigurationState = { status: "loading" };
   const runtime = new PluginRuntime(
     ctx,
@@ -98,6 +101,8 @@ export function createPluginManager(
   const listeners = new Set<() => void>();
   const read = () => ({
     configuration,
+    /** Manifests of the host-owned features, which have no catalog entry. */
+    hostOwned,
     activation: runtime.snapshot(),
     busy,
     error,

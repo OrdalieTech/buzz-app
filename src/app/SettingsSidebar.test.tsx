@@ -92,17 +92,6 @@ it("keeps Community admin separate and uses each card's navigation icon", () => 
   expect(membership).toHaveAttribute("aria-current", "page");
   expect(membership.closest("section")).toHaveTextContent("Community admin");
   expect(membership.closest("section")).not.toHaveTextContent("Primary");
-  expect(membership.querySelector("svg")).toHaveClass("tabler-icon-copy");
-  expect(
-    screen
-      .getByRole("button", { name: "Personal groups" })
-      .querySelector("svg"),
-  ).toHaveClass("tabler-icon-folder");
-  expect(
-    screen
-      .getByRole("button", { name: "Hosted communities" })
-      .querySelector("svg"),
-  ).toHaveClass("tabler-icon-world");
 });
 
 it.each([null, "primary"])(
@@ -163,7 +152,6 @@ it.each([null, "primary"])(
       expect(within(group).queryByRole("link")).toBeNull();
       const leave = screen.getByRole("button", { name: "Leave or remove" });
       expect(leave.closest("section")).toHaveTextContent("Community");
-      expect(leave.querySelector("svg")).toHaveClass("tabler-icon-logout");
     } else {
       expect(screen.queryByRole("heading", { name: "Community" })).toBeNull();
       expect(

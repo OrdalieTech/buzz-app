@@ -37,7 +37,9 @@ test("old root and reply beyond the first thread page open exactly; reclick and 
   page,
   app,
 }) => {
-  await open(page, app);
+  // The read ahead stays pending: the old root is not in the loaded window.
+  await open(page, app, { hold: true });
+  const [ahead] = app.pending;
   const initialHeadQueries = app.report.queries.filter(
     (q) => q.filter.top_level,
   ).length;
@@ -101,7 +103,11 @@ test("old root and reply beyond the first thread page open exactly; reclick and 
     app.report.queries.some((q) => q.filter.thread_cursor !== undefined),
     "the exact reply requires a second thread page",
   ).toBe(true);
-  expect(app.report.queries.filter((q) => q.filter.until)).toHaveLength(0);
+  expect(
+    app.report.queries.filter(
+      (q) => q.filter.until && q.filter !== ahead?.filter,
+    ),
+  ).toHaveLength(0);
   // Settings temporarily takes the rail without disposing the routed thread.
   const threadElement = page.locator('[aria-label="Thread"]');
   await threadElement.evaluate((element) => {
@@ -542,7 +548,8 @@ for (const selected of ["reply", "root"]) {
     page,
     app,
   }) => {
-    await open(page, app);
+    // The read ahead stays pending: the old root is not in the loaded window.
+    await open(page, app, { hold: true });
     const id = selected === "root" ? app.exact.root.id : app.exact.target.id;
     const destination = {
       ...target(app, id),

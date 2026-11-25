@@ -16,6 +16,7 @@ import { MessageProjection } from "./message-projection";
 import { createRelayProfiler } from "./profiling";
 import {
   bounds,
+  completeHeads,
   flush,
   keypair,
   message,
@@ -25,14 +26,6 @@ import {
   scriptedTransport,
   signed,
 } from "./testing";
-
-vi.mock("./fold", async (actual) => {
-  const fold = await actual<typeof import("./fold")>();
-  return { ...fold, foldMessages: vi.fn(fold.foldMessages) };
-});
-/** Unread previews fold with no viewer; other projections pass one. */
-const unreadFolds = () =>
-  vi.mocked(foldMessages).mock.calls.filter(([, author]) => author === "");
 
 it("admits owner edits only after verifying the current signed profile, and revokes replaced evidence", async () => {
   const owner = keypair(),
@@ -188,6 +181,7 @@ it.each(["member", "guest"])(
         profile(agent, owner),
         profile(stranger, stranger),
       ]);
+      completeHeads(wire, relay);
       await connection.session.outbox?.ready();
       // A guest's edit is signed only once the directory's own attestation
       // names its owner; editOwnedAgent's check can settle first.
@@ -755,8 +749,6 @@ it("uses the same verified owner edit in the conversation, prompt history and un
     expect(unread.activity("c").items?.[0]?.preview).toBe("Spoken");
     expect(unread.inbox().items?.[0]?.preview).toBe("Spoken");
     expect(changed).toHaveBeenCalled();
-    // A profile no fold read cannot change the previews: no refold.
-    vi.mocked(foldMessages).mockClear();
     const stranger = keypair();
     live.receive([
       signed(stranger, {
@@ -771,7 +763,6 @@ it("uses the same verified owner edit in the conversation, prompt history and un
         connection.session.profiles.snapshot().get(stranger.pubkey)?.name,
       ).toBe("Stranger"),
     );
-    expect(unreadFolds()).toHaveLength(0);
     profile = eventDto(
       signed(agent, { kind: 0, created_at: 13, content: "{}", tags: [] }),
     );

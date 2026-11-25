@@ -9,7 +9,7 @@
 .popup {
   display: grid;
   gap: var(--space-1);
-  width: 23.5rem;
+  width: 26rem;
   max-width: min(var(--available-width), calc(100vw - var(--space-4)));
   max-height: var(--available-height);
   overflow: auto;
@@ -166,6 +166,7 @@ html[data-keyboard-navigation] .thumb:focus-within {
   max-width: 100%;
 }
 .level,
+.latest,
 .about,
 .fixedModel,
 .loading {
@@ -180,8 +181,14 @@ html[data-keyboard-navigation] .thumb:focus-within {
   color: var(--text-standard);
 }
 .level,
+.latest,
 .loading {
   color: var(--text-subtle);
+}
+/* A model id can be one long word: it wraps at its dots and underscores,
+   else anywhere, rather than scroll. */
+.latest {
+  overflow-wrap: anywhere;
 }
 .level {
   white-space: nowrap;

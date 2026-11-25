@@ -17,6 +17,7 @@ import {
   ZaiLogoIcon,
   KimiLogoIcon,
   RobotIcon,
+  ArrowsSplitIcon,
 } from "../../shared/design-system/icons";
 import { Button } from "../../shared/design-system/ui/Button";
 import { Dialog } from "../../shared/design-system/ui/Dialog";
@@ -25,6 +26,7 @@ import { Input } from "../../shared/design-system/ui/Input";
 import { ModelFamilyMenu } from "./ModelFamilyMenu";
 import { formatModelChoices } from "./formatModelDisplayName";
 import { Select } from "../../shared/design-system/ui/Select";
+import { routeModel, routeOf, useModelRoutes } from "./model-routes";
 
 export type ModelChoice = Readonly<{
   /** The model ID saved in the type's config. */
@@ -40,6 +42,9 @@ export type ModelChoice = Readonly<{
   efforts?: readonly { id: string; label: string }[];
   effortScope?: string;
   loadEfforts?: () => Promise<readonly { id: string; label: string }[]>;
+  /** A plugin's model route, e.g. Auto Balanced: listed first, beside
+   * Default, and it picks the model and effort of each turn itself. */
+  route?: boolean;
 }>;
 
 const CUSTOM_MODEL_ACTION: ModelChoice = {
@@ -71,6 +76,15 @@ export function modelLogo(model: string, className?: string) {
   return Icon ? (
     <Icon className={className} size={20} aria-hidden="true" />
   ) : null;
+}
+
+/** A route's split arrow, else its vendor's artwork. */
+function choiceLogo(model: ModelChoice) {
+  return model.route || routeOf(model.id) ? (
+    <ArrowsSplitIcon size={20} aria-hidden="true" />
+  ) : (
+    modelLogo(`${model.id} ${model.label}`)
+  );
 }
 
 /** Browse surfaces retain the generic mark when the vendor is unknown. */
@@ -155,7 +169,7 @@ export function ModelPicker({
   effort,
   effortLabel,
   onEffortChange,
-  models,
+  models: catalog,
   allowCustomModel = false,
   value,
   defaultLabel,
@@ -169,7 +183,10 @@ export function ModelPicker({
   appearance = "outlined",
   includeDefault = true,
   description,
+  harness,
 }: {
+  /** The agent type's id: its plugins' model routes join the menu. */
+  harness?: string | undefined;
   label?: string;
   resetLabel?: string;
   groupByFamily?: boolean;
@@ -199,6 +216,27 @@ export function ModelPicker({
 }) {
   const [customModel, setCustomModel] = useState<string | null>(null);
   const control = useRef<HTMLDivElement>(null);
+  const offered = useModelRoutes(harness ?? "");
+  // Routes come first; an exclusive harness shows only them and the agent's
+  // own pinned model.
+  const routed = harness !== undefined && offered.routes.length > 0;
+  const own = catalog.filter(
+    (model) =>
+      !routeOf(model.id) &&
+      (!routed || !offered.exclusive || model.id === value),
+  );
+  const models: readonly ModelChoice[] = routed
+    ? [
+        ...offered.routes.map((route) => ({
+          id: routeModel(route.id),
+          label: route.label,
+          description: route.description,
+          route: true,
+        })),
+        ...own,
+      ]
+    : catalog;
+  // Default stays when no own model is offered: it is the harness's own.
   const defaultChoice = models.find((model) => model.id === defaultModel);
   const efforts = models.find(
     (model) => model.id === (value || defaultModel),
@@ -210,12 +248,24 @@ export function ModelPicker({
   // A named model is always a pin, even when it currently matches Default.
   const listed: ModelChoice[] = [...models];
   if (value && !listed.some((model) => model.id === value))
-    listed.push({
-      id: value,
-      label: value,
-      description: allowCustomModel ? "Custom model" : "Unavailable model",
-      unlisted: true,
-    });
+    listed.push(
+      routeOf(value)
+        ? {
+            id: value,
+            label: "Unavailable route",
+            description: "Runs on the default model",
+            unlisted: true,
+            route: true,
+          }
+        : {
+            id: value,
+            label: value,
+            description: allowCustomModel
+              ? "Custom model"
+              : "Unavailable model",
+            unlisted: true,
+          },
+    );
   // The default takes part in telling names apart, even when it is not a row.
   const [formattedDefault = fallback, ...shownListed] = formatModelChoices(
     [fallback, ...listed],
@@ -235,9 +285,7 @@ export function ModelPicker({
   const discovering = loading && !pending;
   const choices =
     allowCustomModel && !compact ? [...shown, CUSTOM_MODEL_ACTION] : shown;
-  const optionLogos = choices.map((model) =>
-    modelLogo(`${model.id} ${model.label}`),
-  );
+  const optionLogos = choices.map(choiceLogo);
   const hasOptionLogos = optionLogos.some(Boolean);
   const openCustomDialog = () => {
     const listed = !value || models.some((model) => model.id === value);
@@ -259,7 +307,8 @@ export function ModelPicker({
             appearance={appearance}
             resetLabel={resetLabel}
             effort={effort}
-            effortLabel={effortLabel}
+            // A route picks each turn's effort itself.
+            effortLabel={routeOf(value) ? undefined : effortLabel}
             onEffortChange={onEffortChange}
             inherited={!discovering && inherited}
             valueSuffix={discovering ? undefined : valueSuffix}
@@ -284,7 +333,7 @@ export function ModelPicker({
             valueLabel={discovering ? "Loading models…" : selected.label}
             valueSuffix={discovering ? undefined : valueSuffix}
             valueTitle={discovering ? "Loading models…" : selectedLabel}
-            leading={modelLogo(`${selected.id} ${selected.label}`)}
+            leading={choiceLogo(selected)}
             variant={compact ? "compact" : "preference"}
             appearance={appearance}
             {...(appearance === "glass-ghost" ? { size: "xs" as const } : {})}

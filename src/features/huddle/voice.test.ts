@@ -132,6 +132,7 @@ function setup() {
     snapshot: () => ({ status: "ready", running }),
     subscribe: a.subscribe,
     types: () => types,
+    reserveVoice: vi.fn(() => () => {}),
   } as unknown as Agents;
   const report = vi.fn();
   const listening = vi.fn();
@@ -153,6 +154,7 @@ function setup() {
     return dispose;
   };
   return {
+    agents_: agents,
     bridge,
     voice,
     connections,
@@ -576,4 +578,26 @@ it("publishes a seat's thinking state until the agent leaves the room", async ()
   f.thinking.mockClear();
   seat.thinking?.(true);
   expect(f.thinking).not.toHaveBeenCalled();
+});
+
+it("reserves each seat before its bridge opens, and opens none it can't reserve", async () => {
+  const f = setup();
+  const order: string[] = [];
+  const reserve = vi.mocked(f.agents_.reserveVoice);
+  reserve.mockImplementation((key) => {
+    order.push(`reserve ${key}`);
+    if (key === "b")
+      throw new Error("This agent is restarting or changing provider");
+    return () => order.push(`end ${key}`);
+  });
+  f.bridge.open.mockImplementation(async (_id, _d, _r, _receive, key) => {
+    order.push(`open ${key}`);
+  });
+  const dispose = f.start();
+  await vi.waitFor(() => expect(f.report).toHaveBeenCalled());
+  expect(order.indexOf("reserve a")).toBeLessThan(order.indexOf("open a"));
+  expect(order).not.toContain("open b");
+  expect(f.report.mock.calls.at(-1)?.[1]).toContain("restarting");
+  dispose();
+  await vi.waitFor(() => expect(order).toContain("end a"));
 });

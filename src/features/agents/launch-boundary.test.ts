@@ -5,7 +5,10 @@
 // the session sees no request at start beyond a turn's conversation reads,
 // online or offline, and the runner's catch-up of the agent's mentions.
 import { Context } from "@deepseek-ai/cordis";
-import { finalizeEvent } from "nostr-tools";
+import { finalizeEvent, matchFilter, type Filter } from "nostr-tools";
+import { schnorr } from "@noble/curves/secp256k1.js";
+import { bytesToHex } from "nostr-tools/utils";
+import { eventsDto } from "../relay/events";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Host, HostProcessOptions } from "../host/service";
 import type { ReadFilter, RelayEvent } from "../relay/events";
@@ -17,7 +20,7 @@ import { AgentConfigStore, type Subject } from "./agent-config";
 import { artifactD, readHead } from "./agent-config-artifacts";
 import type { Mode } from "./agent-start";
 import { createLocalAgentActivity } from "./local-activity";
-import { type AgentReads, ownerReads } from "./reads";
+import type { AgentReads } from "./reads";
 import {
   type AgentCommunities,
   AgentsService,
@@ -25,6 +28,7 @@ import {
   type ConfigBinding,
   type Delivery,
 } from "./service";
+import { writeInterrupted } from "./interrupted";
 import { fakeNative } from "./service-testing";
 import { memoryStorage } from "./test-fakes";
 import type { AgentStore } from "./store";
@@ -37,6 +41,20 @@ import type { Wire } from "../../bundled/codex/rpc";
 import { gooseRun } from "../../bundled/goose/run";
 import { GooseRuntime } from "../../bundled/goose/runtime";
 import { fakeSpawn as fakeGoose } from "../../bundled/goose/goose-testing";
+
+/** A Goose runtime with its own agent storage, as the app gives it. */
+const gooseRuntime = (
+  ...[host, relay, core]: ConstructorParameters<typeof GooseRuntime>
+) =>
+  new GooseRuntime(
+    host,
+    relay,
+    core,
+    undefined,
+    undefined,
+    undefined,
+    memoryStorage(),
+  );
 
 const owner = keypair();
 const relayKey = keypair();
@@ -102,11 +120,30 @@ const conversationRead = (sent: RelayEvent): readonly ReadFilter[] => {
   ];
 };
 
+/** The relay's page of `records` for `filter`: newest first, ties by id,
+ * below its cursor. */
+const relayPage = (records: readonly RelayEvent[], filter: ReadFilter) =>
+  records
+    .filter(
+      (event) =>
+        matchFilter(filter as Filter, event) &&
+        (!filter.before_id ||
+          event.created_at < (filter.until ?? Infinity) ||
+          event.id > filter.before_id),
+    )
+    .sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id))
+    .slice(0, filter.limit);
+
 /** A transport that answers from `records`, recording every request it sees.
  * While `offline`, every request fails as an unreachable relay's does. */
 function countedTransport(records: RelayEvent[]) {
   const requests: Request[] = [];
-  const state = { offline: false, afterRuns: () => false };
+  const state = {
+    offline: false,
+    failMentionCatchUp: false,
+    failIdReads: false,
+    afterRuns: () => false,
+  };
   let live!: LiveCallbacks;
   const transport = {
     viewer: owner.pubkey,
@@ -121,6 +158,13 @@ function countedTransport(records: RelayEvent[]) {
       };
       requests.push(request);
       if (state.offline) throw new Error("Relay unreachable");
+      if (state.failMentionCatchUp && filters[0]?.["#p"] && !filters[0]["#h"])
+        throw new Error("Owner mention read refused");
+      if (state.failIdReads && filters.some((filter) => filter.ids))
+        throw new Error("Owner read refused");
+      // A mention catch-up pages by time, as the relay does.
+      if (filters.length === 1 && filters[0]?.["#p"])
+        return relayPage(records, filters[0]);
       return records.filter((event) =>
         filters.some((filter) => filter.kinds?.includes(event.kind)),
       );
@@ -170,11 +214,13 @@ async function setup<Config>(
   heads: [Subject, RelayEvent][],
   binding: ConfigBinding,
   initialMessages: RelayEvent[] = [],
+  prepare?: (storage: AgentStore) => unknown,
 ) {
   const storage = memoryStorage();
   seed(storage, heads);
+  await prepare?.(storage);
   const counted = countedTransport([
-    metadata(relayKey, channel, "general"),
+    metadata(relayKey, channel, "general", undefined, [["t", "stream"]]),
     roster(relayKey, channel, [owner.pubkey, agentKey.pubkey]),
     profile(owner, { name: "Owner" }),
     profile(agentKey, { name: typeId, is_agent: true }),
@@ -238,7 +284,7 @@ async function setup<Config>(
   const deliveries: Delivery<Config>[] = [];
   const real = runs(
     (pubkey) => service.relay(pubkey),
-    (pubkey) => ownerReads(service.relay(pubkey), pubkey),
+    (pubkey) => service.conversationReads(pubkey),
     (pubkey, signal) => service.core(pubkey, signal),
   );
   plugin.agents.register<Config>({
@@ -601,7 +647,7 @@ it("starts Goose sessions from the synced copies, with no relay request online o
   });
   const f = await setup(
     "goose",
-    (relay, _reads, core) => gooseRun(new GooseRuntime(host, relay, core)),
+    (relay, _reads, core) => gooseRun(gooseRuntime(host, relay, core)),
     { ...GOOSE_LOCAL },
     seeded,
     synced(),
@@ -637,7 +683,7 @@ it("refuses to start from deleted synced settings once: no launch, the reason on
   const { seeded } = heads("buzz/goose", { model: "synced-model" });
   const f = await setup(
     "goose",
-    (relay, _reads, core) => gooseRun(new GooseRuntime(host, relay, core)),
+    (relay, _reads, core) => gooseRun(gooseRuntime(host, relay, core)),
     { ...GOOSE_LOCAL },
     [[settingsSubject, deleted], seeded[1] as [Subject, RelayEvent]],
     synced(),
@@ -724,7 +770,7 @@ it.each([
       });
       const f = await setup(
         "goose",
-        (relay, _reads, core) => gooseRun(new GooseRuntime(host, relay, core)),
+        (relay, _reads, core) => gooseRun(gooseRuntime(host, relay, core)),
         { ...GOOSE_LOCAL },
         seeded,
         synced(),
@@ -873,3 +919,355 @@ it.each(["thread", "channel"] as const)(
     ).toHaveLength(2);
   },
 );
+
+const privateChannel = "4b7939a2-f852-42ae-ab59-2d1588b0d337";
+
+/** An agent-only DM between a sibling and the agent, which the owner cannot
+ * read, answered by the agent's native query alone. */
+async function agentOnlyDm({
+  owned = true,
+  member = true,
+  workflow = false,
+  at = Math.floor(Date.now() / 1000) + 1,
+} = {}) {
+  const sibling = keypair();
+  const conditions = "kind=9";
+  const digest = new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(
+        `nostr:agent-auth:${sibling.pubkey}:${conditions}`,
+      ),
+    ),
+  );
+  const auth = [
+    "auth",
+    owner.pubkey,
+    conditions,
+    bytesToHex(schnorr.sign(digest, owner.secret)),
+  ];
+  const earlier = message(
+    sibling,
+    privateChannel,
+    "Prior private context",
+    at - 1,
+  );
+  const sent = message(sibling, privateChannel, "Private assignment", at, [
+    ["p", agentKey.pubkey],
+    ...(owned ? [auth] : []),
+    ...(workflow ? [["buzz:workflow", "true"]] : []),
+  ]);
+  const records = eventsDto([
+    metadata(relayKey, privateChannel, "Agent DM", at - 2, [
+      ["t", "dm"],
+      ["private"],
+      ["hidden"],
+    ]),
+    roster(
+      relayKey,
+      privateChannel,
+      member ? [sibling.pubkey, agentKey.pubkey] : [sibling.pubkey],
+      at - 2,
+    ),
+    earlier,
+    sent,
+  ]);
+  let withheld: readonly number[] = [];
+  const query = async (_member: unknown, filters: readonly object[]) =>
+    (filters as readonly ReadFilter[]).flatMap((filter) =>
+      relayPage(
+        records.filter((event) => !withheld.includes(event.kind)),
+        filter,
+      ),
+    );
+  return {
+    sent,
+    query,
+    withhold: (...kinds: number[]) => {
+      withheld = kinds;
+    },
+  };
+}
+
+async function gooseSetup(
+  prepare?: (storage: AgentStore) => unknown,
+  initialMessages: RelayEvent[] = [],
+) {
+  const { goose, host } = gooseHost();
+  const { seeded } = heads("buzz/goose", {
+    model: "synced-model",
+    provider: "synced-provider",
+    scope: "thread",
+  });
+  let runtime!: GooseRuntime;
+  const f = await setup(
+    "goose",
+    (relay, reads, core) => {
+      runtime = new GooseRuntime(
+        host,
+        relay,
+        core,
+        memoryStorage(),
+        undefined,
+        undefined,
+        memoryStorage(),
+        undefined,
+        undefined,
+        undefined,
+        reads,
+      );
+      return gooseRun(runtime);
+    },
+    { ...GOOSE_LOCAL },
+    seeded,
+    synced(),
+    initialMessages,
+    prepare,
+  );
+  return { ...f, goose, runtime };
+}
+
+const privateRead = (f: Fixture) =>
+  f.requests.some((request) =>
+    request.filters.some((filter) => filter["#h"]?.includes(privateChannel)),
+  );
+
+it.each(["authorized", "unauthorized", "removed", "workflow"])(
+  "delivers an agent-only DM through native catch-up with sender authority preserved (%s)",
+  async (authority) => {
+    const owned = authority !== "unauthorized";
+    const member = authority !== "removed";
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const f = await gooseSetup();
+    const dm = await agentOnlyDm({
+      owned,
+      member,
+      workflow: authority === "workflow",
+    });
+    f.native.query.mockImplementation(dm.query);
+    expect(f.session.channels.get?.(privateChannel)).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(f.deliveries).toHaveLength(member ? 1 : 0);
+    if (owned && member) {
+      await vi.waitFor(() => expect(f.goose.geese[0]?.turns).toHaveLength(1));
+      const text = f.goose.geese[0]?.turns[0]?.text;
+      expect(text).toContain("Scope: dm");
+      expect(text).toContain("Private assignment");
+      expect(text).toContain("Prior private context");
+      expect(text).toContain("Session scope: dm conversation");
+    } else {
+      expect(f.goose.geese).toHaveLength(0);
+    }
+    expect(f.session.channels.get?.(privateChannel)).toBeUndefined();
+    expect(f.native.query).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pubkey: agentKey.pubkey,
+        relay: "wss://relay.example.test",
+      }),
+      expect.any(Array),
+    );
+    expect(privateRead(f)).toBe(false);
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(f.deliveries).toHaveLength(member ? 1 : 0);
+  },
+);
+
+it("resumes an interrupted agent-only DM turn by reading it as the agent", async () => {
+  const dm = await agentOnlyDm({ at: Math.floor(Date.now() / 1000) - 3_600 });
+  const f = await gooseSetup((storage) =>
+    writeInterrupted(storage, agentKey.pubkey, {
+      [dm.sent.id]: privateChannel,
+    }),
+  );
+  f.native.query.mockImplementation(dm.query);
+  await vi.waitFor(() =>
+    expect(
+      f.service.snapshot().interrupted.map((agent) => agent.pubkey),
+    ).toEqual([agentKey.pubkey]),
+  );
+  expect(f.deliveries).toHaveLength(0);
+  f.service.resumeInterrupted();
+  await vi.waitFor(() => expect(f.goose.geese[0]?.turns).toHaveLength(1));
+  expect(f.deliveries).toHaveLength(1);
+  expect(f.deliveries[0]?.trigger).toMatchObject({
+    type: "mention",
+    resumed: true,
+    event: { id: dm.sent.id },
+  });
+  expect(f.goose.geese[0]?.turns[0]?.text).toContain("Private assignment");
+  expect(f.session.channels.get?.(privateChannel)).toBeUndefined();
+  expect(privateRead(f)).toBe(false);
+});
+
+it("keeps an interrupted private turn for retry when the agent's read fails", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const dm = await agentOnlyDm({ at: Math.floor(Date.now() / 1000) - 3_600 });
+  const f = await gooseSetup((storage) =>
+    writeInterrupted(storage, agentKey.pubkey, {
+      [dm.sent.id]: privateChannel,
+    }),
+  );
+  f.native.query.mockRejectedValue(new Error("Agent read refused"));
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  await vi.waitFor(() =>
+    expect(
+      f.service.snapshot().interrupted.map((agent) => agent.pubkey),
+    ).toEqual([agentKey.pubkey]),
+  );
+  f.service.resumeInterrupted();
+  await vi.waitFor(() =>
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("could not resume its private turns"),
+      expect.any(Error),
+    ),
+  );
+  expect(f.deliveries).toHaveLength(0);
+  const failures = f.native.query.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(20_000);
+  // Backed off, not read again on every service tick.
+  expect(f.native.query.mock.calls.length - failures).toBeLessThanOrEqual(2);
+  f.native.query.mockImplementation(dm.query);
+  await vi.advanceTimersByTimeAsync(300_000);
+  await vi.waitFor(() => expect(f.goose.geese[0]?.turns).toHaveLength(1));
+  expect(f.deliveries[0]?.trigger).toMatchObject({
+    type: "mention",
+    resumed: true,
+    event: { id: dm.sent.id },
+  });
+});
+
+it("backs off Resume while the owner's read fails and the agent's finds nothing", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const dm = await agentOnlyDm({ at: Math.floor(Date.now() / 1000) - 3_600 });
+  const f = await gooseSetup((storage) =>
+    writeInterrupted(storage, agentKey.pubkey, {
+      [dm.sent.id]: privateChannel,
+    }),
+  );
+  f.transport.failIdReads = true;
+  f.native.query.mockResolvedValue([]);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const ownerReads = () =>
+    f.requests.filter((request) =>
+      request.filters.some((filter) => filter.ids?.includes(dm.sent.id)),
+    ).length;
+  await vi.waitFor(() =>
+    expect(
+      f.service.snapshot().interrupted.map((agent) => agent.pubkey),
+    ).toEqual([agentKey.pubkey]),
+  );
+  f.service.resumeInterrupted();
+  await vi.waitFor(() =>
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("could not resume its turns"),
+      expect.any(Error),
+    ),
+  );
+  const failures = ownerReads();
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(ownerReads() - failures).toBeLessThanOrEqual(2);
+  expect(f.deliveries).toHaveLength(0);
+  f.native.query.mockImplementation(dm.query);
+  await vi.advanceTimersByTimeAsync(300_000);
+  await vi.waitFor(() => expect(f.goose.geese[0]?.turns).toHaveLength(1));
+  expect(f.deliveries[0]?.trigger).toMatchObject({
+    type: "mention",
+    resumed: true,
+    event: { id: dm.sent.id },
+  });
+});
+
+it("keeps an agent-only DM out of the owner's saved conversations and labels", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const f = await gooseSetup();
+  const dm = await agentOnlyDm();
+  f.native.query.mockImplementation(dm.query);
+  f.mention();
+  await vi.waitFor(() => expect(f.goose.geese[0]?.turns).toHaveLength(1));
+  await vi.advanceTimersByTimeAsync(50_000);
+  await vi.waitFor(() => expect(f.goose.geese[0]?.turns).toHaveLength(2));
+  const key = f.service.find(agentKey.pubkey)?.key ?? "";
+  const rows = f.runtime.conversations(key).map(({ key: saved }) => ({
+    key: saved,
+    ...f.runtime.source(key, saved),
+  }));
+  expect(rows.map((row) => row.channelId).sort()).toEqual(
+    [channel, privateChannel].sort(),
+  );
+  expect(f.runtime.readableRows(key, rows).map((row) => row.channelId)).toEqual(
+    [channel],
+  );
+  expect(f.runtime.channelLabel(key, privateChannel)).toBeUndefined();
+  expect(f.runtime.channelLabel(key, channel)).toMatchObject({
+    name: "general",
+  });
+});
+
+it.each([
+  { withheld: [39002], what: "its roster" },
+  { withheld: [39000, 39002], what: "all its details" },
+])(
+  "keeps a DM mention pending while the relay withholds $what",
+  async ({ withheld }) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const f = await gooseSetup();
+    const dm = await agentOnlyDm();
+    dm.withhold(...withheld);
+    f.native.query.mockImplementation(dm.query);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(f.deliveries).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("could not catch up its private mentions"),
+      expect.any(Error),
+    );
+    dm.withhold();
+    await vi.advanceTimersByTimeAsync(300_000);
+    await vi.waitFor(() => expect(f.goose.geese[0]?.turns).toHaveLength(1));
+    expect(f.deliveries).toHaveLength(1);
+  },
+);
+
+it("keeps the owner's mention catch-up going while the agent's own reads fail", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const f = await gooseSetup();
+  f.native.query.mockRejectedValue(new Error("Agent read refused"));
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const ownerReads = () => f.requests.filter(mentionCatchUp).length;
+  await vi.advanceTimersByTimeAsync(50_000);
+  const first = ownerReads();
+  expect(first).toBeGreaterThan(0);
+  expect(warn).toHaveBeenCalledWith(
+    expect.stringContaining("could not catch up its private mentions"),
+    expect.any(Error),
+  );
+  await vi.advanceTimersByTimeAsync(100_000);
+  expect(ownerReads()).toBeGreaterThan(first);
+});
+
+it("still catches up agent-only DMs while the owner's mention reads fail", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const f = await gooseSetup();
+  const dm = await agentOnlyDm();
+  f.native.query.mockImplementation(dm.query);
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  f.transport.failMentionCatchUp = true;
+  await vi.advanceTimersByTimeAsync(50_000);
+  await vi.waitFor(() => expect(f.goose.geese[0]?.turns).toHaveLength(1));
+});
+
+it("finishes a private catch-up window whose last page outlasts a tick", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const f = await gooseSetup();
+  const dm = await agentOnlyDm();
+  f.native.query.mockImplementation(async (member, filters) => {
+    const events = await dm.query(member, filters);
+    const page = (filters as readonly ReadFilter[])[0];
+    if (page?.["#p"] && !events.length)
+      await new Promise((resolve) => setTimeout(resolve, 7_000));
+    return events;
+  });
+  await vi.advanceTimersByTimeAsync(80_000);
+  await vi.waitFor(() => expect(f.goose.geese[0]?.turns).toHaveLength(1));
+  expect(f.deliveries).toHaveLength(1);
+});

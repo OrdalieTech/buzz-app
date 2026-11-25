@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { createRelayReader } from "./reader";
+import { ACTIVE_READS, createRelayReader } from "./reader";
 import { scriptedTransport } from "./testing";
 import { yieldToHost } from "./yield";
 
@@ -110,10 +110,10 @@ it("retains queued deadlines during recovery and ignores late transport rejectio
 
 it("coalesces simultaneous failures into one turn and recovers normal capacity", async () => {
   const h = setup();
-  const reads = ["one", "two", "three", "four"].map((id) =>
-    h.read(filter(id)).catch((e) => e),
+  const reads = Array.from({ length: ACTIVE_READS + 1 }, (_, i) =>
+    h.read(filter(`r${i}`)).catch((e) => e),
   );
-  const active = [h.next(), h.next(), h.next()];
+  const active = Array.from({ length: ACTIVE_READS }, () => h.next());
   for (const request of active) request.fail(new Error("offline"));
   await flush();
   expect(h.pending).toHaveLength(0);
@@ -122,11 +122,13 @@ it("coalesces simultaneous failures into one turn and recovers normal capacity",
   h.next().respond([]);
   await Promise.all(reads);
   // Success still releases queued capacity without imposing a task boundary.
-  const more = ["a", "b", "c", "d"].map((id) => h.read(filter(id)));
+  const more = Array.from({ length: ACTIVE_READS + 1 }, (_, i) =>
+    h.read(filter(`m${i}`)),
+  );
   h.next().respond([]);
   await flush();
-  expect(h.pending).toHaveLength(3);
-  for (let i = 0; i < 3; i++) h.next().respond([]);
+  expect(h.pending).toHaveLength(ACTIVE_READS);
+  for (let i = 0; i < ACTIVE_READS; i++) h.next().respond([]);
   await Promise.all(more);
   expect(turns).toHaveLength(0);
 });

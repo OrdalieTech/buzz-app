@@ -1,6 +1,12 @@
 import { openPage } from "./navigation.mjs";
 import { test, expect } from "./fixture.mjs";
-import { anchor, expectAnchor, keyScroll, settle } from "./timeline.mjs";
+import {
+  anchor,
+  expectAnchor,
+  keyScroll,
+  readAhead,
+  settle,
+} from "./timeline.mjs";
 
 test.use({
   membershipActivity: true,
@@ -419,14 +425,17 @@ burstTest(
     ).toBeVisible();
     await expect(groups).toHaveCount(1);
     await expect(groups).toContainText("and 499 others were added");
-    // The second notice read pages below the first by the composite cursor.
-    await expect.poll(() => app.pending.length).toBe(1);
-    const notices = app.pending.shift();
+    // The second notice read pages below the first by the composite cursor,
+    // beside the older messages read ahead.
+    const isNotices = (read) => read.filter.kinds?.includes(40099);
+    await expect.poll(() => app.pending.some(isNotices)).toBe(true);
+    const [notices] = app.pending.splice(app.pending.findIndex(isNotices), 1);
     expect(notices.filter).toMatchObject({ kinds: [40099], "#h": ["alpha"] });
     expect(notices.filter.until).toEqual(expect.any(Number));
     notices.release();
     await expect(groups).toContainText("Pinky and 601 others were added");
     await expect(groups).toHaveCount(1);
+    await readAhead(page, app);
     await settle(page);
     expect(app.pending).toHaveLength(0);
     // A real hover surface must remain reachable and expose every member,

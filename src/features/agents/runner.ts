@@ -1,7 +1,8 @@
 import { interestPaused } from "./attention";
-import type {
-  AgentSessionAssociation,
-  AgentSessionSource,
+import {
+  hasInvocationIntent,
+  type AgentSessionAssociation,
+  type AgentSessionSource,
 } from "./session-admission";
 import { onAutomatic } from "./recommended";
 // The agent runner: one queue per agent, its rate limit, mention and watch
@@ -19,7 +20,9 @@ import type {
   AgentVoicePipe,
   AgentType,
   AgentHandle,
-  SoloWorkspaces,
+  Workspaces,
+  WorkspaceAudience,
+  WorkspaceChat,
   AgentCreationInput,
   AgentReadout,
   AgentUpdateInput,
@@ -27,9 +30,11 @@ import type {
   TeamUpdateInput,
   AgentHandoff,
   RegisteredAgentType,
+  SessionPlace,
   Trigger,
   Agents,
 } from "./service";
+import type { RoutedPick, TurnPick } from "./model-routes";
 import type { LocalAgentActivity, WorkOutcome } from "./local-activity";
 import type { MentionRefusal } from "./owner-attestation";
 import { threadReference } from "../relay/thread-reference";
@@ -103,6 +108,7 @@ import {
   inStream,
   MENTIONS,
   oldestFirst,
+  PRIVATE_MENTIONS,
   POLL_OVERLAP,
   readWindow,
   streamKey,
@@ -111,12 +117,17 @@ import {
   type Checkpoint,
   type Stream,
 } from "./catch-up";
-import type { Interrupted } from "./interrupted";
+import {
+  interruptedChannels,
+  type Interrupted,
+  type InterruptedTurns,
+} from "./interrupted";
 import type { DeviceSettings } from "../../shared/device-settings";
 import {
   fallbackNotice,
   gatewayRoutes,
   TURN_READINESS_WAIT_MS,
+  SELECTION_PENDING_NOTICE,
   unattributedNotice,
 } from "./gateway/route";
 import { turnContextFor } from "./gateway/turn";
@@ -223,6 +234,8 @@ type Job = {
   work?: ReturnType<LocalAgentActivity["begin"]>;
   trigger: Trigger;
   channelId?: string;
+  /** This request already has native placement. */
+  nativePlacement?: true;
   /** For a watch or timer: the object and attention epoch it was matched or
    * found due under. It runs only while both are still current, so a watch or
    * timer edited, disabled, rearmed, replaced or turned off and on again since
@@ -459,8 +472,13 @@ function watchReadErrorSummary(error: unknown): string {
 
 const seconds = () => Math.floor(Date.now() / 1000);
 /** The key of an agent's mention or watch catch-up pass. */
-const passKey = (agent: AgentKey, mentions: boolean) =>
-  `${agent}:${mentions ? "mentions" : "watches"}`;
+/** Catch-up lanes, each its own pass: neither mentions nor private mentions
+ * wait behind the other's backlog, nor behind watch work. */
+const PASSES = ["mentions", "private", "watches"] as const;
+type PassLane = (typeof PASSES)[number];
+const passOf = (stream: Stream): PassLane =>
+  stream.private ? "private" : stream.mentions ? "mentions" : "watches";
+const passKey = (agent: AgentKey, lane: PassLane) => `${agent}:${lane}`;
 const message = (error: unknown) =>
   String(error instanceof Error ? error.message : error);
 
@@ -482,6 +500,7 @@ export type RunnerHost = {
   ownershipChanged?(): void;
   /** A failed watch read set or cleared its retry status. */
   watchReadFailuresChanged(): void;
+  transitionChanged?(): void;
   /** The agent, while its community is live to run it in. */
   ready(key: AgentKey): Agent | undefined;
   /** Whether the agent's community is reloading in place: it starts nothing
@@ -504,12 +523,32 @@ export type RunnerHost = {
    * channel is public; undefined as for `member`. Only a member may be
    * delivered to. */
   reads(agent: Agent, event: Pick<RelayEvent, "tags">): boolean | undefined;
+  /** Whether the agent's own read of DMs its owner cannot read is due: false
+   * while it backs off, undefined when it has none here. */
+  privateMentionsDue?(agent: Agent): boolean | undefined;
+  /** Reads the agent's mentions as itself, failing while any DM they are in
+   * is only partly known. */
+  readPrivateMentions?(
+    agent: Agent,
+    filter: ReadFilter,
+    signal: AbortSignal,
+  ): Promise<readonly RelayEvent[]>;
+  /** Reads as the agent itself what the owner's session cannot, resolving
+   * the channels of what it returns, or undefined when the agent has no read
+   * of its own here. */
+  readAsAgent?(
+    agent: Agent,
+    filter: ReadFilter,
+    signal: AbortSignal,
+  ): Promise<readonly RelayEvent[]> | undefined;
   /** Resolves listening metadata before an enabled watch is admitted. */
   resolveChannels?(
     agent: Agent,
     channels: readonly string[],
     signal: AbortSignal,
   ): Promise<void>;
+  /** Whether the event is in a DM only the agent, not its owner, can read. */
+  ownerHidden?(agent: Agent, event: RelayEvent): boolean;
   /** Whether the event's channel is a DM between the agent and one other. */
   dm(agent: Agent, event: RelayEvent): boolean;
   /** Whether the event came as it would have with no watch keeping channels
@@ -540,8 +579,8 @@ export type RunnerHost = {
   /** Mention turns working when the page went away, as saved. */
   interrupted: {
     read(): Interrupted;
-    /** Saves the agent's turns. Throws when storage refuses it. */
-    write(key: AgentKey, turns: Readonly<Record<string, string>>): void;
+    /** Saves the agent's turns. Rejects when storage refuses it. */
+    write(key: AgentKey, turns: InterruptedTurns): Promise<void>;
     /** This copy began or stopped holding an agent with saved turns. */
     changed(): void;
   };
@@ -570,6 +609,16 @@ export type RunnerHost = {
   progress(key: AgentKey, progress: TimerProgress): void;
   /** The team sections of its prompt; empty without a team. */
   team(key: AgentKey): string;
+  /** When the agent runs on a model route for this turn, given the owner's
+   * `pick` for it: what chooses the model and effort of a turn it starts. */
+  route?(
+    agent: Agent,
+    type: RegisteredAgentType,
+    trigger: Trigger,
+    place: SessionPlace | undefined,
+    pick: Readonly<{ model?: string; effort?: string }>,
+    signal: AbortSignal,
+  ): Promise<((signal: AbortSignal) => Promise<RoutedPick>) | undefined>;
   /** What its next run starts with, from this device's storage only. */
   start(agent: Agent): Start<unknown> | Promise<Start<unknown>>;
   prepareSession?(
@@ -589,6 +638,18 @@ export type RunnerHost = {
       }>
     | undefined
   >;
+  routeConversation?(
+    agent: Agent,
+    type: RegisteredAgentType,
+    trigger: Extract<Trigger, { type: "mention" | "plugin" | "attention" }>,
+    placement: Readonly<{
+      source: AgentSessionSource;
+      conversation: AgentSessionSource;
+    }>,
+    signal: AbortSignal,
+    nativePlacement?: true,
+    pinNativePlacement?: () => Promise<void> | undefined,
+  ): ReturnType<NonNullable<import("./service").Delivery["routeConversation"]>>;
   protection?(agent: Agent): AgentHandle["protection"];
   agentTypes(): ReturnType<NonNullable<AgentHandle["agentTypes"]>>;
   createAgent(
@@ -617,6 +678,7 @@ export type RunnerHost = {
   handoff(agent: Agent, handoff: AgentHandoff): void;
   /** Whether the agent's threads in the channel have sessions of their own. */
   threadsApart?(agent: Agent, channelId: string): boolean | undefined;
+  isTaskThread?(agent: Agent, channelId: string, root: string): boolean;
   /** The instructions plugins give the agent's turns now. */
   instructions?(
     agent: Agent,
@@ -627,9 +689,16 @@ export type RunnerHost = {
     channelId: string,
     root?: string,
   ): ReturnType<NonNullable<AgentHandle["conversationInstructions"]>>;
+  /** The choices for the sections of the agent's base prompt, in one
+   * conversation when the prompt is for its session. */
+  promptSections?(
+    agent: Agent,
+    channelId?: string,
+    root?: string,
+  ): ReturnType<NonNullable<AgentHandle["promptSections"]>>;
   /** The owner's channel templates as the agent's handle offers them. */
   templates(agent: Agent): ReturnType<AgentHandle["templates"]>;
-  soloWorkspaces?(agent: Agent): SoloWorkspaces | undefined;
+  workspaces?(agent: Agent): Workspaces | undefined;
   /** The owner's thread tabs as the agent's handle offers them. */
   tabs(agent: Agent): ReturnType<AgentHandle["tabs"]>;
   /** Buzz settings on this device, where there are any. */
@@ -722,6 +791,8 @@ export class AgentRunners {
   private readonly runners = new Map<string, Runner>();
   /** Holds newly joined memberships while their global provider/policy changes. */
   private readonly transitions = new Set<string>();
+  /** Voice seats opening or live, by agent key. */
+  private readonly seats = new Map<string, number>();
   /** Each agent's last claim or release, which its next waits for. */
   private readonly custody = new Map<string, Promise<void>>();
   /** Agents whose community was live at the last resume. */
@@ -730,6 +801,9 @@ export class AgentRunners {
   private reloads = new Set<string>();
   /** Catch-up progress of each watch stream, as saved. */
   private checkpoints: Readonly<Record<string, Checkpoint>>;
+  private batchingCheckpoints = false;
+  private heardCheckpointDirty = false;
+  private checkpointFlushQueued = false;
   /** By agent, its catch-up running or last run. */
   private passes = new Map<string, Pass>();
   /** By community, for its connect, when each channel's route was first seen
@@ -766,6 +840,13 @@ export class AgentRunners {
   /** The turns the app left working last time, by agent, until the owner
    * forgets them, or resumes them and each agent's are read again. */
   private left: Interrupted;
+  /** When each agent's turns a failed read left are read again while the same
+   * session stays connected, backing off as catch-up does; a reconnect or a
+   * replacement session tries now. */
+  private readonly resumeRetries = new Map<
+    AgentKey,
+    { delay: number; at: number; connection: Connection; epoch: number }
+  >();
   /** The turns the app left working last time, as this page started: only
    * Resume gives them again, never a replay or live delivery. */
   private readonly stopped: Interrupted;
@@ -805,7 +886,7 @@ export class AgentRunners {
   /** The mentions the app left `key` working on, each with its channel or
    * "" without one. */
   interruptedTurns(key: AgentKey): Readonly<Record<string, string>> {
-    return this.left[key] ?? {};
+    return interruptedChannels(this.left[key]);
   }
   /** Gives each of `keys` again the turns it was left working on, once
    * its community is connected. */
@@ -815,7 +896,7 @@ export class AgentRunners {
       const agent = this.host.agent(key);
       const turns = this.left[key];
       if (agent && turns && this.runners.get(key)?.type?.resumes)
-        this.host.resumeFollowUps?.(agent, turns);
+        this.host.resumeFollowUps?.(agent, interruptedChannels(turns));
     }
     for (const runner of this.runners.values()) this.resumeTurns(runner);
   }
@@ -825,7 +906,8 @@ export class AgentRunners {
       const { [key]: turns, ...rest } = this.left;
       if (!turns || !this.runs(key)) continue;
       const agent = this.host.agent(key);
-      if (agent) this.host.abandonFollowUps?.(agent, turns);
+      if (agent)
+        this.host.abandonFollowUps?.(agent, interruptedChannels(turns));
       this.unmark(key, Object.keys(turns));
       this.left = rest;
     }
@@ -1057,6 +1139,37 @@ export class AgentRunners {
     voice: NonNullable<AgentType["voice"]>,
     pluginId?: string,
   ) {
+    const end = this.reserveVoice(seat.agent.key);
+    // The host aborts the seat's signal when its call ends.
+    seat.signal.addEventListener("abort", end, { once: true });
+    try {
+      return await this.connectVoice(seat, voice, pluginId);
+    } catch (error) {
+      end();
+      throw error;
+    }
+  }
+  /** Counts a voice seat from before its call opens, so a restart refuses
+   * it; refused while the agent restarts or changes type. Returns its end. */
+  reserveVoice(key: AgentKey) {
+    const pubkey = this.runners.get(key)?.member.pubkey;
+    if (pubkey && this.transitions.has(pubkey))
+      throw new Error("This agent is restarting or changing provider");
+    this.seats.set(key, (this.seats.get(key) ?? 0) + 1);
+    let ended = false;
+    return () => {
+      if (ended) return;
+      ended = true;
+      const left = (this.seats.get(key) ?? 1) - 1;
+      if (left) this.seats.set(key, left);
+      else this.seats.delete(key);
+    };
+  }
+  private async connectVoice(
+    seat: AgentVoicePipe,
+    voice: NonNullable<AgentType["voice"]>,
+    pluginId?: string,
+  ) {
     const agent = this.host.ready(seat.agent.key);
     const handle = agent && this.handle(agent.key, pluginId);
     const type = this.runners.get(seat.agent.key)?.type;
@@ -1122,6 +1235,19 @@ export class AgentRunners {
         );
     });
   }
+  /** Process liveness is independent of the temporary pause on handle calls
+   * during a harness switch. The runner signal still retires the command when
+   * the saved type, plugin, or protection changes. */
+  attentionCommandCurrent(key: AgentKey) {
+    const runner = this.runners.get(key);
+    const signal = runner?.controller.signal;
+    return () =>
+      signal?.aborted === false &&
+      this.runners.get(key) === runner &&
+      this.runs(key) &&
+      !!this.host.ready(key) &&
+      this.host.attentionShown();
+  }
   /** Whether another copy of the app runs an agent this one could. */
   yielded(key: AgentKey) {
     const runner = this.runners.get(key);
@@ -1157,37 +1283,69 @@ export class AgentRunners {
    * every community it is in, as its type is theirs: no turn starts
    * meanwhile, and their queues resume after. Refused while a turn is
    * working, and unless this copy of the app holds the agent. */
-  async retype<T>(
+  retype<T>(key: AgentKey, name: string, change: () => Promise<T>) {
+    return this.hold(key, change, {
+      busy: () => `${name} is answering; change its type when it finishes`,
+      absent:
+        "This agent is not running in this copy of Buzz. Change its provider in the Buzz app that runs it.",
+      changing: `${name}'s provider is already changing`,
+      elsewhere:
+        "Another copy of Buzz is running this agent. Change its provider there, or quit that copy of Buzz and try again.",
+    });
+  }
+  /** Runs `change`, which stops the agent's processes, as `retype` holds it,
+   * and also refused while it has a voice seat opening or live. */
+  restart<T>(key: AgentKey, name: string, change: () => Promise<T>) {
+    return this.hold(key, change, {
+      busy: (pubkey) =>
+        this.inCall(pubkey)
+          ? `${name} is in a call; restart it when the call ends`
+          : `${name} is answering; restart it when it finishes`,
+      absent:
+        "This agent is not running in this copy of Buzz. Restart it in the Buzz app that runs it.",
+      changing: `${name} is already restarting or changing provider`,
+      elsewhere:
+        "Another copy of Buzz is running this agent. Restart it there, or quit that copy of Buzz and try again.",
+      call: true,
+    });
+  }
+  private inCall(pubkey: string) {
+    return [...this.runners.values()].some(
+      (runner) => runner.member.pubkey === pubkey && this.seats.has(runner.key),
+    );
+  }
+  private async hold<T>(
     key: AgentKey,
-    name: string,
     change: () => Promise<T>,
+    refusals: Readonly<{
+      busy: (pubkey: string) => string;
+      absent: string;
+      changing: string;
+      elsewhere: string;
+      call?: boolean;
+    }>,
   ): Promise<T> {
     const runner = this.runners.get(key);
     const held = [...this.runners.values()].filter(
       (other) => other.member.pubkey === runner?.member.pubkey,
     );
-    const answering = () =>
-      new Error(`${name} is answering; change its type when it finishes`);
-    const working = () => held.some((other) => other.working);
-    if (working()) throw answering();
-    if (!runner)
-      throw new Error(
-        "This agent is not running in this copy of Buzz. Change its provider in the Buzz app that runs it.",
-      );
+    const busy = () =>
+      held.some((other) => other.working) ||
+      (!!refusals.call && !!runner && this.inCall(runner.member.pubkey));
+    if (busy()) throw new Error(refusals.busy(runner?.member.pubkey ?? ""));
+    if (!runner) throw new Error(refusals.absent);
     const pubkey = runner.member.pubkey;
     if (
       this.transitions.has(pubkey) ||
       held.some((other) => other.transitioning)
     )
-      throw new Error(`${name}'s provider is already changing`);
+      throw new Error(refusals.changing);
     this.transitions.add(pubkey);
     for (const other of held) other.transitioning = true;
     try {
       if (!(await this.claimForRetype(runner)))
-        throw new Error(
-          "Another copy of Buzz is running this agent. Change its provider there, or quit that copy of Buzz and try again.",
-        );
-      if (working()) throw answering();
+        throw new Error(refusals.elsewhere);
+      if (busy()) throw new Error(refusals.busy(pubkey));
       return await change();
     } finally {
       this.transitions.delete(pubkey);
@@ -1196,10 +1354,12 @@ export class AgentRunners {
         other.transitioning = false;
         void this.drain(other);
       }
+      this.host.transitionChanged?.();
     }
   }
   /** Retires every runner, as when the host stops. */
   clear() {
+    if (this.heardCheckpointDirty) this.saveCheckpoints();
     for (const runner of this.runners.values()) this.retire(runner);
     this.runners.clear();
   }
@@ -1242,9 +1402,13 @@ export class AgentRunners {
       classified: Promise.resolve(),
     };
   }
+  private passUnderway(runner: Runner, lane: PassLane) {
+    const pass = this.passes.get(passKey(runner.key, lane));
+    return !!pass && !pass.done && !pass.failedAt;
+  }
   private retire(runner: Runner) {
-    for (const mentions of [true, false]) {
-      const key = passKey(runner.key, mentions);
+    for (const lane of PASSES) {
+      const key = passKey(runner.key, lane);
       this.passes.get(key)?.controller.abort();
       this.passes.delete(key);
     }
@@ -1282,40 +1446,52 @@ export class AgentRunners {
   /** Gives a community's live events, and replayed ones from `since` on, to
    * the agents in it. */
   dispatch(batch: LiveBatch, heard: (agent: Agent) => boolean, since: number) {
-    for (const runner of this.runners.values()) {
-      const agent = this.host.ready(runner.key);
-      if (!agent || !heard(agent) || !runner.type?.run) continue;
-      let overflow = 0;
-      for (const event of batch.events) {
-        if (batch.replay && event.created_at < since) continue;
-        if (!batch.replay) {
-          this.hear(runner, agent, event, batch.channelId);
-          continue;
+    this.batchCheckpoints(() => {
+      for (const runner of this.runners.values()) {
+        const agent = this.host.ready(runner.key);
+        if (!agent || !heard(agent) || !runner.type?.run) continue;
+        // An earlier slice may have filled the queue before a rate window
+        // opened. Give that work room before filling it with this slice.
+        if (
+          batch.replay &&
+          runner.backlog.length &&
+          runner.backlog.length + batch.events.length > BACKLOG_LIMIT
+        ) {
+          this.admit(runner);
+          if (runner.controller.signal.aborted) continue;
         }
-        const channel = event.tags.find((tag) => tag[0] === "h")?.[1];
-        if (this.hasSeen(runner, event.id, channel)) continue;
-        // Left unseen, so a later replay or catch-up can still deliver it.
-        if (runner.backlog.length >= BACKLOG_LIMIT) {
-          overflow++;
-          continue;
+        let overflow = 0;
+        for (const event of batch.events) {
+          if (batch.replay && event.created_at < since) continue;
+          if (!batch.replay) {
+            this.hear(runner, agent, event, batch.channelId);
+            continue;
+          }
+          const channel = event.tags.find((tag) => tag[0] === "h")?.[1];
+          if (this.hasSeen(runner, event.id, channel)) continue;
+          // Left unseen, so a later replay or catch-up can still deliver it.
+          if (runner.backlog.length >= BACKLOG_LIMIT) {
+            overflow++;
+            continue;
+          }
+          this.markSeen(runner, event.id, channel);
+          if (this.isOwn(agent, event)) continue;
+          // A replay waits for room rather than take the drops a burst of
+          // live traffic would.
+          runner.backlog.push({
+            event,
+            ...(batch.channelId ? { channelId: batch.channelId } : {}),
+            addressable: this.host.unattended(agent, event, true),
+            replay: true,
+          });
         }
-        this.markSeen(runner, event.id, channel);
-        if (this.isOwn(agent, event)) continue;
-        // A replay waits for room rather than take the drops a burst of
-        // live traffic would.
-        runner.backlog.push({
-          event,
-          ...(batch.channelId ? { channelId: batch.channelId } : {}),
-          addressable: this.host.unattended(agent, event, true),
-          replay: true,
-        });
+        if (overflow)
+          console.warn(
+            `Agent ${agent.name} left ${overflow} replayed events for later`,
+          );
+        if (batch.replay) this.admit(runner);
       }
-      if (overflow)
-        console.warn(
-          `Agent ${agent.name} left ${overflow} replayed events for later`,
-        );
-      if (batch.replay) this.admit(runner);
-    }
+    });
   }
   /** The agent's watches whose streams started after a replayed `event`.
    * Asked as it is admitted: an attention change starts its streams in the
@@ -1445,32 +1621,38 @@ export class AgentRunners {
       runner.later.shift();
       this.submit(runner, agent, job);
     }
-    while (runner.backlog.length) {
-      const { event, channelId, addressable, replay, ...entry } = runner
-        .backlog[0] as Runner["backlog"][0];
-      // Matched against the watches as they are now: one turned on while a
-      // replay waited does not wake for it.
-      const done = replay
-        ? new Set([...(entry.done ?? []), ...this.before(runner, agent, event)])
-        : entry.done;
-      const heard = this.heard(runner, agent, event, addressable, done);
-      if (
-        (heard.held && runner.held.size >= HELD_LIMIT) ||
-        !this.takes(runner, heard.triggers)
-      )
-        return;
-      runner.backlog.shift();
-      this.deliver(
-        runner,
-        agent,
-        event,
-        channelId,
-        addressable,
-        heard,
-        done,
-        replay,
-      );
-    }
+    if (!runner.backlog.length) return;
+    this.batchCheckpoints(() => {
+      while (runner.backlog.length) {
+        const { event, channelId, addressable, replay, ...entry } = runner
+          .backlog[0] as Runner["backlog"][0];
+        // Matched against the watches as they are now: one turned on while a
+        // replay waited does not wake for it.
+        const done = replay
+          ? new Set([
+              ...(entry.done ?? []),
+              ...this.before(runner, agent, event),
+            ])
+          : entry.done;
+        const heard = this.heard(runner, agent, event, addressable, done);
+        if (
+          (heard.held && runner.held.size >= HELD_LIMIT) ||
+          !this.takes(runner, heard.triggers)
+        )
+          return;
+        runner.backlog.shift();
+        this.deliver(
+          runner,
+          agent,
+          event,
+          channelId,
+          addressable,
+          heard,
+          done,
+          replay,
+        );
+      }
+    });
   }
   /** Gives the agent `event` once, however many times it arrives. */
   private hear(
@@ -1502,7 +1684,9 @@ export class AgentRunners {
     for (const stream of streamsOf(agent))
       if ((!done || done.has(stream.slug)) && inStream(stream, event))
         changed = this.heardIn(stream.key, event) || changed;
-    if (changed) this.saveCheckpoints();
+    if (!changed) return;
+    if (this.batchingCheckpoints) this.heardCheckpointDirty = true;
+    else this.saveCheckpoints();
   }
   /** Adds `event` to what the stream heard past its checkpoint, unless it is
    * not past it; returns whether it did. */
@@ -1607,7 +1791,14 @@ export class AgentRunners {
       const community = agent && this.host.community(agent);
       const on = !!agent?.attentionEnabled && !!runner.type?.run;
       const reading: Stream[] = [];
-      const streams = agent ? streamsOf(agent) : [];
+      // Only an agent with reads of its own here has private mentions.
+      const streams = agent
+        ? streamsOf(agent).filter(
+            (stream) =>
+              !stream.private ||
+              this.host.privateMentionsDue?.(agent) !== undefined,
+          )
+        : [];
       // Saved edits still invalidate retries when a disconnect hides the row.
       const attention =
         agent?.attention ?? this.host.savedAttention(runner.key);
@@ -1653,7 +1844,14 @@ export class AgentRunners {
           (stream.channel === undefined ||
             !community?.session.attendPending(stream.channel)) &&
           (runner.readRetries.get(stream.key)?.failure.retryAt ?? 0) <=
-            Date.now()
+            Date.now() &&
+          // Not due only holds back a new private pass; one under way runs
+          // until its window completes.
+          !(
+            stream.private &&
+            !this.host.privateMentionsDue?.(agent as Agent) &&
+            !this.passUnderway(runner, "private")
+          )
         )
           reading.push(stream);
       }
@@ -1670,11 +1868,10 @@ export class AgentRunners {
         if (created < mentioned - POLL_OVERLAP) runner.mentioned.delete(id);
       // Mentions have their own pass, so watch work waiting for room never
       // holds up the next mention read.
-      for (const mentions of [true, false]) {
-        const key = passKey(runner.key, mentions);
-        const streams = reading.filter(
-          (stream) => !!stream.mentions === mentions,
-        );
+      for (const lane of PASSES) {
+        const mentions = lane !== "watches";
+        const key = passKey(runner.key, lane);
+        const streams = reading.filter((stream) => passOf(stream) === lane);
         const pass = this.passes.get(key);
         // Only a watch's live events wait for its catch-up.
         const catching = (slugs: readonly Stream[]) => {
@@ -1790,70 +1987,134 @@ export class AgentRunners {
     const left = this.left[runner.key];
     const agent = this.host.ready(runner.key);
     const community = agent && this.host.community(agent);
+    const retry = this.resumeRetries.get(runner.key);
     if (
       !this.resuming.has(runner.key) ||
       !left ||
       !agent ||
       !runner.type ||
-      community?.connection.since === undefined
+      community?.connection.since === undefined ||
+      (retry?.connection === community.connection &&
+        retry.epoch === community.connection.epoch &&
+        retry.at > Date.now())
     )
       return;
     const { [runner.key]: _, ...rest } = this.left;
     this.left = rest;
-    const ids = Object.keys(left);
+    const channels = interruptedChannels(left);
+    const ids = Object.keys(channels);
     if (!runner.type.resumes) {
-      this.host.abandonFollowUps?.(agent, left);
+      this.host.abandonFollowUps?.(agent, channels);
       return this.unmark(runner.key, ids);
     }
-    this.host.resumeFollowUps?.(agent, left);
+    this.host.resumeFollowUps?.(agent, channels);
+    const { signal } = community.controller;
+    const { connection } = community;
+    const { epoch } = connection;
     // Not read(): it returns the owner's own mentions as unproven outbox copies.
-    void community.session
-      .readRemote([{ ids, limit: ids.length }], {
-        signal: community.controller.signal,
-        fresh: true,
-      })
-      .then(
-        (events) => {
-          // A turn's own run forgets it when it settles.
-          const kept = new Set<string>();
-          // Oldest first, as they were sent: a later correction stays last.
-          const proven = (events.filter(hasEventProof) as RelayEvent[]).sort(
-            (a, b) =>
-              a.created_at - b.created_at ||
-              (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    const read = async () => {
+      // Each read failing leaves its turns for the next try; the other still
+      // resumes what it finds.
+      let retry: readonly string[] = [];
+      const owned = await community.session
+        .readRemote([{ ids, limit: ids.length }], { signal, fresh: true })
+        .catch((error) => {
+          if (signal.aborted) throw error;
+          console.warn(`Agent ${agent.name} could not resume its turns`, error);
+          retry = ids;
+          return [] as RelayEvent[];
+        });
+      const found = new Set(owned.filter(hasEventProof).map(({ id }) => id));
+      const hidden = ids.filter((id) => !found.has(id));
+      let agents: readonly RelayEvent[] | undefined;
+      if (hidden.length)
+        try {
+          agents = await this.host.readAsAgent?.(
+            agent,
+            { ids: hidden, limit: hidden.length },
+            signal,
           );
-          for (const event of proven) {
-            const channel = left[event.id];
-            if (channel === undefined) continue;
-            if (!this.hasSeen(runner, event.id, channelOf(event)))
-              this.markSeen(runner, event.id, channelOf(event));
-            const queued = this.enqueue(runner, {
-              trigger: { type: "mention", event, resumed: true },
-              ...(channel ? { channelId: channel } : {}),
-            });
-            if (queued) kept.add(event.id);
-          }
-          const forgotten = Object.fromEntries(
-            Object.entries(left).filter(([id]) => !kept.has(id)),
+        } catch (error) {
+          if (signal.aborted) throw error;
+          retry = [...new Set([...retry, ...hidden])];
+          console.warn(
+            `Agent ${agent.name} could not resume its private turns`,
+            error,
           );
-          this.host.abandonFollowUps?.(agent, forgotten);
-          this.unmark(runner.key, Object.keys(forgotten));
-        },
-        (error) => {
-          this.left = { ...this.left, [runner.key]: left };
-          if (!community.controller.signal.aborted)
-            console.warn(
-              `Agent ${agent.name} could not resume its turns`,
-              error,
-            );
-        },
+        }
+      const recovered = new Set(
+        (agents ?? []).filter(hasEventProof).map(({ id }) => id),
       );
+      return {
+        events: [...owned, ...(agents ?? [])],
+        retry: retry.filter((id) => !recovered.has(id)),
+      };
+    };
+    void read().then(
+      ({ events, retry }) => {
+        // Turns a failed read left back off until a try finds them all.
+        if (!retry.length) this.resumeRetries.delete(runner.key);
+        else {
+          const delay = Math.min(
+            (this.resumeRetries.get(runner.key)?.delay ??
+              CATCH_UP_RETRY_MS / 2) * 2,
+            CATCH_UP_RETRY_BASE_MAX_MS,
+          );
+          this.resumeRetries.set(runner.key, {
+            delay,
+            at: Date.now() + delay + Math.floor((delay * Math.random()) / 4),
+            connection,
+            epoch,
+          });
+        }
+        if (retry.length)
+          this.left = {
+            ...this.left,
+            [runner.key]: Object.fromEntries(
+              retry.map((id) => [id, left[id] ?? ""]),
+            ),
+          };
+        // A turn's own run forgets it when it settles.
+        const kept = new Set<string>();
+        // Oldest first, as they were sent: a later correction stays last.
+        const proven = (events.filter(hasEventProof) as RelayEvent[]).sort(
+          (a, b) =>
+            a.created_at - b.created_at ||
+            (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+        );
+        for (const event of proven) {
+          const channel = channels[event.id];
+          if (channel === undefined) continue;
+          if (!this.hasSeen(runner, event.id, channelOf(event)))
+            this.markSeen(runner, event.id, channelOf(event));
+          const queued = this.enqueue(runner, {
+            trigger: { type: "mention", event, resumed: true },
+            ...(channel ? { channelId: channel } : {}),
+            ...(typeof left[event.id] === "string"
+              ? { nativePlacement: true }
+              : {}),
+          });
+          if (queued) kept.add(event.id);
+        }
+        const forgotten = Object.fromEntries(
+          Object.entries(channels).filter(
+            ([id]) => !kept.has(id) && !retry.includes(id),
+          ),
+        );
+        this.host.abandonFollowUps?.(agent, forgotten);
+        this.unmark(runner.key, Object.keys(forgotten));
+      },
+      (error) => {
+        this.left = { ...this.left, [runner.key]: left };
+        if (!community.controller.signal.aborted)
+          console.warn(`Agent ${agent.name} could not resume its turns`, error);
+      },
+    );
   }
-  /** Saves the mention `id` as working, in `channel` or "" without one. */
-  private mark(key: AgentKey, id: string, channel: string) {
-    this.saveTurns(key, {
+  private mark(key: AgentKey, id: string, entry: InterruptedTurns[string]) {
+    return this.saveTurns(key, {
       ...this.turns,
-      [key]: { ...this.turns[key], [id]: channel },
+      [key]: { ...this.turns[key], [id]: entry },
     });
   }
   private unmark(key: AgentKey, ids: readonly string[]) {
@@ -1869,11 +2130,11 @@ export class AgentRunners {
   /** Saves `key`'s turns only: another program may run the others. */
   private saveTurns(key: AgentKey, turns: Interrupted) {
     this.turns = turns;
-    try {
-      this.host.interrupted.write(key, turns[key] ?? {});
-    } catch (error) {
-      console.warn("Agent turns in progress were not saved", error);
-    }
+    const saved = this.host.interrupted.write(key, turns[key] ?? {});
+    void saved.catch((error) =>
+      console.warn("Agent turns in progress were not saved", error),
+    );
+    return saved;
   }
   /** Reads each stream's missed events through `upper`, or its own `upper`
    * when that is a function, a window at a time,
@@ -1895,25 +2156,32 @@ export class AgentRunners {
       pass.community.controller.signal,
     ]);
     const name = () => this.host.agent(runner.key)?.name;
-    const read = async (filter: ReadFilter) => {
+    const read = (stream: Stream) => async (filter: ReadFilter) => {
       // Only the relay's page: read() also adds events the session observed
       // meanwhile and the owner's messages not yet sent, and an older one of
       // those would page past events the relay has not returned yet.
-      const events = await pass.community.session.readRemote([filter], {
-        signal,
-        priority: "background",
-        fresh: true,
-        // Of every channel: a public one the session does not know yet too.
-        ...(filter["#h"] ? {} : { resolveChannels: true }),
-      });
+      const agent = this.host.agent(runner.key);
+      const events = stream.private
+        ? agent && this.host.readPrivateMentions
+          ? await this.host.readPrivateMentions(agent, filter, signal)
+          : []
+        : await pass.community.session.readRemote([filter], {
+            signal,
+            priority: "background",
+            fresh: true,
+            // Of every channel: a public one the session does not know yet too.
+            ...(filter["#h"] ? {} : { resolveChannels: true }),
+          });
       signal.throwIfAborted();
       // Only what the relay signed.
       const signed = events.filter(hasEventProof) as RelayEvent[];
-      const agent = this.host.agent(runner.key);
       for (const event of signed)
         this.readAddressable.set(
           event,
-          !!agent && this.host.unattended(agent, event, false),
+          !!agent &&
+            this.host.unattended(agent, event, false) &&
+            // The owner's mentions stream gives the rest.
+            (!stream.private || !!this.host.ownerHidden?.(agent, event)),
         );
       return signed;
     };
@@ -1930,7 +2198,7 @@ export class AgentRunners {
               stream,
               this.checkpoints[stream.key],
               typeof upper === "number" ? upper : upper(stream),
-              read,
+              read(stream),
             )
               .then((window) => {
                 signal.throwIfAborted();
@@ -1939,6 +2207,13 @@ export class AgentRunners {
                 return window;
               })
               .catch((error) => {
+                if (stream.private && !signal.aborted) {
+                  console.warn(
+                    `Agent ${name()} could not catch up its private mentions`,
+                    error,
+                  );
+                  return undefined;
+                }
                 if (signal.aborted || stream.mentions) throw error;
                 const object = pass.attention?.[slug];
                 if (!object) throw error;
@@ -2257,10 +2532,29 @@ export class AgentRunners {
     const checkpoint = this.checkpoints[streamOf(runner.key, trigger)];
     return !!checkpoint && undelivered(checkpoint, trigger.event);
   }
+  /** Keep progress current during admission. A relay slice may arrive as
+   * several synchronous deliveries with different channel provenance. */
+  private batchCheckpoints(run: () => void) {
+    if (this.batchingCheckpoints) return run();
+    this.batchingCheckpoints = true;
+    try {
+      run();
+    } finally {
+      this.batchingCheckpoints = false;
+      if (this.heardCheckpointDirty && !this.checkpointFlushQueued) {
+        this.checkpointFlushQueued = true;
+        queueMicrotask(() => {
+          this.checkpointFlushQueued = false;
+          if (this.heardCheckpointDirty) this.saveCheckpoints();
+        });
+      }
+    }
+  }
   /** Saves the checkpoints of watches that still exist. Unsaved, catch-up
    * starts from the last saved one again, which `seen` dedupes until a
    * restart, and each stream's saved `heard` after one. */
   private saveCheckpoints() {
+    this.heardCheckpointDirty = false;
     const keys = new Set([
       ...this.host.records().flatMap((record) =>
         // A record's `pubkey` is its membership's key.
@@ -2270,7 +2564,10 @@ export class AgentRunners {
       ),
       // Mentions need no record: a membership added to a community has none
       // until something is saved for it there.
-      ...[...this.runners.keys()].map((key) => streamKey(key, MENTIONS)),
+      ...[...this.runners.keys()].flatMap((key) => [
+        streamKey(key, MENTIONS),
+        streamKey(key, PRIVATE_MENTIONS),
+      ]),
     ]);
     this.checkpoints = Object.fromEntries(
       Object.entries(this.checkpoints).filter(([key]) => keys.has(key)),
@@ -2443,11 +2740,12 @@ export class AgentRunners {
       count(-1);
     };
     const lifetime = runner.controller.signal;
-    // Whether this runner, as it is now, should still act on the event.
-    const live = () =>
-      !lifetime.aborted &&
+    // Source output belongs to its watch registration, which can survive a
+    // harness change. Event classification still belongs to its original run.
+    const sameRunner = () =>
       this.runners.get(runner.key) === runner &&
-      this.stillCurrent(runner, job);
+      (trigger.type === "source" || !lifetime.aborted);
+    const live = () => sameRunner() && this.stillCurrent(runner, job);
     // Checked as non-null by the caller.
     const classifier = trigger.watch.classifier as NonNullable<
       EventWatch["classifier"]
@@ -2468,8 +2766,7 @@ export class AgentRunners {
       try {
         await previous;
         const results = await outcomes;
-        // A retired or replaced runner keeps none of its work.
-        if (lifetime.aborted || this.runners.get(runner.key) !== runner) return;
+        if (!sameRunner()) return;
         unreserve();
         if (trigger.type === "watch" || trigger.type === "source") {
           const [result] = results;
@@ -2903,6 +3200,7 @@ export class AgentRunners {
                   ? { type: "mention", event: trigger.event }
                   : trigger,
               ...(job.channelId ? { channelId: job.channelId } : {}),
+              ...(job.nativePlacement ? { nativePlacement: true } : {}),
             })
         : undefined,
       trigger.type === "mention"
@@ -3042,7 +3340,13 @@ export class AgentRunners {
    * replayed. A turn whose access is revoked after dispatch is the harness's
    * to fail visibly. An `attribution` type's turn never waits or fails here:
    * it takes the route as it stands, and any blocked route, `auth` and
-   * `readiness_pending` included, runs it unattributed with a notice. */
+   * `readiness_pending` included, runs it unattributed with a notice. A
+   * harness a plugin's list leaves out (`GatewayRoutes.excludes`) runs with
+   * its own configuration, without a notice, whatever the route: a turn
+   * waits for the list first, within the same cap, and then neither waits
+   * for nor rechecks an access check. An `attribution` turn doesn't wait for
+   * the list either: while it is unknown, the turn runs unattributed with
+   * `SELECTION_PENDING_NOTICE`, unless its route is already external. */
   private async gatewayRouting(
     agent: Agent,
     type: RegisteredAgentType,
@@ -3054,17 +3358,46 @@ export class AgentRunners {
     const upstream = harness && gatewayRoutes.upstream(harness);
     if (!upstream) return {};
     const attribution = type.gateway?.mode === "attribution";
-    // Attribution never holds a turn for an access check: it takes the
-    // route as it stands, while any check carries on for later turns.
-    const route = await gatewayRoutes.routeForTurn(
-      agent.key,
-      attribution
-        ? undefined
-        : AbortSignal.any([
-            signal,
-            AbortSignal.timeout(TURN_READINESS_WAIT_MS),
-          ]),
-    );
+    // Attribution never holds a turn, for the plugin's list or an access
+    // check. A list that leaves this harness out, or a route already
+    // external, runs it on its own configuration without a notice. While the
+    // list is unknown, it runs unattributed with a notice that says only
+    // that, since no access check has gone out yet.
+    if (attribution) {
+      if (gatewayRoutes.excludes(harness)) return {};
+      if (gatewayRoutes.selecting) {
+        if (gatewayRoutes.routeFor(agent.key).kind === "external") return {};
+        const notice = SELECTION_PENDING_NOTICE;
+        job.work?.notice(notice);
+        return {
+          gatewayFallback: Object.freeze({
+            reason: "readiness_pending" as const,
+            notice,
+          }),
+        };
+      }
+    }
+    // One cap for the list and the access check together.
+    const wait = attribution
+      ? undefined
+      : AbortSignal.any([signal, AbortSignal.timeout(TURN_READINESS_WAIT_MS)]);
+    // The list first, so a harness it leaves out never waits for, or
+    // rechecks, an access check. A route already external, such as an
+    // unlisted community's, doesn't wait for the list.
+    if (
+      wait &&
+      gatewayRoutes.selecting &&
+      gatewayRoutes.routeFor(agent.key).kind !== "external"
+    ) {
+      await gatewayRoutes.selectionForTurn(wait);
+      signal.throwIfAborted();
+    }
+    // A harness the plugin's list leaves out keeps its own configuration
+    // whatever the route, so a partial list never fails its turns.
+    if (gatewayRoutes.excludes(harness)) return {};
+    // Attribution takes the route as it stands, while any check carries on
+    // for later turns.
+    const route = await gatewayRoutes.routeForTurn(agent.key, wait);
     signal.throwIfAborted();
     if (route.kind === "external") return {};
     if (route.kind === "blocked") {
@@ -3145,6 +3478,29 @@ export class AgentRunners {
     };
     const completion = Promise.resolve().then(async () => {
       this.assertProtected(agent, type, handle);
+      if (
+        trigger.type === "mention" &&
+        !(type.invocationRouting && this.host.routeConversation)
+      ) {
+        const { event } = trigger;
+        const thread = threadReference(event);
+        const channelId =
+          job.channelId ?? event.tags.find(([tag]) => tag === "h")?.[1];
+        if (
+          thread &&
+          channelId &&
+          hasInvocationIntent({
+            agent: agent.key,
+            owner: agent.owner,
+            invocationId: event.id,
+            event,
+            source: { channelId, root: thread.rootId },
+          })
+        )
+          throw new Error(
+            "Invocation routing is unavailable for this agent. Restore it and retry.",
+          );
+      }
       // Before any type code (its models included) runs for this turn.
       const routing = await this.gatewayRouting(
         agent,
@@ -3153,7 +3509,67 @@ export class AgentRunners {
         anchor,
         signal,
       );
-      const pick = await pickFor(job.trigger, agent, type);
+      const owned = await pickFor(job.trigger, agent, type);
+      // A watch or timer run as a standalone turn keeps its own picks: the
+      // harness starts it on its default, so no route chooses for it.
+      const runsAlone = !addressed(trigger) && !anchor && !!type.runOnce;
+      const choose = runsAlone
+        ? undefined
+        : await this.host.route?.(
+            agent,
+            type,
+            trigger,
+            trigger.type === "mention"
+              ? {
+                  channelId: job.channelId ?? channelOf(trigger.event) ?? "",
+                  root:
+                    threadReference(trigger.event)?.rootId ?? trigger.event.id,
+                }
+              : anchor && {
+                  channelId: anchor.channel,
+                  ...(anchor.root ? { root: anchor.root } : {}),
+                },
+            owned,
+            signal,
+          );
+      // The harness's Stop for this request, once it offers one.
+      let harnessStop: (() => Promise<void>) | undefined;
+      let selecting = false;
+      let chosen: Promise<TurnPick | undefined> | undefined;
+      // Asked by the harness as the turn starts, once: Stop meanwhile ends
+      // the choice, and the request with it.
+      const route =
+        choose &&
+        (() =>
+          (chosen ??= (async () => {
+            const stop = new AbortController();
+            selecting = true;
+            job.work?.interruptible(async () => {
+              stop.abort(new Error("The owner stopped the request"));
+              await harnessStop?.().catch(() => {});
+            });
+            try {
+              const { routed, ended, ...pick } = await choose(
+                AbortSignal.any([lifetime, stop.signal]),
+              );
+              // The conversation's last routed turn ends with its work.
+              if (ended) void working.settled.then(ended, ended);
+              // The turn's activity says what its route chose, and why.
+              if (routed)
+                job.work?.notice(
+                  `${routed.route.label}${routed.fallback ? " fell back to" : " chose"} ${routed.label}${routed.rationale ? `: ${routed.rationale}` : ""}`,
+                );
+              return pick;
+            } catch (error) {
+              if (stop.signal.aborted) return undefined;
+              throw error;
+            } finally {
+              selecting = false;
+              if (harnessStop) job.work?.interruptible(harnessStop);
+            }
+          })()));
+      // A route's pick is the turn's, chosen as it starts.
+      const pick = route ? {} : owned;
       const start = await this.host.start(agent);
       if (!start.ok) throw new Error(start.reason);
       const team = this.host.team(agent.key);
@@ -3181,8 +3597,40 @@ export class AgentRunners {
           : undefined;
       };
       signal.throwIfAborted();
+      const routingTrigger = addressed(job.trigger) ? job.trigger : anchor;
+      const routeConversation = this.host.routeConversation;
       const delivery = Object.freeze({
         trigger: job.trigger,
+        ...(routingTrigger && routeConversation
+          ? {
+              routeConversation: async (
+                placement: Parameters<
+                  NonNullable<import("./service").Delivery["routeConversation"]>
+                >[0],
+                admissionSignal = signal,
+              ) => {
+                const route = await routeConversation(
+                  agent,
+                  type,
+                  routingTrigger,
+                  placement,
+                  admissionSignal,
+                  job.nativePlacement,
+                  routingTrigger.type === "mention"
+                    ? working.pinNativePlacement
+                    : undefined,
+                );
+                if (!route && routingTrigger.type === "mention") {
+                  admissionSignal.throwIfAborted();
+                  // Ordinary turns keep the best-effort recovery write. A
+                  // matching router awaits the pin when it chooses native.
+                  void working.pinNativePlacement();
+                  job.nativePlacement = true;
+                }
+                return route;
+              },
+            }
+          : {}),
         ...(type.sessionAdmission ? { prepareSession } : {}),
         ...(job.channelId ? { channelId: job.channelId } : {}),
         ...routing,
@@ -3191,6 +3639,7 @@ export class AgentRunners {
         revisions: start.revisions,
         ...(start.synced && { synced: start.synced }),
         ...pick,
+        ...(route ? { route } : {}),
         ...(team ? { team } : {}),
         signal,
         ...(job.guardedWake ? { accepted: job.guardedWake.accepted } : {}),
@@ -3204,8 +3653,11 @@ export class AgentRunners {
                 void admission?.then((admitted) => admitted?.acknowledged());
               },
               superseded: () => job.work?.supersede(),
-              interruptible: (stop: () => Promise<void>) =>
-                job.work?.interruptible(stop),
+              interruptible: (stop: () => Promise<void>) => {
+                harnessStop = stop;
+                // While a route chooses, its Stop calls this one too.
+                if (!selecting) job.work?.interruptible(stop);
+              },
               step: (tool: string, target?: string) =>
                 job.work?.step(tool, target),
             }
@@ -3410,7 +3862,7 @@ export class AgentRunners {
     const lifetime = runner.controller.signal;
     const protection = this.host.protection?.(agent);
     const settings = run ? this.host.settings?.() : undefined;
-    const workspaces = run ? this.host.soloWorkspaces?.(agent) : undefined;
+    const workspaces = run ? this.host.workspaces?.(agent) : undefined;
     const creations = new Map<string, (event: RelayEvent) => void>();
     const handle = guarded(
       {
@@ -3555,6 +4007,10 @@ export class AgentRunners {
             lifetime.throwIfAborted();
             return this.host.threadsApart?.(agent, channelId);
           },
+          isTaskThread: (channelId: string, root: string) => {
+            lifetime.throwIfAborted();
+            return this.host.isTaskThread?.(agent, channelId, root) ?? false;
+          },
           // The control outlives this call, so each of its calls checks the
           // run's lifetime, and set again once it has read the agents.
           bestie: () => {
@@ -3577,14 +4033,34 @@ export class AgentRunners {
           },
         }),
         ...(workspaces && {
-          soloWorkspaces: {
+          workspaces: {
             list: (signal?: AbortSignal) =>
               workspaces.list(
                 AbortSignal.any([lifetime, ...(signal ? [signal] : [])]),
               ),
+            defaults: (
+              workspace: string,
+              chat: WorkspaceChat,
+              signal?: AbortSignal,
+            ) =>
+              workspaces.defaults(
+                workspace,
+                chat,
+                AbortSignal.any([lifetime, ...(signal ? [signal] : [])]),
+              ),
+            move: (
+              id: string,
+              workspace: string | undefined,
+              signal?: AbortSignal,
+            ) =>
+              workspaces.move(
+                id,
+                workspace,
+                AbortSignal.any([lifetime, ...(signal ? [signal] : [])]),
+              ),
             prepare: async (
               workspace: string,
-              members: readonly string[],
+              audience: WorkspaceAudience,
               channelId: string,
               signal?: AbortSignal,
             ) => {
@@ -3592,7 +4068,11 @@ export class AgentRunners {
                 lifetime,
                 ...(signal ? [signal] : []),
               ]);
-              const file = await workspaces.prepare(workspace, members, active);
+              const file = await workspaces.prepare(
+                workspace,
+                audience,
+                active,
+              );
               // Each overlapping call owns one exact future create, consumed once.
               let created: RelayEvent | undefined;
               if (creations.has(channelId))
@@ -3604,7 +4084,7 @@ export class AgentRunners {
               return async (id: string) => {
                 active.throwIfAborted();
                 if (attempted)
-                  throw new Error("Solo placement was already attempted");
+                  throw new Error("Workspace placement was already attempted");
                 const event = created;
                 if (id !== channelId || !event)
                   throw new Error("No new chat from this run to file");
@@ -3618,6 +4098,8 @@ export class AgentRunners {
         instructions: () => this.host.instructions?.(agent) ?? [],
         conversationInstructions: (channelId: string, root?: string) =>
           this.host.conversationInstructions?.(agent, channelId, root),
+        promptSections: (channelId?: string, root?: string) =>
+          this.host.promptSections?.(agent, channelId, root) ?? {},
         tabs: () => this.host.tabs(agent),
         // Only a run's: a plugin acting through the agent doesn't get them.
         ...(settings && { settings }),
@@ -3661,7 +4143,7 @@ export class AgentRunners {
    * activity stays on this device. */
   private working(
     runner: Runner,
-    { trigger, channelId, work }: Job,
+    { trigger, channelId, nativePlacement, work }: Job,
     agent: Agent,
   ) {
     work?.started();
@@ -3683,7 +4165,15 @@ export class AgentRunners {
       trigger.type === "mention" && runner.type?.resumes
         ? trigger.event.id
         : undefined;
-    if (resumable) this.mark(runner.key, resumable, channel ?? "");
+    if (resumable)
+      this.mark(
+        runner.key,
+        resumable,
+        nativePlacement
+          ? (channel ?? "")
+          : { channel: channel ?? "", placement: "pending" },
+      );
+    let savedNative: Promise<void> | undefined;
     let typing: (() => void) | undefined;
     const beginTyping = () => {
       if (typing || !event || !channel) return;
@@ -3757,6 +4247,11 @@ export class AgentRunners {
       }
     };
     return {
+      pinNativePlacement: () => {
+        if (holds <= 0 || !resumable || nativePlacement) return;
+        savedNative ??= this.mark(runner.key, resumable, channel ?? "");
+        return savedNative;
+      },
       ok: () => outcome.ok && !outcome.stopped,
       /** Settles once the run and all it handed off have, or it is retired. */
       settled,

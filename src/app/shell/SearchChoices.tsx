@@ -13,7 +13,9 @@ import {
 } from "react";
 import { Virtualizer } from "virtua";
 import {
+  ArrowRightIcon,
   type ChatCircleIcon,
+  SparklesIcon,
   XIcon,
 } from "../../shared/design-system/icons/index";
 import type { PeekFollow, PeekTarget } from "./SearchPreview";
@@ -103,6 +105,9 @@ export type SearchGroup = {
   headingStatus?: string | undefined;
   /** Why the group sits where it does, e.g. "Exact name". */
   why?: string | undefined;
+  /** Its rows are in the order a decision provider judged best, which a
+   * small mark after the heading shows. */
+  reranked?: boolean | undefined;
   /** How many it holds when that differs from its rows, e.g. "20+". */
   count?: string | undefined;
   /** The group's icon in the rail. */
@@ -152,6 +157,9 @@ export type SearchPeek = {
    * too short to search messages, say), so they may still come back, each
    * with the reason shown while it's chosen. */
   unsearched?: Readonly<Record<string, ReactNode>> | undefined;
+  /** Called once the person moves the highlight for this text: rows on
+   * screen shouldn't move under them after that. */
+  onMove?: (() => void) | undefined;
 };
 
 /** The person's keys for the previous and next result, which the field
@@ -410,6 +418,7 @@ export function SearchChoices({
   const tabs = landing ? [...ranked, landing] : ranked;
   const countOf = (group: SearchGroup) =>
     group.count ?? String(resultRows(group).length);
+  /** How many rows Top results shows of each group it cuts short. */
   const truncated = new Map<string, number>();
   const groups: SearchGroup[] = !peek?.ranked
     ? merged
@@ -425,16 +434,17 @@ export function SearchChoices({
             const limit = rows[cap]?.attached ? cap + 1 : cap;
             if (rows.length <= limit && !group.count)
               return { ...group, destinations: rows };
-            truncated.set(group.label, rows.length);
+            const shown = [
+              ...rows.slice(0, limit),
+              ...rows.slice(limit).filter((row) => row.attached),
+            ];
+            truncated.set(group.label, shown.length);
             // Each row is read as one of the whole group: "1 of 37", or of
             // an open set when more may follow ("20+").
             const count = countOf(group);
             return {
               ...group,
-              destinations: [
-                ...rows.slice(0, limit),
-                ...rows.slice(limit).filter((row) => row.attached),
-              ],
+              destinations: shown,
               total: /^\d+$/.test(count) ? Number(count) : -1,
             };
           });
@@ -474,7 +484,11 @@ export function SearchChoices({
     // waiting for results never runs one of its rows.
     query: onBack ? `\u0000${query}` : query,
     keys,
-    onChoose: (key) => destinations.find((row) => row.key === key)?.run(),
+    onChoose: (key) => {
+      // Choosing acts on the order shown: a later rerank must not move it.
+      peek?.onMove?.();
+      destinations.find((row) => row.key === key)?.run();
+    },
     open,
     pending,
     isAction,
@@ -489,6 +503,11 @@ export function SearchChoices({
         : {}),
   });
   const selected = highlight.active;
+  const onMove = peek?.onMove;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Reports each text's first move once.
+  useEffect(() => {
+    if (highlight.moved) onMove?.();
+  }, [highlight.moved, query]);
   const moved = previewing && highlight.moved;
   const steps = useContext(SearchStepsContext);
   // biome-ignore lint/correctness/useExhaustiveDependencies: Freezes the order just shown, once per text.
@@ -511,10 +530,17 @@ export function SearchChoices({
     document.getElementById(highlight.rowId(key))?.getBoundingClientRect();
   const inView = (key: string) => {
     const content = resultsContent.current;
-    const box = key ? rowBox(key) : undefined;
-    if (!content || !box) return false;
+    const row = key ? document.getElementById(highlight.rowId(key)) : null;
+    if (!content || !row) return false;
+    const box = row.getBoundingClientRect();
     const view = content.getBoundingClientRect();
-    return box.bottom > view.top && box.top < view.bottom;
+    // A cut group's pinned heading covers the rows scrolling under it.
+    const heading = row
+      .closest(".search-palette-group")
+      ?.querySelector("[data-search-cut]")
+      ?.getBoundingClientRect();
+    const top = Math.max(view.top, heading?.bottom ?? view.top);
+    return box.bottom > top && box.top < view.bottom;
   };
   const keepPlace = () => {
     const content = resultsContent.current;
@@ -1089,17 +1115,10 @@ export function SearchChoices({
                 {group?.label === "Direct messages"
                   ? "DMs"
                   : (group?.label ?? "Top results")}
-                {/* A landing group has no count yet. */}
-                {(!group || group !== landing) && (
-                  <span className="search-peek-count">
-                    {group
-                      ? countOf(group)
-                      : `${ranked.reduce(
-                          (sum, item) =>
-                            sum + (item.browse ? 0 : resultRows(item).length),
-                          0,
-                        )}${ranked.some((item) => !item.browse && item.count?.endsWith("+")) ? "+" : ""}`}
-                  </span>
+                {/* A landing group has no count yet. Top results has none:
+                  it shows only the first rows of each group. */}
+                {group && group !== landing && (
+                  <span className="search-peek-count">{countOf(group)}</span>
                 )}
                 {index === 1 && group !== landing && !!query.trim() && (
                   <Badge size="xs" tone="success">
@@ -1163,9 +1182,25 @@ export function SearchChoices({
                       notice,
                       headingStatus,
                       why,
+                      reranked,
                       tone,
                       multiline,
                     }) => {
+                      const shown = truncated.get(label);
+                      const count = countOf(
+                        ranked.find((group) => group.label === label) ?? {
+                          label,
+                          destinations,
+                        },
+                      );
+                      // The heading's cut and rerank mark are hidden from
+                      // assistive technology, so the group describes them.
+                      const summary = [
+                        shown !== undefined && `Top ${shown} of ${count}`,
+                        reranked && "Reranked",
+                      ]
+                        .filter(Boolean)
+                        .join(", ");
                       const heading = (
                         <span
                           className={`navigation-section-label text-body text-secondary${headingStatus ? " truncate" : ""}`}
@@ -1180,11 +1215,8 @@ export function SearchChoices({
                                 aria-hidden="true"
                               >
                                 {" "}
-                                {countOf(
-                                  ranked.find(
-                                    (group) => group.label === label,
-                                  ) ?? { label, destinations },
-                                )}
+                                {shown !== undefined && `· Top ${shown} of `}
+                                {count}
                               </span>
                             )}
                           {why && (
@@ -1195,6 +1227,13 @@ export function SearchChoices({
                               {" "}
                               · {why}
                             </span>
+                          )}
+                          {reranked && (
+                            <SparklesIcon
+                              size={12}
+                              title="Reranked"
+                              className="search-peek-reranked"
+                            />
                           )}
                           {headingStatus && (
                             <span aria-hidden="true"> · {headingStatus}</span>
@@ -1207,6 +1246,11 @@ export function SearchChoices({
                           key={label}
                           role={hasControls ? "rowgroup" : "group"}
                           aria-label={label}
+                          aria-describedby={
+                            summary
+                              ? `${peekPanelId(label)}-summary`
+                              : undefined
+                          }
                           // A status-only group has no rows yet; busy states why.
                           aria-busy={
                             (!!headingStatus && !destinations.length) ||
@@ -1215,33 +1259,43 @@ export function SearchChoices({
                           className="search-palette-group"
                           data-tone={tone}
                         >
+                          {summary && (
+                            <span id={`${peekPanelId(label)}-summary`} hidden>
+                              {summary}
+                            </span>
+                          )}
                           <div className="navigation-section" data-buzz-ui="">
                             {!hideLabel && (
                               <div
                                 className="navigation-section-heading"
-                                data-search-action={
+                                // A cut group's heading stays in view while
+                                // its rows scroll, with the way to the rest.
+                                data-search-cut={
                                   truncated.has(label) || undefined
                                 }
                                 aria-hidden={hasControls || undefined}
                               >
                                 <h2 className="m-0 min-w-0 flex-1">
-                                  {truncated.has(label) ? (
-                                    <Button
-                                      variant="plain"
-                                      size="inline"
-                                      aria-label={`Show all ${label}`}
-                                      tabIndex={-1}
-                                      onMouseDown={(event) =>
-                                        event.preventDefault()
-                                      }
-                                      onClick={() => showScope(label)}
-                                    >
-                                      {heading}
-                                    </Button>
-                                  ) : (
-                                    heading
-                                  )}
+                                  {heading}
                                 </h2>
+                                {truncated.has(label) && (
+                                  <Button
+                                    variant="ghost"
+                                    size="xs"
+                                    aria-label={`Show all ${label}`}
+                                    tabIndex={-1}
+                                    onMouseDown={(event) =>
+                                      event.preventDefault()
+                                    }
+                                    onClick={() => showScope(label)}
+                                  >
+                                    Show all
+                                    <ArrowRightIcon
+                                      size={14}
+                                      aria-hidden="true"
+                                    />
+                                  </Button>
+                                )}
                               </div>
                             )}
                             <div className="navigation-section-rows">

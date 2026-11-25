@@ -79,7 +79,8 @@ test("Messages receives scoped typing through authenticated live traffic and exp
   ).toContainText("is typing");
   await expect(indicator).toHaveCount(1);
   await expect(
-    composer
+    page
+      .locator("[data-composer-dock]", { has: composer })
       .locator("..")
       .getByRole("status", { name: "Conversation activity" }),
   ).toBeEmpty();
@@ -156,7 +157,9 @@ for (const scope of ["channel", "thread"]) {
       name: scope === "thread" ? "Reply to thread" : "Send a message to Alpha",
       exact: true,
     });
-    const indicator = composer
+    // Activity floats beside the composer's dock, not inside it.
+    const indicator = page
+      .locator("[data-composer-dock]", { has: composer })
       .locator("..")
       .locator('[aria-hidden="true"]')
       .filter({ hasText: /is typing$/ });

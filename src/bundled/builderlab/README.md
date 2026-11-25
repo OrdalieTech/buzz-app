@@ -74,8 +74,7 @@ still use the existing canonical browser authentication gate.
 
 The bundled `block.builderlab` plugin adds Settings → Plugins → Builderlab: one
 sign-in, the native NIP-FI session (or in live development the broker's), then
-hosted communities (`communities/`, see
-[plugin architecture](../../../docs/plugin-architecture.md)) and remote agents.
+hosted communities (`communities/`) and remote agents.
 With a configured Builderlab, it also registers
 `block.builderlab/builderlab` in Agents' new-agent type picker.
 `adapter-type/` connects this hosted type to Beekeeper: provision registers the
@@ -196,8 +195,7 @@ agents are not migrated into this type.
   page reads the backed-up key that way, and the pairing plugin's mobile card
   gets only the app's yes-or-no `builderlabPhone.restoresOnPhone`, never the
   session itself.
-  A successful first-run sign-in continues into the app-owned setup steps
-  described in [identity](../../../docs/identity.md): the app reads the key
+  A successful first-run sign-in continues into the app-owned setup steps: the app reads the key
   bound to the account, the destinations saved to it (this plugin's
   known-communities list route, never through the Settings session's client)
   and the communities it owns through this plugin's bundled grant
@@ -246,8 +244,7 @@ agents are not migrated into this type.
   destination's latest queued join or leave one at a time, retrying failures
   as sent. A list this client cannot read halts sync until the next sign-in,
   as does a 404 on any route (not yet deployed); a listed address the device
-  could never save is dropped and counted, never a halt. See
-  [communities](../../../docs/communities.md#known-communities).
+  could never save is dropped and counted, never a halt.
 
 The plugin's server is the build's Builderlab: its first
 [sign-in server](../../../docs/configuration.md#federated-identity-build-input),
@@ -283,3 +280,20 @@ native `decide` posts to the identity origin's API with that
 session as `Authorization: Bearer`, as for the build's other Builderlab calls;
 the token never reaches the webview. A 401 there refuses only that call, and
 native asks the adapter once whether the session still stands.
+
+It offers Builderlab as a speech to text provider the same way, reading
+`capabilities.can_use_hosted_transcription`, but like remote agents it signs
+in at the server of the community in view, since the call bills that
+community: a Builderlab customer's community (`buzz.{name}.builderlab.xyz`)
+transcribes at `{name}.builderlab.xyz`, not the build's server. Native
+`speech_connect` routes the call by its community to that server's NIP-FI
+session, posts the host's WebRTC offer to `v3/builderlab/transcription/calls`
+with the community in `x-buzz-community`, and returns Builderlab's SDP answer.
+In live development the broker forwards it to `BUZZ_BUILDERLAB_URL` with its
+own sign-in, as it does decisions; it names no model, so Builderlab chooses one. Audio
+then goes peer to peer, and the host commits it at each pause and at the end so
+Builderlab can meter the transcribed seconds. Builderlab hangs a call up at its
+cap: 30 seconds unless the listen asks for longer with `maxSeconds`, sent as
+`max_seconds`, so a forgotten microphone cannot run long. Voice commands never
+ask. Builderlab may grant less than was asked (its ceiling is an hour), and the
+granted `max_seconds` reaches the listen's `onCallLimit`.

@@ -292,8 +292,6 @@ different case-folding rule is a different policy, not byte-identical conformanc
 - Context and fact selection: [directory.ts](../../features/identity-names/directory.ts),
   [react.ts](../../features/identity-names/react.ts), and
   [use-mention-choices.ts](../mentions/use-mention-choices.ts).
-- buzz-app feature-contract precedent: [Profiles](../../../docs/profiles.md) and
-  [Unread](../../../docs/unread.md), especially explicit consumer and authority boundaries.
 - block/buzz, inspected at `797012ff01a6d499959b45ed2e56f7927c6a4d6b`:
   [NIP-MP](https://github.com/block/buzz/blob/797012ff01a6d499959b45ed2e56f7927c6a4d6b/docs/nips/NIP-MP.md)
   supplies the abstract/non-goals/normative-rules pattern;

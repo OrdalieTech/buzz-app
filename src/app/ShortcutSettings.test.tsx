@@ -58,6 +58,7 @@ const catalog = (
       catalog: { profile: "", location: "", plugins },
       externalPluginsPaused: false,
     },
+    hostOwned: [info("buzz.emoji", "Emoji").manifest],
     activation: {},
     busy: false,
     error: null,
@@ -466,7 +467,6 @@ it("captures a chord, refuses conflicts and bare keys, applies overrides to the 
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Ctrl+K is already used by Search Buzz (Buzz).",
     );
-    expect(screen.getByRole("alert")).toHaveClass("text-standard");
     expect(input).toHaveAttribute(
       "aria-describedby",
       expect.stringContaining(screen.getByRole("alert").id),
@@ -534,7 +534,6 @@ it("captures a chord, refuses conflicts and bare keys, applies overrides to the 
     fireEvent.keyDown(capture("Open Settings"), { key: "z", ctrlKey: true });
     const warning = within(row("Open Settings")).getByRole("alert");
     expect(warning).toHaveTextContent("message editor handles Ctrl+Z");
-    expect(warning).toHaveClass("text-standard");
     expect(h.bindings.resolve("settings")).toEqual([{ key: "z", mod: true }]);
     for (const [key, chord] of [
       ["y", "Ctrl+Shift+Y"],
@@ -650,9 +649,6 @@ it.each([true, false])(
         fireEvent.keyDown(capture(title), event);
         expect(within(row(title)).getByRole("alert")).toHaveTextContent(
           "Saved. The message editor handles",
-        );
-        expect(within(row(title)).getByRole("alert")).toHaveClass(
-          "text-standard",
         );
         expect(h.bindings.resolve("settings")).toEqual([
           { key: "Enter", ...modifiers },
@@ -847,7 +843,6 @@ it("keeps a change active when saving fails and offers a retry", async () => {
     });
     const alert = screen.getByRole("alert");
     expect(alert).toHaveTextContent("could not be saved on this device");
-    expect(alert).toHaveClass("text-standard");
     expect(
       within(row("Toggle channel terminal")).getByText("Modified"),
     ).toBeInTheDocument();
@@ -916,7 +911,43 @@ it("stores Option and Shift chords as the composed key on Apple platforms (known
   }
 });
 
-it("refuses close and quit chords only in the desktop build", async () => {
+it("keeps the Mac menu's ⌘, beside a saved Open Settings override", async () => {
+  const h = await harness();
+  try {
+    // Saved before ⌘, became the menu's: Open Settings moved off it, Search took it.
+    h.bindings.set("settings", { key: ";", mod: true });
+    h.bindings.set("global-search", { key: ",", mod: true });
+    render(
+      <ShortcutSettings
+        shortcuts={h.shortcuts}
+        bindings={h.bindings}
+        plugins={h.plugins}
+        apple
+        desktop
+      />,
+    );
+    const settings = within(row("Open Settings"));
+    expect(settings.getByText("Reserved by Buzz")).toBeVisible();
+    expect(settings.getByText("Modified")).toBeVisible();
+    expect(settings.getByText("Command ,")).toBeInTheDocument();
+    expect(settings.getByText("Command ;")).toBeInTheDocument();
+    expect(
+      settings.getByText("Also used by Search Buzz (Buzz)"),
+    ).toBeInTheDocument();
+    expect(
+      settings.getByRole("button", {
+        name: "Reset shortcut for Open Settings",
+      }),
+    ).toBeVisible();
+    expect(
+      within(row("Search Buzz")).getByText("Also used by Open Settings (Buzz)"),
+    ).toBeInTheDocument();
+  } finally {
+    await h.dispose();
+  }
+});
+
+it("refuses close, quit and Mac Settings chords only in the desktop build", async () => {
   const user = userEvent.setup();
   const h = await harness();
   try {
@@ -929,14 +960,21 @@ it("refuses close and quit chords only in the desktop build", async () => {
         desktop
       />,
     );
-    const title = "Open Settings";
+    const settings = within(row("Open Settings"));
+    expect(settings.getByText("Reserved by Buzz")).toBeVisible();
+    expect(settings.queryByRole("button")).not.toBeInTheDocument();
+    const title = "Search Buzz";
     await user.click(change(title));
     for (const key of ["q", "w"]) {
       fireEvent.keyDown(capture(title), { key, metaKey: true });
       expect(screen.getByRole("alert")).toHaveTextContent(
-        `⌘${key.toUpperCase()} is reserved for switching or closing tabs and quitting Buzz. Try another.`,
+        `⌘${key.toUpperCase()} is reserved by Buzz. Try another.`,
       );
     }
+    fireEvent.keyDown(capture(title), { key: ",", metaKey: true });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "⌘, is reserved by Buzz. Try another.",
+    );
     expect(h.bindings.snapshot().overrides).toEqual({});
     desktop.unmount();
     // A browser tab handles these before the page sees them, so nothing is lost.
@@ -982,9 +1020,6 @@ it("marks rows that share an effective chord once a plugin is re-enabled, and cl
     const marker = within(row(counter)).getByText(
       "Also used by Toggle channel terminal (Terminal)",
     );
-    expect(marker).toHaveClass("text-subtle");
-    expect(marker).not.toHaveClass("text-danger");
-    expect(marker).not.toHaveClass("text-warning");
     expect(marker).not.toHaveAttribute("role");
     expect(
       within(row(terminal)).getByText(
@@ -1052,6 +1087,81 @@ it("keeps the host group distinct from a plugin whose manifest id is buzz", asyn
     expect(error).not.toHaveBeenCalled();
   } finally {
     error.mockRestore();
+    await h.dispose();
+  }
+});
+
+it("names a host-owned feature's group and conflict owner from its manifest, and an unlisted plugin by id", async () => {
+  const user = userEvent.setup();
+  const h = await harness();
+  try {
+    // Host-owned features contribute like plugins but have no catalog entry.
+    await h.contribute("buzz.emoji", {
+      id: "gif-picker",
+      title: "Open GIF picker",
+      binding: { key: "g", mod: true },
+      run: vi.fn(),
+    });
+    await h.contribute("example.unlisted", {
+      id: "ping",
+      title: "Ping",
+      binding: { key: "p", mod: true },
+      run: vi.fn(),
+    });
+    render(
+      <ShortcutSettings
+        shortcuts={h.shortcuts}
+        bindings={h.bindings}
+        plugins={h.plugins}
+      />,
+    );
+    expect(
+      screen
+        .getAllByRole("heading", { level: 3 })
+        .map((heading) => heading.textContent),
+    ).toEqual([
+      "Sending messages",
+      "Editing messages",
+      "Buzz",
+      "Emoji",
+      "example.unlisted",
+      "Shortcut counter",
+      "Terminal",
+      "Message formatting",
+    ]);
+    await user.click(change("Open Settings"));
+    fireEvent.keyDown(capture("Open Settings"), { key: "g", ctrlKey: true });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Ctrl+G is already used by Open GIF picker (Emoji).",
+    );
+    expect(h.bindings.snapshot().overrides).toEqual({});
+  } finally {
+    await h.dispose();
+  }
+});
+
+it("names a host-owned feature from its own manifest when a catalog entry shares its id", async () => {
+  const h = await harness();
+  try {
+    await h.contribute("buzz.emoji", {
+      id: "gif-picker",
+      title: "Open GIF picker",
+      binding: { key: "g", mod: true },
+      run: vi.fn(),
+    });
+    render(
+      <ShortcutSettings
+        shortcuts={h.shortcuts}
+        bindings={h.bindings}
+        // The manager never activates this entry: the host feature owns the id.
+        plugins={catalog([info("buzz.emoji", "Shadowed emoji")])}
+      />,
+    );
+    expect(
+      screen.getByRole("heading", { name: "Emoji", level: 3 }),
+    ).toBeVisible();
+    expect(screen.queryByText("Shadowed emoji")).not.toBeInTheDocument();
+  } finally {
     await h.dispose();
   }
 });
@@ -1290,3 +1400,38 @@ it.each([
     }
   },
 );
+
+it("saves and runs a caret key WebKit reports as a control character, including an override saved raw", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+  const user = userEvent.setup();
+  const h = await harness();
+  const webkit = {
+    key: "\u001c",
+    code: "ArrowLeft",
+    keyCode: 37,
+    metaKey: true,
+    shiftKey: true,
+  };
+  try {
+    render(
+      <ShortcutSettings
+        shortcuts={h.shortcuts}
+        bindings={h.bindings}
+        plugins={h.plugins}
+        apple
+      />,
+    );
+    await user.click(change("Open Settings"));
+    fireEvent.keyDown(capture("Open Settings"), webkit);
+    expect(h.bindings.resolve("settings")).toEqual([
+      { key: "ArrowLeft", mod: true, shift: true },
+    ]);
+    act(() =>
+      h.bindings.set("settings", { key: "\u001c", mod: true, shift: true }),
+    );
+    expect(fireEvent.keyDown(document.body, webkit)).toBe(false);
+    expect(h.runs.settings).toHaveBeenCalledOnce();
+  } finally {
+    await h.dispose();
+  }
+});

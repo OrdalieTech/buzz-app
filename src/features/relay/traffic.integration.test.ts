@@ -710,7 +710,10 @@ it("continues incoming traffic at the history budget and applies live membership
   expect(h.session.channels.window("c").rows.map((row) => row.content)).toEqual(
     ["two", "three"],
   );
-  expect(h.session.channels.window("c").historyLimited).toBe(true);
+  expect(h.session.channels.window("c")).toMatchObject({
+    historyLimited: false,
+    hasMore: true,
+  });
   h.emit([roster(relay, "c", [], 1800000000)]);
   expect(h.session.channels.window("c").rows).toHaveLength(0);
   h.emit([message(other, "c", "late revoked traffic", 4)]);
@@ -727,10 +730,12 @@ it("keeps an inactive channel preview and its next window consistent with incomi
       ?.preview,
   ).toBe(remote.content);
   h.session.channels.ensure("other");
-  expect(
-    h.session.channels.window("other").rows.some((row) => row.id === remote.id),
-  ).toBe(true);
-  // Even a failed/stale finite read cannot discard the separately retained traffic.
+  // The retained traffic waits for the head page, so the view loads whole.
+  expect(h.session.channels.window("other")).toMatchObject({
+    status: "loading",
+    rows: [],
+  });
+  // A head page that does not hold it cannot discard the retained traffic.
   await flush();
   expect(
     h.session.channels.window("other").rows.some((row) => row.id === remote.id),

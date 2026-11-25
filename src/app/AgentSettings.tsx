@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useState, useSyncExternalStore } from "react";
 import type { PageNavigation } from "../features/navigation/service";
 import type { Agents } from "../features/agents/service";
 import { AgentDefaults } from "../bundled/agents/AgentDefaults";
+import { AgentEnvironment } from "../bundled/agents/AgentEnvironment";
+import { BaseInstructions } from "../features/agents/BaseInstructions";
 import { Header, InlineHeader } from "../shared/design-system/ui/Header";
 
 import { SettingsGroup } from "../shared/design-system/ui/SettingsGroup";
@@ -34,21 +36,40 @@ const delayLabel = (minutes: number) =>
   minutes < 60
     ? `${minutes} minutes`
     : `${minutes / 60} hour${minutes === 60 ? "" : "s"}`;
+const noSubscribe = () => () => {};
 
 export function AgentSettings({
   agents,
   active = true,
   navigation,
   onProvider,
+  sectionPlugins,
   keepAwakeAvailable = isTauri() && isApplePlatform(navigator.platform),
 }: {
   agents?: Agents | undefined;
   active?: boolean;
   navigation?: PageNavigation | undefined;
   onProvider?: ((provider?: string) => void) | undefined;
+  /** The names of the plugins that can replace a base instruction section. */
+  sectionPlugins?: ((section: string) => readonly string[]) | undefined;
   /** Only the macOS app can keep the computer awake. */
   keepAwakeAvailable?: boolean;
 }) {
+  const activeAgents = active ? agents : undefined;
+  const mayRestart = useSyncExternalStore(
+    activeAgents?.subscribe ?? noSubscribe,
+    () => {
+      if (!activeAgents) return false;
+      const types = activeAgents.types();
+      return activeAgents
+        .snapshot()
+        .running.some((agent) =>
+          types
+            .find((type) => type.key === agent.type)
+            ?.mayRestartForBaseInstructions?.(agent),
+        );
+    },
+  );
   const rememberAgents = useRememberAgentsPreference();
   const keepAwake = useKeepAwakePreference();
   const keepAwakeApplyError = useKeepAwakeApplyError();
@@ -68,6 +89,9 @@ export function AgentSettings({
           onProvider={onProvider}
         />
       )}
+      {/* Mounted while the section is hidden, so a save that settles after
+          leaving it keeps its error and value. */}
+      {agents && <AgentEnvironment />}
       <div className="mt-section-gap">
         <InlineHeader title="Agent behavior" />
         <SettingsGroup>
@@ -120,6 +144,13 @@ export function AgentSettings({
           )}
         </SettingsGroup>
       </div>
+      {agents && (
+        <BaseInstructions
+          store={agents.storage}
+          replacedBy={sectionPlugins}
+          mayRestart={mayRestart}
+        />
+      )}
       {active && mentionError && (
         <ToastNotice
           title="Agent preference wasn’t saved"

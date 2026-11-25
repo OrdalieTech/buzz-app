@@ -61,6 +61,8 @@ export type Stream = Readonly<{
   slug: string;
   channel?: string;
   mentions?: string;
+  /** Mentions in DMs only the agent can read, which it reads as itself. */
+  private?: true;
   /** The watch's kinds; a watch of every kind reads those live hears, as a
    * relay read must name its kinds. */
   kinds: readonly number[];
@@ -78,6 +80,7 @@ export const oldestFirst = (a: Position, b: Position) =>
 
 /** The slug of an agent's mention stream. Attention slugs have no `@`. */
 export const MENTIONS = "@mentions";
+export const PRIVATE_MENTIONS = "@private-mentions";
 /** Whether `event` is of the stream's kinds and of its channel, and names
  * its agent when it is a mention stream. */
 export const inStream = (
@@ -328,6 +331,15 @@ export async function splitLegacyCheckpoints(storage: AgentStore) {
  * on or off, and one for each channel of each event watch, enabled or not. */
 export function streamsOf(agent: Pick<Agent, "key" | "attention">) {
   const streams: Stream[] = [
+    {
+      key: streamKey(agent.key, PRIVATE_MENTIONS),
+      slug: PRIVATE_MENTIONS,
+      mentions: pubkeyOf(agent.key),
+      private: true,
+      kinds: CHAT_KINDS,
+      since: 0,
+      enabled: true,
+    },
     {
       key: streamKey(agent.key, MENTIONS),
       slug: MENTIONS,

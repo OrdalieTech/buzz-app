@@ -1,0 +1,6 @@
+/* The attention page's compact column headings. */
+.headings {
+  box-sizing: border-box;
+  min-height: var(--space-8);
+  border-block-end: 1px solid var(--border-standard);
+}

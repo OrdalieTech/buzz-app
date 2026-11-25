@@ -1,5 +1,5 @@
 import { test, expect } from "./fixture.mjs";
-import { openPage } from "./navigation.mjs";
+import { clickSidebarHeadingAction, openPage } from "./navigation.mjs";
 // Real app/header portals, caller wiring, row relocation and cold reload through
 // the production signing broker. Failure/lifecycle matrices stay in Vitest.
 test.use({ productionBroker: true, savedSidebar: true, largeSidebar: false });
@@ -19,9 +19,10 @@ test.describe("section removal", () => {
     const group = page.locator(`[data-sidebar-section="group:${id}"]`);
     const row = page.locator(`[data-channel-id="${channel}"]`);
     await expect(group.locator(`[data-channel-id="${channel}"]`)).toBeVisible();
-    await page
-      .getByRole("button", { name: `More actions for ${title}` })
-      .click();
+    const more = group.getByRole("button", {
+      name: `More actions for ${title}`,
+    });
+    await clickSidebarHeadingAction(more);
     await page
       .getByRole("menuitem", { name: "Remove workspace", exact: true })
       .click();
@@ -39,9 +40,7 @@ test.describe("section removal", () => {
     await expect(group).toBeVisible();
     await group.locator("summary").click();
     await expect(group.locator("details")).not.toHaveAttribute("open");
-    await page
-      .getByRole("button", { name: `More actions for ${title}` })
-      .click();
+    await clickSidebarHeadingAction(more);
     await page
       .getByRole("menuitem", { name: "Remove workspace", exact: true })
       .click();

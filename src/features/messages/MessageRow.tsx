@@ -4,12 +4,16 @@ import { requestWork, isSettledWork } from "../agents/request-work";
 import { ActivityDisclosure } from "./ActivityDisclosure";
 import { ActivityOutcome } from "./ActivityOutcome";
 import { AgentResponsePreview } from "./AgentResponsePreview";
+import { useChannelActivitySubscription } from "../agents/use-channel-agent-activity";
+import { useSpringLoaded } from "./spring-loaded-drag";
 import { useActivityIndicator } from "./use-activity-indicator";
 import type { ActivityRowPresentation } from "./activity-presentation";
 import { ShimmerText } from "../../shared/design-system/ui/ShimmerText";
 import { Collapsible } from "@base-ui/react/collapsible";
-import { formatItemTimestamp } from "../../shared/datetime";
-import { useClockPreference } from "../../shared/clock-preference";
+import {
+  formatFullTimestamp,
+  formatItemTimestamp,
+} from "../../shared/datetime";
 import { ProfilePeek } from "../profiles/ProfilePeek";
 import { AgentAvatar } from "../agents/AgentAvatar";
 import {
@@ -20,6 +24,7 @@ import {
 import { breathing, localActivity } from "../agents/local-activity";
 import { Avatar } from "../../shared/design-system/ui/Avatar";
 import {
+  CaretRightIcon,
   DotsThreeIcon,
   LightningIcon,
   RobotIcon,
@@ -39,6 +44,7 @@ import { MessageLink } from "../conversation/MessageLink";
 import {
   DayDivider,
   MessageTimestamp,
+  useMessageTimeVisible,
   MessageTimestampHint,
 } from "./MessageTimestamp";
 import { useChannelIdentityNames } from "../identity-names/react";
@@ -47,6 +53,7 @@ import { ReplySummary } from "./ReplySummary";
 import { usePresenceStatus } from "../presence/react";
 import { UserStatusDisplay } from "../user-status/StatusDisplay";
 import { useMessageDensity } from "../../shared/theme/message-density";
+import { useLocalDay } from "../../shared/use-local-day";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
 import {
   memo,
@@ -55,6 +62,7 @@ import {
   useRef,
   useState,
   useEffect,
+  useLayoutEffect,
   useCallback,
   useSyncExternalStore,
   type ReactNode,
@@ -95,7 +103,10 @@ import { AttachmentDownloadContext } from "./AttachmentDownloadContext";
 import { isNativeMediaSource, isProxySource } from "./attachment-source";
 import { FileAttachment } from "./FileAttachment";
 import { useReferenceDirectory } from "./ReferenceText";
+import { withoutRelayNotice } from "../relay/relayed-from";
 import { EditedMarker, MessageMarkdown } from "./MessageMarkdown";
+import { DetailsMessage } from "./DetailsMessage";
+import { useComposerScope } from "./composer-overlay";
 import {
   safeMessageUrl,
   projectMarkdownAttachments,
@@ -112,7 +123,12 @@ import {
 } from "./MessageManagement";
 import { MessageActionBar } from "./MessageActionBar";
 import { useForwardMessage } from "./ForwardMessage";
-import { FlagIcon, ListBulletsIcon } from "../../shared/design-system/icons";
+import {
+  FlagIcon,
+  ListBulletsIcon,
+  PinIcon,
+} from "../../shared/design-system/icons";
+import { usePinnedMessages } from "./use-pins";
 import {
   MenuIcon,
   MenuItem,
@@ -127,7 +143,12 @@ import { messageCopyLink, messageCopyText } from "./message-copy";
 import { avatarMedia } from "../../shared/avatar-source";
 import { useThreadDraft } from "./draft-places";
 
-export type MessageLinkOrigin = Readonly<{ rootId: string }>;
+export type MessageLinkOrigin = Readonly<{
+  rootId: string;
+  /** The view the row reads in, when it reads in one: the conversation, or
+   * the thread with this root. An opening can become a dialog on it. */
+  view?: Readonly<{ rootId?: string | undefined }> | undefined;
+}>;
 export type MessageRowProps = {
   row: ChannelMessage;
   /** Read-only presentations can retain their own prose highlighting. */
@@ -151,13 +172,15 @@ export type MessageRowProps = {
   participantProfiles?: ReadonlyMap<string, Profile> | undefined;
   agentPubkeys?: ReadonlySet<string> | undefined;
   canOpenLink?: ((target: string) => boolean) | undefined;
-  media(url: string, size?: "small"): string | undefined;
+  media(url: string, size?: "small", channel?: string): string | undefined;
   /** Receives the thread the link was opened from: the row’s root, or the row. */
   onOpenLink(url: string, origin?: MessageLinkOrigin): boolean;
   day: boolean;
   retry: ((id: string) => void) | undefined;
   /** Pins this row in a virtualized list; returns the release. */
   keepMounted?: ((messageId: string) => () => void) | undefined;
+  /** A details message in this row expanded or folded in place. */
+  onExpandDetails?: (() => void) | undefined;
   onOpenThread?:
     | ((messageId: string, threadRootId: string, intent?: "reply") => void)
     | undefined;
@@ -190,6 +213,8 @@ export type MessageRowProps = {
 
 type MessageContentProps = MessageRowProps & {
   shownRow?: ChannelMessage;
+  /** Leave out the reactions row and its controls. */
+  withoutReactions?: boolean;
   renderMessage?: (
     message: ReactNode,
     trigger: RefObject<HTMLButtonElement | null>,
@@ -201,8 +226,9 @@ function useCompletedMessageWork(
   activity: RelaySession["agentActivity"] | undefined,
   row: ChannelMessage,
 ) {
+  const subscribe = useChannelActivitySubscription(activity, row.channelId);
   const read = () => {
-    const snapshot = activity?.snapshot();
+    const snapshot = activity?.snapshot(row.channelId);
     if (!snapshot) return false;
     const published = (snapshot.local ?? []).filter(
       (work) =>
@@ -224,7 +250,7 @@ function useCompletedMessageWork(
       )
     );
   };
-  return useSyncExternalStore(activity?.subscribe ?? noSubscribe, read, read);
+  return useSyncExternalStore(subscribe, read, read);
 }
 
 const FullMessageRow = memo(function MessageRow(props: MessageContentProps) {
@@ -244,6 +270,7 @@ function MessageRowContent({
   bodyContent,
   fullWidth = false,
   shownRow,
+  withoutReactions = false,
   renderMessage,
   getThreadRoot,
   session,
@@ -258,6 +285,7 @@ function MessageRowContent({
   day,
   retry,
   keepMounted,
+  onExpandDetails,
   onOpenThread,
   onReply,
   startsThreads = true,
@@ -311,9 +339,20 @@ function MessageRowContent({
     row.channelId,
     rootId,
   );
+  const composerView = useComposerScope();
+  const inView = !!composerView;
+  const viewRoot = composerView?.rootId;
   const openLink = useCallback(
-    (url: string) => onOpenLink(url, { rootId }),
-    [onOpenLink, rootId],
+    (url: string) =>
+      onOpenLink(url, {
+        rootId,
+        ...(inView && { view: { rootId: viewRoot } }),
+      }),
+    [onOpenLink, rootId, inView, viewRoot],
+  );
+  const springLoadedThread = useSpringLoaded(
+    () => onOpenThread?.(row.id, rootId),
+    threadOpen,
   );
   const channels = session?.channels;
   const listed = useListedChannel(
@@ -336,20 +375,12 @@ function MessageRowContent({
     row.channelId,
     (channel) => !!channel?.readOnly,
   );
-  const { messageTimestamps } = useClockPreference();
-  const solo = useListedChannel(
-    references?.channels,
-    row.channelId,
-    (channel) => channel?.channelType === "solo",
-  );
   const dmMembers = useListedChannel(
     references?.channels,
     row.channelId,
     (channel) => (channel?.channelType === "dm" && channel.members) || none,
   );
-  const showTime =
-    messageTimestamps === "show" ||
-    (messageTimestamps === "hide-solo" && !solo);
+  const showTime = useMessageTimeVisible(references?.channels, row.channelId);
   const unreadLabel =
     threadUnread?.manual === "local-only"
       ? "Thread marked unread on this device only"
@@ -757,6 +788,10 @@ function MessageRowContent({
       previous.push(attachment);
     else attachmentGroups.push([attachment]);
   }
+  // A message's images are saved with its channel, so losing the channel
+  // forgets them.
+  const attachmentMedia = (url: string, size?: "small") =>
+    media(url, size, row.channelId);
   const attachmentContent = (copied = false) =>
     attachmentGroups.some(
       (group) => copiedUrls.has(group[0]?.url ?? "") === copied,
@@ -785,7 +820,7 @@ function MessageRowContent({
             const items = previews.map((attachment, index) => {
               const url = safeMessageUrl(attachment.url);
               if (!url) return null;
-              const source = media(url);
+              const source = attachmentMedia(url);
               if (attachment.kind === "file") {
                 const fallback = (
                   <FileAttachment
@@ -848,8 +883,7 @@ function MessageRowContent({
                 );
               }
               if (attachment.kind === "image") {
-                // biome-ignore lint/plugin: Attachment thumbnails, not avatars.
-                const small = media(url, "small");
+                const small = attachmentMedia(url, "small");
                 // Third-party URLs map to themselves: no thumbnail. JPEG
                 // drops alpha, so these formats use the WebP variant.
                 const alpha =
@@ -858,7 +892,7 @@ function MessageRowContent({
                   small === source
                     ? undefined
                     : alpha
-                      ? media(`${alpha[1]}.thumb.webp`)
+                      ? attachmentMedia(`${alpha[1]}.thumb.webp`)
                       : small;
                 const image = (
                   <AttachmentImage
@@ -919,7 +953,7 @@ function MessageRowContent({
                 <MediaAttachment
                   key={url}
                   attachment={{ ...attachment, url }}
-                  media={media}
+                  media={attachmentMedia}
                   compact={images && group.length >= 4 && !!onOpenMediaReview}
                   overlayCount={collapsed && index === 3 ? group.length - 3 : 0}
                   label={
@@ -970,7 +1004,9 @@ function MessageRowContent({
               </div>
             ) : files ? (
               <div className={styles.fileGroup} key={group[0]?.url}>
-                {items}
+                {/* A block each, so a copied selection puts every
+                    card on its own line. */}
+                {items.map((item) => item && <div key={item.key}>{item}</div>)}
               </div>
             ) : (
               items
@@ -1060,6 +1096,42 @@ function MessageRowContent({
           </p>
         )}
       </div>
+    ) : row.audience === "details" ? (
+      // Details read as their brief, which opens into their own reader.
+      <DetailsMessage
+        messageId={row.id}
+        channelId={row.channelId}
+        author={name}
+        createdAt={row.createdAt}
+        keepMounted={keepMounted}
+        onExpand={onExpandDetails}
+        preview={
+          <MessageMarkdown
+            directory={directory}
+            session={references}
+            scope={scope}
+            row={displayRow}
+            extensions={extensions}
+            media={media}
+            onOpenLink={openLink}
+            canOpenLink={canOpenLink}
+            participantProfiles={participantProfiles}
+            edited={editedInBody && displayRow.edited}
+          />
+        }
+      >
+        <MessageMarkdown
+          directory={directory}
+          session={references}
+          scope={scope}
+          row={displayRow}
+          extensions={extensions}
+          media={media}
+          onOpenLink={openLink}
+          canOpenLink={canOpenLink}
+          participantProfiles={participantProfiles}
+        />
+      </DetailsMessage>
     ) : (
       <MessageMarkdown
         directory={directory}
@@ -1353,6 +1425,7 @@ function MessageRowContent({
               event.currentTarget.focus();
               onOpenThread(row.id, row.threadRootId ?? row.id);
             }}
+            {...springLoadedThread}
           >
             <ReplySummary
               hideEmptyLabel={!!activity}
@@ -1633,6 +1706,9 @@ function MessageRowContent({
                   )}
               </div>
             </div>
+            {session?.relayAuthor && !row.membership && !row.huddle && (
+              <PinnedMarker session={session} row={row} />
+            )}
             {row.sentFromThread && (
               <div className={styles.sentFromThread}>
                 Sent from{" "}
@@ -1710,7 +1786,7 @@ function MessageRowContent({
                     body
                   )}
                   {editedInBubble && shown.edited && <EditedMarker />}
-                  {reactionsInBubble && reactionContent}
+                  {reactionsInBubble && !withoutReactions && reactionContent}
                 </div>
               )}
               {previewUrls.length > 0 && (
@@ -1719,6 +1795,7 @@ function MessageRowContent({
                   messageId={row.id}
                   registry={linkPreviewRegistry}
                   onOpenLink={openLink}
+                  settings={extensions?.settings}
                 />
               )}
               {attachmentContent()}
@@ -1727,7 +1804,7 @@ function MessageRowContent({
               )}
             </MessageTimestampHint>
           </div>
-          {!reactionsInBubble && reactionContent}
+          {!reactionsInBubble && !withoutReactions && reactionContent}
           <DeliveryNotice row={row} retry={retry} />
           {session && scope && (
             <AgentDeclineNotes
@@ -1817,11 +1894,17 @@ export const MessageRow = memo(function AudienceMessageRow(
 ) {
   const { onOpenLink, canOpenLink, row } = props;
   const rootId = row.threadRootId ?? row.id;
+  const view = useComposerScope();
   // Plugin content in this row opens targets as the row's own links do.
   return (
     <TargetOpenerProvider
       canOpen={(target) => canOpenLink?.(target) ?? false}
-      open={(target) => onOpenLink(target, { rootId })}
+      open={(target) =>
+        onOpenLink(target, {
+          rootId,
+          ...(view && { view: { rootId: view.rootId } }),
+        })
+      }
     >
       {row.notice === "execution-failure" &&
       !row.edited &&
@@ -1836,6 +1919,8 @@ export const MessageRow = memo(function AudienceMessageRow(
         ) : (
           <AgentsMessageRow {...props} failure />
         )
+      ) : row.relayedFrom?.verified ? (
+        <RelayedMessageRow {...props} />
       ) : row.audience === "agents" ? (
         <AgentsMessageRow {...props} />
       ) : (
@@ -1845,6 +1930,9 @@ export const MessageRow = memo(function AudienceMessageRow(
   );
 });
 
+// What can hold focus in an activity entry. Its line is the first.
+const focusStops =
+  "a[href], button, input, select, textarea, summary, audio[controls], video[controls], [tabindex]";
 function AgentsMessageRow(props: MessageRowProps & { failure?: boolean }) {
   const {
     row,
@@ -1889,6 +1977,25 @@ function AgentsMessageRow(props: MessageRowProps & { failure?: boolean }) {
   useEffect(() => {
     if (open) return keepMounted?.(row.id);
   }, [open, keepMounted, row.id]);
+  // Changing container replaces the entry. A reader whose focus was in it
+  // stays on the same stop in its replacement, or else on its line, so Tab
+  // continues from this row. Focus that had left the entry is not moved.
+  const entry = useRef<HTMLDivElement | null>(null);
+  const focused = useRef<{ entry: Element; stop: Element } | null>(null);
+  useLayoutEffect(() => {
+    void bubble;
+    const was = focused.current;
+    const now = entry.current;
+    if (!was || !now || was.stop.isConnected) return;
+    const stops = (root: Element) => [
+      ...root.querySelectorAll<HTMLElement>(focusStops),
+    ];
+    const [line, ...rest] = stops(now);
+    const same = rest[stops(was.entry).indexOf(was.stop as HTMLElement) - 1];
+    (same?.tagName === was.stop.tagName ? same : line)?.focus({
+      preventScroll: true,
+    });
+  }, [bubble]);
   const resolveName = useChannelIdentityNames(references, row.channelId);
   const directory = useReferenceDirectory(references, participantProfiles);
   const { recipients, body } = useMemo(
@@ -2011,6 +2118,16 @@ function AgentsMessageRow(props: MessageRowProps & { failure?: boolean }) {
               data-highlight-surface=""
               data-thread-open={props.threadOpen || undefined}
               aria-current={props.threadOpen ? true : undefined}
+              ref={entry}
+              onFocus={(event) => {
+                focused.current = {
+                  entry: event.currentTarget,
+                  stop: event.target,
+                };
+              }}
+              onBlur={() => {
+                focused.current = null;
+              }}
               // One stable anchor survives both animation directions. Not the
               // button: revealing an anchor takes it out of the Tab order.
               data-message-id={row.id}
@@ -2100,6 +2217,188 @@ function AgentsMessageRow(props: MessageRowProps & { failure?: boolean }) {
   );
 }
 
+/** Another agent's message that its owner relayed here from another chat. It
+ * reads as that agent's quiet line, never as the signer's own message, and
+ * opens to the text without the notice older clients show in its place. */
+function RelayedMessageRow(props: MessageRowProps) {
+  const { row, session, media, participantProfiles, agentPubkeys } = props;
+  const source = row.relayedFrom;
+  const references = props.references ?? session;
+  const [open, setOpen] = useState(false);
+  const keepMounted = props.keepMounted;
+  useEffect(() => {
+    if (open) return keepMounted?.(row.id);
+  }, [open, keepMounted, row.id]);
+  const resolveName = useChannelIdentityNames(references, row.channelId);
+  const directory = useReferenceDirectory(references, participantProfiles);
+  const showTime = useMessageTimeVisible(references?.channels, row.channelId);
+  // The button's name carries the full date, so it follows time zone changes.
+  useLocalDay();
+  const shown = useMemo(() => {
+    const content = withoutRelayNotice(row.content, row.relayedFrom?.notice);
+    const removed = row.content.length - content.length;
+    // Attachment seams are offsets into the content, so they move with it.
+    const attachmentSeams = row.attachmentSeams?.flatMap((seam) =>
+      seam >= removed ? [seam - removed] : [],
+    );
+    return {
+      ...row,
+      content,
+      ...(attachmentSeams ? { attachmentSeams } : {}),
+    };
+  }, [row]);
+  if (!source) return null;
+  const name = (pubkey: string) =>
+    resolveName(
+      pubkey,
+      (pubkey === row.authorId ? props.profile : directory.profiles.get(pubkey))
+        ?.name ?? pubkey.slice(0, 10),
+    );
+  const agent = {
+    name: name(source.agent),
+    profile: directory.profiles.get(source.agent),
+  };
+  const recipients = row.mentions
+    .filter((pubkey) => pubkey !== source.agent)
+    .map(name);
+  // Only the reader's own chats are named; anyone else sees the agent alone.
+  const chat = directory.channels.find((item) => item.id === source.channelId);
+  const chatLabel =
+    chat && `${chat.channelType === "dm" ? "" : "#"}${chat.name}`;
+  const excerpt = Array.from(
+    messagePreviewText(shown.content).replace(/\s+/g, " "),
+  );
+  const preview =
+    excerpt.length > 280
+      ? `${excerpt.slice(0, 279).join("")}…`
+      : excerpt.join("");
+  return (
+    <FullMessageRow
+      {...props}
+      shownRow={shown}
+      withoutReactions
+      alignViewer={false}
+      day={false}
+      layout="continuation"
+      stackPrevious
+      stackNext
+      renderMessage={(message, trigger) => (
+        <div
+          className={styles.relayedRow}
+          data-relayed=""
+          data-layout={props.layout ?? "timeline"}
+          data-open={open || undefined}
+        >
+          {props.day && <DayDivider createdAt={row.createdAt} />}
+          <Collapsible.Root
+            open={open}
+            onOpenChange={setOpen}
+            className={styles.relayedEntry}
+            data-highlight-surface=""
+            data-thread-open={props.threadOpen || undefined}
+            aria-current={props.threadOpen ? true : undefined}
+            data-message-id={row.id}
+          >
+            {/* The whole line opens it; only the source chat link sits above. */}
+            <div className={styles.relayedHeader} data-open={open || undefined}>
+              <Collapsible.Trigger
+                ref={trigger}
+                data-buzz-ui=""
+                className={styles.relayedTrigger}
+                aria-label={`${agent.name}${chatLabel ? ` from ${chatLabel}` : ""}: ${preview}${row.edited ? " (edited)" : ""}${row.replyCount > 0 ? `, ${row.replyCount === 1 ? "1 reply" : `${row.replyCount} replies`}` : ""}, ${formatFullTimestamp(row.createdAt)}`}
+              />
+              <span className={styles.relayedAvatar} aria-hidden="true">
+                <AgentAvatar
+                  session={session}
+                  agentPubkey={source.agent}
+                  channelId={row.channelId}
+                  src={avatarMedia(agent.profile?.picture, media)}
+                  alt=""
+                  fallback={agent.name}
+                  size="fill"
+                  shape={
+                    agentPubkeys?.has(source.agent) || agent.profile?.isAgent
+                      ? "squircle"
+                      : "circle"
+                  }
+                />
+              </span>
+              <span className={styles.relayedName} aria-hidden="true">
+                {agent.name}
+              </span>
+              {chat && (
+                <>
+                  <span
+                    className={styles.relayedSubtle}
+                    data-relayed-source=""
+                    data-relayed-from={chat.channelType === "dm" ? "dm" : ""}
+                    aria-hidden="true"
+                  >
+                    from
+                  </span>
+                  <span className={styles.relayedChat} data-relayed-source="">
+                    <MessageLink
+                      url={`buzz://channel/${encodeURIComponent(chat.id)}`}
+                      label={chatLabel}
+                      registry={props.extensions?.links}
+                      onOpenLink={(url) => props.onOpenLink(url)}
+                      session={session}
+                      scope={props.scope}
+                      channelPrivate={!!chat.private}
+                    />
+                  </span>
+                </>
+              )}
+              <span className={styles.relayedPreview} aria-hidden="true">
+                {!open && preview}
+              </span>
+              {!open && row.edited && (
+                <span aria-hidden="true">
+                  <EditedMarker />
+                </span>
+              )}
+              {/* Opening the line shows the thread control and its unread cue. */}
+              {!open && row.replyCount > 0 && (
+                <span className={styles.relayedSubtle} aria-hidden="true">
+                  {row.replyCount === 1
+                    ? "1 reply"
+                    : `${row.replyCount} replies`}
+                </span>
+              )}
+              <span className={styles.relayedTime} aria-hidden="true">
+                <MessageTimestamp
+                  createdAt={row.createdAt}
+                  visible={showTime}
+                />
+              </span>
+              <CaretRightIcon
+                className={styles.relayedCaret}
+                aria-hidden="true"
+              />
+            </div>
+            <Collapsible.Panel
+              className={styles.relayedPanel}
+              inert={!open || undefined}
+              aria-hidden={!open || undefined}
+            >
+              <div className={styles.relayedBody}>
+                {message}
+                <p className={styles.relayedFooter}>
+                  Sent as{" "}
+                  {row.authorId === (props.viewer ?? session?.viewer)
+                    ? "you"
+                    : name(row.authorId)}
+                  {recipients.length > 0 && ` · to ${recipients.join(", ")}`}
+                </p>
+              </div>
+            </Collapsible.Panel>
+          </Collapsible.Root>
+        </div>
+      )}
+    />
+  );
+}
+
 // Subscribe only for mounted thread buttons. Evidence and reading remain session-owned;
 // rendering a row must not initiate per-thread reads or acknowledge unseen replies.
 function useThreadUnread(
@@ -2159,8 +2458,12 @@ function useThreadAgents(
     get,
   );
   // Subscribe to this thread's working agents, not every activity step.
+  const subscribeWork = useChannelActivitySubscription(
+    session?.agentActivity,
+    channelId,
+  );
   const getWork = () => {
-    const activity = session?.agentActivity?.snapshot();
+    const activity = session?.agentActivity?.snapshot(channelId);
     const typers = threadWorkingAgents(
       activity,
       keys ? keys.split(",") : [],
@@ -2181,11 +2484,7 @@ function useThreadAgents(
       typers.length > 0 && typers.every((agent) => breathing(local.get(agent)));
     return `${waiting ? "waiting" : "working"}:${typers.join(",")}`;
   };
-  const work = useSyncExternalStore(
-    session?.agentActivity?.subscribe ?? noSubscribe,
-    getWork,
-    getWork,
-  );
+  const work = useSyncExternalStore(subscribeWork, getWork, getWork);
   const [state, joined = ""] = work.split(/:(.*)/s);
   const typers = joined ? joined.split(",") : [];
   const hasWork = typers.length > 0;
@@ -2200,4 +2499,24 @@ function useThreadAgents(
       library?.identities.filter(({ pubkey }) => typers.includes(pubkey)) ?? [],
     waiting: state === "waiting",
   };
+}
+
+/** A quiet line on a message that is pinned in its channel. */
+function PinnedMarker({
+  session,
+  row,
+}: {
+  session: RelaySession;
+  row: ChannelMessage;
+}) {
+  const pins = usePinnedMessages(session, row.channelId);
+  if (!pins.set.has(row.id)) return null;
+  return (
+    <div className={styles.pinnedMarker}>
+      <span>
+        <PinIcon size={12} aria-hidden="true" />
+        Pinned
+      </span>
+    </div>
+  );
 }

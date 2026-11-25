@@ -690,6 +690,30 @@ describe("github_watch_pr", () => {
     app.dispose();
   });
 
+  it("tells a lost approval again after a wake that could not be sent saw it come back", async () => {
+    const app = setup();
+    const green = { checks: [{ name: "unit", conclusion: "SUCCESS" }] };
+    app.gh(answer({ ...green, decision: "APPROVED", threads: [false] }));
+    await app.call({ url });
+    app.gh(answer({ ...green, decision: "REVIEW_REQUIRED", threads: [false] }));
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(app.texts()).toEqual([
+      `${url} is no longer approved: GitHub wants a review again, as when an approval is dismissed or more are required.`,
+    ]);
+    // Approved again and ready, but the wake cannot be sent; then dismissed.
+    await vi.advanceTimersByTimeAsync(SPACING_MS);
+    app.runs(false);
+    app.gh(answer({ ...green, decision: "APPROVED", threads: [true] }));
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    app.gh(answer({ ...green, decision: "REVIEW_REQUIRED", threads: [true] }));
+    app.runs(true);
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(app.texts().slice(1)).toEqual([
+      `${url} is no longer approved: GitHub wants a review again, as when an approval is dismissed or more are required.`,
+    ]);
+    app.dispose();
+  });
+
   it("wakes the agent in its thread when CI finishes, naming the failed checks", async () => {
     const app = setup();
     app.gh(answer({ checks: [{ name: "unit", conclusion: null }] }));

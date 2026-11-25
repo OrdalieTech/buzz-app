@@ -12,12 +12,13 @@ import {
 import { assert, afterEach, expect, it, vi } from "vitest";
 import { ComposerAttachments } from "./ComposerAttachments";
 import type { RelaySession } from "../relay/session";
-import type { UploadedAttachment } from "../relay/attachments";
+import { UploadError, type UploadedAttachment } from "../relay/attachments";
 import {
   useAttachmentDraft,
   attachmentDraft,
   transferAttachmentDraft,
   subscribeAttachmentDraftCounts,
+  unsupportedTypes,
 } from "./attachment-draft";
 
 function deferred<T>() {
@@ -387,6 +388,79 @@ it("names three files per reason, counts the rest and gives empty files one sent
     "a.png, b.png, c.png are empty.",
     "11.txt, 12.txt, 13.txt and 2 more: Attach at most 10 files per message.",
   ]);
+});
+
+it("refuses a folder as a folder, alone or in a batch, and a zero-byte file still as empty", () => {
+  const h = fixture();
+  const draft = renderHook(() => useAttachmentDraft(h.session, "one", "one"));
+  const folder = file("top-recipes", 0);
+  const add = (files: globalThis.File[], folders: globalThis.File[]) =>
+    draft.result.current.store.add(files, undefined, new Set(folders));
+  expect(() => add([folder], [folder])).toThrow(
+    /^top-recipes is a folder\. Folders can’t be attached\.$/,
+  );
+  expect(() => add([file("empty.txt", 0)], [folder])).toThrow(
+    /^empty\.txt is empty\.$/,
+  );
+  // A folder's reported size varies by platform; its size never admits it.
+  const more = ["photos", "drafts", "notes"].map((name) => file(name, 4096));
+  let left: readonly string[] = [];
+  act(() => {
+    left = add(
+      [folder, file("notes.txt"), file("empty.txt", 0), ...more],
+      [folder, ...more],
+    );
+  });
+  expect(draft.result.current.items.map((item) => item.file.name)).toEqual([
+    "notes.txt",
+  ]);
+  expect(left).toEqual([
+    "top-recipes, photos, drafts and 1 more are folders. Folders can’t be attached.",
+    "empty.txt is empty.",
+  ]);
+  act(() => {
+    left = add([folder, file("more.txt")], [folder]);
+  });
+  expect(left).toEqual(["top-recipes is a folder. Folders can’t be attached."]);
+  expect(draft.result.current.items.map((item) => item.file.name)).toEqual([
+    "notes.txt",
+    "more.txt",
+  ]);
+});
+
+it("marks only the file whose type the relay refused, until it is retried", async () => {
+  const h = fixture();
+  const draft = renderHook(() => useAttachmentDraft(h.session, "one", "one"));
+  act(() => draft.result.current.store.add([file("setup.exe"), file()]));
+  const marks = () =>
+    draft.result.current.items.map((item) => [item.status, item.unsupported]);
+  await waitFor(() => expect(h.calls).toHaveLength(1));
+  await act(async () => h.calls[0]?.result.reject(new UploadError("type")));
+  await waitFor(() => expect(h.calls).toHaveLength(2));
+  // Any other refusal, even of the file's content, leaves the type unjudged.
+  await act(async () => h.calls[1]?.result.reject(new UploadError("rejected")));
+  expect(marks()).toEqual([
+    ["error", true],
+    ["error", undefined],
+  ]);
+  expect(draft.result.current.blocked).toBe(true);
+  const refused = draft.result.current.items[0];
+  assert(refused);
+  act(() => draft.result.current.store.retry(refused.id));
+  await waitFor(() => expect(h.calls).toHaveLength(3));
+  expect(marks()).toEqual([
+    ["uploading", undefined],
+    ["error", undefined],
+  ]);
+});
+
+it("names three files the relay refused for their type and counts the rest", () => {
+  expect(unsupportedTypes(["setup.exe"])).toBe(
+    "setup.exe isn’t a supported file type.",
+  );
+  expect(unsupportedTypes(["a.exe", "b.exe", "c.exe", "d.exe", "e.exe"])).toBe(
+    "a.exe, b.exe, c.exe and 2 more aren’t supported file types.",
+  );
 });
 
 it("charges a batch's admitted files, not its refused ones, to the shared retention budget", () => {

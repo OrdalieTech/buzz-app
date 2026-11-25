@@ -179,9 +179,10 @@ describe("native live verification", () => {
     const host = gate();
     const h = setup(["a"], undefined, undefined, undefined, host.check);
     const delivered: string[] = [];
-    h.callbacks.receive.mockImplementation(([event], provenance) =>
-      delivered.push(`${event?.content}:${provenance?.phase}`),
-    );
+    h.callbacks.receive.mockImplementation((events, provenance) => {
+      for (const event of events)
+        delivered.push(`${event.content}:${provenance?.phase}`);
+    });
     h.callbacks.established.mockImplementation((channel) => {
       if (channel === "a") delivered.push("EOSE");
     });
@@ -222,6 +223,81 @@ describe("native live verification", () => {
       h.owner.dispose();
     }
   });
+
+  it.each(["same-channel", "mixed-channel"])(
+    "preserves session order and provenance for a 120-event %s replay",
+    async (scenario) => {
+      const host = gate();
+      const h = setup([], undefined, undefined, undefined, host.check);
+      const relay = keypair();
+      const wire = scriptedTransport(h.key.pubkey, relay.pubkey);
+      const session = createRelaySession({
+        ...wire.transport,
+        subscribe(callbacks) {
+          h.callbacks.receive.mockImplementation(callbacks.receive);
+          h.callbacks.state.mockImplementation(callbacks.state);
+          return h.owner;
+        },
+      });
+      const replay = vi.fn();
+      session.session.subscribeLive(replay, { replay: true });
+      try {
+        h.callbacks.receive(
+          ["a", "b"].map((id) => roster(relay, id, [h.key.pubkey])),
+        );
+        h.callbacks.receive.mockClear();
+        await h.first.auth();
+        const routes = ["a", "b"].map((id) => {
+          const route = h.first
+            .requests()
+            .find((request) => scopeOf(request).includes(id));
+          assert.exists(route);
+          return route[1];
+        });
+        const events = Array.from({ length: 120 }, (_, index) =>
+          message(
+            h.key,
+            scenario === "mixed-channel" && index % 2 ? "b" : "a",
+            `replayed ${index}`,
+            1700000120 - index,
+          ),
+        );
+        const frames = events.map((event, index) =>
+          h.first.receive([
+            "EVENT",
+            routes[scenario === "mixed-channel" ? index % 2 : 0],
+            event,
+          ]),
+        );
+        const eose = [...new Set(routes)].map((id) =>
+          h.first.receive(["EOSE", id]),
+        );
+        await vi.waitFor(() => expect(host.check).toHaveBeenCalledOnce());
+        host.release();
+        await Promise.all([...frames, ...eose]);
+
+        const calls = h.callbacks.receive.mock.calls;
+        if (scenario === "same-channel")
+          expect(calls.length).toBeLessThanOrEqual(12);
+        expect(
+          replay.mock.calls.flatMap(([batch]) =>
+            batch.events.map(({ id }: VerifiedEvent) => id),
+          ),
+        ).toEqual(events.map(({ id }) => id));
+        for (const [batch] of replay.mock.calls) {
+          expect(batch.replay).toBe(true);
+          for (const event of batch.events)
+            expect(event.tags).toContainEqual(["h", batch.channelId]);
+        }
+        expect(h.callbacks.established).toHaveBeenCalledWith(
+          expect.arrayContaining(["a", "b"]),
+        );
+      } finally {
+        host.release();
+        session.dispose();
+      }
+    },
+  );
 
   it.each(["retire", "disconnect", "dispose"])(
     "discards native results after %s",
@@ -6144,6 +6220,44 @@ it("establishes a carried batch whose renewal replay carried a reply", async () 
   }
   expect(vi.getTimerCount()).toBe(0);
 });
+it("keeps a channel continuous when its renewal replay carried a pin list", async () => {
+  vi.useFakeTimers();
+  const h = setup([]);
+  try {
+    h.owner.update(["a", "b", "c"], ["a", "b"]);
+    await establish(h.first);
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    for (const request of h.first.requests())
+      await h.first.receive(["EOSE", request[1]]);
+    h.callbacks.established.mockClear();
+    renew(h.first);
+    const second = h.sockets[1];
+    assert.exists(second);
+    await second.auth();
+    await vi.advanceTimersByTimeAsync(750);
+    const batch = second.requests().find((r) => scopeOf(r).includes("a"));
+    assert.exists(batch);
+    // Its `e` tags name pins, not replies: no thread changed.
+    const pins = signed(keypair(), {
+      kind: 30623,
+      content: "",
+      created_at: 1700000000,
+      tags: [
+        ["d", "a"],
+        ["h", "a"],
+        ["e", "1".repeat(64)],
+      ],
+    });
+    await second.receive(["EVENT", batch[1], pins]);
+    for (const request of second.requests())
+      await second.receive(["EOSE", request[1]]);
+    // As with a renewal that carried nothing, no channel owes catch-up.
+    expect(h.callbacks.established).not.toHaveBeenCalled();
+  } finally {
+    h.owner.dispose();
+  }
+  expect(vi.getTimerCount()).toBe(0);
+});
 it("keeps a planned renewal connected and skips catch-up for carried routes", async () => {
   vi.useFakeTimers();
   const h = setup([]);
@@ -6392,8 +6506,10 @@ it.each(["complete", "cut", "closed", "renewed"] as const)(
         expect(reads).not.toContainEqual([
           expect.objectContaining({ kinds: [39002] }),
         ]);
+        // The head read carries the channel's newest notices.
         expect(reads).toContainEqual([
           expect.objectContaining({ "#h": ["a"], top_level: true }),
+          expect.objectContaining({ "#h": ["a"], kinds: [40099] }),
         ]);
       }
     } finally {

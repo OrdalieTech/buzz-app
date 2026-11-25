@@ -11,6 +11,7 @@ import {
   soloAgentOwnership,
 } from "./solo-admins";
 import { isBatchAddition } from "../channel-members/members";
+import { isMigrationSource } from "./migration";
 import { withdraw } from "./withdraw";
 import type { ChannelQueries, ChannelSummary } from "./contracts";
 import type { RelayReader } from "./reader";
@@ -520,10 +521,32 @@ export function createChannelWrites(
           )
         );
       });
-      if (previous && Date.now() / 1000 - previous.event.created_at >= 15 * 60)
-        throw new Error(
-          `This agent-add request expired. Open Outbox, remove the “Add agent ${key.slice(0, 12)}” item, then add the agent again. Check channel membership first if the request was unconfirmed.`,
-        );
+      if (
+        previous &&
+        Date.now() / 1000 - previous.event.created_at >= 15 * 60
+      ) {
+        if (previous.delivery === "sending")
+          throw new Error(
+            "This agent-add request is still sending. Try again when it finishes.",
+          );
+        // The relay refuses an expired event, so a new Add replaces it and
+        // repeats every admission check from a fresh roster. Only the roster
+        // shows whether an unconfirmed one applied.
+        if (previous.delivery === "unknown") await refreshMembership(id);
+        await writer(true).dismiss(previous.event.id);
+        if (
+          (receipts ?? outbox)
+            ?.snapshot()
+            .some((item) => item.event.id === previous.event.id)
+        )
+          throw new Error(
+            "This agent-add request is still in progress. Try again when it finishes.",
+          );
+        if (active?.() === false)
+          throw new DOMException("Channel addition cancelled", "AbortError");
+        if (added.length) await refresh(id, { members: added }, false);
+        return addAgents(id, keys, active);
+      }
       let owned: (() => boolean) | undefined;
       if (
         original.channelType === "solo" &&
@@ -701,10 +724,14 @@ export function createChannelWrites(
         labels?: readonly string[] | undefined;
         /** NIP-CL system channel: left out of reads that do not name it. */
         system?: boolean | undefined;
+        migration?: string | undefined;
       }> = {},
     ) {
       writer();
       identifier(id);
+      const { migration } = options;
+      if (migration !== undefined && !isMigrationSource(migration))
+        throw new Error("Use a nonempty migration source.");
       const labelTags = channelLabelTags(options.labels ?? []);
       const name = canonicalDetailsName(title);
       const about = description?.trim();
@@ -733,6 +760,7 @@ export function createChannelWrites(
             ...(about ? [["about", about]] : []),
             ...(ttlSeconds ? [["ttl", String(ttlSeconds)]] : []),
             ...labelTags,
+            ...(migration ? [["migration", migration]] : []),
           ],
         },
         undefined,

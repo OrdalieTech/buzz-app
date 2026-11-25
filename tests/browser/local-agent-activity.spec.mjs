@@ -283,6 +283,24 @@ test("Stop in a message's activity ends its local work quietly", async ({
   ).toBeFocused();
   const note = row.getByText("Stopped", { exact: true });
   await expect(note).toBeVisible();
+  // The outcome keeps an inset inside its outlined bubble in every density.
+  for (const density of ["default", "compact"]) {
+    await page.evaluate((density) => {
+      document.documentElement.dataset.messageDensity = density;
+    }, density);
+    const inset = await note.evaluate((label) => {
+      const text = label.getBoundingClientRect();
+      const bubble = label
+        .closest('[class*="messageBubble"]')
+        .getBoundingClientRect();
+      return Math.min(
+        text.left - bubble.left,
+        text.top - bubble.top,
+        bubble.bottom - text.bottom,
+      );
+    });
+    expect(inset, density).toBeGreaterThanOrEqual(4);
+  }
   await expect(
     page.locator('[data-channel-id="alpha"] [data-channel-working]'),
   ).toHaveCount(0);
@@ -751,7 +769,12 @@ test("the published-activity tab shows turns its agent published", async ({
     key,
   );
   await page
-    .getByRole("form", { name: "Send a message to Alpha", exact: true })
+    .locator("[data-composer-dock]", {
+      has: page.getByRole("form", {
+        name: "Send a message to Alpha",
+        exact: true,
+      }),
+    })
     .locator("..")
     .getByRole("button", { name: /^Activity: .+ working$/ })
     .hover();

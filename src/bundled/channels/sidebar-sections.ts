@@ -14,8 +14,7 @@ export type SidebarRowKind = "channel" | "dm" | "solo" | "forum";
 const anyRow: readonly SidebarRowKind[] = ["solo", "channel", "forum", "dm"];
 const homeRows: Partial<Record<string, readonly SidebarRowKind[]>> = {
   solo: ["solo"],
-  channels: ["channel"],
-  forums: ["forum"],
+  channels: ["channel", "forum"],
   dms: ["dm"],
 };
 
@@ -34,13 +33,11 @@ export function sidebarRowKind(channel: ChannelSummary): SidebarRowKind {
 
 export function sidebarHome(channel: ChannelSummary) {
   const kind = sidebarRowKind(channel);
-  return kind === "channel"
+  return kind === "channel" || kind === "forum"
     ? "channels"
     : kind === "dm"
       ? "dms"
-      : kind === "forum"
-        ? "forums"
-        : kind;
+      : kind;
 }
 
 export function contributedSidebarSectionKey(key: string) {
@@ -75,7 +72,7 @@ function compareName(a: ChannelSummary, b: ChannelSummary) {
  * creation so a chat just started leads before its first message lands and
  * cannot step backward when that message is acknowledged. Channels with
  * neither follow, then by name. */
-function recentAt(channel: ChannelSummary) {
+export function recentAt(channel: ChannelSummary) {
   return channel.lastActivityAt !== undefined && channel.createdAt !== undefined
     ? Math.max(channel.lastActivityAt, channel.createdAt)
     : (channel.lastActivityAt ?? channel.createdAt);
@@ -94,7 +91,6 @@ const titles: Record<string, string> = {
   starred: "Starred",
   solo: "Solo",
   channels: "Team",
-  forums: "Forums",
   dms: "Direct messages",
 };
 

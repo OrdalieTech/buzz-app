@@ -14,10 +14,14 @@ const state = vi.hoisted(() => ({
   saves: [] as string[],
   clears: 0,
   refusals: [] as string[],
+  /** Each local agent's own variable names (`agent_env.rs`). */
+  agentEnv: new Map<string, string[]>(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({
   isTauri: () => true,
-  invoke: async (command: string, args?: { value: string }) => {
+  invoke: async (command: string, args?: { value: string; agent?: string }) => {
+    if (command === "agent_env_status")
+      return { names: state.agentEnv.get(args?.agent ?? "") ?? [] };
     if (command === "claude_api_key_status") {
       state.asked += 1;
       return state.saved;
@@ -46,6 +50,7 @@ function store(saved = true) {
     clears: 0,
     refusals: [],
   });
+  state.agentEnv.clear();
 }
 beforeEach(() => void store());
 
@@ -125,6 +130,40 @@ it("refuses a turn's claude without a key, but lets setup run its checks", async
   });
 });
 
+it("starts a turn's claude with no saved key when its agent's own variables set one", async () => {
+  const { spawn, started } = host();
+  store(false);
+  const agent = "a".repeat(64);
+  const other = "b".repeat(64);
+  state.agentEnv.set(agent, ["ANTHROPIC_API_KEY"]);
+  state.agentEnv.set(other, ["OTHER"]);
+  const authorized = new ClaudeAuth(spawn).authorize(spawn, true);
+  const options = { env: ENV, secrets: ["agent-env" as const] };
+  await authorized("claude", { ...options, envAgent: agent });
+  expect(started.at(-1)?.options?.envAgent).toBe(agent);
+  await expect(
+    authorized("claude", { ...options, envAgent: other }),
+  ).rejects.toThrow("Claude needs an Anthropic API key.");
+  // An inherited key is still no credential: Claude's env removes it.
+  await expect(authorized("claude", options)).rejects.toThrow(
+    "Claude needs an Anthropic API key.",
+  );
+  expect(started).toHaveLength(1);
+  // One the device list sets counts for every agent, and for the spare.
+  state.agentEnv.set("", ["ANTHROPIC_API_KEY"]);
+  await authorized("claude", { ...options, envAgent: other });
+  await authorized("claude", options);
+  expect(started).toHaveLength(3);
+  // Without own setup, each asks native for a key: its own list's, the
+  // device's, then the shared one.
+  for (const { options } of started)
+    expect(options?.secrets).toEqual(["agent-env", "anthropic-api-key"]);
+  // A launch that doesn't ask for the lists never gets that key.
+  await expect(authorized("claude", { env: ENV })).rejects.toThrow(
+    "Claude needs an Anthropic API key.",
+  );
+});
+
 it("passes a full host's refusal on, rather than taking it for no setup", async () => {
   const { spawn, started } = host();
   store(false);
@@ -149,6 +188,23 @@ it("reads a full host as no own setup outside a turn", async () => {
   await expect(auth.check()).resolves.toEqual({});
   store(false);
   await expect(auth.check()).resolves.toBeUndefined();
+});
+
+it("counts a device-list key for ordinary agents, after the person's own setup", async () => {
+  store(false);
+  state.agentEnv.set("", ["ANTHROPIC_API_KEY"]);
+  await expect(new ClaudeAuth(host().spawn).check()).resolves.toEqual({});
+  // The person's own sign-in still wins: Claude starts without a key.
+  const own = host({ loggedIn: true });
+  const signedIn = new ClaudeAuth(own.spawn);
+  await expect(signedIn.check()).resolves.toEqual({});
+  expect(signedIn.usesOwnSetup).toBe(true);
+  await signedIn.authorize(own.spawn, true)("claude", { env: ENV });
+  expect(own.started).toEqual([{ id: "claude", options: { env: ENV } }]);
+  // Security reviews still need the saved key.
+  await expect(new ClaudeAuth(host().spawn).review()).rejects.toThrow();
+  state.agentEnv.clear();
+  await expect(new ClaudeAuth(host().spawn).check()).resolves.toBeUndefined();
 });
 
 it("asks again until a key is saved, then once until it is saved or checked", async () => {
@@ -427,4 +483,100 @@ it("points a refused own setup at the Claude CLI rather than a key", async () =>
   expect(auth.explainTurn("Error: overloaded", settings)).toBe(
     "Error: overloaded",
   );
+});
+
+it("keeps the person's own setup with a device-list key: no key is asked for", async () => {
+  const { spawn, started } = host({ loggedIn: true });
+  store(false);
+  state.agentEnv.set("", ["ANTHROPIC_API_KEY"]);
+  const authorized = new ClaudeAuth(spawn).authorize(spawn, true);
+  const agent = "a".repeat(64);
+  const options = { env: ENV, secrets: ["agent-env" as const] };
+  await authorized("claude", { ...options, envAgent: agent });
+  await authorized("claude", options);
+  expect(started.map(({ options }) => options)).toEqual([
+    { ...options, envAgent: agent },
+    options,
+  ]);
+});
+
+it("keeps protected eligibility to the person's own setup or a saved key, from the check's own answers", async () => {
+  // Only the device list: ordinary agents are ready, protected ones are not.
+  store(false);
+  state.agentEnv.set("", ["ANTHROPIC_API_KEY"]);
+  const device = host();
+  const auth = new ClaudeAuth(device.spawn);
+  expect(auth.protectedEligible).toBeUndefined();
+  await expect(auth.check()).resolves.toEqual({});
+  expect(auth.protectedEligible).toBe(false);
+  // Read from what the check sampled: no second key or own-setup ask.
+  const asked = [state.asked, device.status.asked];
+  await expect(auth.protectedReady()).resolves.toBe(false);
+  expect([state.asked, device.status.asked]).toEqual(asked);
+  // A saved key counts at once, and clearing it takes it away again.
+  await auth.save(KEY);
+  expect(auth.protectedEligible).toBe(true);
+  await auth.clear();
+  expect(auth.protectedEligible).toBe(false);
+  // The person's own setup counts without a key.
+  const own = new ClaudeAuth(host({ loggedIn: true }).spawn);
+  await own.check();
+  expect(own.protectedEligible).toBe(true);
+  // Unsampled, it asks rather than assuming either way.
+  store(true);
+  await expect(new ClaudeAuth(host().spawn).protectedReady()).resolves.toBe(
+    true,
+  );
+});
+
+it("stops admitting protected agents on the person's own setup once a fresh check of it fails", async () => {
+  store(false);
+  state.agentEnv.set("", ["ANTHROPIC_API_KEY"]);
+  const own = host({ loggedIn: true });
+  const auth = new ClaudeAuth(own.spawn);
+  await auth.check();
+  expect(auth.protectedEligible).toBe(true);
+  // Claude can't say this time: ordinary agents keep the device key...
+  own.status.own = null as never;
+  await expect(auth.check()).resolves.toEqual({});
+  // ...and the last answer, but protected admission is unknown, not yes.
+  expect(auth.usesOwnSetup).toBe(true);
+  expect(auth.protectedEligible).toBeUndefined();
+  await expect(auth.protectedReady()).rejects.toThrow();
+  // A saved key still admits it.
+  await auth.save(KEY);
+  expect(auth.protectedEligible).toBe(true);
+});
+
+it("never admits a protected agent on a probe a newer, failed check replaced", async () => {
+  store(false);
+  const answers: ((status: unknown) => void)[] = [];
+  const spawn: Spawn = async (_id, options) => {
+    let stdout = "";
+    const exited = new Promise<number>((resolve) => {
+      answers.push((status) => {
+        stdout = JSON.stringify(status);
+        options?.onStdout?.(stdout);
+        resolve(0);
+      });
+    });
+    return {
+      write: async () => undefined,
+      end: async () => undefined,
+      kill: async () => undefined,
+      exited,
+    };
+  };
+  const auth = new ClaudeAuth(spawn);
+  // Admission starts probe A; a newer check replaces it with probe B.
+  const admitted = auth.protectedReady();
+  await vi.waitFor(() => expect(answers).toHaveLength(1));
+  const checked = auth.check();
+  await vi.waitFor(() => expect(answers).toHaveLength(2));
+  // B can't say, then A answers yes.
+  (answers[1] as (status: unknown) => void)(null);
+  await checked;
+  (answers[0] as (status: unknown) => void)({ loggedIn: true });
+  await expect(admitted).rejects.toThrow();
+  expect(auth.protectedEligible).toBeUndefined();
 });

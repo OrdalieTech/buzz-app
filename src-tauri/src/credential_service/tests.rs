@@ -950,7 +950,9 @@ fn the_policy_binds_each_proof_to_the_community() {
 #[test]
 fn every_kind_has_one_class() {
     let classes = |kind| classify(kind, &[], NOW, NOW, RELAY);
-    for kind in [7, 9, 30174, 20001, 24200, 40002, 41010, 45010, 46020, 1621] {
+    for kind in [
+        7, 9, 30174, 20001, 24200, 40002, 40010, 40011, 41010, 45010, 46020, 1621,
+    ] {
         assert_eq!(classes(kind), Verdict::Sign, "{kind}");
     }
     for kind in [

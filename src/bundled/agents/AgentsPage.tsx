@@ -489,8 +489,8 @@ export function AgentsPage({
   };
   // Read as a team's visit arrives, or as a held leave runs, not a reason
   // to apply them again.
-  const leave = useRef({ browse, editingTeam, editTeam });
-  leave.current = { browse, editingTeam, editTeam };
+  const leave = useRef({ browse, editingTeam, editTeam, selectedKey, unsaved });
+  leave.current = { browse, editingTeam, editTeam, selectedKey, unsaved };
   useEffect(() => {
     if (!routedEntry) return;
     const { browse, editingTeam } = leave.current;
@@ -511,8 +511,12 @@ export function AgentsPage({
     });
   }, [routedTeam, routedEntry]);
   useEffect(() => {
-    // Back to an agent's visit leaves a busy team editor open too.
+    // Back to an agent's visit leaves a busy team editor open too, and
+    // another agent's visit leaves a running save or restart open, so its
+    // failure still shows.
     if (!routedAgent || !routedEntry || teamBusy.current) return;
+    const { selectedKey, unsaved } = leave.current;
+    if (unsaved.saving && routedAgent !== selectedKey) return;
     setEditingTeam(undefined);
     setSharedSelection(undefined);
     setTab("yours");

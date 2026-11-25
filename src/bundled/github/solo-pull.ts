@@ -9,6 +9,7 @@ import type { EventData } from "../../features/relay/events";
 import type { RelaySession } from "../../features/relay/session";
 import type { PullState, PullStates } from "./pull-states";
 import { parseGitHubReference } from "./references";
+import { ownSolo } from "../../features/solo/labels";
 
 export const SOLO_PULL_TYPE = "buzz.solo.pr";
 /** How soon shown chats whose links could not be read try again. */
@@ -92,6 +93,16 @@ async function readLinks(
     }
   }
   return links;
+}
+
+/** Whether the signed-in `viewer` manages `channel`'s link: their own Solo
+ * chat, or one their agent `agent` started for them. */
+export function linksSolo(
+  channel: Parameters<typeof ownSolo>[0],
+  viewer: string | undefined,
+  agent?: string | undefined,
+) {
+  return ownSolo(channel, viewer) || (!!viewer && ownSolo(channel, agent));
 }
 
 /** Links `url` to the Solo chat `channel`, or unlinks it with `null`, as the

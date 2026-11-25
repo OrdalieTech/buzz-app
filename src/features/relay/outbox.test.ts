@@ -219,6 +219,101 @@ it("failed sends remain retryable, and retry republishes exactly the same signed
   await flush();
   expect(h.outbox.snapshot()).toHaveLength(0);
 });
+it.each([
+  [
+    "a relay receipt",
+    new PublishRejected("duplicate: reaction already exists"),
+  ],
+  [
+    "an HTTP refusal",
+    new PublishRejected(
+      "Reaction already exists",
+      "duplicate: reaction already exists",
+    ),
+  ],
+])(
+  "a reaction refused as a duplicate in %s retires the send instead of leaving it to retry",
+  async (_, refusal) => {
+    const storage = memoryStorage();
+    const h = setup(storage);
+    await h.open();
+    const id = h.outbox.send({
+      kind: 7,
+      content: "❌",
+      tags: [["h", "c"]],
+    });
+    await h.signNext();
+    const publication = h.publications.shift();
+    assert.exists(publication);
+    publication.reject(refusal);
+    await flush();
+    expect(h.outbox.snapshot()).toHaveLength(0);
+    expect((await storage.load()).some((item) => item.event.id === id)).toBe(
+      false,
+    );
+    h.outbox.retry(id);
+    await flush();
+    expect(h.publications).toHaveLength(0);
+  },
+);
+it("a duplicate refusal of anything but a reaction stays failed for its caller to verify", async () => {
+  const h = setup();
+  await h.open();
+  const id = h.send();
+  await h.signNext();
+  const publication = h.publications.shift();
+  assert.exists(publication);
+  publication.reject(new PublishRejected("duplicate: channel already exists"));
+  await flush();
+  expect(h.outbox.snapshot()).toMatchObject([
+    { event: { id }, delivery: "failed", refused: true },
+  ]);
+});
+it("drops duplicate reaction refusals that an earlier version saved, and keeps other kinds' duplicate refusals", async () => {
+  const savedRefusals: readonly Pick<OutgoingEvent, "delivery" | "error">[] = [
+    { delivery: "failed", error: "duplicate: reaction already exists" },
+    {
+      delivery: "unknown",
+      error: "Retry blocked: duplicate: reaction already exists",
+    },
+    { delivery: "failed", error: "Reaction already exists" },
+    { delivery: "unknown", error: "Retry blocked: Reaction already exists" },
+  ];
+  const savedReactions = savedRefusals.map((refusal, index) => {
+    const reaction = signed(viewer, {
+      kind: 7,
+      content: `❌${index}`,
+      tags: [["h", "c"]],
+    });
+    return { event: reaction, signed: reaction, ...refusal };
+  });
+  const message = signed(viewer, {
+    kind: 9,
+    content: "taken channel",
+    tags: [["h", "c"]],
+  });
+  let records: readonly OutgoingEvent[] = [
+    ...savedReactions,
+    {
+      event: message,
+      signed: message,
+      delivery: "failed",
+      error: "duplicate: channel already exists",
+    },
+  ];
+  const h = setup({
+    load: () => structuredClone(records),
+    save: (next) => {
+      records = structuredClone(next);
+    },
+  });
+  await h.outbox.ready();
+  await flush();
+  expect(h.outbox.snapshot().map((item) => item.event.id)).toEqual([
+    message.id,
+  ]);
+  expect(records.map((item) => item.event.id)).toEqual([message.id]);
+});
 it("persists before publish, restores uncertain writes without auto-sending, and retries using the same event ID", async () => {
   const storage = memoryStorage();
   const first = setup(storage);
@@ -237,6 +332,27 @@ it("persists before publish, restores uncertain writes without auto-sending, and
   expect(second.sign).not.toHaveBeenCalled();
   expect(second.publications[0]?.event.id).toBe(event.id);
 });
+it.each([40010, 40011])(
+  "completes accepted kind %i, which the relay never echoes",
+  async (kind) => {
+    const storage = memoryStorage();
+    const first = setup(storage);
+    first.outbox.send({
+      kind,
+      content: "",
+      tags: [
+        ["h", "c"],
+        ["e", "a".repeat(64)],
+      ],
+    });
+    await first.signNext();
+    first.publications[0]?.resolve();
+    await flush();
+    expect(first.outbox.snapshot()).toEqual([]);
+    first.dispose();
+    expect(setup(storage).outbox.snapshot()).toEqual([]);
+  },
+);
 it("never publishes when durable storage fails and reports that failure on the shared event", async () => {
   const h = setup({
     load: () => [],
@@ -1176,6 +1292,257 @@ it("refuses a Canvas past its allowance, at admission, without blocking messages
     expect(saved.some((item) => item.event.id === id)).toBe(true);
   });
   expect(h.outbox.snapshot().some((item) => item.error)).toBe(false);
+});
+it("replaces a failed Canvas inside a full allowance and drops it in the same save", async () => {
+  const storage = memoryStorage();
+  const content = "a".repeat(LIVE_CANVAS_BYTES);
+  const failed = Array.from({ length: 7 }, (_, i) =>
+    signed(viewer, {
+      kind: 40100,
+      content,
+      tags: [["h", `c${i}`]],
+      created_at: 1700000000 + i,
+    }),
+  );
+  await storage.save(
+    failed.map((event) => ({ event, signed: event, delivery: "failed" })),
+  );
+  const save = vi.spyOn(storage, "save");
+  const h = setup(storage);
+  await vi.waitFor(() => expect(h.outbox.snapshot()).toHaveLength(7));
+  const retired = failed[0]?.id ?? "";
+  const input = { kind: 40100, content, tags: [["h", "c0"]] };
+  expect(() => h.outbox.send(input)).toThrow("Outbox storage is full");
+  const id = (await h.outbox.replace?.(input, [retired])) ?? "";
+  const saved = (await storage.load()).map((item) => item.event.id);
+  expect(saved).toContain(id);
+  expect(saved).not.toContain(retired);
+  for (const [rows] of save.mock.calls) {
+    const ids = rows.map((item) => item.event.id);
+    expect(ids.includes(id) && ids.includes(retired)).toBe(false);
+  }
+  expect(h.outbox.snapshot()).toHaveLength(7);
+  await expect(
+    h.outbox.replace?.(input, [failed[1]?.id ?? "", id]),
+  ).rejects.toThrow("still sending");
+});
+it("keeps a full outbox loadable when a replacement's journal write fails", async () => {
+  const storage = memoryStorage();
+  const canvas = signed(viewer, {
+    kind: 40100,
+    content: "lost",
+    tags: [["h", "c"]],
+    created_at: 1700000000,
+  });
+  const messages = Array.from({ length: 255 }, (_, i) =>
+    signed(viewer, {
+      kind: 9,
+      content: `m${i}`,
+      tags: [["h", "c"]],
+      created_at: 1700000000 + i,
+    }),
+  );
+  await storage.save(
+    [canvas, ...messages].map((event) => ({
+      event,
+      signed: event,
+      delivery: "failed" as const,
+    })),
+  );
+  const save = storage.save;
+  let failed = false;
+  storage.save = (rows) => {
+    if (!failed && !rows.some((item) => item.event.id === canvas.id)) {
+      failed = true;
+      throw new Error("Disk full");
+    }
+    return save(rows);
+  };
+  const h = setup(storage);
+  await vi.waitFor(() => expect(h.outbox.snapshot()).toHaveLength(256));
+  const error = await Promise.resolve(
+    h.outbox.replace?.({ kind: 40100, content: "new", tags: [["h", "c"]] }, [
+      canvas.id,
+    ]),
+  ).catch((reason: unknown) => reason);
+  await flush();
+  expect(failed).toBe(true);
+  expect(h.outbox.snapshot().map((item) => item.event.id)).toContain(canvas.id);
+  expect(await storage.load()).toHaveLength(256);
+  h.dispose();
+  const restored = setup(storage);
+  await vi.waitFor(() => expect(restored.outbox.snapshot()).toHaveLength(256));
+  expect(String(error)).toMatch("Disk full");
+});
+it("never saves a replacement beside the entry it retires, even from a queued write", async () => {
+  const storage = memoryStorage();
+  const old = signed(viewer, {
+    kind: 40100,
+    content: "lost",
+    tags: [["h", "c"]],
+    created_at: 1700000000,
+  });
+  await storage.save([{ event: old, signed: old, delivery: "failed" }]);
+  const save = storage.save;
+  const rows: string[][] = [];
+  let release = () => {};
+  let hold = false;
+  storage.save = async (next) => {
+    rows.push(next.map((item) => item.event.id));
+    if (hold) {
+      hold = false;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    }
+    return save(next);
+  };
+  const h = setup(storage);
+  await vi.waitFor(() => expect(h.outbox.snapshot()).toHaveLength(1));
+  hold = true;
+  h.send("first");
+  await vi.waitFor(() => expect(hold).toBe(false));
+  h.send("queued before the swap");
+  const replacing = h.outbox.replace?.(
+    { kind: 40100, content: "new", tags: [["h", "c"]] },
+    [old.id],
+  );
+  release();
+  const id = (await replacing) ?? "";
+  await vi.waitFor(async () =>
+    expect((await storage.load()).map((item) => item.event.id)).toContain(id),
+  );
+  for (const ids of rows)
+    expect(ids.includes(old.id) && ids.includes(id)).toBe(false);
+});
+it("lets only one replacement claim a failed entry at the pending limit", async () => {
+  const storage = memoryStorage();
+  const lost = signed(viewer, {
+    kind: 40100,
+    content: "lost",
+    tags: [["h", "c"]],
+    created_at: 1700000000,
+  });
+  const messages = Array.from({ length: 255 }, (_, i) =>
+    signed(viewer, {
+      kind: 9,
+      content: `m${i}`,
+      tags: [["h", "c"]],
+      created_at: 1700000000 + i,
+    }),
+  );
+  await storage.save(
+    [lost, ...messages].map((event) => ({
+      event,
+      signed: event,
+      delivery: "failed" as const,
+    })),
+  );
+  const h = setup(storage);
+  await vi.waitFor(() => expect(h.outbox.snapshot()).toHaveLength(256));
+  const input = { kind: 40100, content: "new", tags: [["h", "c"]] };
+  const results = await Promise.allSettled([
+    h.outbox.replace?.(input, [lost.id]),
+    h.outbox.replace?.(input, [lost.id]),
+  ]);
+  expect(results.map((result) => result.status).sort()).toEqual([
+    "fulfilled",
+    "rejected",
+  ]);
+  await flush();
+  expect(await storage.load()).toHaveLength(256);
+  h.dispose();
+  const restored = setup(storage);
+  await vi.waitFor(() => expect(restored.outbox.snapshot()).toHaveLength(256));
+});
+it("counts a pending replacement beside its predecessor when admitting another Canvas", async () => {
+  const storage = memoryStorage();
+  const content = "a".repeat(LIVE_CANVAS_BYTES);
+  const full = Array.from({ length: 6 }, (_, i) =>
+    signed(viewer, {
+      kind: 40100,
+      content,
+      tags: [["h", `c${i}`]],
+      created_at: 1700000000 + i,
+    }),
+  );
+  const small = signed(viewer, {
+    kind: 40100,
+    content: "small",
+    tags: [["h", "s"]],
+    created_at: 1700000010,
+  });
+  await storage.save(
+    [...full, small].map((event) => ({
+      event,
+      signed: event,
+      delivery: "failed" as const,
+    })),
+  );
+  const save = storage.save;
+  let release: (() => void) | undefined;
+  storage.save = async (rows) => {
+    if (!rows.some((item) => item.event.id === small.id))
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    return save(rows);
+  };
+  const h = setup(storage);
+  await vi.waitFor(() => expect(h.outbox.snapshot()).toHaveLength(7));
+  const replacing = h.outbox.replace?.(
+    { kind: 40100, content, tags: [["h", "s"]] },
+    [small.id],
+  );
+  await vi.waitFor(() => expect(release).toBeDefined());
+  expect(() =>
+    h.outbox.send({ kind: 40100, content, tags: [["h", "other"]] }),
+  ).toThrow("Outbox storage is full");
+  release?.();
+  await replacing;
+  expect(h.outbox.snapshot()).toHaveLength(7);
+});
+it("drops an entry another window already replaced, so a retry stops naming it", async () => {
+  // Like the browser journal: windows share rows and write only their own changes.
+  const rows = new Map<string, OutgoingEvent>();
+  const journal = (): OutboxStorage => {
+    let owned = new Set<string>();
+    return {
+      load(options) {
+        if (!options?.readOnly) owned = new Set(rows.keys());
+        return structuredClone([...rows.values()]);
+      },
+      save(next, options) {
+        const retired = options?.retired ?? [];
+        if (retired.some((id) => !rows.has(id)))
+          throw new Error("This save was replaced in another window.");
+        const ids = new Set(next.map((item) => item.event.id));
+        for (const id of [...owned, ...retired])
+          if (!ids.has(id)) rows.delete(id);
+        for (const item of next)
+          if (rows.has(item.event.id) || !owned.has(item.event.id))
+            rows.set(item.event.id, structuredClone(item));
+        owned = ids;
+      },
+    };
+  };
+  const lost = signed(viewer, {
+    kind: 40100,
+    content: "lost",
+    tags: [["h", "c"]],
+    created_at: 1700000000,
+  });
+  rows.set(lost.id, { event: lost, signed: lost, delivery: "failed" });
+  const first = setup(journal());
+  const stale = setup(journal());
+  await vi.waitFor(() => expect(stale.outbox.snapshot()).toHaveLength(1));
+  const input = { kind: 40100, content: "new", tags: [["h", "c"]] };
+  const replacement = await first.outbox.replace?.(input, [lost.id]);
+  await expect(stale.outbox.replace?.(input, [lost.id])).rejects.toThrow(
+    "replaced in another window",
+  );
+  expect([...rows.keys()]).toEqual([replacement]);
+  expect(stale.outbox.snapshot()).toEqual([]);
 });
 it("refuses a message past its allowance without blocking a Canvas", async () => {
   const storage = memoryStorage();

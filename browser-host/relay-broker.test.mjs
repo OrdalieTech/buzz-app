@@ -4,6 +4,7 @@ import {
   createUpstream,
   validFilters,
   validMessageTemplate,
+  validPinCommand,
 } from "./relay-broker.mjs";
 
 test("read broker accepts non-channel finite reads without relaxing filter budgets", () => {
@@ -229,4 +230,34 @@ test("workflow list batches alone may exceed four filters, with 128 unique chann
     [...batch.slice(0, 5), null],
   ])
     assert.equal(validFilters(invalid), false);
+});
+
+test("pin commands name one channel and one message, with only a client id besides", () => {
+  const pin = {
+    kind: 40010,
+    created_at: 1,
+    content: "",
+    tags: [
+      ["h", "channel"],
+      ["e", "a".repeat(64)],
+      ["client-id", "local"],
+    ],
+  };
+  assert.equal(validPinCommand(pin), true);
+  assert.equal(validPinCommand({ ...pin, kind: 40011 }), true);
+  for (const invalid of [
+    { ...pin, kind: 9 },
+    { ...pin, content: "x" },
+    { ...pin, tags: pin.tags.slice(1) },
+    { ...pin, tags: [pin.tags[0], pin.tags[2]] },
+    { ...pin, tags: [...pin.tags, ["h", "other"]] },
+    { ...pin, tags: [...pin.tags, ["e", "b".repeat(64)]] },
+    { ...pin, tags: [...pin.tags, ["client-id", "again"]] },
+    { ...pin, tags: [...pin.tags, ["p", "c".repeat(64)]] },
+    { ...pin, tags: [["h", ""], pin.tags[1]] },
+    { ...pin, tags: [["h", "x".repeat(257)], pin.tags[1]] },
+    { ...pin, tags: [pin.tags[0], ["e", "A".repeat(64)]] },
+    { ...pin, tags: [pin.tags[0], ["e", "a".repeat(64), "relay"]] },
+  ])
+    assert.equal(validPinCommand(invalid), false);
 });

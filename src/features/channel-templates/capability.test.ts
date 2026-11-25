@@ -61,8 +61,18 @@ function fixture() {
       events.push(event);
       return event.id;
     }),
-    dismiss: vi.fn(async () => {}),
+    dismiss: vi.fn(async (id: string) => {
+      const index = pending.findIndex((item) => item.event.id === id);
+      if (index >= 0) pending.splice(index, 1);
+    }),
     retry: vi.fn(),
+    replace: vi.fn(async (value, retired) => {
+      for (const id of retired) {
+        const index = pending.findIndex((item) => item.event.id === id);
+        if (index >= 0) pending.splice(index, 1);
+      }
+      return outbox.send(value);
+    }),
   };
   const reader: RelayReader = {
     read: vi.fn(async (filters: readonly ReadFilter[]) =>
@@ -279,10 +289,11 @@ it("keeps drafts safe from stale Canvas, unresolved writes and access loss", asy
   await expect(f.canvas.save(channel, "New", undefined)).rejects.toThrow(
     CanvasConflictError,
   );
-  f.pending.push({ event: head, delivery: "unknown" });
+  f.pending.push({ event: head, delivery: "sending" });
   await expect(f.canvas.save(channel, "New", head.id)).rejects.toThrow(
-    /unresolved/,
+    /still sending/,
   );
+  expect(f.outbox.dismiss).not.toHaveBeenCalled();
   f.pending.length = 0;
   f.canWrite.mockReturnValue(false);
   await expect(f.canvas.save(channel, "New", head.id)).rejects.toThrow(
@@ -301,6 +312,210 @@ it("keeps drafts safe from stale Canvas, unresolved writes and access loss", asy
     ],
     content: "New",
   });
+});
+it.each(["Canvas", "recipe"] as const)(
+  "refuses a %s save in another window that loaded before this save began",
+  async (target) => {
+    const first = fixture();
+    const second = fixture();
+    const save = (f: ReturnType<typeof fixture>) =>
+      target === "Canvas"
+        ? f.canvas.save(channel, "Draft", undefined)
+        : f.capability.save(record.value, undefined);
+    let published!: () => void;
+    const publishing = new Promise<void>((resolve) => {
+      published = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const read = vi.mocked(first.reader.read);
+    const answer = read.getMockImplementation();
+    read.mockImplementation(async (filters, options) => {
+      if (filters.some((filter) => filter.ids)) {
+        published();
+        await gate;
+      }
+      return (await answer?.(filters, options)) ?? [];
+    });
+    const saving = save(first);
+    try {
+      await publishing;
+      await expect(save(second)).rejects.toThrow(
+        "An earlier save is still sending. Try again in a moment.",
+      );
+      expect(second.outbox.send).not.toHaveBeenCalled();
+    } finally {
+      release();
+    }
+    await saving;
+    await save(second);
+    expect(second.outbox.send).toHaveBeenCalledOnce();
+  },
+);
+it.each(["failed", "unknown"] as const)(
+  "replaces a %s earlier save instead of blocking new saves",
+  async (delivery) => {
+    const f = fixture();
+    const canvas = signed(viewer, {
+      kind: 40100,
+      tags: [["h", channel]],
+      content: "Lost",
+      created_at: 1_600_000_000,
+    });
+    const recipe = signed(viewer, {
+      kind: 30078,
+      tags: [
+        ["d", coordinate(record)],
+        ["t", KIT_TAG],
+      ],
+      content: JSON.stringify(record),
+      created_at: 1_600_000_000,
+    });
+    f.pending.push(
+      { event: canvas, delivery, error: "Delivery timed out" },
+      { event: recipe, delivery, error: "Delivery timed out" },
+    );
+    const saved = await f.canvas.save(channel, "New", undefined);
+    expect(saved.content).toBe("New");
+    expect(f.pending.map((item) => item.event.id)).toEqual([recipe.id]);
+    const id = await f.capability.save(record.value, undefined);
+    expect(f.capability.snapshot().entries[0]?.eventId).toBe(id);
+    expect(f.pending).toEqual([]);
+  },
+);
+it("never replaces a failed chat message, another Canvas or another recipe", async () => {
+  const f = fixture();
+  const failed = (template: Parameters<typeof signed>[1]): OutgoingEvent => ({
+    event: signed(viewer, { created_at: 1_600_000_000, ...template }),
+    delivery: "failed",
+    error: "Delivery timed out",
+  });
+  const unrelated = [
+    failed({ kind: 9, tags: [["h", channel]], content: "Chat message" }),
+    failed({
+      kind: 40100,
+      tags: [["h", "22222222-2222-4222-8222-222222222222"]],
+      content: "Other Canvas",
+    }),
+    failed({
+      kind: 30078,
+      tags: [
+        ["d", coordinate(other)],
+        ["t", KIT_TAG],
+      ],
+      content: JSON.stringify(other),
+    }),
+  ];
+  f.pending.push(...unrelated);
+  await f.canvas.save(channel, "New", undefined);
+  await f.capability.save(record.value, undefined);
+  expect(f.outbox.replace).not.toHaveBeenCalled();
+  expect(f.pending).toEqual(unrelated);
+});
+const recipeEvent = (content: string, created_at: number) =>
+  signed(viewer, {
+    kind: 30078,
+    tags: [
+      ["d", coordinate(record)],
+      ["t", KIT_TAG],
+    ],
+    content,
+    created_at,
+  });
+it("reads the recipe head strongly, so a stale replica cannot hide another device's newer save", async () => {
+  const f = fixture();
+  const mine = recipeEvent(JSON.stringify(record), 1_600_000_000);
+  const theirs = recipeEvent(
+    JSON.stringify({ ...record, value: { ...record.value, name: "Theirs" } }),
+    1_600_000_100,
+  );
+  f.events.push(mine, theirs);
+  f.pending.push({
+    event: recipeEvent("lost", 1_600_000_050),
+    delivery: "unknown",
+  });
+  vi.mocked(f.reader.read).mockImplementation(async (filters) =>
+    f.events.filter((event) =>
+      filters.some(
+        (filter) =>
+          matchesEvent(event, filter) &&
+          (filter.consistency === "strong" || event !== theirs),
+      ),
+    ),
+  );
+  await expect(f.capability.save(record.value, mine.id)).rejects.toThrow(
+    /saved recipe changed/,
+  );
+  expect(f.outbox.send).not.toHaveBeenCalled();
+  expect(f.pending).toHaveLength(1);
+});
+it("keeps the earlier unresolved save when its replacement cannot be prepared", async () => {
+  const f = fixture();
+  const lost = recipeEvent("lost", 1_600_000_000);
+  f.pending.push({ event: lost, delivery: "failed" });
+  f.host.prepare.mockRejectedValueOnce(new Error("Encryption failed"));
+  await expect(f.capability.save(record.value, undefined)).rejects.toThrow(
+    "Encryption failed",
+  );
+  expect(f.outbox.send).not.toHaveBeenCalled();
+  expect(f.pending.map((item) => item.event.id)).toEqual([lost.id]);
+});
+it("saves a retry's frozen recipe again when its original never landed and can no longer replay", async () => {
+  const f = fixture();
+  const expired = recipeEvent(
+    "expired",
+    Math.floor(Date.now() / 1000) - 16 * 60,
+  );
+  f.pending.push({ event: expired, delivery: "unknown" });
+  const resume = {
+    id: expired.id,
+    enqueued: vi.fn((id: string) => {
+      resume.id = id;
+    }),
+  };
+  const id = await f.capability.save(
+    record.value,
+    undefined,
+    false,
+    undefined,
+    resume,
+  );
+  expect(id).not.toBe(expired.id);
+  expect(resume.enqueued).toHaveBeenCalledWith(id);
+  expect(f.events.map((event) => event.id)).toEqual([id]);
+  expect(f.pending).toEqual([]);
+  // A later retry confirms the replacement instead of sending again.
+  await f.capability.save(record.value, id, false, undefined, resume);
+  expect(f.outbox.send).toHaveBeenCalledTimes(1);
+});
+it("saves a retry's frozen recipe again under a new ID after the relay refused the original", async () => {
+  const f = fixture();
+  const refused = recipeEvent("refused", Math.floor(Date.now() / 1000));
+  f.pending.push({
+    event: refused,
+    delivery: "failed",
+    refused: true,
+    error: "invalid: created_at too far in the future",
+  });
+  const resume = {
+    id: refused.id,
+    enqueued: vi.fn((id: string) => {
+      resume.id = id;
+    }),
+  };
+  const id = await f.capability.save(
+    record.value,
+    undefined,
+    false,
+    undefined,
+    resume,
+  );
+  expect(id).not.toBe(refused.id);
+  expect(resume.enqueued).toHaveBeenCalledWith(id);
+  expect(f.events.map((event) => event.id)).toEqual([id]);
+  expect(f.pending).toEqual([]);
 });
 it("never re-signs an expired uncertain operation and clears candidates on retirement", async () => {
   const f = fixture();
@@ -393,7 +608,7 @@ it("ignores retired personal groups without rejecting the catalog", async () => 
 });
 
 it.each(["recipe", "Canvas"])(
-  "waits for the session outbox to hydrate before admitting a replacement %s save",
+  "waits for the session outbox to hydrate, then replaces its unresolved %s save",
   async (kind) => {
     const relay = keypair();
     const prior = signed(
@@ -420,7 +635,9 @@ it.each(["recipe", "Canvas"])(
     const sign = vi.fn<RelayWriter["sign"]>(async (template) =>
       signed(viewer, template),
     );
-    const publish = vi.fn(async () => {});
+    const publish = vi.fn(async (event: RelayEvent) => {
+      events.push(event);
+    });
     const prepare = vi.fn(async () => "encrypted replacement");
     const storageSave = vi.fn();
     const owner = createRelaySession(
@@ -452,26 +669,32 @@ it.each(["recipe", "Canvas"])(
         kind === "recipe"
           ? owner.session.channelKit.save(record.value, undefined)
           : owner.session.canvas.save(channel, "Replacement", undefined);
-      const rejected = expect(saving).rejects.toThrow(/unresolved/);
       // Drain read/admission microtasks while storage is explicitly held. No timer
       // delay can stand in for hydration, and no replacement intent may be queued.
       await vi.advanceTimersByTimeAsync(0);
       expect(owner.session.outbox?.snapshot()).toEqual([]);
       expect(prepare).not.toHaveBeenCalled();
+      expect(sign).not.toHaveBeenCalled();
       hydrate([{ event: prior, signed: prior, delivery: "unknown" }]);
-      await rejected;
+      vi.useRealTimers();
+      // Delivery itself is out of scope; only the replacement matters here.
+      await saving.catch(() => {});
       expect(
         owner.session.outbox?.snapshot().map((row) => row.event.id),
-      ).toEqual([prior.id]);
-      expect(sign).not.toHaveBeenCalled();
-      expect(publish).not.toHaveBeenCalled();
-      // Discovery queues the outbox's existing access-evidence purge behind
-      // hydration. It may persist, but must preserve only the prior intent.
-      await vi.advanceTimersByTimeAsync(0);
-      for (const [rows] of storageSave.mock.calls)
-        expect(rows).toEqual([
-          { event: prior, signed: prior, delivery: "unknown" },
-        ]);
+      ).not.toContain(prior.id);
+      const persisted = storageSave.mock.calls.flatMap(([rows]) => rows);
+      expect(persisted).toContainEqual(
+        expect.objectContaining({
+          event: expect.objectContaining({
+            kind: prior.kind,
+            content:
+              kind === "recipe" ? "encrypted replacement" : "Replacement",
+          }),
+        }),
+      );
+      expect(storageSave.mock.calls.at(-1)?.[0]).not.toContainEqual(
+        expect.objectContaining({ event: prior }),
+      );
     } finally {
       hydrate([]);
       owner.dispose();
@@ -594,7 +817,9 @@ it.each(["failed", "unknown"] as const)(
       delivery === "failed" ? /Canvas changed.*draft is kept/ : /conflict:/,
     );
     if (delivery === "failed") {
-      expect(f.outbox.dismiss).toHaveBeenCalledWith(f.pending[0]?.event.id);
+      expect(f.outbox.dismiss).toHaveBeenCalledWith(
+        vi.mocked(f.outbox.send).mock.results[0]?.value,
+      );
       expect(f.delivered).not.toHaveBeenCalled();
     } else expect(f.outbox.dismiss).not.toHaveBeenCalled();
   },
@@ -695,7 +920,7 @@ it.each([false, true])(
   },
 );
 
-it("retains an uncertain Canvas after lost ACK and CAS-refused exact retry, blocking replacement", async () => {
+it("retains an uncertain Canvas after lost ACK and CAS-refused exact retry until a reviewed save replaces it", async () => {
   const f = fixture();
   const before = signed(viewer, {
     kind: 40100,
@@ -710,16 +935,24 @@ it("retains an uncertain Canvas after lost ACK and CAS-refused exact retry, bloc
     created_at: 101,
   });
   let head = before;
+  const relayed = new Map<string, RelayEvent>();
   const reader: RelayReader = {
     // No exact-ID confirmation is available for the uncertain publication.
     read: async (filters) =>
-      filters.some((filter) => !filter.ids) ? [head] : [],
+      filters.some((filter) => !filter.ids)
+        ? [head]
+        : filters.flatMap((filter) =>
+            (filter.ids ?? []).flatMap((id) => relayed.get(id) ?? []),
+          ),
   };
   const sign = vi.fn(async (event: Parameters<RelayWriter["sign"]>[0]) =>
     signed(viewer, event),
   );
   const publish = vi
-    .fn(async (_event: RelayEvent) => {})
+    .fn(async (event: RelayEvent) => {
+      relayed.set(event.id, event);
+      head = event;
+    })
     .mockRejectedValueOnce(new Error("Lost ACK"))
     .mockRejectedValueOnce(
       new PublishRejected("conflict: the relay state changed"),
@@ -732,14 +965,12 @@ it("retains an uncertain Canvas after lost ACK and CAS-refused exact retry, bloc
   );
   const dismiss = vi.fn(owner.outbox.dismiss);
   const delivered = async (id: string) => {
-    await vi.waitFor(() =>
-      expect(
-        owner.outbox.snapshot().find((item) => item.event.id === id)?.delivery,
-      ).toBe("unknown"),
-    );
-    throw new Error(
-      owner.outbox.snapshot().find((item) => item.event.id === id)?.error,
-    );
+    const item = () =>
+      owner.outbox.snapshot().find((item) => item.event.id === id);
+    await vi.waitFor(() => expect(item()?.delivery).not.toBe("sending"));
+    const settled = item();
+    if (settled?.delivery === "unknown" || settled?.delivery === "failed")
+      throw new Error(settled.error);
   };
   const kit = createChannelKit({
     host: undefined,
@@ -778,9 +1009,6 @@ it("retains an uncertain Canvas after lost ACK and CAS-refused exact retry, bloc
     await expect(kit.confirm(original.id)).rejects.toThrow(
       "Retry blocked: conflict:",
     );
-    await expect(
-      kit.canvas.save(channel, "Reviewed draft", winner.id),
-    ).rejects.toThrow(/unresolved Canvas save/);
     expect(dismiss).not.toHaveBeenCalled();
     expect(sign).toHaveBeenCalledTimes(1);
     expect(publish.mock.calls.map(([event]) => event)).toEqual([
@@ -791,6 +1019,16 @@ it("retains an uncertain Canvas after lost ACK and CAS-refused exact retry, bloc
       expect.objectContaining({ signed: original, delivery: "unknown" }),
     ]);
     expect(head).toBe(winner);
+    // A save reviewed against the current head replaces the stale one.
+    const saved = await kit.canvas.save(channel, "Reviewed draft", winner.id);
+    expect(saved.content).toBe("Reviewed draft");
+    expect(saved.tags).toContainEqual(["expected-revision", winner.id]);
+    expect(
+      owner.outbox.snapshot().some((item) => item.event.id === original.id),
+    ).toBe(false);
+    expect(storage.save.mock.calls.at(-1)?.[0]).not.toContainEqual(
+      expect.objectContaining({ signed: original }),
+    );
   } finally {
     owner.dispose();
     f.controller.abort();

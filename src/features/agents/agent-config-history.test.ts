@@ -207,6 +207,16 @@ describe("diff", () => {
       { field: "model", before: "a", after: "b" },
       { field: "scope", before: undefined, after: "x" },
     ]);
+    expect(
+      settingsDiff(
+        settings({ model: "a" }),
+        JSON.stringify({
+          version: 1,
+          settings: { model: "" },
+          modelRoute: "auto-balanced",
+        }),
+      ),
+    ).toEqual([{ field: "model", before: "a", after: "route:auto-balanced" }]);
   });
 });
 

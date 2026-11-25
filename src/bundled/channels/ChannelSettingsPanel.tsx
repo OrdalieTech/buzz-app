@@ -48,6 +48,7 @@ import {
   type ChannelDetailsAction,
 } from "./ChannelDetailsEditor";
 import { writeClipboardText } from "../../shared/clipboard";
+import { diagnosticsAvailable } from "../../features/developer/mode";
 
 export function ChannelSettingsPanel({
   channel,
@@ -269,10 +270,12 @@ export function ChannelSettingsPanel({
           )}
           {editStatus}
           {setupTools}
-          <details className={styles.settingsDiagnostics}>
-            <summary>Diagnostics</summary>
-            <div className={styles.settingsTools}>{children}</div>
-          </details>
+          {diagnosticsAvailable && (
+            <details className={styles.settingsDiagnostics}>
+              <summary>Diagnostics</summary>
+              <div className={styles.settingsTools}>{children}</div>
+            </details>
+          )}
         </div>
       </div>
     </Panel>

@@ -29,6 +29,8 @@ it("restores a roster a complete read omitted once a later complete read lists i
   // A lagging read replica omits the just-created DM.
   state.retain(new Set(), state.rosterVersions());
   expect(state.canAccess("dm")).toBe(false);
+  // An omission is not the relay's answer for the channel.
+  expect(state.revoked("dm")).toBe(false);
 
   const started = state.rosterVersions();
   state.accept(roster);
@@ -45,9 +47,10 @@ it("keeps a relay denial when a later complete read lists the same roster", () =
   state.accept(metadata);
   state.accept(roster);
   state.retain(new Set(), state.rosterVersions());
-  state.deny("dm");
+  state.revoke("dm");
 
   state.accept(roster);
   state.retain(new Set(["dm"]), state.rosterVersions());
   expect(state.canAccess("dm")).toBe(false);
+  expect(state.revoked("dm")).toBe(true);
 });

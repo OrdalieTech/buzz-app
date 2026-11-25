@@ -1401,6 +1401,63 @@ test.describe("Solo composer caret", () => {
   });
 });
 
+// Inline completion inserting a tag at a native caret mid-sentence needs a browser.
+test.describe("Solo tags join the pill", () => {
+  test.use({ soloAgentNames: ["Owned Honey", "Owned Brain"] });
+  test("a tag typed later in the message joins the pill's agent, and one that opens it goes alone", async ({
+    page,
+    app,
+  }) => {
+    await page.goto(app.origin);
+    await newChat(page);
+    const composer = page.getByRole("textbox", {
+      name: "Message your agents",
+      exact: true,
+    });
+    const [honey, brain] = app.soloAgents;
+    const pill = page.getByRole("button", { name: /Change agents$/ });
+    await expect(pill).toHaveAccessibleName(
+      `Sending to ${honey.name}. Change agents`,
+    );
+    await composer.click();
+    await page.keyboard.insertText("plan this, then ");
+    await page.keyboard.type(`@${brain.name}`);
+    await page.keyboard.press("Enter");
+    await page.keyboard.insertText("can build it");
+    await expect(composer).toHaveText(
+      `plan this, then @${brain.name} can build it`,
+    );
+    await expect(pill).toHaveAccessibleName(
+      `Sending to ${honey.name}, ${brain.name}. Change agents`,
+    );
+    // Removing the pill's agent leaves the tag alone; the text is untouched.
+    await page
+      .getByRole("button", {
+        name: `Remove agent ${honey.name} ${honey.pubkey}`,
+      })
+      .click();
+    await expect(pill).toHaveAccessibleName(
+      `Sending to ${brain.name}. Change agents`,
+    );
+    await expect(composer).toHaveText(
+      `plan this, then @${brain.name} can build it`,
+    );
+    await expect(composer).toBeFocused();
+    // A new draft that opens with the tag goes to that agent alone.
+    await composer.fill("");
+    await expect(pill).toHaveAccessibleName(
+      `Sending to ${honey.name}. Change agents`,
+    );
+    await page.keyboard.type(`@${brain.name}`);
+    await page.keyboard.press("Enter");
+    await page.keyboard.insertText("build it");
+    await expect(composer).toHaveText(`@${brain.name} build it`);
+    await expect(pill).toHaveAccessibleName(
+      `Sending to ${brain.name}. Change agents`,
+    );
+  });
+});
+
 // Real :focus-visible matching on a focused, briefly non-editable editor needs a
 // browser. Solo admission disables the editor while its membership refreshes.
 test.describe("Solo send focus", () => {

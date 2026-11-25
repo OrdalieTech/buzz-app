@@ -606,8 +606,12 @@ it.each([true, false])(
       const id = await owner.session.channelCreation.create({
         name: "Daily",
         visibility: "open",
+        migration: "example-import",
         setup: { canvas: "# Plan", agents: [], groupId: "", templateId: "" },
       });
+      expect(
+        published.find((event) => event.kind === 9007)?.tags,
+      ).toContainEqual(["migration", "example-import"]);
       const receipt = `buzz-channel-setup.v2:https://setup.example.test:${viewer.pubkey}:${id}`;
       if (visible) {
         await vi.waitFor(() =>

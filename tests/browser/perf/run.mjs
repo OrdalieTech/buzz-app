@@ -14,6 +14,7 @@ const cases = [
   "scroll-long",
   "scroll-paging-fast",
   "scroll-paging-delayed",
+  "scroll-paging-delayed-short",
   "scroll-paging-fast-keyboard",
   "scroll-paging-fast-markdown",
   "scroll-paging-fast-first-seen",

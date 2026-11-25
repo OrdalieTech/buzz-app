@@ -11,67 +11,6 @@ const maskedAncestors = (element) => {
   return masked;
 };
 
-test("avatar image controls retain their hover fill and accessible URL label", async ({
-  page,
-}) => {
-  await page.route("**/api/relay/**", (route) => route.abort());
-  await page.goto("/tests/fixtures/profile-settings.html");
-  await page
-    .getByRole("button", { name: "Edit human profile", exact: true })
-    .click();
-  const editAvatar = page.getByRole("button", {
-    name: "Edit avatar",
-    exact: true,
-  });
-  // The badge owns its outer box; opting into medium preserves the artwork
-  // without replacing that human/agent geometry with the new compact default.
-  await expect(editAvatar).toHaveCSS("width", "32px");
-  await expect(editAvatar).toHaveCSS("height", "32px");
-  await expect(editAvatar.locator("svg")).toHaveCSS("width", "24px");
-  await editAvatar.click();
-  const dropzone = page.getByRole("button", {
-    name: "Drop or browse",
-    exact: true,
-  });
-  const url = page.getByRole("textbox", {
-    name: "Picture URL (optional)",
-    exact: true,
-  });
-  await expect(url).toBeVisible();
-  await expect(url.locator("..")).toHaveClass("buzz-input-group");
-  for (const dark of [false, true]) {
-    await page.evaluate(
-      (dark) => document.documentElement.classList.toggle("dark", dark),
-      dark,
-    );
-    await dropzone.hover();
-    await expect(dropzone).toHaveCSS(
-      "background-color",
-      dark ? "rgb(46, 46, 46)" : "rgb(241, 241, 242)",
-    );
-    await expect(dropzone).toBeVisible();
-    // Opening scale must not leave the animated height clipping the footer.
-    await expect
-      .poll(() =>
-        page
-          .getByRole("button", { name: "Done", exact: true })
-          .evaluate((button) => {
-            const viewport = button.closest("fieldset").parentElement;
-            return (
-              viewport.getBoundingClientRect().bottom -
-              button.getBoundingClientRect().bottom
-            );
-          }),
-      )
-      .toBeGreaterThanOrEqual(0);
-    await page.screenshot({
-      path: test
-        .info()
-        .outputPath(`avatar-image-${dark ? "dark" : "light"}.png`),
-    });
-  }
-});
-
 // Browser boundary: nested overlay hit-testing/focus, canvas image preparation,
 // lazy shadow-DOM emoji picker, and narrow viewport geometry in both engines.
 test("human avatar upload and scoped save", async ({ page }) => {

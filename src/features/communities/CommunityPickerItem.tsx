@@ -1,3 +1,4 @@
+import { useDndMonitor, useDraggable, useDroppable } from "@dnd-kit/core";
 import {
   useCallback,
   useEffect,
@@ -12,6 +13,8 @@ import type { OpenTarget } from "../navigation/targets";
 import type { UnreadCapability } from "../relay/unread";
 import type { CommunityUnread } from "../notifications/community-unread";
 import {
+  ArrowDownIcon,
+  ArrowUpIcon,
   ChecksIcon,
   LinkIcon,
   SignOutIcon,
@@ -39,9 +42,10 @@ import { writeClipboardText } from "../../shared/clipboard";
 /** The bundled moderation plugin's Membership card, addressed by contribution key. */
 export const MEMBERSHIP_SECTION = "buzz.moderation/membership";
 
-/** A community the menu can act on through its own ready session. Absent for
- * inactive communities: no item here ever acquires a session. */
-export type SelectedSession = {
+/** A community the menu can act on through its own ready session: the
+ * selected one's, or the one behind an inactive community's known unread. No
+ * item here ever acquires a session. */
+export type CommunitySession = {
   unread: Pick<
     UnreadCapability,
     "sync" | "subscribeSync" | "markAllChannelsRead"
@@ -65,6 +69,8 @@ export function markAllRead(
 /** One picker row and its context menu. Selection stays with the picker. */
 export function CommunityPickerItem({
   membership,
+  index,
+  move,
   icon,
   selected,
   viewer,
@@ -78,11 +84,17 @@ export function CommunityPickerItem({
   onLeave,
 }: {
   membership: Membership;
+  /** Its place among the communities, for the side a drop lands on. */
+  index: number;
+  /** The keyboard path for a drag; absent when there is nothing to reorder. */
+  move:
+    | { up: (() => void) | undefined; down: (() => void) | undefined }
+    | undefined;
   icon: string | undefined;
   selected: boolean;
   viewer: string | undefined;
-  /** The selected community's session once it is ready; never another community's. */
-  session: SelectedSession | undefined;
+  /** This community's ready session, if the app already holds one. */
+  session: CommunitySession | undefined;
   /** This community's unread, once known; never the selected community's. */
   unread?: CommunityUnread | undefined;
   /** The viewer is an owner or admin of this community, and this build can mint invites. */
@@ -120,6 +132,31 @@ export function CommunityPickerItem({
         ? active
         : null;
   };
+  // One node is both the row a pull picks up and the place another lands.
+  const drag = useDraggable({
+    id: membership.id,
+    data: { index },
+    disabled: !move,
+  });
+  const drop = useDroppable({ id: membership.id, disabled: !move });
+  const { setNodeRef: setDragRef } = drag;
+  const { setNodeRef: setDropRef } = drop;
+  const row = useCallback(
+    (node: HTMLElement | null) => {
+      setDragRef(node);
+      setDropRef(node);
+    },
+    [setDragRef, setDropRef],
+  );
+  const from = drop.active?.data.current?.index;
+  // A pull that Escape cancels can still be released over its own row, and
+  // the browser then clicks it. That release is not a choice.
+  const pulled = useRef(false);
+  useDndMonitor({
+    onDragStart: ({ active }) => {
+      if (active.id === membership.id) pulled.current = true;
+    },
+  });
   const notify = useToastNotification();
   const name = communityName(membership);
   const origin = communityDestination(membership.id).url;
@@ -160,9 +197,26 @@ export function CommunityPickerItem({
       }}
     >
       <ContextMenuTrigger
-        render={<div className={styles.item} />}
+        render={
+          <div
+            ref={row}
+            className={styles.item}
+            data-dragging={drag.isDragging || undefined}
+            data-drop-edge={
+              drop.isOver && from !== undefined && from !== index
+                ? from < index
+                  ? "after"
+                  : "before"
+                : undefined
+            }
+          />
+        }
         onKeyDown={openFromKeyboard}
-        onPointerDown={rememberInterrupted}
+        onPointerDown={(event) => {
+          pulled.current = false;
+          rememberInterrupted(event);
+          drag.listeners?.onPointerDown?.(event);
+        }}
       >
         <NavigationItem
           ref={(node) => {
@@ -183,7 +237,10 @@ export function CommunityPickerItem({
               src={icon}
             />
           }
-          onClick={() => onSelect(membership.id)}
+          // Keyboard activation carries no pointer detail and always selects.
+          onClick={(event) => {
+            if (!pulled.current || event.detail === 0) onSelect(membership.id);
+          }}
         />
       </ContextMenuTrigger>
       <MenuPopup
@@ -215,6 +272,23 @@ export function CommunityPickerItem({
           session={session}
           notify={notify}
         />
+        {move && (
+          <>
+            <MenuSeparator />
+            <MenuItem disabled={!move.up} onClick={() => move.up?.()}>
+              <MenuIcon>
+                <ArrowUpIcon size={14} />
+              </MenuIcon>
+              Move up
+            </MenuItem>
+            <MenuItem disabled={!move.down} onClick={() => move.down?.()}>
+              <MenuIcon>
+                <ArrowDownIcon size={14} />
+              </MenuIcon>
+              Move down
+            </MenuItem>
+          </>
+        )}
         <MenuSeparator />
         <MenuItem onClick={() => void copy()}>
           <MenuIcon>
@@ -289,7 +363,7 @@ function MarkAllReadItem({
 }: {
   name: string;
   selected: boolean;
-  session: SelectedSession | undefined;
+  session: CommunitySession | undefined;
   notify: ReturnType<typeof useToastNotification>;
 }) {
   const noteId = useId();
@@ -305,14 +379,14 @@ function MarkAllReadItem({
     () => unread?.sync().capability,
   );
   // Read state is session-bound and validated against the relay snapshot, so an
-  // inactive community cannot be marked without acquiring it.
-  const reason = !selected
-    ? "Only the selected community can be marked as read."
-    : !unread
+  // inactive community is marked only through the session its unread came from.
+  const reason = !unread
+    ? selected
       ? `Waiting for ${name} to connect.`
-      : capability !== "frontier-sync"
-        ? "Read state can’t sync on this connection."
-        : undefined;
+      : `Open ${name} to mark it as read.`
+    : capability !== "frontier-sync"
+      ? "Read state can’t sync on this connection."
+      : undefined;
   return (
     <>
       <MenuItem

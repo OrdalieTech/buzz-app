@@ -27,6 +27,9 @@ import type { DraftAttachment } from "./attachment-draft";
 import styles from "./ComposerAttachments.module.css";
 import { useMediaElementSource } from "./use-media-element-source";
 
+/** Follows the relay's refusal of a file's type, which offers no Retry. */
+const UNSUPPORTED_GUIDANCE = " Remove it to send.";
+
 /** A GIF staged with the draft. It sends as its Markdown, not as an upload. */
 export type ComposerGif = Readonly<{
   markdown: string;
@@ -307,14 +310,19 @@ function AttachmentItem({
         </AttachmentDownloadContext>
         {item.error && (
           <>
-            <span role="alert">{item.error}</span>
-            <button
-              type="button"
-              disabled={disabled}
-              onClick={() => retry(item.id)}
-            >
-              Retry voice note upload
-            </button>
+            <span role="alert">
+              {item.error}
+              {item.unsupported && UNSUPPORTED_GUIDANCE}
+            </span>
+            {!item.unsupported && (
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={() => retry(item.id)}
+              >
+                Retry voice note upload
+              </button>
+            )}
           </>
         )}
       </motion.li>
@@ -418,6 +426,7 @@ function AttachmentItem({
         <p className={styles.error} role="alert">
           <span className="sr-only">{item.file.name}: </span>
           {item.error || "Upload failed. Retry or remove it to send."}
+          {item.unsupported && UNSUPPORTED_GUIDANCE}
         </p>
       )}
       <div
@@ -426,19 +435,22 @@ function AttachmentItem({
       >
         {uploadFailed ? (
           <>
-            <Button
-              size="sm"
-              disabled={disabled}
-              aria-label={`Retry ${item.file.name}`}
-              onClick={(event) => {
-                // Retry replaces this control. Hand off only focus that it owns.
-                if (document.activeElement === event.currentTarget)
-                  previewButton.current?.focus();
-                retry(item.id);
-              }}
-            >
-              Retry
-            </Button>
+            {/* The relay would refuse the same bytes again. */}
+            {!item.unsupported && (
+              <Button
+                size="sm"
+                disabled={disabled}
+                aria-label={`Retry ${item.file.name}`}
+                onClick={(event) => {
+                  // Retry replaces this control. Hand off only focus that it owns.
+                  if (document.activeElement === event.currentTarget)
+                    previewButton.current?.focus();
+                  retry(item.id);
+                }}
+              >
+                Retry
+              </Button>
+            )}
             <Button
               size="sm"
               variant="ghost"

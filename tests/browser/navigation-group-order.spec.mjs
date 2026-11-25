@@ -1,5 +1,5 @@
 import { test, expect } from "./fixture.mjs";
-import { openPage } from "./navigation.mjs";
+import { clickSidebarHeadingAction, openPage } from "./navigation.mjs";
 
 // Pointer hit testing, drop-edge geometry and header click suppression need a
 // layout engine. Record edits and store supersession stay in Vitest.
@@ -174,7 +174,9 @@ test("dragging a group header moves the whole group, keeps its state, and persis
   expect(orders(app)).toEqual({ laptop: 0, missing: 1, work: 2 });
 
   // The section menu is the single-pointer and keyboard path.
-  await page.getByRole("button", { name: "More actions for Work" }).click();
+  await clickSidebarHeadingAction(
+    page.getByRole("button", { name: "More actions for Work" }),
+  );
   await expect(
     page.getByRole("menuitem", { name: "Move down", exact: true }),
   ).toBeEnabled();
@@ -216,7 +218,9 @@ test("group move recovery keeps keyboard focus on the group header", async ({
     .getByRole("alert")
     .filter({ hasText: "Couldn’t save the move for Work" });
   const failMove = async () => {
-    await page.getByRole("button", { name: "More actions for Work" }).click();
+    await clickSidebarHeadingAction(
+      page.getByRole("button", { name: "More actions for Work" }),
+    );
     await page
       .getByRole("menuitem", { name: "Move down", exact: true })
       .click();

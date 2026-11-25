@@ -90,8 +90,10 @@ export function NotificationSettings({
     notifications.snapshot,
   );
   const { preferences, permission } = state;
+  // Only a read: the one automatic system prompt belongs to entering the app
+  // and to a window focus, never to this button.
   const [checking, checkPermission] = usePermissionCheck(() =>
-    notifications.refreshPermission(),
+    notifications.refreshPermission({ ask: false }),
   );
   const preview = useRef<{
     category: NotificationCategory;

@@ -1,0 +1,60 @@
+.messages {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  width: min(100%, var(--timeline-measure));
+  margin-inline: auto;
+  overflow: hidden;
+}
+.row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+.body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+/* Message-shaped placeholders that pulse slowly between the inset and panel
+   surfaces; still under reduced motion. */
+.box {
+  display: block;
+  height: var(--space-3);
+  border-radius: var(--radius-chip);
+  background: var(--surface-inset);
+  animation: message-loading-pulse 2s var(--easing-state) infinite;
+}
+.avatar {
+  flex: none;
+  width: var(--space-8);
+  height: var(--space-8);
+  border-radius: var(--radius-pill);
+}
+.name {
+  width: 28%;
+}
+.text {
+  width: 76%;
+}
+.row:nth-child(2) .text {
+  width: 58%;
+}
+.row:nth-child(3) .text {
+  width: 88%;
+}
+.tail {
+  width: 46%;
+}
+@keyframes message-loading-pulse {
+  50% {
+    background: var(--surface-panel);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .box {
+    animation: none;
+  }
+}

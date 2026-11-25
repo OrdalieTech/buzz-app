@@ -9,12 +9,14 @@ import { useChannelWindow } from "../../features/relay/react";
 import { useRecoveryOwns } from "../../features/relay/RecoveryNotice";
 import { headRecovering } from "../../features/relay/live-recovery";
 import { clientMetrics } from "../../features/developer/client-metrics";
+import { MessageLoading } from "../../features/messages/MessageLoading";
 import { Button } from "../../shared/design-system/ui/Button";
 import styles from "./Channels.module.css";
 
 export const ChannelBody = memo(function ChannelBody({
   cached,
   intro,
+  trailing,
   latestRequest,
   viewer,
   revealMessageId,
@@ -29,6 +31,7 @@ export const ChannelBody = memo(function ChannelBody({
   onContentReady?(channelId: string): void;
   cached: boolean;
   intro?: ReactNode;
+  trailing?: ChannelTimelineProps["trailing"];
   latestRequest?: AbortSignal | undefined;
   viewer?: string | undefined;
   navigation?: PageNavigation | undefined;
@@ -116,17 +119,17 @@ export const ChannelBody = memo(function ChannelBody({
   if (holding || (window.status !== "ready" && !window.rows.length))
     return (
       <div
-        className={`${styles.empty} ${styles.timelinePlaceholder}`}
-        role="status"
+        className={`${styles.empty} ${styles.timelinePlaceholder} ${styles.timelineLoading}`}
         data-buzz-launch-pending={!cached ? "required" : undefined}
       >
-        Loading messages…
+        <MessageLoading />
       </div>
     );
   return (
     <ConversationTimeline
       continuityKey={continuityKey}
       intro={intro}
+      trailing={trailing}
       latestRequest={latestRequest}
       viewer={viewer}
       window={window}

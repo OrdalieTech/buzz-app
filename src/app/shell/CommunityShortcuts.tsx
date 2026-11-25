@@ -6,9 +6,9 @@ import type { SearchServices } from "./PageSearch";
 const ORDER = 77;
 
 /**
- * Slack's workspace keys, over the community switcher's own order: ⌘1 is its
- * first entry (Personal space) and ⌘2–⌘9 the communities after it. ⌘⇧] and
- * ⌘⇧[ step through the same list and wrap. Keys with no entry are left alone.
+ * Slack's workspace keys, over the community switcher's own order: ⌘1–⌘9 are
+ * its communities, and Personal space has no number. ⌘⇧] and ⌘⇧[ step through
+ * Personal space and the communities and wrap. Keys with no entry are left alone.
  */
 export function CommunityShortcuts({
   communities,
@@ -27,10 +27,8 @@ export function CommunityShortcuts({
   const latest = useRef({ client, onSelect });
   latest.current = { client, onSelect };
   useEffect(() => {
-    const entries = () => [
-      null,
-      ...latest.current.client.memberships.map(({ id }) => id),
-    ];
+    const ids = () => latest.current.client.memberships.map(({ id }) => id);
+    const entries = () => [null, ...ids()];
     const select = (id: string | null) => {
       const { onSelect } = latest.current;
       if (onSelect) onSelect(id);
@@ -44,16 +42,17 @@ export function CommunityShortcuts({
     const removes = [
       ...Array.from({ length: 9 }, (_, index) =>
         shortcuts.registerHost({
-          id: `switch-community-${index + 1}`,
-          title:
-            index === 0
-              ? "Switch to Personal space"
-              : `Switch to community ${index + 1} in the switcher`,
+          // New ids, so rebinds saved for the old numbering do not carry over.
+          id: `community-${index + 1}`,
+          title: `Switch to community ${index + 1} in the switcher`,
           binding: { key: String(index + 1), mod: true },
           order: ORDER + index / 100,
           allowInEditable: true,
-          when: () => index < entries().length,
-          run: () => select(entries()[index] ?? null),
+          when: () => index < ids().length,
+          run: () => {
+            const id = ids()[index];
+            if (id) select(id);
+          },
         }),
       ),
       ...(

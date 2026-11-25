@@ -4,9 +4,19 @@ import { useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import type { ChannelSummary } from "../../features/relay/contracts";
 import type { ProfileQueries } from "../../features/relay/profile-directory";
 import { selectProfiles } from "../../features/relay/profile-selection";
-import { sortParticipantNames } from "../../features/identity-names/participant-order";
+import {
+  dmNamedParticipants,
+  sortParticipantNames,
+} from "../../features/identity-names/participant-order";
 
-/** Share bounded profiles, not per-row fetches; pickers may widen the name scope. */
+/** What a channel list shows. Not access: an archived or hidden channel is
+ * still joined. */
+const listed = (channel: ChannelSummary) =>
+  !channel.archived && (!channel.hidden || channel.channelType === "dm");
+
+/** Share bounded profiles, not per-row fetches; pickers may widen the name scope.
+ * `channels` are the rows a channel list shows; `joined` is every row given,
+ * the archived and hidden ones too, for resolving a tab's conversation. */
 export function useChannelLabels(
   roster: readonly ChannelSummary[],
   queries: ProfileQueries,
@@ -14,15 +24,7 @@ export function useChannelLabels(
   nameCandidates?: readonly string[],
 ) {
   const resolveName = useIdentityNames(names);
-  const channels = useMemo(
-    () =>
-      roster.filter(
-        (channel) =>
-          !channel.archived &&
-          (!channel.hidden || channel.channelType === "dm"),
-      ),
-    [roster],
-  );
+  const channels = useMemo(() => roster.filter(listed), [roster]);
   const key = useMemo(
     () =>
       [...new Set(channels.flatMap((channel) => channel.participants ?? []))]
@@ -68,9 +70,9 @@ export function useChannelLabels(
       }
     >(),
   );
-  const labelledChannels = useMemo(
+  const joined = useMemo(
     () =>
-      channels.map((channel) => {
+      roster.map((channel) => {
         if (channel.channelType !== "dm" || !channel.participants)
           return channel;
         // Roster changes keep unchanged channels; their names need no lookup.
@@ -83,7 +85,7 @@ export function useChannelLabels(
           return previous.channel;
         const name = channel.participants.length
           ? sortParticipantNames(
-              channel.participants.map((id) =>
+              dmNamedParticipants(channel.participants, profiles).map((id) =>
                 resolveName(
                   id,
                   profiles.get(id)?.name ?? id.slice(0, 10),
@@ -103,7 +105,8 @@ export function useChannelLabels(
         });
         return result;
       }),
-    [channels, profiles, resolveName, nameCandidates],
+    [roster, profiles, resolveName, nameCandidates],
   );
-  return { channels: labelledChannels, profiles };
+  const labelledChannels = useMemo(() => joined.filter(listed), [joined]);
+  return { channels: labelledChannels, joined, profiles };
 }

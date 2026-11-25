@@ -165,6 +165,18 @@ it.each(["different owner", "nonempty conditions", "malformed signature"])(
   },
 );
 
+it("copies a plugin's text through Buzz's clipboard, natively on macOS", async () => {
+  const { plugin } = pluginContext();
+  vi.mocked(invoke).mockResolvedValue(undefined);
+  await plugin.host.writeClipboardText?.("x²");
+  expect(invoke).toHaveBeenCalledWith("clipboard_write_text", { text: "x²" });
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  vi.stubGlobal("navigator", { platform: "Win32", clipboard: { writeText } });
+  await plugin.host.writeClipboardText?.("y");
+  expect(writeText).toHaveBeenCalledWith("y");
+  expect(invoke).toHaveBeenCalledTimes(1);
+});
+
 it("uses the calling plugin identity and preserves bounded command output", async () => {
   const { plugin } = pluginContext();
   vi.mocked(invoke).mockResolvedValue("ready \n");

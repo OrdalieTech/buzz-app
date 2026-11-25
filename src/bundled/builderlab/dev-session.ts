@@ -345,6 +345,18 @@ export function createDevSession() {
           });
         }
       : undefined,
+    connectSpeech: isTauri()
+      ? async (request: unknown) => {
+          const viewer = session.viewerSession();
+          if (!("broker" in viewer))
+            throw new Error("Development session unavailable");
+          return invoke("speech_connect", {
+            provider: "builderlab",
+            request,
+            broker: viewer.broker,
+          });
+        }
+      : undefined,
     apps: { request: transport, upload: transport } satisfies Pick<
       Host,
       "request" | "upload"

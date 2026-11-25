@@ -1,4 +1,12 @@
-import { useEffect, useEffectEvent, type RefObject } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useEffectEvent,
+  useLayoutEffect,
+  useRef,
+  type RefObject,
+} from "react";
 import type { RelaySession } from "../relay/session";
 import type { ReadingHandle } from "../relay/unread";
 import { useMessageEditScope } from "./MessageEditScope";
@@ -47,7 +55,14 @@ type Reading = {
   /** False: this list marks nothing read; its owner decides what was read, or
    * when reading may start. Turning it on schedules dwell at once. */
   enabled?: boolean | undefined;
+  /** The top of content covering the rows' bottom: rows below it aren't
+   * shown. */
+  trailing?: (() => number | undefined) | undefined;
 };
+/** Boxes of content floating over the rows below: a row any of them overlaps
+ * isn't shown. Its provider wakes dwell, with `readingPositioned`, when they
+ * change. */
+export const ReadingCovers = createContext<() => readonly DOMRect[]>(() => []);
 /** `useReading` for an owner that renders its own `MessageEditScope`. */
 export function Reading(props: Reading) {
   useReading(props);
@@ -68,12 +83,22 @@ export function useReading({
   settled,
   restoring,
   enabled = true,
+  trailing,
 }: Reading) {
   const composer = useMessageEditScope()?.input;
+  const covers = useContext(ReadingCovers);
   // Read at measurement time: a new latest message mutates the list, which
   // already remeasures in the next frame, so it must not restart observation.
   const latestId = useEffectEvent(() => latestMessageId);
   const catchUpId = useEffectEvent(() => catchUpMessageId ?? latestMessageId);
+  // A ref, not an effect event: unread attention asks whether a row is shown
+  // while it renders.
+  const trailingEdge = useRef(trailing);
+  const covering = useRef(covers);
+  useLayoutEffect(() => {
+    trailingEdge.current = trailing;
+    covering.current = covers;
+  });
   useEffect(() => {
     if (!enabled || !scroller.current) return;
     const element: HTMLElement = scroller.current;
@@ -171,24 +196,47 @@ export function useReading({
     }
     // Within a pixel: scroll offsets snap to whole pixels but rows sit at
     // fractional ones, so an exact reveal can leave its row a sliver past an edge.
-    function shown(row: HTMLElement, viewport: DOMRect) {
+    function shown(
+      row: HTMLElement,
+      viewport: DOMRect,
+      covers = covering.current(),
+    ) {
       const bounds = row.getBoundingClientRect();
       return (
+        !covered(bounds, covers) &&
         row.dataset.membershipRow === undefined &&
         row.dataset.huddleRow === undefined &&
         bounds.height > 0 &&
         bounds.width > 0 &&
         bounds.top >= Math.max(viewport.top, 0) - 1 &&
-        bounds.bottom <= Math.min(viewport.bottom, window.innerHeight) + 1 &&
+        bounds.bottom <=
+          Math.min(shownBottom(viewport), window.innerHeight) + 1 &&
         bounds.left >= Math.max(viewport.left, 0) - 1 &&
         bounds.right <= Math.min(viewport.right, window.innerWidth) + 1
       );
     }
+    // Overlapping by more than a pixel, like the edges above.
+    function covered(bounds: DOMRect, covers: readonly DOMRect[]) {
+      return covers.some(
+        (box) =>
+          box.left < bounds.right - 1 &&
+          box.right > bounds.left + 1 &&
+          box.top < bounds.bottom - 1 &&
+          box.bottom > bounds.top + 1,
+      );
+    }
+    function shownBottom(viewport: DOMRect) {
+      return Math.min(
+        viewport.bottom,
+        trailingEdge.current?.() ?? viewport.bottom,
+      );
+    }
     function visibleIds() {
       const viewport = element.getBoundingClientRect();
+      const covers = covering.current();
       return [...element.querySelectorAll<HTMLElement>("[data-message-id]")]
         .flatMap((row) =>
-          row.dataset.messageId && shown(row, viewport)
+          row.dataset.messageId && shown(row, viewport, covers)
             ? [row.dataset.messageId]
             : [],
         )
@@ -215,15 +263,23 @@ export function useReading({
       )
         return;
       const viewport = element.getBoundingClientRect();
+      // A folded preview that shows the latest message stands in for its row
+      // here only: what it folds is not observed as individually read.
       const row = [
-        ...element.querySelectorAll<HTMLElement>("[data-message-id]"),
-      ].find((row) => row.dataset.messageId === latest);
+        ...element.querySelectorAll<HTMLElement>(
+          "[data-message-id], [data-preview-message-id]",
+        ),
+      ].find(
+        (row) =>
+          (row.dataset.messageId ?? row.dataset.previewMessageId) === latest,
+      );
       const bounds = row?.getBoundingClientRect();
       return bounds &&
+        !covered(bounds, covering.current()) &&
         bounds.height > 0 &&
         bounds.width > 0 &&
         bounds.bottom > Math.max(viewport.top, 0) &&
-        bounds.bottom <= Math.min(viewport.bottom, window.innerHeight) &&
+        bounds.bottom <= Math.min(shownBottom(viewport), window.innerHeight) &&
         bounds.left >= Math.max(viewport.left, 0) &&
         bounds.right <= Math.min(viewport.right, window.innerWidth)
         ? latest

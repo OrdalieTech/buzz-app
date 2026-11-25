@@ -68,7 +68,7 @@ export function documentEditorDraft(markdown: string) {
             : undefined;
     if (mark && "children" in node)
       return node.children.flatMap((child) =>
-        inline(child, [...marks, mark.create()]),
+        inline(child, mark.create().addToSet(marks)),
       );
     if (
       node.type === "link" &&

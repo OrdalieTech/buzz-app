@@ -506,3 +506,27 @@ it("exposes host bindings to the host with change notifications", async () => {
   await ctx.fiber.dispose();
   expect(service.hostSnapshot()).toEqual([]);
 });
+
+it("calls plugin predicates without arguments so default parameters retain their meaning", async () => {
+  const b = browser(),
+    root = new Context(),
+    run = vi.fn();
+  const target = { tagName: "BUTTON" };
+  const when = vi.fn((active = target) => active === target);
+  const runtime = new PluginRuntime(root, async () => ({
+    inject: ["shortcuts"],
+    apply(ctx) {
+      ctx.shortcuts.register({ ...shortcut(run), when });
+    },
+  }));
+  const service = new ShortcutsService(root, b.host);
+  try {
+    runtime.reconcile([plugin("example")]);
+    await vi.waitFor(() => expect(service.snapshot()).toHaveLength(1));
+    b.key();
+    expect(when).toHaveBeenCalledWith();
+    expect(run).toHaveBeenCalledOnce();
+  } finally {
+    await root.fiber.dispose();
+  }
+});

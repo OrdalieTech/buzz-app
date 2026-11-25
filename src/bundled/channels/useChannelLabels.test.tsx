@@ -354,3 +354,35 @@ it("names group DMs with participants in alphabetical order", async () => {
     await act(async () => root.unmount());
   }
 });
+
+it("leaves agents out of DM names unless no other person is in it", async () => {
+  const ana = "a".repeat(64),
+    bot = "b".repeat(64);
+  const profiles = new Map<string, { name: string; isAgent?: true }>([
+    [ana, { name: "Ana" }],
+    [bot, { name: "Bot", isAgent: true }],
+  ]);
+  const queries = {
+    snapshot: () => profiles,
+    subscribe: () => () => {},
+    ensure: async () => {},
+  } as unknown as Parameters<typeof useChannelLabels>[1];
+  let labels: (string | undefined)[] = [];
+  function Probe() {
+    labels = useChannelLabels(
+      [
+        { id: "both", name: "", channelType: "dm", participants: [bot, ana] },
+        { id: "agent", name: "", channelType: "dm", participants: [bot] },
+      ],
+      queries,
+    ).channels.map((channel) => channel.name);
+    return null;
+  }
+  const root = createRoot(container());
+  try {
+    await act(async () => root.render(createElement(Probe)));
+    expect(labels).toEqual(["Ana", "Bot"]);
+  } finally {
+    await act(async () => root.unmount());
+  }
+});

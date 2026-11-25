@@ -1,3 +1,4 @@
+import { useChannelActivitySubscription } from "../../features/agents/use-channel-agent-activity";
 import { activityTranscript } from "../../features/agents/activity-transcript";
 import { useRecordedActivityAgents } from "../../features/conversation/typing-presentation";
 import { useToastNotification } from "../../shared/design-system/ui/Toast";
@@ -69,6 +70,7 @@ import { RemoteAgentHint } from "../../features/messages/RemoteAgentHint";
 import { remoteWorkDetail } from "../../features/agents/execution-location";
 
 const noSubscribe = () => () => {};
+const noSnapshot = () => undefined;
 export type ActivityAgents = WorkStopAgents;
 type ActivityProps = ComposerAccessoryProps & { agents?: ActivityAgents };
 const noWork: RequestWork[] = [];
@@ -113,34 +115,64 @@ export function ActivityAccessory(props: ActivityProps) {
     </>
   );
 }
+type MessageActivityProps = ActivityProps & {
+  stoppedAgent?: string;
+  threadScoped?: boolean;
+};
 /** With `stoppedAgent`, only that agent's outcome for `message`. */
-function MessageActivity(
-  props: ActivityProps & { stoppedAgent?: string; threadScoped?: boolean },
-) {
-  const { session, channelId, message, canOpen, stoppedAgent } = props;
+function MessageActivity(props: MessageActivityProps) {
+  const { session, channelId, message } = props;
   const messageId = message?.id;
-  const recorded = useRecordedActivityAgents(session, channelId, messageId);
-  // Every row mounts this; only rows with work subscribe to each activity
-  // step, profile and choice change. Others read once and wait for work.
-  const hasWork = useSyncExternalStore(session.agentActivity.subscribe, () => {
+  // Every row mounts this; only rows with work mount the part that holds the
+  // activity snapshot and subscribes to each step, profile and choice change.
+  const subscribe = useChannelActivitySubscription(
+    session.agentActivity,
+    channelId,
+  );
+  const hasWork = useSyncExternalStore(subscribe, () => {
     if (!messageId) return false;
     const work = messageWork(
-      session.agentActivity.snapshot(),
+      session.agentActivity.snapshot(channelId),
       channelId,
       messageId,
     );
     return work.live.length > 0 || work.stopped.length > 0;
   });
+  const [mounted, setMounted] = useState(hasWork);
+  if (hasWork && !mounted) setMounted(true);
+  const release = useCallback(() => setMounted(false), []);
+  return mounted ? (
+    <MessageWork
+      {...props}
+      hasWork={hasWork}
+      subscribe={subscribe}
+      onIdle={release}
+    />
+  ) : null;
+}
+/** Unmounted once idle and its leave presentation ends, so no fiber of an
+ * idle row keeps a superseded activity snapshot alive. */
+function MessageWork(
+  props: MessageActivityProps & {
+    hasWork: boolean;
+    subscribe: (listener: () => void) => () => void;
+    onIdle: () => void;
+  },
+) {
+  const { session, channelId, message, canOpen, stoppedAgent } = props;
+  const { hasWork, subscribe, onIdle } = props;
+  const messageId = message?.id;
+  const recorded = useRecordedActivityAgents(session, channelId, messageId);
   const snapshot = useSyncExternalStore(
-    hasWork ? session.agentActivity.subscribe : noSubscribe,
-    session.agentActivity.snapshot,
+    hasWork ? subscribe : noSubscribe,
+    hasWork ? () => session.agentActivity.snapshot(channelId) : noSnapshot,
   );
   const work = useMemo(
     () =>
-      messageId && hasWork
+      messageId && snapshot
         ? messageWork(snapshot, channelId, messageId)
         : { live: noWork, stopped: noWork },
-    [snapshot, channelId, messageId, hasWork],
+    [snapshot, channelId, messageId],
   );
   const entries = [...work.live, ...work.stopped].filter((entry) => {
     const outcome = settledOutcome(entry);
@@ -190,7 +222,7 @@ function MessageActivity(
       props.threadScoped ??
       (props.messageLayout === "thread" || !!message?.threadRootId);
     if (!threadScoped) {
-      const local = (snapshot.local ?? []).filter(
+      const local = (snapshot?.local ?? []).filter(
         (work) =>
           work.agent === entry.agent &&
           work.channelId === channelId &&
@@ -299,6 +331,10 @@ function MessageActivity(
   const bubble = (
     shown.length ? shown : (leaving ?? (ended ? retained.current : []))
   ).filter((entry) => !recorded.has(entry.agent));
+  const idle = !hasWork && !bubble.length;
+  useEffect(() => {
+    if (idle) onIdle();
+  }, [idle, onIdle]);
   if (!bubble.length) return null;
   const primary = bubble[0];
   if (!primary) return null;
@@ -848,10 +884,11 @@ function ActivityBubble({
  * main's existing presentation rather than disappearing without a bubble. */
 export function ActivityTypingReplacement(props: ComposerAccessoryProps) {
   // Subscribe to which agents are replaced, not every observer frame.
-  const agents = useSyncExternalStore(
-    props.session.agentActivity.subscribe,
-    () => replacedAgents(props),
+  const subscribe = useChannelActivitySubscription(
+    props.session.agentActivity,
+    props.channelId,
   );
+  const agents = useSyncExternalStore(subscribe, () => replacedAgents(props));
   return (
     <>
       {agents
@@ -864,7 +901,7 @@ export function ActivityTypingReplacement(props: ComposerAccessoryProps) {
   );
 }
 function replacedAgents(props: ComposerAccessoryProps) {
-  const activity = props.session.agentActivity.snapshot();
+  const activity = props.session.agentActivity.snapshot(props.channelId);
   const ids = [
     ...(props.threadRootId ? [props.threadRootId] : []),
     ...(activity.local ?? [])

@@ -577,7 +577,7 @@ export async function runScenario(
     const metrics = await Promise.race([
       (async () => {
         await scenario.run(page, { signal: stop });
-        // The app's own client-metrics export (docs/client-metrics.md).
+        // The app's own client-metrics export (Settings → Developer).
         return await page.evaluate(
           (label) => globalThis.__buzzClientMetrics.export(label),
           path.basename(scenario.file),

@@ -79,7 +79,8 @@ export function EmojiPicker({
   addEmoji?: Pick<AddEmoji, "snapshot" | "subscribe"> | undefined;
   scope: string;
   disabled: boolean;
-  insert(value: string): void;
+  /** Return false when the choice is rejected or must not count as a use. */
+  insert(value: string): unknown;
   reaction?: boolean;
   gifRequests?: GifRequests | undefined;
   externalTrigger?: {
@@ -306,9 +307,10 @@ export function EmojiPicker({
           entries,
           media: session.media,
           select: (value) => {
-            onInsert.current(value);
+            const inserted = onInsert.current(value);
             accepted.current = true;
             setOpen(false);
+            return inserted;
           },
           close: () => setOpen(false),
           skinToneChange: (tone, menuOpen) =>

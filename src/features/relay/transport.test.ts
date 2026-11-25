@@ -10,7 +10,7 @@ import {
   ReadStateTimestampRejected,
   READ_STATE_TIMESTAMP_REFUSAL,
 } from "./read-state-host";
-import { PublishRejected } from "./outbox";
+import { PublishNotSent, PublishRejected } from "./outbox";
 import { hostSigner, keypair, signed } from "./testing";
 const key = keypair();
 afterEach(() => vi.unstubAllGlobals());
@@ -143,6 +143,57 @@ it("sends a message while task artifacts wait for native HTTP capacity", async (
   }
 });
 
+it.each([
+  [429, { error: "rate-limited: quota exceeded; retry in 5s" }, true],
+  [
+    503,
+    { error: "rate-limited: shared admission unavailable", sent: false },
+    true,
+  ],
+  [429, { error: "rate-limited: quota exceeded; retry in 5s" }, false],
+] as const)(
+  "keeps the HTTP refusal (%s) and scopes its cooldown (migration=%s)",
+  async (status, refusal, scoped) => {
+    const regular = signed(key, {
+      kind: 9,
+      content: "hello",
+      tags: [["h", "c"]],
+    });
+    const migration = signed(key, {
+      kind: 9000,
+      content: "",
+      tags: [
+        ["h", "c"],
+        ["p", "c".repeat(64)],
+        ["migration", "slack"],
+      ],
+    });
+    const request = vi.fn(async (_url: string, body: string) =>
+      JSON.parse(body).id === migration.id
+        ? Response.json(refusal, {
+            status,
+            ...(scoped ? { headers: { "Retry-After": "5" } } : {}),
+          })
+        : Response.json({ accepted: true, event_id: regular.id }),
+    );
+    const transport = await connectSignedTransport(
+      hostSigner(key, request),
+      `https://${scoped ? "migration" : "shared"}.example.org`,
+      "relay",
+    );
+    assert.exists(transport.writer);
+    const signal = new AbortController().signal;
+    const failure = await transport.writer
+      .publish(migration, signal)
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PublishNotSent);
+    expect(failure).toHaveProperty("message", refusal.error);
+    const ordinary = transport.writer.publish(regular, signal);
+    if (scoped) await expect(ordinary).resolves.toBe("");
+    else await expect(ordinary).rejects.toThrow(/^Relay requests paused/);
+    expect(request).toHaveBeenCalledTimes(scoped ? 2 : 1);
+  },
+);
 it("distinguishes explicit rejection from invalid or missing delivery receipts", async () => {
   const event = signed(key, { kind: 9, content: "hello", tags: [["h", "c"]] });
   const transport = await connectSignedTransport(

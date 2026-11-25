@@ -254,6 +254,7 @@ async function remoteFixture(readyReads?: ClaudeReady) {
     soloChat: async () => false,
     read: async () => [],
     channelLabel: () => undefined,
+    ownerReadable: () => true,
     workflowAuthority: () => undefined,
     name: () => undefined,
     memoryListing: async () => ({ entries: [], partial: false }),

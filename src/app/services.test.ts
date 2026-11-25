@@ -226,6 +226,16 @@ it.each([
   },
 );
 
+it("lists the host-owned features' real manifests on the plugin manager's snapshot", () => {
+  expect(
+    services.plugins.snapshot().hostOwned.map(({ id, name }) => [id, name]),
+  ).toEqual([
+    ["buzz.emoji", "Emoji"],
+    ["buzz.mentions", "Mentions"],
+    ["buzz.plugin-requests", "Plugin requests"],
+  ]);
+});
+
 it("disposes the real host services and plugins once", async () => {
   await openCommunities();
   const appearanceDisposal = vi.spyOn(services.appearance, "dispose");

@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import {
+  API_ACTIVE_LIMIT,
   apiFailure,
   admittedApiRequest,
   ApiPaused,
@@ -9,7 +10,7 @@ import {
 } from "./http-admission";
 
 afterEach(() => vi.useRealTimers());
-it("starts six background reads immediately and refills by foreground priority", async () => {
+it("starts background reads immediately up to the request ceiling and refills by foreground priority", async () => {
   vi.useFakeTimers();
   const lane = createApiAdmission();
   const calls: string[] = [];
@@ -18,13 +19,13 @@ it("starts six background reads immediately and refills by foreground priority",
     calls.push(name);
     return new Promise<void>((resolve) => release.push(resolve));
   };
-  const active = Array.from({ length: 6 }, (_, i) =>
+  const active = Array.from({ length: API_ACTIVE_LIMIT }, (_, i) =>
     lane.run(work(`${i}`), undefined, "background"),
   );
-  expect(calls).toEqual(["0", "1", "2", "3", "4", "5"]);
+  expect(calls).toEqual(active.map((_, i) => `${i}`));
   const background = lane.run(work("background"), undefined, "background");
   const foreground = lane.run(work("foreground"));
-  expect(calls).toHaveLength(6);
+  expect(calls).toHaveLength(API_ACTIVE_LIMIT);
   release.shift()?.();
   await active[0];
   await Promise.resolve();
@@ -83,7 +84,7 @@ it("pauses queued consumers, cancels before dispatch, and never retries admitted
     release = resolve;
   });
   const work = vi.fn(() => held);
-  const active = Array.from({ length: 6 }, () => lane.run(work));
+  const active = Array.from({ length: API_ACTIVE_LIMIT }, () => lane.run(work));
   const controller = new AbortController();
   const cancelled = expect(
     lane.run(work, controller.signal),
@@ -100,7 +101,7 @@ it("pauses queued consumers, cancels before dispatch, and never retries admitted
   await expect(lane.run(work)).rejects.toBeInstanceOf(ApiPaused);
   await vi.advanceTimersByTimeAsync(1);
   await lane.run(async () => {});
-  expect(work).toHaveBeenCalledTimes(6);
+  expect(work).toHaveBeenCalledTimes(API_ACTIVE_LIMIT);
   expect(vi.getTimerCount()).toBe(0);
 });
 it("normalizes only upstream quota hints and bounds streaming error bodies", async () => {

@@ -1,6 +1,10 @@
-import type { ChannelMessage, MembershipChange } from "./contracts";
-import type { EventData } from "./events";
-import { objectBody } from "./body";
+import type {
+  ChannelMessage,
+  ChannelSummary,
+  MembershipChange,
+} from "./contracts.ts";
+import type { EventData } from "./events.ts";
+import { objectBody } from "./body.ts";
 
 /** Content rows retained by channel history/live windows, not the unread kind set. */
 export const CHANNEL_ROW_KINDS = [9, 40002, 40008, 40099, 48100, 48103];
@@ -9,8 +13,14 @@ export const channelRowKind = (kind: number) =>
 /** A content row has one channel home; ambiguous tags are not membership evidence. */
 export function channelRowChannel(event: EventData): string | undefined {
   if (!channelRowKind(event.kind)) return undefined;
-  const channels = event.tags.filter((tag) => tag[0] === "h");
-  return channels.length === 1 && channels[0]?.[1] ? channels[0][1] : undefined;
+  let home: string[] | undefined;
+  for (let index = 0; index < event.tags.length; index++) {
+    const entry = event.tags[index];
+    if (entry?.[0] !== "h") continue;
+    if (home) return undefined;
+    home = entry;
+  }
+  return home?.[1] || undefined;
 }
 const pubkey = (value: unknown): value is string =>
   typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
@@ -49,6 +59,8 @@ export function rowProfileIds(row: ChannelMessage): readonly string[] {
     : [
         row.authorId,
         ...(row.workflowOwnerId ? [row.workflowOwnerId] : []),
+        // Loading the claimed agent's profile is what lets its owner verify.
+        ...(row.relayedFrom ? [row.relayedFrom.agent] : []),
         ...row.mentions,
         ...(row.mentionReferences ?? []),
         ...row.participants,
@@ -68,4 +80,17 @@ export function messagePreview(
     if (row && !row.membership && !row.huddle)
       return row.diff ? diffPreview(row.diff) : row.content;
   }
+}
+
+/** Viewer-only membership. Legacy summaries may still carry only a signed roster.
+ * Explicit viewer evidence wins even when a retained peer roster disagrees. */
+export function viewerMember(
+  channel: Pick<ChannelSummary, "viewerMembership" | "members"> | undefined,
+  viewer: string | undefined,
+): boolean {
+  if (!channel || !viewer) return false;
+  const membership = channel.viewerMembership;
+  return membership
+    ? membership.pubkey === viewer && membership.joined
+    : !!channel.members?.includes(viewer);
 }

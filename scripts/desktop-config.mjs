@@ -61,7 +61,7 @@ export function desktopOverlay(root) {
   return config;
 }
 
-// Each worktree owns one native MCP test instance (docs/native-mcp.md), so
+// Each worktree owns one native MCP test instance, so
 // relaunches keep its app data and its client finds it rather than another
 // worktree's. The bridge scans 100 ports up from its base, so bases are 100
 // apart, in [20000, 59900]. native_mcp.rs checks the identifier shape and

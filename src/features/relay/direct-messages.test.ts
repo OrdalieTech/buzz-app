@@ -4,12 +4,45 @@ import { createRelaySession } from "./session";
 import { createDirectMessages, NeedsHistoryChoice } from "./direct-messages";
 import type { RelayReader } from "./reader";
 import type { VerifiedProfileAuthority } from "./verified-profile";
-import { keypair, profile, roster, signed } from "./testing";
+import { keypair, profile, roster, signed, type Key } from "./testing";
+import { bindNames, type IdentityNames } from "../identity-names/service";
+import { agentDirectory } from "../identity-names/testing";
+import { schnorr } from "@noble/curves/secp256k1.js";
+import { bytesToHex } from "nostr-tools/utils";
 import { PublishRejected } from "./outbox";
 import { eventDto, type ReadFilter, type RelayEvent } from "./events";
 import type { RelayWriter } from "./transport";
 
 const id = "11111111-1111-4111-8111-111111111111";
+const namingDirectory: IdentityNames = {
+  bind: (source) =>
+    bindNames(source, {
+      snapshot: () => [agentDirectory],
+      subscribe: () => () => {},
+    }),
+  register() {},
+};
+/** An agent's signed profile, its owner attested (NIP-OA). Newer than
+ * `setup`'s profiles, so it replaces one. */
+async function agentProfile(agent: Key, name: string, owner: Key) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`nostr:agent-auth:${agent.pubkey}:kind=0`),
+  );
+  return signed(agent, {
+    kind: 0,
+    content: JSON.stringify({ name, is_agent: true }),
+    tags: [
+      [
+        "auth",
+        owner.pubkey,
+        "kind=0",
+        bytesToHex(schnorr.sign(new Uint8Array(digest), owner.secret)),
+      ],
+    ],
+    created_at: 1_700_000_001,
+  });
+}
 function setup(
   options: {
     badRoster?: boolean;
@@ -19,6 +52,11 @@ function setup(
     /** A member the DM holds that the viewer did not name: one of its
      * people's agents, as only the relay knows, with no agent profile. */
     extra?: boolean;
+    /** Other profiles the relay holds, beside these people's. A newer one
+     * for `other` replaces its profile. */
+    profiles?: (keys: { other: Key; agentOwner: Key }) => Promise<RelayEvent[]>;
+    /** Label identities as the app does, telling namesakes apart. */
+    names?: boolean;
   } = {},
 ) {
   const viewer = keypair(),
@@ -60,6 +98,7 @@ function setup(
               tags: [["auth", agentOwner.pubkey, "", "a".repeat(128)]],
             }),
         ...(options.extra ? [profile(unnamed, { name: "Unnamed" })] : []),
+        ...((await options.profiles?.({ other, agentOwner })) ?? []),
       ];
     return options.lagging &&
       !filters.every((filter) => filter.consistency === "strong")
@@ -83,7 +122,10 @@ function setup(
         publish,
       },
     },
-    { outboxStorage: { load: () => [], save: () => {} } },
+    {
+      outboxStorage: { load: () => [], save: () => {} },
+      ...(options.names ? { identityNames: namingDirectory } : {}),
+    },
   );
   return {
     owner,
@@ -230,6 +272,104 @@ it("a refusal that needs the history choice is told apart from other refusals", 
     await expect(
       t.dm.add(id, [t.other.pubkey], "ask", new AbortController().signal),
     ).rejects.not.toBeInstanceOf(NeedsHistoryChoice);
+  } finally {
+    t.owner.dispose();
+  }
+});
+it("names the agent whose add policy refused an open or an addition", async () => {
+  const t = setup();
+  try {
+    t.openDirectMessage.mockRejectedValueOnce(
+      new Error(`policy:owner_only (agent ${t.other.pubkey})`),
+    );
+    await expect(
+      t.dm.open([t.other.pubkey], new AbortController().signal),
+    ).rejects.toThrow("Only the owner of Other can add it to a DM.");
+    t.openDirectMessage.mockRejectedValueOnce(
+      new Error(`policy:nobody (agent ${t.other.pubkey})`),
+    );
+    const refused = t.dm.add(
+      id,
+      [t.other.pubkey],
+      "ask",
+      new AbortController().signal,
+    );
+    await expect(refused).rejects.toThrow(
+      "Couldn’t add them. Other can’t be added to a DM.",
+    );
+    await expect(refused).rejects.not.toBeInstanceOf(NeedsHistoryChoice);
+  } finally {
+    t.owner.dispose();
+  }
+});
+it("names the agent's verified owner as the one to ask", async () => {
+  const t = setup({
+    profiles: async ({ other, agentOwner }) => [
+      eventDto(await agentProfile(other, "Other", agentOwner)),
+      profile(agentOwner, { name: "Morgan" }),
+    ],
+  });
+  try {
+    t.openDirectMessage.mockRejectedValueOnce(
+      new Error(`policy:owner_only (agent ${t.other.pubkey})`),
+    );
+    await expect(
+      t.dm.open([t.other.pubkey], new AbortController().signal),
+    ).rejects.toThrow("Only Morgan can add Other to a DM.");
+  } finally {
+    t.owner.dispose();
+  }
+});
+it("tells a refused agent apart from another agent of its name", async () => {
+  const namesake = keypair(),
+    wes = keypair();
+  const t = setup({
+    names: true,
+    profiles: async ({ agentOwner }) => [
+      profile(agentOwner, { name: "Morgan" }),
+      profile(wes, { name: "Wes" }),
+      await agentProfile(namesake, "Other", wes),
+    ],
+  });
+  try {
+    // Other's own owner claim is unverified, so it names no one to ask.
+    t.openDirectMessage.mockRejectedValueOnce(
+      new Error(`policy:owner_only (agent ${t.other.pubkey})`),
+    );
+    await expect(
+      t.dm.open([t.other.pubkey], new AbortController().signal),
+    ).rejects.toThrow("Only the owner of Morgan’s Other can add it to a DM.");
+  } finally {
+    t.owner.dispose();
+  }
+});
+it("tells a refused agent apart from a person of its name", async () => {
+  const person = keypair();
+  const t = setup({
+    names: true,
+    profiles: async () => [profile(person, { name: "Other" })],
+  });
+  try {
+    t.openDirectMessage.mockRejectedValueOnce(
+      new Error(`policy:nobody (agent ${t.other.pubkey})`),
+    );
+    await expect(
+      t.dm.open([t.other.pubkey], new AbortController().signal),
+    ).rejects.toThrow("Other (agent) can’t be added to a DM.");
+  } finally {
+    t.owner.dispose();
+  }
+});
+it("refuses without the agent's name when its profile cannot be read", async () => {
+  const t = setup();
+  try {
+    const unknown = "e".repeat(64);
+    t.openDirectMessage.mockRejectedValueOnce(
+      new Error(`policy:owner_only (agent ${unknown})`),
+    );
+    await expect(
+      t.dm.open([t.other.pubkey], new AbortController().signal),
+    ).rejects.toThrow("Only the owner of this agent can add it to a DM.");
   } finally {
     t.owner.dispose();
   }

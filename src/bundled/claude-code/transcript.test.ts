@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import {
+  appendFileSync,
   chmodSync,
   mkdirSync,
   mkdtempSync,
@@ -14,11 +15,13 @@ import type { HostProcessOptions } from "../../features/host/service";
 import { manifestProcesses } from "./claude-testing";
 import manifest from "./manifest.json";
 import type { EventData } from "../../features/relay/events";
-import { localStore } from "../../features/agents/state";
+import { fileStore, localStore } from "../../features/agents/state";
 import type { TranscriptTurn } from "../../features/agents/activity-transcript";
+import { conversationKey } from "../../features/agents/conversation-folders";
 import { sessionPrompts } from "../../features/agents/session-prompts";
 import { steerPrompt, turnPrompt } from "./prompt";
 import { ClaudeRuntime } from "./runtime";
+import { localSessions } from "./sessions";
 import {
   claudeTurns,
   projectName,
@@ -27,7 +30,9 @@ import {
   readTranscript,
   TURN_LIMIT,
   withNotices,
+  type WorkingPoll,
 } from "./transcript";
+import type { AgentReads } from "../../features/agents/reads";
 
 const root = "c".repeat(64);
 const homes: string[] = [];
@@ -144,14 +149,15 @@ it("groups a session file into prompted turns with steering, tools and replies",
   );
 });
 
+const send = (id: string, text: string, tool = "send") =>
+  line("assistant", [
+    { type: "tool_use", id, name: `mcp__buzz__${tool}`, input: { text } },
+  ]);
+const result = (id: string, content: string, is_error = false) =>
+  line("user", [{ type: "tool_result", tool_use_id: id, content, is_error }]);
+
 it("shows what the agent posted as its reply once sent, and names Buzz tools as Codex does", () => {
   clock = 0;
-  const send = (id: string, text: string, tool = "send") =>
-    line("assistant", [
-      { type: "tool_use", id, name: `mcp__buzz__${tool}`, input: { text } },
-    ]);
-  const result = (id: string, content: string, is_error = false) =>
-    line("user", [{ type: "tool_result", tool_use_id: id, content, is_error }]);
   const [turn] = claudeTurns(
     [
       line("user", prompt("review it")),
@@ -363,6 +369,343 @@ function host(files: Record<string, string>) {
   });
   return { spawn, reads, home };
 }
+
+const savedPath = "./-Users-me--buzz/session-1.jsonl";
+
+const ownerReads = {
+  ownerReadable: () => true,
+  channelLabel: () => undefined,
+  name: () => undefined,
+} as unknown as AgentReads;
+
+function previewHost(
+  files: Record<string, string>,
+  remote?: "bound" | "inspected",
+) {
+  const { spawn, reads } = host(files);
+  const storage = fileStore(new Map(), async () => {});
+  const saved = localSessions(storage, agent);
+  saved.set(conversationKey(conversation.channelId, root), {
+    id: conversation.sessionId,
+    at: 1000,
+    seen: 0,
+  });
+  const runtime = new ClaudeRuntime(
+    { spawn },
+    () => ownerReads,
+    async () => null,
+    storage,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    async () =>
+      remote === "inspected" ? { provider: "example/worker" } : undefined,
+    () => remote === "bound",
+  );
+  const signal = new AbortController().signal;
+  return { runtime, spawn, reads, signal };
+}
+
+it("opens only the bound saved tail before reading canonical order across sessions", async () => {
+  const { runtime, spawn, reads, signal } = previewHost({
+    [savedPath]: [
+      line("user", turn("before the clock rolled back"), {
+        uuid: "before",
+        timestamp: "2026-01-03T00:00:00Z",
+      }),
+      line("assistant", [{ type: "text", text: "x".repeat(3 << 20) }], {
+        timestamp: "2026-01-03T00:00:01Z",
+      }),
+      line("assistant", [{ type: "text", text: "part of the older turn" }], {
+        timestamp: "2026-01-03T00:00:02Z",
+      }),
+      line("user", turn("recent saved prompt"), {
+        uuid: "recent",
+        timestamp: "2026-01-01T00:00:00Z",
+      }),
+      line("assistant", [{ type: "text", text: "recent saved reply" }], {
+        timestamp: "2026-01-01T00:00:01Z",
+      }),
+    ].join("\n"),
+    "./-Users-me--buzz/discovered.jsonl": line(
+      "user",
+      turn("discovered prompt"),
+      { uuid: "discovered", timestamp: "2026-01-02T00:00:00Z" },
+    ),
+  });
+  const preview = await runtime.transcriptPreview(
+    conversation,
+    "~/.buzz",
+    false,
+    signal,
+  );
+  expect(preview).toMatchObject({
+    more: true,
+    turns: [
+      {
+        turnId: "recent",
+        newSession: false,
+        continued: true,
+        partial: false,
+        items: [
+          { type: "prompt", text: "recent saved prompt" },
+          { type: "message", text: "recent saved reply" },
+        ],
+      },
+    ],
+  });
+  expect(reads).toHaveLength(0);
+  expect(
+    spawn.mock.calls.some(([id]) => id === "list" || id === "starts"),
+  ).toBe(false);
+  expect(
+    spawn.mock.calls
+      .filter(([id]) => id === "read-page")
+      .map(([, options]) => options?.args?.[2]),
+  ).toEqual(["2"]);
+
+  const canonical = await runtime.transcript(
+    conversation,
+    "~/.buzz",
+    false,
+    signal,
+  );
+  expect(canonical?.turns.map(({ turnId }) => turnId)).toEqual([
+    "recent",
+    "discovered",
+    "before",
+  ]);
+  expect(canonical?.more).toBe(false);
+});
+
+it.each(["bound", "inspected"] as const)(
+  "skips local file reads for a %s remote session",
+  async (placement) => {
+    const { runtime, spawn, signal } = previewHost(
+      { [savedPath]: line("user", turn("local copy")) },
+      placement,
+    );
+    await expect(
+      runtime.transcriptPreview(conversation, "~/.buzz", false, signal),
+    ).resolves.toBeUndefined();
+    expect(spawn).not.toHaveBeenCalled();
+  },
+);
+
+it("leaves a prompt without a timestamp to the full reader's preceding turn clock", async () => {
+  const { runtime, signal } = previewHost({
+    [savedPath]: [
+      line("user", turn("earlier"), { timestamp: "2026-01-03T00:00:00Z" }),
+      line("system", "x".repeat(3 << 20)),
+      line("user", turn("after the cut"), {
+        uuid: "latest",
+        timestamp: undefined,
+      }),
+    ].join("\n"),
+  });
+  await expect(
+    runtime.transcriptPreview(conversation, "~/.buzz", false, signal),
+  ).resolves.toBeUndefined();
+  const full = await runtime.transcript(conversation, "~/.buzz", false, signal);
+  expect(full?.turns.at(-1)).toMatchObject({
+    turnId: "latest",
+    startedAt: Date.parse("2026-01-03T00:00:00Z"),
+  });
+});
+
+it("leaves a visible clock rollback to canonical timestamp order", async () => {
+  const { runtime, signal } = previewHost({
+    [savedPath]: [
+      line("system", "x".repeat(3 << 20)),
+      line("user", turn("before rollback"), {
+        uuid: "before",
+        timestamp: "2026-01-02T00:00:00Z",
+      }),
+      line("user", turn("after rollback"), {
+        uuid: "after",
+        timestamp: "2026-01-01T00:00:00Z",
+      }),
+    ].join("\n"),
+  });
+  await expect(
+    runtime.transcriptPreview(conversation, "~/.buzz", false, signal),
+  ).resolves.toBeUndefined();
+  const canonical = await runtime.transcript(
+    conversation,
+    "~/.buzz",
+    false,
+    signal,
+  );
+  expect(canonical?.turns.map(({ turnId }) => turnId)).toEqual([
+    "after",
+    "before",
+  ]);
+});
+
+it("does not preview an ID saved for another agent or conversation, or only discovered on disk", async () => {
+  const { runtime, spawn, signal } = previewHost({
+    [savedPath]: line("user", turn("saved prompt")),
+    "./-Users-me--buzz/discovered.jsonl": line(
+      "user",
+      turn("discovered prompt"),
+    ),
+  });
+  for (const mismatch of [
+    { agent: sam },
+    { root: sam },
+    { sessionId: "discovered" },
+  ]) {
+    await expect(
+      runtime.transcriptPreview(
+        { ...conversation, ...mismatch },
+        "~/.buzz",
+        false,
+        signal,
+      ),
+    ).resolves.toBeUndefined();
+  }
+  expect(spawn).not.toHaveBeenCalled();
+});
+
+it.each(["queued steer", "user steer"] as const)(
+  "leaves a clipped %s for canonical history even when another prompt fits",
+  async (kind) => {
+    const steer = steerPrompt(turn("follow-up"));
+    const clipped =
+      kind === "queued steer"
+        ? line("attachment", undefined, {
+            attachment: { type: "queued_command", prompt: steer },
+          })
+        : line("user", steer);
+    const { runtime, signal } = previewHost({
+      [savedPath]: [
+        line("user", turn("opening prompt")),
+        line("assistant", [
+          { type: "thinking", thinking: "x".repeat(3 << 20) },
+        ]),
+        clipped,
+        line("user", turn("later complete prompt")),
+      ].join("\n"),
+    });
+    await expect(
+      runtime.transcriptPreview(conversation, "~/.buzz", false, signal),
+    ).resolves.toBeUndefined();
+    const canonical = await runtime.transcript(
+      conversation,
+      "~/.buzz",
+      false,
+      signal,
+    );
+    expect(canonical?.turns).toHaveLength(2);
+    expect(canonical?.turns[0]?.items).toContainEqual(
+      expect.objectContaining({
+        type: "prompt",
+        steer: true,
+        text: "follow-up",
+      }),
+    );
+  },
+);
+
+it.each(["discarded", "retained"] as const)(
+  "handles a clipped tool result in the %s turn on preview, poll and stop",
+  async (location) => {
+    const clippedResult = [
+      { type: "tool_result", tool_use_id: "earlier-tool", content: "result" },
+    ];
+    const follow = turn("visible complete prompt");
+    const { runtime, signal } = previewHost({
+      [savedPath]: [
+        line("user", turn("opening prompt")),
+        line("assistant", [
+          { type: "tool_use", id: "earlier-tool", name: "Read", input: {} },
+        ]),
+        line("assistant", [
+          { type: "thinking", thinking: "x".repeat(3 << 20) },
+        ]),
+        ...(location === "discarded" ? [line("user", clippedResult)] : []),
+        line("user", follow),
+        ...(location === "retained" ? [line("user", clippedResult)] : []),
+        line("assistant", [{ type: "text", text: "visible reply" }]),
+      ].join("\n"),
+    });
+    const preview = await runtime.transcriptPreview(
+      conversation,
+      "~/.buzz",
+      false,
+      signal,
+    );
+    const visibleTurns = [
+      {
+        partial: false,
+        items: [
+          { type: "prompt", text: "visible complete prompt" },
+          { type: "message", text: "visible reply" },
+        ],
+      },
+    ];
+    const latest = (working: boolean) =>
+      runtime.latestTurns(conversation, "~/.buzz", working, signal, []);
+    await expect(latest(true)).resolves.toMatchObject(visibleTurns);
+    if (location === "retained") {
+      expect(preview).toBeUndefined();
+      await expect(latest(false)).resolves.toBeUndefined();
+    } else {
+      expect(preview?.turns).toMatchObject(visibleTurns);
+      await expect(latest(false)).resolves.toMatchObject(visibleTurns);
+    }
+  },
+);
+
+it("uses canonical discovery directly for a saved file small enough to fit one page", async () => {
+  const { runtime, spawn, signal } = previewHost({
+    [savedPath]: line("user", turn("saved prompt")),
+    "./-Users-me--buzz/discovered.jsonl": line(
+      "user",
+      turn("discovered prompt"),
+    ),
+  });
+  await expect(
+    runtime.transcriptPreview(conversation, "~/.buzz", false, signal),
+  ).resolves.toBeUndefined();
+  expect(spawn.mock.calls.some(([id]) => id === "read-page")).toBe(false);
+  const canonical = await runtime.transcript(
+    conversation,
+    "~/.buzz",
+    false,
+    signal,
+  );
+  expect(canonical?.turns.map(({ sessionId }) => sessionId)).toEqual([
+    "session-1",
+    "discovered",
+  ]);
+});
+
+it("leaves a 9 MiB session record for canonical history", async () => {
+  const reply = "x".repeat(9 << 20);
+  const { runtime, reads, signal } = previewHost({
+    [savedPath]: [
+      line("user", turn("opening prompt")),
+      line("assistant", [{ type: "text", text: reply }]),
+    ].join("\n"),
+  });
+  await expect(
+    runtime.transcriptPreview(conversation, "~/.buzz", false, signal),
+  ).resolves.toBeUndefined();
+  expect(reads).toHaveLength(0);
+  const canonical = await runtime.transcript(
+    conversation,
+    "~/.buzz",
+    false,
+    signal,
+  );
+  expect(canonical?.turns[0]?.items[1]).toMatchObject({
+    type: "message",
+    text: reply,
+  });
+});
 
 it("reads the session file from the project of the agent's workspace", async () => {
   const { spawn, reads } = host({
@@ -1021,32 +1364,244 @@ it("requests a full read when a clipped turn contains a delivered steer", async 
   expect(latest?.map(({ turnId }) => turnId)).toEqual(["u5"]);
 });
 
-it("reads a turn larger than the chunk in full only every 30 s, keeping what is shown between", async () => {
+it("keeps an incomplete UTF-8 record across working polls and retries from the accepted byte", async () => {
   clock = 0;
-  const { spawn } = host({
-    "./-Users-me--buzz/session-1.jsonl": [
-      line("user", prompt("only")),
-      line("assistant", [{ type: "text", text: "x".repeat(3 << 20) }]),
-      line("assistant", [{ type: "text", text: "done" }]),
+  const { spawn, home } = host({
+    [savedPath]: [
+      line("user", prompt("check deployment")),
+      line("assistant", [
+        { type: "tool_use", name: "Read", id: "r", input: { path: "/log" } },
+      ]),
+      JSON.stringify({ type: "progress", text: "x".repeat(3 << 20) }),
+      "",
     ].join("\n"),
   });
-  const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
-  const latest = () =>
+  const signal = new AbortController().signal;
+  const accepted: WorkingPoll = {};
+  const full = await readTranscript(
+    spawn,
+    "~/.buzz",
+    conversation,
+    true,
+    signal,
+    undefined,
+    accepted,
+  );
+  const path = join(home, ".claude/projects", savedPath);
+  const result = Buffer.from(
+    `${line(
+      "user",
+      [{ type: "tool_result", tool_use_id: "r", content: "ready ✓" }],
+      { timestamp: undefined },
+    )}\n`,
+  );
+  const split = result.indexOf("✓") + 1;
+  const latest = (poll: WorkingPoll) =>
     readLatestTurns(
       spawn,
       "~/.buzz",
       conversation,
       true,
-      new AbortController().signal,
+      signal,
+      undefined,
+      poll,
     );
-  // Undefined reads it in full; none keeps what is shown.
-  await expect(latest()).resolves.toBeUndefined();
-  now.mockReturnValue(1_000_000 + OVERSIZED_READ_MS - 1);
-  await expect(latest()).resolves.toEqual([]);
-  now.mockReturnValue(1_000_000 + OVERSIZED_READ_MS);
-  await expect(latest()).resolves.toBeUndefined();
-  await expect(latest()).resolves.toEqual([]);
-  now.mockRestore();
+  appendFileSync(path, result.subarray(0, split));
+  expect(await latest({ ...accepted })).toEqual([]);
+  appendFileSync(path, result.subarray(split));
+  const staged = { ...accepted };
+  const changed = await latest(staged);
+  expect(changed?.[0]?.items.at(-1)).toMatchObject({
+    output: "ready ✓",
+    status: "completed",
+    completedAt: 2000,
+  });
+  expect(full?.turns[0]?.items.at(-1)).toMatchObject({
+    status: "in_progress",
+    output: "",
+  });
+  expect(await latest({ ...accepted })).toEqual(changed);
+  expect(await latest(staged)).toEqual([]);
+  appendFileSync(path, `${line("user", prompt("next request"))}\n`);
+  expect(await latest(staged)).toBeUndefined();
+});
+
+it("matches each accepted working poll to a full read of the same session bytes", async () => {
+  const { home, spawn, reads } = host({
+    [savedPath]: [
+      line("user", turn("Check the report")),
+      line("progress", "x".repeat(2 << 20)),
+      "",
+    ].join("\n"),
+  });
+  const path = join(home, ".claude/projects", savedPath);
+  const disk = manifestProcesses(home);
+  const args = [
+    "~/.buzz",
+    conversation,
+    true,
+    new AbortController().signal,
+  ] as const;
+  let poll: WorkingPoll = {};
+  const seed = async () => {
+    poll = {};
+    await readTranscript(disk, ...args, undefined, poll);
+  };
+  const append = (...records: string[]) =>
+    appendFileSync(path, records.join("\n") + "\n");
+  const latest = () => readLatestTurns(spawn, ...args, undefined, poll);
+  const accept = async (shape: string, ...records: string[]) => {
+    append(...records);
+    const polled = await latest();
+    expect(polled, shape).toHaveLength(1);
+    expect(reads, shape).toHaveLength(0);
+    const full = await readTranscript(disk, ...args);
+    expect(polled, shape).toStrictEqual(full?.turns);
+    return polled?.[0]?.items.at(-1);
+  };
+  const text = (value: string, extra = {}) =>
+    line("assistant", [{ type: "text", text: value }], extra);
+  const read = (id: string) =>
+    line("assistant", [
+      { type: "tool_use", id, name: "Read", input: { path: id } },
+    ]);
+  await seed();
+  await accept("assistant text", text("Checking"));
+  await accept(
+    "thinking",
+    line("assistant", [{ type: "thinking", thinking: "Compare reports" }]),
+  );
+  await accept("open tool", read("report"));
+  await accept("complete tool", result("report", "ready"));
+  await accept("open second tool", read("missing"));
+  await accept("failed tool", result("missing", "file missing", true));
+  await accept(
+    "posted send",
+    send("post", "Report ready"),
+    result("post", `sent ${"a".repeat(64)}`),
+  );
+  await accept(
+    "failed send",
+    send("error", "Second report"),
+    result("error", "send failed", true),
+  );
+
+  const userSteer = await accept(
+    "timestamped user steer",
+    line("user", steerPrompt(turn("Check totals"))),
+  );
+  const queuedSteer = await accept(
+    "untimed queued steer",
+    line("attachment", undefined, {
+      timestamp: undefined,
+      attachment: {
+        type: "queued_command",
+        prompt: steerPrompt(turn("Check dates")),
+      },
+    }),
+  );
+  expect(userSteer).toMatchObject({ steer: true, text: "Check totals" });
+  expect(queuedSteer).toMatchObject({
+    steer: true,
+    text: "Check dates",
+    at: userSteer?.at,
+  });
+
+  await accept("meta", line("user", turn("Hidden"), { isMeta: true }));
+  await accept("sidechain", text("Hidden", { isSidechain: true }));
+  await accept("missing uuid", text("Hidden", { uuid: undefined }));
+  await accept(
+    "other attachment",
+    line("attachment", undefined, {
+      attachment: { type: "other", prompt: steerPrompt(turn("Hidden")) },
+    }),
+  );
+  await accept("progress", line("progress", "Checking"));
+  await accept("system", line("system", "Notice"));
+  await accept(
+    "multiple pages",
+    text("Report complete", { padding: "x".repeat(1 << 20) }),
+  );
+  const [process, options] = spawn.mock.calls.at(-1) ?? [];
+  expect(process).toBe("read-page");
+  expect(Number(options?.args?.[2])).toBeGreaterThan(1);
+
+  await accept("pending send", send("late", "Final report"));
+  append(result("late", `sent ${"b".repeat(64)}`));
+  expect(await latest(), "receipt from an earlier poll").toBeUndefined();
+  await seed();
+  await accept("after the full read", text("Finished"));
+});
+
+it("requests a full read immediately for a second oversized working turn", async () => {
+  clock = 0;
+  const session = { ...conversation, sessionId: "consecutive-oversized" };
+  const path = "./-Users-me--buzz/consecutive-oversized.jsonl";
+  const progress = JSON.stringify({
+    type: "progress",
+    text: "x".repeat(3 << 20),
+  });
+  const oversizedTurn = (text: string) =>
+    `${line("user", prompt(text))}\n${progress}\n`;
+  const { spawn, home } = host({ [path]: oversizedTurn("first") });
+  const signal = new AbortController().signal;
+  const args = [spawn, "~/.buzz", session, true, signal] as const;
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    vi.setSystemTime(1_000_000);
+    await expect(readLatestTurns(...args)).resolves.toBeUndefined();
+    const poll: WorkingPoll = {};
+    await readTranscript(...args, undefined, poll);
+    vi.setSystemTime(1_001_000);
+    const file = join(home, ".claude/projects", path);
+    appendFileSync(file, oversizedTurn("second"));
+    const next = await readLatestTurns(...args, undefined, {});
+    expect(next).toBeUndefined();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("reads a turn larger than the chunk in full only every 30 s, keeping what is shown between", async () => {
+  clock = 0;
+  const files = { [savedPath]: line("user", prompt("only")) };
+  const { spawn, home } = host(files);
+  const signal = new AbortController().signal;
+  const append = (content: string) => {
+    files[savedPath] +=
+      `\n${line("assistant", [{ type: "text", text: content }])}`;
+    writeFileSync(join(home, ".claude/projects", savedPath), files[savedPath]);
+  };
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(1_000_000);
+  const latest = (working = true) =>
+    readLatestTurns(spawn, "~/.buzz", conversation, working, signal);
+  try {
+    expect((await latest())?.[0]?.turnId).toBe("u1");
+    append("x".repeat(3 << 20));
+    await expect(latest()).resolves.toBeUndefined();
+    vi.setSystemTime(1_000_000 + OVERSIZED_READ_MS - 1);
+    await expect(latest()).resolves.toEqual([]);
+    vi.setSystemTime(1_000_000 + OVERSIZED_READ_MS);
+    await expect(latest()).resolves.toBeUndefined();
+    await expect(latest()).resolves.toEqual([]);
+    append("final reply");
+    await expect(latest(false)).resolves.toBeUndefined();
+    const stopped = await readTranscript(
+      spawn,
+      "~/.buzz",
+      conversation,
+      false,
+      signal,
+    );
+    expect(stopped?.turns).toHaveLength(1);
+    expect(stopped?.turns[0]?.endedAt).toBe(3000);
+    expect(stopped?.turns[0]?.items.at(-1)).toMatchObject({
+      text: "final reply",
+    });
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it("shows a session's prompt once over the latest turns it swaps in", async () => {
@@ -1075,7 +1630,7 @@ it("shows a session's prompt once over the latest turns it swaps in", async () =
     ClaudeRuntime.prototype.latestTurns.call(
       {
         spawn,
-        reads: () => undefined,
+        reads: () => ({ ownerReadable: () => true, name: () => undefined }),
         prompts: () => prompts,
         notices: new Map(),
         place: (_agent: string, _key: string, workspace: string) => workspace,

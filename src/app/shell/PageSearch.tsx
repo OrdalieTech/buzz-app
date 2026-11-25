@@ -64,6 +64,7 @@ export type SearchServices = Pick<
       | "plugins"
       | "adminAccess"
       | "settingsCards"
+      | "decisions"
     >
   >;
 const SEARCH_ID = "global-search";
@@ -621,6 +622,8 @@ function CommunitySearch({
         onScopeChange={onScopeChange}
         usageScope={usageScope(scope)}
         sidebarScope={connection.scope}
+        decisions={services.decisions}
+        community={scope.communityOrigin}
         views={views}
         offline={saved ? offline : undefined}
         openConversation={openConversation}

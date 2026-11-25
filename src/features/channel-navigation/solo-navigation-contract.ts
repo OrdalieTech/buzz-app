@@ -90,6 +90,8 @@ export type SoloRegionHandle = Readonly<{
   label: string;
   /** Keyed draft context is retained in navigation and the saved start record. */
   draftContext: true;
+  /** `ui.ChannelGroup` accepts `placement: "team-row"`. */
+  teamRowChannelGroups: true;
   /** The same device state as component props, available before mount. */
   state(binding: SoloRegionBinding): SoloRegionProps["state"];
   /** Open New chat for this region. Its first send creates the chat with this
@@ -124,11 +126,26 @@ export type SoloRegionProps = Readonly<{
     Workspace?: ComponentType<SoloWorkspaceProps>;
     /** A joined channel's native heading and actions around source-owned content. */
     ChannelGroup?: ComponentType<SoloChannelGroupProps>;
+    /** Workspace and ChannelGroup accept entries for their Solo overflow menus. */
+    headerMenuActions?: true;
     Chats?: ComponentType<Readonly<{ all?: boolean }>>;
     /** All ordinary chats without workspace chrome; keeps host rows and filing. */
     ChatList?: ComponentType;
   }>;
 }>;
+/** A leading action whose artwork shares the native disclosure slot. */
+export type SoloHeaderLeading = Readonly<{
+  /** Non-interactive artwork for the action button. */
+  icon: ReactNode;
+  label: string;
+  onActivate(): void;
+  /** Render the intact controls in a non-interactive anchor, for example for a hover card. */
+  wrapControls?(controls: ReactNode): ReactNode;
+}>;
+export type SoloHeaderMenuAction = Pick<
+  SoloRegionAction,
+  "id" | "label" | "onSelect"
+>;
 export type SoloChannelGroupProps = Readonly<{
   channelId: string;
   selected?: boolean;
@@ -139,6 +156,20 @@ export type SoloChannelGroupProps = Readonly<{
   onToggle(): void;
   /** Offered only while the host permits starting a chat from this channel. */
   onNewTask?(): void;
+  headerLeading?: SoloHeaderLeading | undefined;
+  /** Entries in the Solo channel overflow, after View channel details.
+   * The host ignores these in Team-row placement. */
+  headerMenuActions?:
+    | readonly (SoloHeaderMenuAction &
+        Readonly<{ icon?: ReactNode; hint?: string }>)[]
+    | undefined;
+  /** Independent header content that stays visible when collapsed. */
+  headerAccessory?: ReactNode;
+  /** Compact, non-interactive content shown in place of quiet header actions. */
+  headerMetadata?: ReactNode;
+  /** Shows the disclosure, task action and content with the channel's Team
+   * sidebar row, which stays the heading, instead of in the region. */
+  placement?: "team-row";
   children?: ReactNode;
 }>;
 export type SoloWorkspaceProps = Readonly<{
@@ -146,6 +177,12 @@ export type SoloWorkspaceProps = Readonly<{
   selected?: boolean;
   onSelect?(): void;
   onNewTask?(): void;
+  headerLeading?: SoloHeaderLeading | undefined;
+  headerMenuActions?: readonly SoloHeaderMenuAction[] | undefined;
+  /** Independent header content that stays visible when collapsed. */
+  headerAccessory?: ReactNode;
+  /** Compact, non-interactive content shown in place of quiet header actions. */
+  headerMetadata?: ReactNode;
   /** @deprecated Legacy no-op. Use the workspace disclosure to open it. */
   reveal?: string;
   dropTarget?: boolean;

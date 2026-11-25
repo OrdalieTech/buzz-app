@@ -31,7 +31,8 @@ import type { ChannelMessage } from "../relay/contracts";
 import { TypingIndicator } from "../messages/TypingIndicator";
 
 const a = "a".repeat(64),
-  b = "b".repeat(64);
+  b = "b".repeat(64),
+  person = "c".repeat(64);
 const noInbox = { status: "ready", items: [], freshness: "observed" };
 const stops: (() => void)[] = [];
 // jsdom lacks scrollIntoView; mention and search highlights reveal their rows.
@@ -52,6 +53,7 @@ function fixture() {
   const profiles = new Map([
     [a, { name: "Larry", isAgent: true as const }],
     [b, { name: "Larry", isAgent: true as const }],
+    [person, { name: "Pat" }],
   ]);
   let channel = {
     id: "c",
@@ -179,8 +181,8 @@ function fixture() {
       presenceStatus = status;
       for (const listener of listeners) listener();
     },
-    join() {
-      channel = { ...channel, members: [a, b], participants: [a, b] };
+    join(members = [a, b]) {
+      channel = { ...channel, members, participants: members };
       list = { ...list, channels: [channel] };
       for (const listener of listeners) listener();
     },
@@ -471,4 +473,40 @@ it("scopes search DM labels and message authors to their own conversation", asyn
       name: /hello.*Larry · 04hu, Larry · rcaj · Larry · rcaj/,
     }),
   ).toBeVisible();
+});
+it("names a DM by its people, not its agents, in each consumer", async () => {
+  const f = fixture();
+  f.join([a, person]);
+  function Sidebar() {
+    const list = useSyncExternalStore(
+      f.session.channels.subscribeList,
+      f.session.channels.list,
+    );
+    const labels = useChannelLabels(
+      list.channels,
+      f.session.profiles,
+      f.session.names,
+    );
+    return <output aria-label="DM label">{labels.channels[0]?.name}</output>;
+  }
+  render(
+    <>
+      <Sidebar />
+      <BuzzLinkPreview session={f.session} channelId="c" messageId="m" />
+      <SearchResults
+        session={f.session}
+        query="hello"
+        onQueryChange={() => {}}
+        input={createRef()}
+        pages={[]}
+        openNewMessage={() => {}}
+        openConversation={() => {}}
+      />
+    </>,
+  );
+  expect(screen.getByLabelText("DM label")).toHaveTextContent(/^Pat$/);
+  const result = await screen.findByRole("option", { name: /hello/ });
+  expect(result).toHaveAccessibleName(/Pat · Larry/);
+  expect(result).not.toHaveAccessibleName(/Larry, Pat/);
+  expect(await screen.findByText(/^Pat$/, { selector: "span" })).toBeVisible();
 });

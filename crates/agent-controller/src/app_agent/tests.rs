@@ -406,8 +406,8 @@ fn signs_only_bounded_kinds_with_the_saved_attestation() {
     let key = agent.read_key(&credentials).unwrap();
     let saved: Vec<String> = serde_json::from_str(&agent.auth).unwrap();
     for kind in [
-        5, 7, 9, 9000, 9001, 9002, 9007, 9008, 9021, 9022, 20002, 30023, 30617, 40003, 40100,
-        41010, 45010,
+        5, 7, 9, 9000, 9001, 9002, 9007, 9008, 9021, 9022, 20002, 30023, 30617, 40003, 40010,
+        40011, 40100, 41010, 45010,
     ] {
         let tags = vec![
             vec!["auth".to_owned(), "forged".to_owned()],
@@ -1875,4 +1875,31 @@ fn a_forced_profile_republishes_a_current_one_with_its_saved_owner_proof() {
     let saved: Vec<String> = serde_json::from_str(&current.auth).unwrap();
     assert_eq!(event["tags"], serde_json::json!([saved]));
     assert!(event["created_at"].as_u64() > first["created_at"].as_u64());
+}
+
+#[test]
+fn the_last_membership_ignores_unfinished_joins_and_counts_live_ones() {
+    const OTHER: &str = "wss://other.example";
+    let dir = tempfile::tempdir().unwrap();
+    let credentials = Memory::default();
+    let (agents, agent) = created(dir.path(), &credentials);
+    assert!(agents.is_last_membership(&agent.pubkey, RELAY).unwrap());
+    agents
+        .update(|rows| {
+            rows.push(AppAgent {
+                relay: OTHER.into(),
+                home: Some(RELAY.into()),
+                joining: true,
+                ..agent.clone()
+            });
+            Ok(())
+        })
+        .unwrap();
+    // As `remove` decides: an unfinished join is no community it stays in.
+    assert!(agents.is_last_membership(&agent.pubkey, RELAY).unwrap());
+    agents
+        .join(&agent.pubkey, RELAY, OTHER, None, &credentials)
+        .unwrap();
+    assert!(!agents.is_last_membership(&agent.pubkey, RELAY).unwrap());
+    assert!(!agents.is_last_membership(&agent.pubkey, OTHER).unwrap());
 }

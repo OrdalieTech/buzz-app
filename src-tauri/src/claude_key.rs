@@ -176,7 +176,7 @@ impl KeyStore for OsKeyStore {
     any(target_os = "macos", target_os = "windows", target_os = "linux"),
     not(test)
 ))]
-fn stored(error: buzz_credential_store::Error) -> String {
+pub(crate) fn stored(error: buzz_credential_store::Error) -> String {
     use buzz_credential_store::Error;
     match error {
         Error::Denied if cfg!(target_os = "macos") => {

@@ -15,6 +15,7 @@ import {
   type SavedConversation,
   ServerPool,
   AgentProcess,
+  type SessionStore,
   type SessionsOptions,
 } from "./sessions";
 
@@ -46,7 +47,7 @@ const setup = (
     started?: SessionsOptions["started"];
     tags?: SessionsOptions["tags"];
     onChange?: () => void;
-    store?: Map<string, SavedConversation>;
+    store?: SessionStore;
     /** Wraps the fake's `serve`. */
     serve?: (serve: ServeMcp) => ServeMcp;
     silent?: readonly string[];
@@ -355,27 +356,28 @@ describe("AgentSessions", () => {
     },
   );
 
-  it("keeps the session when a prompt update fails, and updates it at the next turn", async () => {
+  it("fails a turn whose prompt update fails, keeps the session, and updates it at the next turn", async () => {
     const { fake, sessions, change } = setup({}, false, {
       fingerprint: (settings) => settings.workspace,
     });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await sessions.deliver("a", "one", 1);
     const [goose] = fake.geese;
     if (goose) goose.promptError = "database is locked";
     change({ systemPrompt: "newer" });
-    await sessions.deliver("a", "two", 2);
-    expect(warn).toHaveBeenCalled();
+    // It is not run on the rules it had before.
+    await expect(sessions.deliver("a", "two", 2)).resolves.toEqual({
+      ok: false,
+      error: expect.stringContaining(
+        "could not update its instructions: database is locked",
+      ),
+      undelivered: true,
+    });
     expect(goose?.prompts.get("session-1")).toBe("prompt");
     await sessions.deliver("a", "three", 3);
     expect(goose?.opened).toHaveLength(1);
     expect(goose?.closed).toEqual([]);
     expect(goose?.prompts.get("session-1")).toBe("newer");
-    expect(goose?.turns.map((turn) => turn.text)).toEqual([
-      "one",
-      "two",
-      "three",
-    ]);
+    expect(goose?.turns.map((turn) => turn.text)).toEqual(["one", "three"]);
   });
 
   it("shows a reopened conversation everything again", async () => {
@@ -865,6 +867,18 @@ describe("AgentSessions", () => {
     expect(started.mock.calls.map((call) => call[3])).toEqual([
       "chan/root",
       undefined,
+    ]);
+  });
+
+  it("says which turn a one-off session was started for, and none for a conversation", async () => {
+    vi.useFakeTimers();
+    const started = vi.fn();
+    const { sessions } = setup({}, false, { started });
+    await sessions.deliver("chan/root", "one", 1);
+    await sessions.runOnce("watch/x", () => "look");
+    expect(started.mock.calls.map((call) => call[4])).toEqual([
+      undefined,
+      "watch/x",
     ]);
   });
 
@@ -1481,6 +1495,87 @@ it("repeats a failed kill on the next retirement", async () => {
   await shutdown.work;
 });
 
+it("keeps what held work saved, and New session, as stored across every write", () => {
+  const data = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => data.get(key) ?? null,
+    setItem: (key: string, value: string) => void data.set(key, value),
+  } as Storage;
+  const damaged = { session: 7, junk: [1] };
+  data.set(
+    "buzz.goose.sessions.v1",
+    JSON.stringify({
+      one: {
+        broken: { at: 1, sessions: ["s1"], binding: damaged, next: "new" },
+      },
+    }),
+  );
+  const one = localSessions(storage, "one");
+  // Another conversation's write rewrites every record, leaving this raw.
+  one.set("other", {
+    at: 2,
+    sessions: ["g1"],
+    binding: { session: "g1", value: { v: 1 } },
+  });
+  const reloaded = localSessions(storage, "one");
+  expect(reloaded.get("broken")).toEqual({
+    at: 1,
+    sessions: ["s1"],
+    binding: damaged,
+    next: "new",
+  });
+  expect(reloaded.get("other")).toEqual({
+    at: 2,
+    sessions: ["g1"],
+    binding: { session: "g1", value: { v: 1 } },
+  });
+});
+
+it("refuses New session, keeping what was saved, when storage cannot save it", async () => {
+  const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const data = new Map<string, string>();
+  let full = false;
+  const storage = {
+    getItem: (key: string) => data.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      if (full) throw new DOMException("quota", "QuotaExceededError");
+      data.set(key, value);
+    },
+  } as Storage;
+  const prior = {
+    at: 1,
+    sessions: ["g1", "g0"],
+    binding: { session: "g1", value: { v: 1 } },
+  };
+  localSessions(storage, "one").set("a", prior);
+  full = true;
+  const { sessions } = setup({}, false, {
+    store: localSessions(storage, "one"),
+  });
+  await expect(sessions.reset("a", "new")).resolves.toEqual({
+    ok: false,
+    error: "goose could not save New session",
+  });
+  expect(warned).toHaveBeenCalledWith(
+    "goose sessions were not saved",
+    expect.any(DOMException),
+  );
+  full = false;
+  expect(localSessions(storage, "one").get("a")).toEqual(prior);
+  // The next held work resumes what was left, with its value.
+  await expect(
+    sessions.exclusive("a", async ({ saved, reset, binding }) => ({
+      saved,
+      reset,
+      binding,
+    })),
+  ).resolves.toEqual({
+    saved: "g1",
+    reset: false,
+    binding: { value: { v: 1 } },
+  });
+});
+
 it("keeps saved conversations per agent in storage, most recent first", () => {
   const data = new Map<string, string>();
   const storage = {
@@ -1733,4 +1828,92 @@ it("stops a goose replaced by a compaction change when retired", async () => {
   await flush(30);
   expect(fake.geese.map((goose) => goose.killed)).toEqual([true, true]);
   await shutdown.work;
+});
+
+describe("AgentSessions held work", () => {
+  it("stops waiting its turn at its deadline, but never ends work it started", async () => {
+    const { sessions } = setup();
+    let release!: () => void;
+    const holding = sessions.exclusive(
+      "a",
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+    await flush(10);
+    const deadline = new AbortController();
+    const ran = vi.fn(async () => undefined);
+    const waiting = sessions.exclusive("a", ran, undefined, deadline.signal);
+    await flush(10);
+    deadline.abort();
+    await expect(waiting).rejects.toThrow("goose did not start in time");
+    expect(ran).not.toHaveBeenCalled();
+    release();
+    await holding;
+    // Past its deadline once it holds the conversation: it runs on.
+    const late = new AbortController();
+    let finish!: () => void;
+    const running = sessions.exclusive(
+      "a",
+      async ({ signal }) => {
+        late.abort();
+        await new Promise<void>((resolve) => (finish = resolve));
+        return signal.aborted;
+      },
+      undefined,
+      late.signal,
+    );
+    await flush(10);
+    finish();
+    await expect(running).resolves.toBe(false);
+  });
+
+  it("notes what held work's session was shown only while it holds the conversation", async () => {
+    const { sessions } = setup();
+    let note!: (seen: number) => void;
+    await sessions.exclusive("a", async ({ shown }) => {
+      note = shown;
+      shown(5);
+      shown(3);
+    });
+    expect(sessions.seen("a")).toBe(5);
+    note(9);
+    expect(sessions.seen("a")).toBe(5);
+  });
+
+  it("holds a busy pooled server for a session outside its own, closing an idle one to make room", async () => {
+    const pool = new ServerPool(1);
+    const { fake, sessions } = setup({}, false, { pool });
+    await sessions.deliver("a", "one", 1);
+    const handler = async () => undefined;
+    const server = await sessions.pooled(fake.serve)(handler as never);
+    expect(fake.geese[0]?.closed).toEqual(["session-1"]);
+    expect(pool.size).toBe(1);
+    // Busy until closed: the next session goes over rather than close it.
+    expect(pool.evict()).toBeUndefined();
+    await server.close();
+    await flush(10);
+    expect(pool.size).toBe(0);
+    // One that fails to start holds nothing.
+    await expect(
+      sessions.pooled(async () => {
+        throw new Error("Too many MCP servers are running");
+      })(handler as never),
+    ).rejects.toThrow("Too many");
+    expect(pool.size).toBe(0);
+  });
+});
+
+it("asks for the variables of the local agent it runs, and none for no agent", async () => {
+  const agent = { pubkey: "a".repeat(64), relay: "wss://relay.test" };
+  const fake = fakeSpawn();
+  const own = new AgentProcess(fake, fake.serve, undefined, () => agent);
+  const none = new AgentProcess(fake, fake.serve);
+  await own.get();
+  await none.get();
+  expect(fake.geese.map((goose) => goose.options.secrets)).toEqual([
+    ["agent-env"],
+    undefined,
+  ]);
+  expect(fake.geese[0]?.options.envAgent).toBe(agent.pubkey);
+  await own.shutdown();
+  await none.shutdown();
 });

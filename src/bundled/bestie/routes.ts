@@ -45,6 +45,32 @@ export function bestieBaseTarget(target: BestiePageTarget): BestiePageTarget {
   return base;
 }
 
+/** The thread with root `inline` read over the conversation's composer. */
+export type BestieInlineRoute = { channelId: string; inline: string };
+
+export function bestieInlineRoute(
+  value: JsonValue | undefined,
+): BestieInlineRoute | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const route = value as Readonly<Record<string, JsonValue>>;
+  if (
+    Object.keys(route).length !== 2 ||
+    typeof route.channelId !== "string" ||
+    !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$/.test(route.channelId) ||
+    typeof route.inline !== "string" ||
+    !hex.test(route.inline)
+  )
+    return;
+  return { channelId: route.channelId, inline: route.inline };
+}
+
+export function bestieInlineTarget(
+  target: BestiePageTarget,
+  route: BestieInlineRoute,
+): BestiePageTarget {
+  return { ...target, route: { version: 1, params: { ...route } } };
+}
+
 export type BestieDetailRoute = {
   channelId: string;
   detail: string;

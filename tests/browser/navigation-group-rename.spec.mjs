@@ -1,5 +1,5 @@
 import { test, expect } from "./fixture.mjs";
-import { openPage } from "./navigation.mjs";
+import { clickSidebarHeadingAction, openPage } from "./navigation.mjs";
 
 test.use({ productionBroker: true, savedSidebar: true, sidebarIcons: true });
 
@@ -22,7 +22,9 @@ test("editing a saved group's name persists and keeps its channels", async ({
   const work = page.locator('[data-sidebar-section="group:work"]');
   await expect(work.locator('[data-channel-id="beta"]')).toBeVisible();
 
-  await page.getByRole("button", { name: "More actions for Work" }).click();
+  await clickSidebarHeadingAction(
+    page.getByRole("button", { name: "More actions for Work" }),
+  );
   await page.getByRole("menuitem", { name: "Workspace settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Workspace settings" });
   const input = dialog.getByRole("textbox", { name: "Workspace name" });
@@ -53,7 +55,7 @@ test("section emoji edits are centered, keyboard-safe, independently removable a
   const work = page.locator('[data-sidebar-section="group:work"]');
   const more = page.getByRole("button", { name: "More actions for Work" });
   const openEditor = async () => {
-    await more.click();
+    await clickSidebarHeadingAction(more);
     await page.getByRole("menuitem", { name: "Workspace settings" }).click();
     const dialog = page.getByRole("dialog", { name: "Workspace settings" });
     await expect(dialog).toBeVisible();
@@ -229,7 +231,43 @@ test("section emoji edits are centered, keyboard-safe, independently removable a
   });
   await page.setViewportSize({ width: 1440, height: 950 });
   await expectPickerBelow(dialog, picker);
+  // Mart applies attribute changes on a timer. A theme change that lands just
+  // before closing makes that timer fire after the picker drops its custom
+  // emoji, which Frequent still lists (`:stamp:`). The keyboard-navigation mark
+  // no longer re-sets an unchanged theme, so flip the theme itself as the real
+  // click arrives: a capturing listener runs in the click's task, ahead of the
+  // handler that closes the picker.
+  await page.evaluate(() => {
+    window.teardownRace = new Promise((resolve) => {
+      const arm = () => {
+        const mart = document.querySelector("em-emoji-picker");
+        // Armed first, this 0 ms timer runs just before the one Mart arms below.
+        const beforeMart = new Promise((fired) => setTimeout(fired));
+        // Mart's private deferred-render handle; it must change, or no race is armed.
+        const timerBefore = mart?.component?.nextStateTimer;
+        mart?.setAttribute(
+          "theme",
+          mart.getAttribute("theme") === "dark" ? "light" : "dark",
+        );
+        const timerAfter = mart?.component?.nextStateTimer;
+        beforeMart.then(() =>
+          resolve({
+            martArmedRender:
+              timerAfter !== undefined && timerAfter !== timerBefore,
+            closedBeforeMartTimer: mart !== null && !mart.isConnected,
+          }),
+        );
+      };
+      window.addEventListener("click", arm, { capture: true, once: true });
+    });
+  });
   await remove.click();
+  // If teardown were deferred past Mart's timer, the timer would render while
+  // the emoji still exist, and this step would stop reproducing the race.
+  expect(await page.evaluate(() => window.teardownRace)).toEqual({
+    martArmedRender: true,
+    closedBeforeMartTimer: true,
+  });
   await expect(picker).toHaveCount(0);
   await expect(input).toHaveValue("Work");
   await expect(

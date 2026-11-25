@@ -3,7 +3,8 @@ import { workflowOwner } from "./workflow-attribution";
 import type { CustomEmoji } from "./emoji";
 import { validatedBlurhash } from "./blurhash";
 import { threadReference } from "./thread-reference";
-import { agentAudience } from "./audience";
+import { messageAudience } from "./audience";
+import { relayedFromClaim, relayNotice } from "./relayed-from";
 import { pluginRequestId } from "./plugin-request";
 import { emojiTags } from "./emoji";
 import { objectBody } from "./body";
@@ -436,6 +437,8 @@ export function foldMessages(
         : author;
     });
     const forward = readForward({ ...event, content });
+    const audience = messageAudience(event);
+    const relayed = relayedFromClaim(event);
     rows.push(
       Object.freeze({
         id: event.id,
@@ -466,7 +469,22 @@ export function foldMessages(
         ...(forward ? { forward } : {}),
         ...(projected.content !== content ? { sourceContent: content } : {}),
         ...(event.kind === 40002 ? { agentEnvelope: true as const } : {}),
-        ...(agentAudience(event) ? { audience: "agents" as const } : {}),
+        ...(audience ? { audience } : {}),
+        // Only the signer's own agent: an attributed author signed nothing here.
+        ...(relayed && relayed.agent !== event.pubkey
+          ? {
+              relayedFrom: Object.freeze({
+                ...relayed,
+                ...(() => {
+                  const notice = relayNotice(event.content);
+                  return notice ? { notice } : {};
+                })(),
+                verified:
+                  authorId === event.pubkey &&
+                  agentOwner?.(relayed.agent) === event.pubkey,
+              }),
+            }
+          : {}),
         ...(() => {
           // One exact id, or none: conflicting claims bind no request.
           const ids = new Set(

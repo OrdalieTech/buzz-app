@@ -4,6 +4,7 @@
 // into Buzz.
 import type { ModelChoice } from "../../features/agents/ModelPicker";
 import { withProviderWords } from "../../features/agents/failure-words";
+import { routeOf } from "../../features/agents/model-routes";
 import type {
   ProtectedSpawn,
   ReviewPrompt,
@@ -13,10 +14,15 @@ import type {
   Models,
 } from "../../features/agents/service";
 import {
+  type Inherited,
+  parseInherited,
+} from "../../features/agents/gateway/forwarding";
+import {
   GooseProcess,
   REQUEST_TIMEOUT_MS,
   type Choice,
   type GooseHost,
+  type Spawn,
 } from "./goose";
 import {
   type ConfigValue,
@@ -138,6 +144,7 @@ const TEST_TIMEOUT_MS = 60_000;
 
 export class GooseSetup {
   private listing: Promise<Providers> | undefined;
+  private current: Promise<string | undefined> | undefined;
   private readonly live = new Map<string, Promise<readonly ModelChoice[]>>();
   private readonly thinking = new Map<string, Promise<Efforts>>();
 
@@ -149,6 +156,10 @@ export class GooseSetup {
   constructor(
     private readonly host: GooseHost | undefined,
     private readonly defaultsChanged: () => void = () => {},
+    /** Whether its goose gets the device's environment variables; the
+     * protection picker's does not, as the review worker it offers for
+     * never gets them. */
+    private readonly deviceEnv = true,
   ) {}
 
   snapshot = () => this.state;
@@ -168,6 +179,7 @@ export class GooseSetup {
   check = (): Promise<void> => {
     if (this.checking) return this.checking;
     this.listing = undefined;
+    this.current = undefined;
     this.live.clear();
     this.thinking.clear();
     this.update({ readiness: "checking" });
@@ -245,6 +257,9 @@ export class GooseSetup {
           modelId,
         });
       });
+      // A read started before the save must not answer later turns, and the
+      // check below may join one already running that won't clear it.
+      this.current = undefined;
       this.defaultsChanged();
       this.checkedDefaults = undefined;
       await this.check();
@@ -269,9 +284,12 @@ export class GooseSetup {
     // A provider not set up offers only the model the agent names.
     const ready = Boolean(id && !listed?.needs);
     const offered = ready ? await this.models(id ?? "") : [];
-    // A model its provider does not list is still the one it runs on.
+    // A model its provider does not list is still the one it runs on; a
+    // saved route is the current choice, and the agents service lists it.
     const named =
-      !current || offered.some((model) => model.id === current)
+      !current ||
+      routeOf(current) ||
+      offered.some((model) => model.id === current)
         ? offered
         : [{ id: current, label: current }, ...offered];
     // Without levels a model offers no slider, so a failed read costs only it.
@@ -301,20 +319,33 @@ export class GooseSetup {
     return { current, models };
   }
 
+  /** A forwarded turn needs the current default, including external edits:
+   * turns share only a read still running, never a finished one, which could
+   * pin goose to a provider its owner has since changed. */
+  defaultProvider(): Promise<string | undefined> {
+    if (this.current) return this.current;
+    const current = this.with(
+      async (goose) => (await readDefaults(goose)).providerId ?? undefined,
+    );
+    this.current = current;
+    const settle = () => {
+      if (this.current === current) this.current = undefined;
+    };
+    current.then(settle, settle);
+    return current;
+  }
+
   /** goose's providers, read once until something is saved. */
   providers(): Promise<Providers> {
     this.listing ??= this.with(async (goose) => {
-      const [{ entries }, defaults] = (await Promise.all([
+      const [{ entries }, defaults] = await Promise.all([
         goose.request(
           "_goose/unstable/providers/list",
           { providerIds: [] },
           REQUEST_TIMEOUT_MS,
-        ),
-        goose.request("_goose/unstable/defaults/read", {}, REQUEST_TIMEOUT_MS),
-      ])) as [
-        { entries: Entry[] },
-        { providerId?: string | null; modelId?: string | null },
-      ];
+        ) as Promise<{ entries: Entry[] }>,
+        readDefaults(goose),
+      ]);
       return {
         // Providers that are other agents (`claude-acp`, …) are not offered.
         providers: entries
@@ -494,12 +525,28 @@ export class GooseSetup {
       .sort((a, b) => Number(Boolean(a)) - Number(Boolean(b)));
     if (wanted.length) {
       const read = this.with(async (goose, cwd) => {
+        // goose opens a session naming no provider only on its config's
+        // default provider and model. Without that model, the session names
+        // the default provider and opens on the provider's own default
+        // model, which is not the one goose would run "" on.
+        const defaults = provider
+          ? {}
+          : ((await goose.request(
+              "_goose/unstable/defaults/read",
+              {},
+              REQUEST_TIMEOUT_MS,
+            )) as { providerId?: string | null; modelId?: string | null });
+        const fallback = !provider && !defaults.modelId && defaults.providerId;
+        const named = fallback || provider;
         const opened = (await goose.request(
           "session/new",
           {
             cwd,
             mcpServers: [],
-            _meta: { enabledExtensions: [], ...(provider ? { provider } : {}) },
+            _meta: {
+              enabledExtensions: [],
+              ...(named ? { provider: named } : {}),
+            },
           },
           REQUEST_TIMEOUT_MS,
         )) as ConfigOptions & { sessionId: string };
@@ -507,6 +554,8 @@ export class GooseSetup {
           const found = new Map<string, Efforts | Error>();
           for (const model of wanted) {
             try {
+              if (!model && fallback)
+                throw new Error("goose's config names no default model");
               const { configOptions = [] } = model
                 ? ((await goose.request(
                     "session/set_config_option",
@@ -587,6 +636,7 @@ export class GooseSetup {
       }),
     );
     this.listing = undefined;
+    this.current = undefined;
     this.live.delete(id);
     this.thinking.clear();
   }
@@ -637,17 +687,41 @@ export class GooseSetup {
     run: (goose: GooseProcess, cwd: string) => Promise<T>,
     env: Readonly<Record<string, string>> = {},
   ): Promise<T> {
-    return briefly(this.host, run, env);
+    return briefly(this.host, run, env, undefined, this.deviceEnv);
   }
 }
 
+/** NO_PROXY and no_proxy as goose's processes inherit them from the app,
+ * empty where unset, and whether they inherit a proxy, from the manifest's
+ * `no-proxy` step. One that can't be read fails rather than passing. */
+export async function readNoProxy(spawn: Spawn): Promise<Inherited> {
+  let stdout = "";
+  let stderr = "";
+  const process = await spawn("no-proxy", {
+    onStdout: (data) => {
+      stdout += data;
+    },
+    onStderr: (data) => {
+      stderr += data;
+    },
+  });
+  const timer = setTimeout(() => void process.kill(), REQUEST_TIMEOUT_MS);
+  const code = await process.exited.finally(() => clearTimeout(timer));
+  if (code !== 0)
+    throw new Error(stderr.trim() || "The proxy exceptions are unreadable");
+  return parseInherited(stdout);
+}
+
 /** Runs `run` against a `goose-acp` started for it in the home folder, and
- * stops it after. It serves no Buzz tools; `signal` stops its startup. */
+ * stops it after. It serves no Buzz tools; `signal` stops its startup. Unless
+ * `deviceEnv` is false it gets the device's environment variables, naming no
+ * agent, so a provider key kept only there counts as set up. */
 export async function briefly<T>(
   host: GooseHost | undefined,
   run: (goose: GooseProcess, cwd: string) => Promise<T>,
   env: Readonly<Record<string, string>> = {},
   signal?: AbortSignal,
+  deviceEnv = true,
 ): Promise<T> {
   if (!host) throw new Error("goose runs only in the desktop app");
   const cwd = await host.resolveDirectory("~");
@@ -655,6 +729,7 @@ export async function briefly<T>(
   const goose = await GooseProcess.start(host.spawn, {
     cwd,
     env,
+    ...(deviceEnv && { secrets: ["agent-env" as const] }),
     ...(signal && { signal }),
   });
   try {
@@ -662,6 +737,17 @@ export async function briefly<T>(
   } finally {
     await goose.kill();
   }
+}
+
+function readDefaults(goose: GooseProcess) {
+  return goose.request(
+    "_goose/unstable/defaults/read",
+    {},
+    REQUEST_TIMEOUT_MS,
+  ) as Promise<{
+    providerId?: string | null;
+    modelId?: string | null;
+  }>;
 }
 
 function provider(entry: Entry): Provider {

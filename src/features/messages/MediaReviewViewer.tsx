@@ -1,3 +1,5 @@
+import { hostComposerProvenance } from "./mention-draft";
+import { MessageLoading } from "./MessageLoading";
 import { TypingIndicator } from "./TypingIndicator";
 import { workflowLabel } from "../relay/workflow-attribution";
 import { MessageEditScope } from "./MessageEditScope";
@@ -47,6 +49,7 @@ import { parseMediaTimeReply } from "./media-timecode";
 import { VideoReviewReactions } from "./VideoReviewReactions";
 import styles from "./Messages.module.css";
 import { MediaReviewFrame } from "./MediaReviewFrame";
+import { ComposerScopeProvider } from "./composer-overlay";
 import { avatarMedia } from "../../shared/avatar-source";
 import { LinkThreadTabContext } from "../conversation/LinkLabelContext";
 
@@ -111,8 +114,11 @@ export function MediaReviewViewer(props: MediaReviewViewerProps) {
         request: current.request + 1,
       })),
   };
+  // The review's comment box is its own view's composer, not the page's.
   return (
-    <ResolvedReview {...activeProps} view={view} threadError={threadError} />
+    <ComposerScopeProvider local>
+      <ResolvedReview {...activeProps} view={view} threadError={threadError} />
+    </ComposerScopeProvider>
   );
 }
 
@@ -277,7 +283,7 @@ function ReviewShell({
   error?: string;
   retry?: () => void | Promise<void>;
 }) {
-  const source = session.media(attachment.url);
+  const source = session.media(attachment.url, undefined, channelId);
   // Listener unavailability is not a playback error the selection resets.
   const sourceUnavailable = useMediaElementSource(
     attachment.kind === "video" ? source : undefined,
@@ -529,6 +535,7 @@ function ReviewShell({
                   }}
                 >
                   <MessageComposer
+                    evidenceOwner={hostComposerProvenance}
                     shown={commentsOpen}
                     extensions={extensions}
                     session={session}
@@ -548,9 +555,11 @@ function ReviewShell({
                   />
                 </div>
               </MessageEditScope>
+            ) : !error ? (
+              <MessageLoading label="Loading comments…" />
             ) : (
-              <p className={styles.empty} role={error ? "alert" : "status"}>
-                {error ?? "Loading comments…"}
+              <p className={styles.empty} role="alert">
+                {error}
                 {retry && !unavailable && (
                   <Button size="sm" type="button" onClick={retryThread}>
                     Retry
@@ -588,7 +597,7 @@ function ReviewShell({
           poster={
             (selectionRequest === 0 ? origin?.poster : undefined) ??
             (attachment.previewUrl
-              ? session.media(attachment.previewUrl)
+              ? session.media(attachment.previewUrl, undefined, channelId)
               : undefined)
           }
           initialTime={initialTime}
@@ -698,6 +707,17 @@ function ReviewComments({
         .ensure(authors.split(":"), "background")
         .catch(() => {});
   }, [session.profiles, authors, profileGeneration]);
+  // A working step joins the group above only when that row is its agent's own
+  // comment. Earlier steps are history lines here, not part of one group, so a
+  // step under one is named and shown on its own.
+  const stacks = (at: number) => {
+    const step = activity.byRow.get(replies[at]?.id ?? "");
+    return (
+      !!step?.active &&
+      step.container === "bubble" &&
+      !activity.byRow.has(replies[at - 1]?.id ?? "")
+    );
+  };
   // Comment links stay inert: no host tab opener reaches them behind the review,
   // so mentions render as static names.
   return (
@@ -709,20 +729,31 @@ function ReviewComments({
         aria-label="Media comments"
       >
         {replies.map((row, index) => {
+          const recorded = activity.byRow.get(row.id);
           return (
             <div
               key={row.id}
               data-review-comment={row.id}
               data-selected={selectedComment === row.id || undefined}
+              // Row spacing follows this grouping, not the rows drawn inside.
+              data-stack-previous={stacks(index) || undefined}
+              data-stack-next={stacks(index + 1) || undefined}
               className={styles.mediaReviewComment}
             >
               <MessageRow
                 row={row}
                 recordedActivity={stableActivity.activity(
                   row.id,
-                  activity.byRow.get(row.id),
-                  "history",
+                  recorded,
+                  // A working step is this thread's indicator, laid out like
+                  // one. Finished steps stay quiet history lines.
+                  !recorded?.active
+                    ? "history"
+                    : stacks(index)
+                      ? "bubble"
+                      : "standalone",
                 )}
+                stackNext={stacks(index + 1)}
                 extensions={extensions}
                 session={session}
                 scope={scope}

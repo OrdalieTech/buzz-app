@@ -1354,6 +1354,10 @@ test("the first toned pick asks for a default skin tone", async ({ page }) => {
     };
     const savedTone = () =>
       page.evaluate(() => localStorage.getItem("emoji-mart.skin"));
+    const usage = () =>
+      page.evaluate(() =>
+        JSON.parse(localStorage.getItem("buzz.emoji-usage.v1") ?? "{}"),
+      );
     const grid = (label) =>
       page
         .locator(`em-emoji-picker .category button[aria-label="${label}"]`)
@@ -1381,6 +1385,8 @@ test("the first toned pick asks for a default skin tone", async ({ page }) => {
     await expect(toneMenu).toHaveCount(0);
     await expect(draft).not.toContainText("👍");
     expect(await savedTone()).toBeNull();
+    // Nor does it count as a use.
+    expect(await usage()).toEqual({ grinning: 1 });
     await page
       .getByRole("button", { name: "Choose default skin tone" })
       .click();
@@ -1396,6 +1402,7 @@ test("the first toned pick asks for a default skin tone", async ({ page }) => {
     await toneMenu.locator(".option").nth(3).click();
     await expect(draft).toContainText("👍🏽");
     expect(await savedTone()).toBe("4");
+    expect(await usage()).toEqual({ grinning: 1, "+1": 1 });
     await draft.fill("");
     await openPicker();
     await grid("👍🏽").click();

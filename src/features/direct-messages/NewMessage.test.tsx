@@ -11,6 +11,7 @@ import {
   describe,
   expect,
   it,
+  onTestFinished,
   vi,
 } from "vitest";
 import { npubEncode } from "nostr-tools/nip19";
@@ -1036,6 +1037,7 @@ it("addresses the draft to the person it was opened from, creating the DM only o
   expect(
     await screen.findByRole("button", { name: "Remove Person 1" }),
   ).toBeVisible();
+  await waitFor(() => expect(screen.getByRole("textbox")).toHaveFocus());
   expect(t.directMessages.open).not.toHaveBeenCalled();
   await t.user.type(screen.getByRole("textbox"), "Hello");
   await t.user.click(send());
@@ -1312,8 +1314,6 @@ it("removes once for pointerdown plus click, then Backspace; effects outlive chi
     screen.queryByRole("button", { name: "Remove Person 1" }),
   ).not.toBeInTheDocument();
   expect(play).toHaveBeenCalledOnce();
-  const frame = document.querySelector('img[src$="poof1@3x.png"]');
-  expect(frame?.parentElement).toHaveStyle({ left: "123px", top: "234px" });
   await t.user.keyboard("{Backspace}");
   expect(
     screen.queryAllByRole("button", { name: /^Remove Person/ }),
@@ -1372,7 +1372,6 @@ it("holds Send while the To field has text that is not a recipient", async () =>
     screen.getByRole("group", { name: "Recipients" }),
   ).getByRole("status");
   expect(hint).toHaveTextContent(error);
-  expect(hint).toHaveClass("text-body-sm", "text-danger");
   // Back in To it hides with the list open, and shows when Escape closes it.
   await t.user.click(recipient());
   expect(screen.queryByText(error)).not.toBeInTheDocument();
@@ -1715,15 +1714,33 @@ it("loads directory pages on scroll and ignores a late previous search", async (
 
 it("keeps loaded pages when clearing search or returning to New message, scoped to the session", async () => {
   const t = setup();
-  t.directMessages.people.mockImplementation(async (query, page) => ({
-    people: query ? people.slice(2, 3) : people.slice(page - 1, page),
-    hasMore: !query && page < 3,
-  }));
+  const thirdPages: (() => void)[] = [];
+  const releaseThirdPages = () => {
+    for (const release of thirdPages.splice(0)) release();
+  };
+  onTestFinished(releaseThirdPages);
+  t.directMessages.people.mockImplementation(async (query, page) => {
+    // Automatic paging may start before typing. Keep its result pending until
+    // the restored two-page cache is asserted, including after remount.
+    if (!query && page === 3)
+      await new Promise<void>((resolve) => thirdPages.push(resolve));
+    return {
+      people: query ? people.slice(2, 3) : people.slice(page - 1, page),
+      hasMore: !query && page < 3,
+    };
+  });
   const view = t.mount();
   await screen.findByRole("option", { name: "Person 1" });
   fireEvent.scroll(screen.getByRole("listbox"));
   await screen.findByRole("option", { name: "Person 2, Agent" });
   const loaded = screen.getAllByRole("option").map((row) => row.textContent);
+  await waitFor(() =>
+    expect(t.directMessages.people).toHaveBeenLastCalledWith(
+      "",
+      3,
+      expect.any(AbortSignal),
+    ),
+  );
   await t.user.type(recipient(), "Person 3");
   await screen.findByRole("option", { name: "Person 3" });
   await t.user.clear(recipient());
@@ -1741,6 +1758,10 @@ it("keeps loaded pages when clearing search or returning to New message, scoped 
       loaded,
     ),
   );
+  await waitFor(() =>
+    expect(t.directMessages.people).toHaveBeenCalledTimes(requests + 1),
+  );
+  await act(async () => releaseThirdPages());
   await screen.findByRole("option", { name: "Person 3" });
   expect(t.directMessages.people).toHaveBeenCalledTimes(requests + 1);
   expect(t.directMessages.people).toHaveBeenLastCalledWith(

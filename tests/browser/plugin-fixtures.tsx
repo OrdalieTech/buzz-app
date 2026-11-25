@@ -1,9 +1,11 @@
 // Installed fixture code only; app composition, manager, contributions and UI remain production.
 import { soloRegionFixture } from "./solo-region-fixture";
 import { companionPlugins } from "./companion-fixture";
+import { trailingBrief, trailingCard } from "./trailing-fixture";
+import { AsideWidget, type AsideSize } from "./aside-fixture";
 import * as shortcutCounter from "../../examples/plugins/shortcut-counter/plugin.js";
 import shortcutManifest from "../../examples/plugins/shortcut-counter/manifest.json";
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { flushSync } from "react-dom";
 import type { BundledPlugin } from "../../src/plugins/manager";
 import type { Navigation } from "../../src/features/navigation/controller";
@@ -55,9 +57,12 @@ function DrillInFixture({ target, context }: PanelProps) {
 
 declare global {
   interface Window {
+    fixtureLinkSetup?: (status: "checking" | "ready" | "needs-setup") => void;
     stalePanelClose?: () => void;
     fixtureNavigation?: Navigation;
     fixtureNotify?: (input: NotificationInput) => Promise<boolean>;
+    /** Adds or removes the reader's aside in place; undefined follows the route. */
+    fixtureAside?: (size: AsideSize | null | undefined) => void;
     fixturePageBroken?: boolean;
     fixtureSidebarWorkIconThrows?: boolean;
     fixtureSidebarRecovery?: boolean;
@@ -140,6 +145,31 @@ const fill = (background: string, zIndex?: number) => () => (
 
 export const fixturePlugins: readonly BundledPlugin[] = [
   soloRegionFixture,
+  {
+    manifest: {
+      id: "fixture.notices",
+      name: "Notice fixture",
+      apiVersion: 1,
+    },
+    enabledByDefault: false,
+    module: {
+      apply(ctx) {
+        const notices = ctx.reflect.get("notices");
+        void notices
+          ?.show({
+            title: "Let Fixture delete a.txt?",
+            actions: [
+              { id: "once", label: "Allow once", prominent: true },
+              { id: "deny", label: "Deny" },
+            ],
+          })
+          .then((answer) =>
+            notices.show({ title: `Answered ${answer ?? "nothing"}` }),
+          );
+        void notices?.show({ title: "Fixture is waiting" });
+      },
+    },
+  },
   {
     manifest: {
       id: "fixture.backdrops",
@@ -470,15 +500,51 @@ export const fixturePlugins: readonly BundledPlugin[] = [
           const Workspace = ctx.conversation.ui.Workspace;
           const route = navigation?.target;
           const opening = navigation?.signal;
-          const target =
+          const params =
             route?.kind === "page"
-              ? (route.route?.params as PageTabTarget)
+              ? (route.route?.params as PageTabTarget & {
+                  trailing?: "none" | "short" | "long";
+                  aside?: AsideSize;
+                })
               : undefined;
+          const trailing = params?.trailing;
+          // A plugin adds or removes its aside in place, as its content arrives.
+          const [shownAside, setShownAside] = useState<AsideSize | null>();
+          // The page's own control drives the aside, as the contract asks.
+          const [asideOpen, setAsideOpen] = useState(true);
+          const [asideFloating, setAsideFloating] = useState<boolean>();
           useEffect(() => {
-            if (connection.status === "ready" && Workspace && target)
+            window.fixtureAside = setShownAside;
+            return () => {
+              delete window.fixtureAside;
+            };
+          }, []);
+          const asideSize =
+            shownAside === undefined
+              ? params?.aside
+              : (shownAside ?? undefined);
+          // The route's own target, kept stable across renders.
+          const target = useMemo(() => {
+            if (!params) return undefined;
+            const { trailing: _, aside: __, ...target } = params;
+            return target;
+          }, [params]);
+          // Approving removes the card in place, as a plugin's decision does.
+          const [approved, setApproved] = useState<string>();
+          const card = useMemo(
+            () =>
+              trailing &&
+              trailing !== approved &&
+              trailingCard(trailingBrief(trailing), () =>
+                setApproved(trailing),
+              ),
+            [trailing, approved],
+          );
+          useEffect(() => {
+            if (connection.status === "ready" && Workspace && params)
               navigation?.complete({ status: "opened" });
-          }, [connection.status, Workspace, target, navigation]);
-          if (connection.status !== "ready" || !Workspace || !target)
+          }, [connection.status, Workspace, params, navigation]);
+          if (connection.status !== "ready" || !Workspace || !params)
             return null;
           return (
             <div
@@ -501,13 +567,32 @@ export const fixturePlugins: readonly BundledPlugin[] = [
               >
                 Jump retained transcript
               </button>
+              {asideSize && (
+                <button
+                  type="button"
+                  aria-expanded={asideOpen}
+                  data-aside-floating={asideFloating}
+                  onClick={() => setAsideOpen(!asideOpen)}
+                >
+                  {asideOpen ? "Hide plan" : "Show plan"}
+                </button>
+              )}
               <div style={{ flex: 1, minHeight: 0 }}>
                 <Workspace
                   id="reader-fixture"
                   session={connection.session}
                   scope={connection.scope}
                   label="Transcript fixture"
-                  target={target}
+                  target={target as PageTabTarget}
+                  {...(card ? { trailing: card } : {})}
+                  {...(asideSize
+                    ? {
+                        aside: <AsideWidget size={asideSize} />,
+                        asideOpen,
+                        onAsideOpenChange: setAsideOpen,
+                        onAsideFloatingChange: setAsideFloating,
+                      }
+                    : {})}
                   latestRequest={
                     request && request.opening === opening
                       ? request.signal
@@ -661,6 +746,62 @@ export const fixturePlugins: readonly BundledPlugin[] = [
           title: "Legacy",
           primary: true,
           component: Legacy,
+        });
+      },
+    },
+  },
+  {
+    manifest: {
+      id: "fixture.link-setup",
+      name: "Tracker previews",
+      apiVersion: 1,
+    },
+    module: {
+      inject: ["conversation", "settingsCards"],
+      apply(ctx) {
+        let status: "checking" | "ready" | "needs-setup" = "needs-setup";
+        const listeners = new Set<() => void>();
+        const set = (next: typeof status) => {
+          status = next;
+          for (const listener of [...listeners]) listener();
+        };
+        window.fixtureLinkSetup = set;
+        ctx.conversation.registerLinkPreview({
+          id: "tracker",
+          title: "Tracker",
+          matches: (url) => new URL(url).host === "tracker.example",
+          order: 0,
+          status: () => status,
+          subscribe(listener) {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+          },
+          settings: "setup",
+          component: ({ url }) => (
+            <p data-tracker-card>Tracker issue {new URL(url).pathname}</p>
+          ),
+        });
+        function TrackerSetup() {
+          const current = useSyncExternalStore(
+            (listener) => {
+              listeners.add(listener);
+              return () => listeners.delete(listener);
+            },
+            () => status,
+          );
+          return current === "ready" ? (
+            <p>Signed in to Tracker</p>
+          ) : (
+            <button type="button" onClick={() => set("ready")}>
+              Sign in to Tracker
+            </button>
+          );
+        }
+        ctx.settingsCards.register({
+          id: "setup",
+          title: "Tracker previews",
+          group: "Plugins",
+          component: TrackerSetup,
         });
       },
     },

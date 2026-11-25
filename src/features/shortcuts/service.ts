@@ -19,9 +19,15 @@ import {
   type Shortcut,
 } from "./bindings";
 export type { KeyBinding, NormalizedShortcut, Shortcut } from "./bindings";
+type HostShortcutDefinition = Shortcut & {
+  /** Keyboard-only eligibility; programmatic host actions still use when(). */
+  whenKeyboard?: ((event: KeyboardEvent) => boolean) | undefined;
+};
 export type RegisteredShortcut = Contribution<NormalizedShortcut>;
 /** Host-only: a field matches it itself, so it is listed in Settings but never reserved or run. */
-export type HostShortcut = NormalizedShortcut & Readonly<{ local: boolean }>;
+export type HostShortcut = NormalizedShortcut &
+  Pick<HostShortcutDefinition, "whenKeyboard"> &
+  Readonly<{ local: boolean }>;
 export type Shortcuts = {
   register(shortcut: Shortcut): void;
   snapshot(): readonly RegisteredShortcut[];
@@ -41,14 +47,20 @@ declare module "@deepseek-ai/cordis" {
 const MODAL = 'dialog[open], [aria-modal="true"]';
 /** No modal, an addressable dialog that is its own navigation visit, or any other modal. */
 type Modal = false | "visit" | true;
-function eligibleIn(shortcut: Shortcut, editable: boolean, modal: Modal) {
+function eligibleIn(
+  shortcut: Shortcut,
+  editable: boolean,
+  modal: Modal,
+  keyboardEligible?: () => boolean,
+) {
   try {
     return (
       (!editable || shortcut.allowInEditable) &&
       (!modal ||
         shortcut.allowInModal ||
         (modal === "visit" && shortcut.allowInVisit)) &&
-      (!shortcut.when || shortcut.when())
+      (!shortcut.when || shortcut.when()) &&
+      (!keyboardEligible || keyboardEligible())
     );
   } catch (error) {
     console.error(`Shortcut predicate failed: ${shortcut.id}`, error);
@@ -104,13 +116,23 @@ export class ShortcutsService extends Service implements Shortcuts {
       const eligible = (shortcut: Shortcut) =>
         eligibleIn(shortcut, editable, modal);
       // Host chords are reserved even while unavailable (e.g. Settings behind a modal).
-      const reserved = [...this.hostBindings.values()].find(
+      // A chord the user assigned outranks a default that later claims it.
+      const hostMatches = [...this.hostBindings.values()].filter(
         (shortcut) =>
           !shortcut.local &&
           matches(bindingsFor(shortcut, shortcut.id), event, apple),
       );
+      const reserved =
+        hostMatches.find((shortcut) =>
+          isBindingList(overrides?.resolve(shortcut.id)),
+        ) ?? hostMatches[0];
       const shortcut = reserved
-        ? eligible(reserved)
+        ? eligibleIn(
+            reserved,
+            editable,
+            modal,
+            () => !reserved.whenKeyboard || reserved.whenKeyboard(event),
+          )
           ? reserved
           : undefined
         : [...this.contributions.snapshot()]
@@ -170,10 +192,11 @@ export class ShortcutsService extends Service implements Shortcuts {
     this.contributions.register(this.ctx, normalizeShortcut(shortcut));
   }
   /** Host composition only; not part of the injected plugin contract. */
-  registerHost(shortcut: Shortcut, { local = false } = {}) {
+  registerHost(shortcut: HostShortcutDefinition, { local = false } = {}) {
     const entry: HostShortcut = Object.freeze({
       ...normalizeShortcut(shortcut),
       local,
+      whenKeyboard: shortcut.whenKeyboard,
     });
     if (this.hostBindings.has(entry.id))
       throw new Error(`Host shortcut already registered: ${entry.id}`);

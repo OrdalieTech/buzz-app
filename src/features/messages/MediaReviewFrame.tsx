@@ -1,4 +1,9 @@
-import { useRef, type ReactNode, type RefObject } from "react";
+import {
+  useRef,
+  type KeyboardEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { createPortal } from "react-dom";
 import {
   PanelHeader,
@@ -15,7 +20,8 @@ import {
 import { seekVideoBy } from "./use-video-gestures";
 import styles from "./Messages.module.css";
 
-/** Shared fullscreen surface for sent media and local composer previews. */
+/** Shared fullscreen surface for sent media and local composer previews.
+ * Media is a viewer: opening and closing it never adds a step to history. */
 export function MediaReviewFrame({
   title,
   label,
@@ -33,24 +39,7 @@ export function MediaReviewFrame({
   sidebar,
   restoreFocus,
   close,
-}: {
-  title: string;
-  label: string;
-  isVideo: boolean;
-  video: RefObject<HTMLVideoElement | null>;
-  frame: RefObject<HTMLElement | null>;
-  origin: ReturnType<typeof readReviewOrigin>;
-  canReturnToOrigin?: boolean;
-  returnOrigin?: (() => ReturnType<typeof readReviewOrigin>) | undefined;
-  commentsOpen?: boolean;
-  commentsMotion?: boolean;
-  actions?: ReactNode;
-  navigate?: ((direction: -1 | 1) => void) | undefined;
-  children: ReactNode;
-  sidebar?: ReactNode;
-  restoreFocus?: RefObject<HTMLElement | null> | undefined;
-  close(): void;
-}) {
+}: MediaReviewFrameProps) {
   const backdrop = useRef<HTMLDivElement>(null);
   const { dismiss } = useReviewEntrance(
     frame,
@@ -86,59 +75,7 @@ export function MediaReviewFrame({
         role="dialog"
         tabIndex={-1}
         aria-modal="true"
-        onKeyDown={(event) => {
-          if (
-            event.currentTarget.hasAttribute("data-review-closing") ||
-            event.defaultPrevented ||
-            event.nativeEvent.isComposing ||
-            event.altKey ||
-            event.ctrlKey ||
-            event.metaKey ||
-            event.shiftKey ||
-            (event.key !== "ArrowLeft" &&
-              event.key !== "ArrowRight" &&
-              event.key !== " ")
-          )
-            return;
-          const target = event.target;
-          if (
-            !(target instanceof Element) ||
-            !event.currentTarget.contains(target) ||
-            target.closest(
-              'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="slider"], [role="menu"], [role="listbox"], [aria-label="Media comments"], [aria-label="Playback speed"]',
-            )
-          )
-            return;
-          if (
-            navigate &&
-            event.key !== " " &&
-            !target.closest("[data-video-controls]")
-          ) {
-            event.preventDefault();
-            event.stopPropagation();
-            navigate(event.key === "ArrowRight" ? 1 : -1);
-            return;
-          }
-          if (!isVideo || !video.current) return;
-          if (event.key === " ") {
-            // Space still activates a deliberately focused control normally.
-            if (
-              target.closest(
-                'button, a[href], [role="button"], [role="checkbox"], [role="switch"]',
-              )
-            )
-              return;
-            event.preventDefault();
-            event.stopPropagation();
-            if (event.repeat) return;
-            if (video.current.paused) void video.current.play().catch(() => {});
-            else video.current.pause();
-            return;
-          }
-          event.preventDefault();
-          event.stopPropagation();
-          seekVideoBy(video.current, event.key === "ArrowRight" ? 10 : -10);
-        }}
+        onKeyDown={(event) => mediaKeyDown(event, isVideo, video, navigate)}
         aria-label={label}
       >
         <div
@@ -176,4 +113,82 @@ export function MediaReviewFrame({
     </div>,
     document.body,
   );
+}
+
+type MediaReviewFrameProps = {
+  title: string;
+  label: string;
+  isVideo: boolean;
+  video: RefObject<HTMLVideoElement | null>;
+  frame: RefObject<HTMLElement | null>;
+  origin: ReturnType<typeof readReviewOrigin>;
+  canReturnToOrigin?: boolean;
+  returnOrigin?: (() => ReturnType<typeof readReviewOrigin>) | undefined;
+  commentsOpen?: boolean;
+  commentsMotion?: boolean;
+  actions?: ReactNode;
+  navigate?: ((direction: -1 | 1) => void) | undefined;
+  children: ReactNode;
+  sidebar?: ReactNode;
+  restoreFocus?: RefObject<HTMLElement | null> | undefined;
+  close(): void;
+};
+
+function mediaKeyDown(
+  event: KeyboardEvent<HTMLElement>,
+  isVideo: boolean,
+  video: RefObject<HTMLVideoElement | null>,
+  navigate?: (direction: -1 | 1) => void,
+) {
+  if (
+    event.currentTarget.hasAttribute("data-review-closing") ||
+    event.defaultPrevented ||
+    event.nativeEvent.isComposing ||
+    event.altKey ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.shiftKey ||
+    (event.key !== "ArrowLeft" &&
+      event.key !== "ArrowRight" &&
+      event.key !== " ")
+  )
+    return;
+  const target = event.target;
+  if (
+    !(target instanceof Element) ||
+    !event.currentTarget.contains(target) ||
+    target.closest(
+      'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="slider"], [role="menu"], [role="listbox"], [aria-label="Media comments"], [aria-label="Playback speed"]',
+    )
+  )
+    return;
+  if (
+    navigate &&
+    event.key !== " " &&
+    !target.closest("[data-video-controls]")
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    navigate(event.key === "ArrowRight" ? 1 : -1);
+    return;
+  }
+  if (!isVideo || !video.current) return;
+  if (event.key === " ") {
+    // Space still activates a deliberately focused control normally.
+    if (
+      target.closest(
+        'button, a[href], [role="button"], [role="checkbox"], [role="switch"]',
+      )
+    )
+      return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.repeat) return;
+    if (video.current.paused) void video.current.play().catch(() => {});
+    else video.current.pause();
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  seekVideoBy(video.current, event.key === "ArrowRight" ? 10 : -10);
 }

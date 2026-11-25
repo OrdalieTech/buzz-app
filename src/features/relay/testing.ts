@@ -6,7 +6,7 @@ import {
   getPublicKey,
   type EventTemplate,
 } from "nostr-tools";
-import type { ReadFilter, RelayEvent } from "./events";
+import { hasTag, type ReadFilter, type RelayEvent } from "./events";
 import { PublishRejected } from "./outbox";
 import { authTagOwner } from "../agents/owner-attestation";
 import type { ReadTransport, Signer } from "./transport";
@@ -190,12 +190,22 @@ export const isNoticeRead = (filters: readonly ReadFilter[]) =>
   filters.every(
     (filter) => filter.kinds?.length === 1 && filter.kinds[0] === 40099,
   );
+/** A status read alone, such as the one beside each byline profile read. */
+export const isStatusRead = (filters: readonly ReadFilter[]) =>
+  filters.length > 0 &&
+  filters.every(
+    (filter) => filter.kinds?.length === 1 && filter.kinds[0] === 30315,
+  );
 /** A transport whose responses the test releases explicitly, so ordering and cancellation are observable.
- * Membership notice reads answer empty at once unless `notices` scripts them too. */
+ * Membership notice and status reads answer empty at once unless `notices` or
+ * `statuses` scripts them too. */
 export function scriptedTransport(
   viewer: string,
   relayAuthor: string,
-  { notices = false }: { notices?: boolean } = {},
+  {
+    notices = false,
+    statuses = false,
+  }: { notices?: boolean; statuses?: boolean } = {},
 ) {
   const pending: Scripted[] = [];
   const transport: ReadTransport = {
@@ -204,6 +214,7 @@ export function scriptedTransport(
     media: (url) => (/^https:\/\//.test(url) ? url : undefined),
     query(filters, signal) {
       if (!notices && isNoticeRead(filters)) return Promise.resolve([]);
+      if (!statuses && isStatusRead(filters)) return Promise.resolve([]);
       return new Promise<RelayEvent[]>((resolve, reject) => {
         const entry: Scripted = {
           filters,
@@ -227,6 +238,26 @@ export function scriptedTransport(
       return entry;
     },
   };
+}
+/** Answer the pending channel head reads as the channel's whole history:
+ * `history`'s rows in that channel, or none, so that only the rows the live
+ * stream delivered show. */
+export function completeHeads(
+  wire: { pending: Scripted[] },
+  relay: Key,
+  history: readonly RelayEvent[] = [],
+) {
+  for (const entry of [...wire.pending]) {
+    const [filter] = entry.filters;
+    const channelId = filter?.["#h"]?.[0];
+    if (!filter?.top_level || !channelId || filter.until !== undefined)
+      continue;
+    wire.pending.splice(wire.pending.indexOf(entry), 1);
+    entry.respond([
+      ...history.filter((event) => hasTag(event, "h", channelId)),
+      bounds(relay, channelId, "head", { has_more: false, next_cursor: null }),
+    ]);
+  }
 }
 export const flush = () =>
   new Promise<void>((resolve) => setTimeout(resolve, 0));

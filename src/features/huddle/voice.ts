@@ -24,7 +24,7 @@ export function createHuddleVoices(
     Huddles,
     "snapshot" | "subscribe" | "voiceListening" | "voiceThinking"
   > & { voiceAgent?(): string | undefined },
-  agents: Pick<Agents, "snapshot" | "subscribe" | "types">,
+  agents: Pick<Agents, "snapshot" | "subscribe" | "types" | "reserveVoice">,
   relay: RelayData,
   bridge: HuddleBridge,
   report: (call: string, error: string) => void,
@@ -48,6 +48,7 @@ export function createHuddleVoices(
     let closing: Promise<void> | undefined;
     let starting: Promise<void> | undefined;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
+    let release: (() => void) | undefined;
     const fail = (error?: unknown) => {
       if (abort.signal.aborted) return;
       void stop();
@@ -65,6 +66,7 @@ export function createHuddleVoices(
       if (closing) return closing;
       abort.abort();
       clearInterval(heartbeat);
+      release?.();
       closing = Promise.allSettled([
         starting,
         Promise.resolve().then(() => connection?.close()),
@@ -85,6 +87,8 @@ export function createHuddleVoices(
     starting = Promise.resolve()
       .then(async () => {
         if (abort.signal.aborted) return;
+        // Counted before the bridge opens, so a restart can't retire it then.
+        release = agents.reserveVoice(agent.key);
         opening = bridge.open(
           id,
           destination,

@@ -3,6 +3,26 @@ import { openPage } from "./navigation.mjs";
 
 test.use({ dmLabels: true, historyCounts: { alpha: 1, beta: 1 } });
 
+test.describe("touch headings", () => {
+  test.use({ hasTouch: true });
+
+  test("an ordinary heading opens its Actions menu on the first tap", async ({
+    page,
+    app,
+  }) => {
+    await page.goto(app.origin);
+    await openPage(page, "Messages");
+    const actions = page.getByRole("button", {
+      name: "More actions for Team",
+      exact: true,
+    });
+    await actions.tap();
+    await expect(
+      page.getByRole("menu", { name: "More actions for Team", exact: true }),
+    ).toBeVisible();
+  });
+});
+
 async function appearance(page, scale, mode = "light") {
   await page.evaluate(
     ({ scale, mode }) => {
@@ -47,7 +67,7 @@ test("sidebar headings keep readable space and compact disclosure targets at enl
       else await resize.press(width === 220 ? "Home" : "End");
       await expect(resize).toHaveAttribute("aria-valuenow", String(width));
       // Measure at rest: the double-click leaves the pointer where a heading
-      // can land, and hovering reveals its actions, which take their width.
+      // can land and reveal its actions.
       await page.mouse.move(0, 0);
       for (const summary of summaries) {
         await summary.scrollIntoViewIfNeeded();
@@ -72,6 +92,10 @@ test("sidebar headings keep readable space and compact disclosure targets at enl
               const gap = Number.parseFloat(
                 getComputedStyle(element).columnGap,
               );
+              const isTeam = element.getAttribute("aria-label") === "Team";
+              const caretGap = isTeam
+                ? label.left - chevron.right
+                : chevron.left - label.right;
               return {
                 readable: title.clientWidth >= 2 * root,
                 singleLine:
@@ -80,12 +104,13 @@ test("sidebar headings keep readable space and compact disclosure targets at enl
                 compact:
                   Math.abs(frame.height - disclosure.height) < 1 &&
                   frame.height <= 2.5 * root,
-                adjacent: Math.abs(chevron.left - label.right - gap) < 1,
-                // The trigger fills the label slot; actions follow it.
+                adjacent: Math.abs(caretGap - gap) < 1,
                 fullTarget:
                   disclosure.left === slot.left &&
                   disclosure.right === slot.right &&
-                  slot.right <= actions.left + 0.5,
+                  (!isTeam || Math.abs(slot.right - frame.right) < 0.5) &&
+                  getComputedStyle(header.lastElementChild).pointerEvents ===
+                    "none",
                 actionsContained:
                   actions.left >= frame.left &&
                   actions.right <= frame.right + 1 &&
@@ -116,21 +141,28 @@ test("sidebar headings keep readable space and compact disclosure targets at enl
   await resize.press("Home");
   await page.setViewportSize({ width: 1440, height: 1200 });
   const channels = summaries[0];
-  // The trailing edge before the revealed action buttons still toggles the
-  // section. Hover first: revealed actions take their width from the trigger.
-  await channels.hover();
+  // The space immediately before the overlaid actions toggles the section.
+  await channels.hover({ position: { x: 12, y: 10 } });
   const target = await channels.boundingBox();
+  const firstActionLeft = await channels.evaluate(
+    (summary) =>
+      summary
+        .closest(".navigation-section-heading")
+        .querySelector(".navigation-section-heading-actions button")
+        .getBoundingClientRect().left,
+  );
   await channels.click({
-    position: { x: target.width - 2, y: target.height / 2 },
+    position: { x: firstActionLeft - target.x - 2, y: target.height / 2 },
   });
   await expect(channels.locator("..")).not.toHaveAttribute("open");
   await channels.press("Enter");
   await expect(channels.locator("..")).toHaveAttribute("open", "");
-  await page.keyboard.press("Tab");
   const more = sidebar.getByRole("button", {
     name: "More actions for Team",
     exact: true,
   });
+  await more.press("Tab");
+  await page.keyboard.press("Shift+Tab");
   await expect(more).toBeFocused();
   await expect(more.locator("..")).toHaveCSS("opacity", "1");
   await more.press("Enter");

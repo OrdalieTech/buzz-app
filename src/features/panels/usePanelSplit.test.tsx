@@ -90,8 +90,177 @@ test("plugin split names cannot read, overwrite or reset host widths", async () 
   }
 });
 
+test.each([
+  { mainMinRem: 20, scaledMax: "650", scaledWidth: "650px" },
+  { mainMinRem: undefined, scaledMax: "810", scaledWidth: "700px" },
+])(
+  "root font size respects the opt-in reserve ($mainMinRem)",
+  async ({ mainMinRem, scaledMax, scaledWidth }) => {
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(1130);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 0, 1130, 0),
+    );
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const root = document.documentElement;
+    const originalStyle = root.getAttribute("style");
+    const disconnect = vi.spyOn(MutationObserver.prototype, "disconnect");
+    function Workspace() {
+      const split = usePanelSplit(
+        "one",
+        "scaled",
+        undefined,
+        316,
+        undefined,
+        mainMinRem,
+      );
+      return (
+        <div ref={split.ref} data-testid="scaled-workspace">
+          {split.handle}
+        </div>
+      );
+    }
+    try {
+      root.style.fontSize = "";
+      writeView("one", "panel-split:scaled", 700);
+      const view = render(<Workspace />);
+      const handle = screen.getByRole("separator");
+      const workspace = screen.getByTestId("scaled-workspace");
+      const width = () =>
+        workspace.style.getPropertyValue("--secondary-panel-width");
+      expect(handle).toHaveAttribute("aria-valuemax", "810");
+      expect(width()).toBe("700px");
+
+      await act(async () => {
+        root.style.fontSize = "1.5rem";
+      });
+      expect(getComputedStyle(root).fontSize).toBe("24px");
+      expect(handle).toHaveAttribute("aria-valuemax", scaledMax);
+      expect(width()).toBe(scaledWidth);
+
+      await act(async () => {
+        root.style.fontSize = "0px";
+      });
+      expect(handle).toHaveAttribute("aria-valuemax", "810");
+      expect(width()).toBe("700px");
+
+      view.unmount();
+      expect(disconnect).toHaveBeenCalledTimes(
+        mainMinRem === undefined ? 0 : 1,
+      );
+    } finally {
+      cleanup();
+      if (originalStyle === null) root.removeAttribute("style");
+      else root.setAttribute("style", originalStyle);
+    }
+  },
+);
+
 // Controlled container measurements exercise the hook's clamp and observer
 // lifecycle. Pointer hit targets and actual grid geometry stay in browser tests.
+test("measured opt-in splits use reachable bounds without replacing saved widths on reflow", async () => {
+  let available = 0;
+  let contentWidth = 0;
+  let measure = () => {};
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(
+    () => available,
+  );
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+    () => new DOMRect(0, 0, contentWidth, 0),
+  );
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      constructor(private callback: () => void) {}
+      observe(element: HTMLElement) {
+        if (element.dataset.testid === "workspace") measure = this.callback;
+      }
+      disconnect() {}
+    },
+  );
+  const root = document.documentElement;
+  const originalStyle = root.getAttribute("style");
+  function Workspace({ reserve = true }: { reserve?: boolean }) {
+    const split = usePanelSplit(
+      "one",
+      "reachable",
+      undefined,
+      316,
+      undefined,
+      reserve ? 20 : undefined,
+    );
+    return (
+      <div ref={split.ref} data-testid="workspace">
+        <section>{split.handle}</section>
+      </div>
+    );
+  }
+  try {
+    root.style.fontSize = "12.825px";
+    writeView("one", "panel-split:reachable", 700);
+    const saved = () =>
+      localStorage.getItem('buzz-view.v1:["one","panel-split:reachable"]');
+    const view = render(<Workspace />);
+    const handle = screen.getByRole("separator");
+    const workspace = screen.getByTestId("workspace");
+    const width = () =>
+      workspace.style.getPropertyValue("--secondary-panel-width");
+    expect(handle).toHaveAttribute("aria-valuemin", "316");
+    expect(handle).toHaveAttribute("aria-valuemax", "316");
+
+    available = 540;
+    contentWidth = 539.546875;
+    act(measure);
+    expect.soft(handle).toHaveAttribute("aria-valuemin", "283");
+    expect.soft(handle).toHaveAttribute("aria-valuemax", "283");
+    expect.soft(width()).toBe("283px");
+    expect(saved()).toBe("700");
+    for (const key of ["Home", "End", "ArrowLeft", "ArrowRight"]) {
+      fireEvent.keyDown(handle, { key });
+      expect.soft(width()).toBe("283px");
+      expect.soft(saved()).toBe("283");
+    }
+    const pointer = (type: string, clientX: number) => {
+      const event = new MouseEvent(type, { bubbles: true, button: 0, clientX });
+      Object.defineProperty(event, "pointerId", { value: 1 });
+      fireEvent(type === "pointerdown" ? handle : window, event);
+    };
+    pointer("pointerdown", 400);
+    pointer("pointerup", 1000);
+    expect.soft(width()).toBe("283px");
+    expect.soft(saved()).toBe("283");
+
+    // A non-opted-in caller keeps its existing floor even below the reserve.
+    view.rerender(<Workspace reserve={false} />);
+    expect(handle).toHaveAttribute("aria-valuemin", "316");
+    expect(handle).toHaveAttribute("aria-valuemax", "316");
+    view.rerender(<Workspace />);
+    act(() => writeView("one", "panel-split:reachable", 700));
+    available = 960;
+    contentWidth = 960;
+    await act(async () => {
+      root.style.fontSize = "15.975px";
+      measure();
+    });
+    expect(handle).toHaveAttribute("aria-valuemin", "316");
+    expect(handle).toHaveAttribute("aria-valuemax", "640");
+    expect(width()).toBe("640px");
+    expect(saved()).toBe("700");
+    fireEvent.keyDown(handle, { key: "End" });
+    expect(width()).toBe("640px");
+    expect(saved()).toBe("640");
+  } finally {
+    cleanup();
+    if (originalStyle === null) root.removeAttribute("style");
+    else root.setAttribute("style", originalStyle);
+  }
+});
+
 test.each([undefined, { defaultWidth: 420, maxRatio: 0.5 }])(
   "optional primary sizing %s preserves widths and existing defaults",
   (primary) => {

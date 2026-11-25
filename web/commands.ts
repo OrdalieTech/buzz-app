@@ -141,6 +141,12 @@ export const commands: Record<string, Handler> = {
   app_agent_list: () => [],
   app_agent_portable: () => ({ agents: [], teams: [], warnings: [] }),
   keep_awake_set: () => null,
+  // Relay media is signed per read by the service worker and cached by the
+  // browser, so there is no saved copy to clear, forget, count or reopen.
+  media_cache_clear: () => undefined,
+  media_cache_forget: () => undefined,
+  media_cache_usage: () => 0,
+  media_download_status: () => false,
   /** Relay media, signed by the service worker, saved the browser's way. */
   async media_download({ source, name }) {
     const url = new URL(source, location.href);

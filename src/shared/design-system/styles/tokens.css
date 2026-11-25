@@ -783,6 +783,8 @@
   --neutral-standard-text: #0f0f0f; /* Designer-requested light primary text and inherited icons. */
   --bubble-neutral: #e9e9ea;
   --bubble-received: #f3f3f4;
+  /* Received bubbles on a raised sheet; light needs no separate step. */
+  --bubble-received-raised: var(--bubble-received);
   --neutral-navigation-text: #404040; /* Tailwind neutral-700. */
   /* Designer-requested light status text: the brightest green and red, 35% of
      the way from step 11 to step 12, that keep AA on every light surface. */
@@ -933,6 +935,9 @@
   --neutral-quiet-hover: #2e2e2e;
   --bubble-neutral: #2e2e2e;
   --bubble-received: #292929;
+  /* Inline sheets are raised (#282828), where #292929 disappears. A bubble
+     step of its own, not neutral-5, the pressed/selected gray. */
+  --bubble-received-raised: #383838;
   --neutral-1: #000000;
   --neutral-inset-subtle: #151515; /* Halfway between panel (#1a1a1a) and inset (#101010). */
   --neutral-2: #101010;
@@ -1120,6 +1125,13 @@
   --surface-message-own: var(--bubble-neutral);
   --surface-message-hover: var(--bubble-hover);
   --surface-message-own-hover: var(--bubble-own-hover);
+  --surface-message-raised: var(--bubble-received-raised);
+  --surface-message-raised-hover: var(--bubble-raised-hover);
+  --bubble-raised-hover: color-mix(
+    in srgb,
+    var(--surface-message-raised) 95%,
+    black
+  );
   --bubble-hover: color-mix(in srgb, var(--surface-message) 95%, black);
   --bubble-own-hover: color-mix(in srgb, var(--surface-message-own) 95%, black);
   --text-message-own: var(--text-standard);
@@ -1285,6 +1297,13 @@
   --surface-message-own: var(--bubble-neutral);
   --surface-message-hover: var(--bubble-hover);
   --surface-message-own-hover: var(--bubble-own-hover);
+  --surface-message-raised: var(--bubble-received-raised);
+  --surface-message-raised-hover: var(--bubble-raised-hover);
+  --bubble-raised-hover: color-mix(
+    in srgb,
+    var(--surface-message-raised) 95%,
+    white
+  );
   --bubble-hover: color-mix(in srgb, var(--surface-message) 95%, white);
   --bubble-own-hover: color-mix(in srgb, var(--surface-message-own) 95%, white);
   --text-message-own: var(--text-standard);

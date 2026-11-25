@@ -36,7 +36,8 @@
 .body {
   width: 100%;
   min-width: 0;
-  max-height: 30em;
+  /* About six lines, so a long forward stays a small card until opened. */
+  max-height: 9em;
   overflow: hidden;
 }
 .body[data-compact] {

@@ -5,7 +5,10 @@ import type { ProtectionAction } from "../features/agent-protection/service";
 import type { GitAuth } from "../features/agents/native";
 import type {
   AgentAttention,
-  SoloPlacement,
+  WorkspaceAudience,
+  WorkspaceChat,
+  WorkspaceDefaults,
+  WorkspacePlacement,
   AgentReadout,
   AgentUpdateInput,
   TeamReadout,
@@ -148,6 +151,8 @@ export interface BuzzClient {
    * cannot tell yet. Unless it says yes, a conversation with no thread is the
    * whole channel. */
   threadsApart?(channel: string): boolean | undefined;
+  /** An exact, saved task anchor for this agent. */
+  isTaskThread?(channel: string, root: string): boolean;
   /** The agent's owner, as its host records it. */
   readonly owner?: string | undefined;
   /** Trusted connection authorities, never inferred from query results. */
@@ -156,7 +161,9 @@ export interface BuzzClient {
    * needs it for verified names, so no other tool waits for it. `undefined`
    * when the relay has no key; rejects when the key cannot be learned. */
   readonly relayAuthorLookup?: () => Promise<string | undefined>;
-  readonly signingAuthority?: string | undefined;
+  /** The relay's NIP-11 self key as the app host knows it: `null` when the
+   * relay advertises none; absent when the host can't tell. */
+  readonly signingAuthority?: string | null;
   /** Reads the community as the agent. Every filter names its kinds. */
   query(filters: readonly Filter[]): Promise<readonly BuzzEvent[]>;
   /** Latest live attachment state, read as this agent from a primary snapshot. */
@@ -189,14 +196,21 @@ export interface BuzzClient {
   /** Writes entry `slug`, newer than the one it replaces (`after`, or 0);
    * a `null` body deletes it. */
   remember(slug: string, body: string | null, after: number): Promise<void>;
-  /** Local run-only discovery and one-use placement of a newly published Solo. */
-  soloWorkspaces?: Readonly<{
+  /** The owner's sidebar workspaces, in a local run: their list, defaults,
+   * one-use placement of a newly published conversation, and moves. */
+  workspaces?: Readonly<{
     list(): Promise<readonly Readonly<{ id: string; name: string }>[]>;
+    defaults(
+      workspace: string,
+      chat: WorkspaceChat,
+    ): Promise<WorkspaceDefaults>;
     prepare(
       workspace: string,
-      members: readonly string[],
+      audience: WorkspaceAudience,
       channelId: string,
-    ): Promise<(id: string) => Promise<SoloPlacement>>;
+    ): Promise<(id: string) => Promise<WorkspacePlacement>>;
+    /** Files conversation `id` in `workspace`, or unfiles it without one. */
+    move(id: string, workspace?: string): Promise<WorkspacePlacement>;
   }>;
   /** The owner's channel templates, where the host has them. */
   templates?(): Promise<readonly ChannelTemplate[]>;
@@ -224,6 +238,8 @@ export type Context = Readonly<{
   session?: import("../features/agents/session-admission").AgentSessionAssociation;
   channel?: string;
   root?: string;
+  /** The physical thread when root is an invocation subthread. */
+  sourceRoot?: string;
   topLevel?: boolean;
   wholeChannel?: boolean;
 }>;

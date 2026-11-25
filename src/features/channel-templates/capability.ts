@@ -1,7 +1,7 @@
 import type { RelayReader } from "../relay/reader";
 import { isTransientFailure } from "../relay/errors";
 import type { RelayEvent, ReadFilter } from "../relay/events";
-import type { Outbox, LocalEvents } from "../relay/outbox";
+import type { Outbox, LocalEvents, OutgoingEvent } from "../relay/outbox";
 import type { ChannelKitHost } from "./host";
 import type { ChannelSummary } from "../relay/contracts";
 import {
@@ -214,32 +214,33 @@ export function createChannelKit({
     })();
     return pending;
   }
+  const landed = async (id: string, readSignal = signal) =>
+    (
+      await fresh([{ ids: [id], limit: 1, consistency: "strong" }], readSignal)
+    ).some((e) => e.id === id);
+  const queued = (id: string) =>
+    local?.snapshot().find((e) => e.event.id === id);
+  const replayable = (
+    saved: OutgoingEvent | undefined,
+  ): saved is OutgoingEvent =>
+    !!saved && Date.now() / 1000 - saved.event.created_at < 15 * 60;
   async function confirm(id: string) {
     try {
-      if (
-        (await fresh([{ ids: [id], limit: 1, consistency: "strong" }])).some(
-          (e) => e.id === id,
-        )
-      )
-        return;
-      const saved = local?.snapshot().find((e) => e.event.id === id);
-      if (!saved || Date.now() / 1000 - saved.event.created_at >= 15 * 60)
+      if (await landed(id)) return;
+      const saved = queued(id);
+      if (!replayable(saved))
         throw new Error(
           "This operation could not be confirmed and is too old to replay. Keep your draft and inspect the current result before making a new save.",
         );
       // A proven Canvas CAS refusal cannot become valid by replaying these bytes.
       if (isDefinitiveCanvasConflict(saved)) throw new Error(saved.error);
       await delivered(id);
-      if (
-        !(await fresh([{ ids: [id], limit: 1, consistency: "strong" }])).some(
-          (e) => e.id === id,
-        )
-      )
+      if (!(await landed(id)))
         throw new Error(
           "Save is awaiting exact relay confirmation; your draft is kept",
         );
     } catch (error) {
-      const failed = local?.snapshot().find((item) => item.event.id === id);
+      const failed = queued(id);
       if (outbox && isDefinitiveCanvasConflict(failed)) {
         // Refused before mutation. Release the pending gate, not uncertain saves.
         await outbox.dismiss(id);
@@ -247,6 +248,53 @@ export function createChannelKit({
       }
       throw error;
     }
+  }
+  /** Holds a document's save from its head read through confirmation, so a
+   * save of it in another window refuses instead of racing this one. */
+  async function claimed<T>(
+    kind: number,
+    target: string,
+    run: () => Promise<T>,
+  ) {
+    if (!navigator.locks) throw new Error("Window ownership is unavailable.");
+    return navigator.locks.request(
+      `buzz-save:${community}:${viewer}:${kind}:${target}`,
+      { ifAvailable: true },
+      (lock) => {
+        if (!lock)
+          throw new Error(
+            "An earlier save is still sending. Try again in a moment.",
+          );
+        return run();
+      },
+    );
+  }
+  /** A failed or unconfirmed earlier save to the same target never retries by
+   * itself, so once the caller's fresh head check passes, this save replaces
+   * it in the same journal write. Only a save that is still sending blocks. */
+  async function send(input: Parameters<Outbox["send"]>[0]) {
+    if (!outbox) throw new Error("Saving is unavailable");
+    const tagValue = (tags: string[][], name: string) =>
+      tags.find(([key]) => key === name)?.[1];
+    const earlier = (local?.snapshot() ?? []).filter(
+      ({ event, delivery }) =>
+        event.kind === input.kind &&
+        tagValue(event.tags, "h") === tagValue(input.tags, "h") &&
+        tagValue(event.tags, "d") === tagValue(input.tags, "d") &&
+        delivery !== "accepted" &&
+        delivery !== "seen",
+    );
+    if (earlier.some((e) => e.delivery === "sending"))
+      throw new Error(
+        "An earlier save is still sending. Try again in a moment.",
+      );
+    if (!earlier.length) return outbox.send(input);
+    if (!outbox.replace)
+      throw new Error("This connection cannot replace a failed save.");
+    return outbox.replace(
+      input,
+      earlier.map((e) => e.event.id),
+    );
   }
   /** One replaceable private-record write: fresh head check, unresolved-save
    * guard, enqueue, exact confirmation and selected-head readback. With
@@ -270,64 +318,64 @@ export function createChannelKit({
     saving.add(d);
     try {
       await ready;
-      const head = async (readSignal = signal) =>
-        selectedHead(
-          await fresh(
-            [
-              {
-                kinds: [30078],
-                authors: [viewer],
-                "#d": [d],
-                limit: 1,
-              },
+      return await claimed(30078, d, async () => {
+        const head = async (readSignal = signal) =>
+          selectedHead(
+            await fresh(
+              [
+                {
+                  kinds: [30078],
+                  authors: [viewer],
+                  "#d": [d],
+                  limit: 1,
+                  consistency: "strong",
+                },
+              ],
+              readSignal,
+            ),
+          );
+        let id = resume?.id;
+        const original = id ? queued(id) : undefined;
+        // An original that never landed and was refused, or can no longer replay,
+        // is saved again with a new ID.
+        if (
+          id &&
+          (!replayable(original) || original.delivery === "failed") &&
+          !(await landed(id, preparing))
+        )
+          id = undefined;
+        if (!id) {
+          preparing.throwIfAborted();
+          const current = await head(preparing);
+          preparing.throwIfAborted();
+          if (current?.id !== expected)
+            throw new Error(
+              "This saved recipe changed. Refresh the catalog and review your draft before replacing it.",
+            );
+          // Replaceable records use seconds. Do not create an ambiguous equal-time replacement.
+          if (current && current.created_at >= Math.floor(Date.now() / 1000))
+            throw new Error(
+              "Please wait a second before saving this recipe again",
+            );
+          const content = await host.prepare(record, preparing);
+          preparing.throwIfAborted();
+          id = await send({
+            kind: 30078,
+            content,
+            tags: [
+              ["d", d],
+              ["t", tag],
             ],
-            readSignal,
-          ),
-        );
-      let id = resume?.id;
-      if (!id) {
-        preparing.throwIfAborted();
-        const current = await head(preparing);
-        preparing.throwIfAborted();
-        if (current?.id !== expected)
+          });
+          resume?.enqueued(id);
+        }
+        await confirm(id);
+        if ((await head())?.id !== id)
           throw new Error(
-            "This saved recipe changed. Refresh the catalog and review your draft before replacing it.",
+            "Another recipe save is selected. Your draft is kept; refresh and review before saving again.",
           );
-        const previous = local
-          ?.snapshot()
-          .find(
-            (e) =>
-              e.event.kind === 30078 &&
-              e.event.tags.some((t) => t[0] === "d" && t[1] === d) &&
-              !["accepted", "seen"].includes(e.delivery),
-          );
-        if (previous)
-          throw new Error(
-            "A save for this recipe is unresolved. Inspect Outbox and refresh before replacing it.",
-          );
-        // Replaceable records use seconds. Do not create an ambiguous equal-time replacement.
-        if (current && current.created_at >= Math.floor(Date.now() / 1000))
-          throw new Error(
-            "Please wait a second before saving this recipe again",
-          );
-        const content = await host.prepare(record, preparing);
-        preparing.throwIfAborted();
-        id = outbox.send({
-          kind: 30078,
-          content,
-          tags: [
-            ["d", d],
-            ["t", tag],
-          ],
-        });
-        resume?.enqueued(id);
-      }
-      await confirm(id);
-      if ((await head())?.id !== id)
-        throw new Error(
-          "Another recipe save is selected. Your draft is kept; refresh and review before saving again.",
-        );
-      return id;
+        return id;
+      });
     } finally {
       saving.delete(d);
     }
@@ -451,43 +499,33 @@ export function createChannelKit({
         throw new Error(`Keep Canvas below ${LIVE_CANVAS_LIMIT}`);
       await ready;
       signal.throwIfAborted();
-      const head = await canvas.read(channel);
-      if (head?.id !== expected) throw new CanvasConflictError();
-      const unapproved =
-        options?.preserveApproval &&
-        (!head || !(await approvedCanvas(head, viewer)));
-      signal.throwIfAborted();
-      const pending = local
-        ?.snapshot()
-        .find(
-          (e) =>
-            e.event.kind === 40100 &&
-            e.event.tags.some((t) => t[0] === "h" && t[1] === channel) &&
-            !["accepted", "seen"].includes(e.delivery),
-        );
-      if (pending)
-        throw new Error(
-          "This channel has an unresolved Canvas save. Inspect Outbox before making another save.",
-        );
-      if (head && head.created_at >= Math.floor(Date.now() / 1000))
-        throw new Error("Please wait a second before saving Canvas again");
-      if (!canWrite(channel)) throw new Error("Channel access changed");
-      const id = outbox.send({
-        kind: 40100,
-        content,
-        tags: [
-          ["h", channel],
-          ["expected-revision", expected ?? "none"],
-          ...(unapproved ? [[CANVAS_INSTRUCTIONS, "unapproved"]] : []),
-        ],
+      return claimed(40100, channel, async () => {
+        const head = await canvas.read(channel);
+        if (head?.id !== expected) throw new CanvasConflictError();
+        const unapproved =
+          options?.preserveApproval &&
+          (!head || !(await approvedCanvas(head, viewer)));
+        signal.throwIfAborted();
+        if (head && head.created_at >= Math.floor(Date.now() / 1000))
+          throw new Error("Please wait a second before saving Canvas again");
+        if (!canWrite(channel)) throw new Error("Channel access changed");
+        const id = await send({
+          kind: 40100,
+          content,
+          tags: [
+            ["h", channel],
+            ["expected-revision", expected ?? "none"],
+            ...(unapproved ? [[CANVAS_INSTRUCTIONS, "unapproved"]] : []),
+          ],
+        });
+        await confirm(id);
+        const selected = await canvas.read(channel);
+        if (selected?.id !== id)
+          throw new Error(
+            "Your save was received, but a different Canvas is selected. Your draft is kept; load the current document.",
+          );
+        return selected;
       });
-      await confirm(id);
-      const selected = await canvas.read(channel);
-      if (selected?.id !== id)
-        throw new Error(
-          "Your save was received, but a different Canvas is selected. Your draft is kept; load the current document.",
-        );
-      return selected;
     },
   });
   signal.addEventListener(

@@ -15,7 +15,9 @@ import { DraftsSentPage } from "./DraftsSentPage";
 import { DraftsSentBadge } from "./DraftsSentBadge";
 import type { RelayData } from "../relay/service";
 import type { Navigation } from "../navigation/controller";
-import { dayLabel, type ReadEvent } from "./model";
+import { setClockPreference } from "../../shared/clock-preference";
+import { formatDayGroupLabel } from "../../shared/datetime";
+import type { ReadEvent } from "./model";
 
 const emptyPanels: never[] = [];
 const panels = {
@@ -430,8 +432,19 @@ it("sent groups by day, updates live, and opens the exact message", async () => 
   expect(h.view.refresh).toHaveBeenCalled();
   expect(await screen.findByText("Recently shipped")).toBeInTheDocument();
   expect(
-    screen.getByRole("region", { name: dayLabel(NOW / 1000 - 600, NOW) }),
+    screen.getByRole("region", {
+      name: formatDayGroupLabel(NOW / 1000 - 600, NOW / 1000),
+    }),
   ).toBeInTheDocument();
+  // Row times follow the clock settings as they change.
+  const time = () =>
+    screen
+      .getByRole("button", { name: /Recently shipped/ })
+      .querySelector("time")?.textContent;
+  expect(time()).not.toMatch(/:\d\d:\d\d/);
+  act(() => setClockPreference({ seconds: true }));
+  expect(time()).toMatch(/:\d\d:\d\d/);
+  act(() => setClockPreference({ seconds: false }));
   act(() =>
     h.emit([
       event({
@@ -867,7 +880,7 @@ it("settles a post you answered in its thread: its reply count stays, but it isn
   expect(screen.queryByText(/with replies after yours/)).toBeNull();
 });
 
-it("stops counting a reply you deleted in its post's thread", () => {
+it("stops counting a reply you or its author deleted in its post's thread", () => {
   vi.useFakeTimers({ now: NOW, toFake: ["Date"] });
   const h = harness();
   const Page = h.page.component;
@@ -886,6 +899,13 @@ it("stops counting a reply you deleted in its post's thread", () => {
     content: "Question",
     tags: [team, ["e", post, "", "reply"]],
   });
+  const later = event({
+    id: "5".repeat(64),
+    pubkey: friend,
+    created_at: t - 400,
+    content: "Follow-up",
+    tags: [team, ["e", post, "", "reply"]],
+  });
   const launch = event({
     id: post,
     content: "Launch post",
@@ -893,12 +913,12 @@ it("stops counting a reply you deleted in its post's thread", () => {
     tags: [team],
   });
   h.emit([mine, launch]);
-  h.replies([reply, mine]);
+  h.replies([reply, later, mine]);
   render(<Page />);
   fireEvent.click(screen.getByRole("tab", { name: "Sent" }));
   expect(
     within(screen.getByRole("button", { name: /Launch post/ })).getByText(
-      "2 replies",
+      "3 replies",
     ),
   ).toBeInTheDocument();
   act(() =>
@@ -915,6 +935,21 @@ it("stops counting a reply you deleted in its post's thread", () => {
     ]),
   );
   expect(screen.queryByRole("button", { name: /Oops/ })).toBeNull();
+  expect(
+    within(screen.getByRole("button", { name: /Launch post/ })).getByText(
+      "2 replies",
+    ),
+  ).toBeInTheDocument();
+  // Someone else's deletion arrives on a read of its own.
+  const removal = event({
+    id: "6".repeat(64),
+    pubkey: friend,
+    kind: 5,
+    created_at: t - 40,
+    content: "",
+    tags: [team, ["e", reply.id], ["k", "9"]],
+  });
+  act(() => h.replies([reply, later, mine, removal]));
   expect(
     within(screen.getByRole("button", { name: /Launch post/ })).getByText(
       "1 reply",

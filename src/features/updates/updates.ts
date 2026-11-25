@@ -31,7 +31,8 @@ export const BACKGROUND_UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 // The updater does not carry the check timeout over to the download.
 export const UPDATE_CHECK_TIMEOUT_MS = 30 * 1000;
 export const UPDATE_DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
-const BACKGROUND_BLOCKED_STATES = new Set<UpdateStatus["state"]>([
+// Neither a background nor a manual check replaces an update in progress.
+const CHECK_BLOCKED_STATES = new Set<UpdateStatus["state"]>([
   "checking",
   "available",
   "downloading",
@@ -131,7 +132,7 @@ export function createUpdates(platform: UpdatePlatform = tauriPlatform) {
       }
       return;
     }
-    if (background && BACKGROUND_BLOCKED_STATES.has(status.state)) return;
+    if (CHECK_BLOCKED_STATES.has(status.state)) return;
 
     checkInFlight = true;
     manualResultRequested = false;

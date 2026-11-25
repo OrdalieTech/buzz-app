@@ -2,6 +2,7 @@ import type { Communities } from "../communities/service";
 import { communityDestination } from "../communities/destination";
 import type { RelayData } from "../relay/service";
 import type { RelaySession } from "../relay/session";
+import { viewerMember } from "../relay/membership";
 import { rowUnread } from "../relay/unread";
 import type { OpenTarget } from "../navigation/targets";
 
@@ -21,12 +22,14 @@ export type CommunityUnread = Readonly<{ unread: boolean; attention: number }>;
  * `undefined` while the session's live connection is not up (HTTP reads can
  * still succeed without it), while its unread is stale (its connection dropped
  * and no fresh evidence has arrived since, which the reconnect's read or a newly
- * arrived event provides) or no counted channel has observed evidence; channels without it are left out of the count. */
+ * arrived event provides) or no counted channel has observed evidence; channels without it are left out of the count.
+ * Its second argument says whether a repair has sampled every counted channel
+ * with evidence, so nothing older is still on its way. */
 export function observeCommunityUnread(
   session: RelaySession,
   viewer: string,
   communityOrigin: string,
-  publish: (state: CommunityUnread | undefined) => void,
+  publish: (state: CommunityUnread | undefined, sampled?: boolean) => void,
   gates?: UnreadGates,
   known = false,
 ) {
@@ -45,12 +48,14 @@ export function observeCommunityUnread(
     let unread = false;
     let attention = 0;
     let observed = 0;
+    let sampled = true;
     for (const channelId of channels.keys()) {
       const snapshot = session.unread.snapshot({ kind: "channel", channelId });
       if (known) {
         if (snapshot.freshness === "stale") return publish(undefined);
         if (snapshot.coverage !== "observed") continue;
         observed++;
+        if (!snapshot.sampled) sampled = false;
       }
       // Count what the channel's sidebar row shows.
       if (rowUnread(snapshot, dms.has(channelId), muted.has(channelId)))
@@ -58,7 +63,7 @@ export function observeCommunityUnread(
       attention += (snapshot.row ?? snapshot).attentionCount ?? 0;
     }
     if (known && !observed) return publish(undefined);
-    publish({ unread, attention });
+    publish({ unread, attention }, known && sampled);
   };
   const roster = () => {
     if (closed) return;
@@ -69,7 +74,9 @@ export function observeCommunityUnread(
           (channel) =>
             !channel.huddle &&
             !channel.metadataPending &&
-            channel.members?.includes(viewer) &&
+            !channel.archived &&
+            (channel.channelType === "dm" || !channel.hidden) &&
+            viewerMember(channel, viewer) &&
             (!gates ||
               gates.allows({
                 version: 1,
@@ -128,7 +135,7 @@ function repairOnRoster(
       status === "ready" ||
       status === "error" ||
       channels.some(
-        (channel) => !channel.cached && channel.members?.includes(viewer),
+        (channel) => !channel.cached && viewerMember(channel, viewer),
       )
     );
   };
@@ -178,6 +185,8 @@ export function createCommunityUnreads(
   const visited = new Set<string>();
   const listeners = new Set<() => void>();
   let states: ReadonlyMap<string, CommunityUnread> = new Map();
+  // Communities whose known unread a repair has fully sampled.
+  const sampled = new Set<string>();
   let closed = false;
   // Badges wait for the selected community's first repair: they share its
   // host's connections, so loading them alongside would delay its own unread.
@@ -196,16 +205,24 @@ export function createCommunityUnreads(
     foreground = true;
     update();
   };
-  const set = (id: string, state: CommunityUnread | undefined) => {
+  const set = (
+    id: string,
+    state: CommunityUnread | undefined,
+    complete = false,
+  ) => {
     const previous = states.get(id);
+    const completed = !!state && complete;
     if (
-      previous === state ||
-      (previous &&
-        state &&
-        previous.unread === state.unread &&
-        previous.attention === state.attention)
+      sampled.has(id) === completed &&
+      (previous === state ||
+        (previous &&
+          state &&
+          previous.unread === state.unread &&
+          previous.attention === state.attention))
     )
       return;
+    if (completed) sampled.add(id);
+    else sampled.delete(id);
     const next = new Map(states);
     if (state) next.set(id, state);
     else next.delete(id);
@@ -238,7 +255,7 @@ export function createCommunityUnreads(
         session,
         viewer,
         communityDestination(id).url,
-        (state) => set(id, state),
+        (state, complete) => set(id, state, complete),
         gates,
         true,
       );
@@ -321,6 +338,11 @@ export function createCommunityUnreads(
   update();
   return {
     snapshot: () => states,
+    /** The session behind a community's known, fully sampled unread, for
+     * acting on it without selecting it; absent whenever `snapshot` has no
+     * entry for it or a repair may still deliver older unread. */
+    session: (id: string) =>
+      states.has(id) && sampled.has(id) ? entries.get(id)?.session : undefined,
     subscribe(listener: () => void) {
       listeners.add(listener);
       return () => {

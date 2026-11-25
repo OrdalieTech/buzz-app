@@ -239,31 +239,34 @@ async function ownedAgentChannel(
   } as unknown as Agents;
   const { AgentConnectionSetup } = await import("./AgentConnectionSetup");
   const { AgentsContext } = await import("./react");
-  const setup = (sessionValue = session, channelValue = channel) => (
-    <ToastProvider>
-      <AgentsContext.Provider value={agents}>
-        <AgentConnectionSetup
-          session={sessionValue}
-          channel={channelValue}
-          rows={[
-            {
-              id: "b".repeat(64),
-              channelId: channel.id,
-              createdAt: 1,
-              content: "Hello",
-              attachments: [],
-              reactions: [],
-              replyCount: 0,
-              participants: [],
-              threadRootId: "c".repeat(64),
-              authorId: viewer,
-              mentions: [candidate.pubkey, "human"],
-            },
-          ]}
-        />
-      </AgentsContext.Provider>
-    </ToastProvider>
-  );
+  const setup = (sessionValue = session, channelValue = channel) => {
+    if (!listed) state.list = { status: "ready", channels: [channelValue] };
+    return (
+      <ToastProvider>
+        <AgentsContext.Provider value={agents}>
+          <AgentConnectionSetup
+            session={sessionValue}
+            channel={channelValue}
+            rows={[
+              {
+                id: "b".repeat(64),
+                channelId: channel.id,
+                createdAt: 1,
+                content: "Hello",
+                attachments: [],
+                reactions: [],
+                replyCount: 0,
+                participants: [],
+                threadRootId: "c".repeat(64),
+                authorId: viewer,
+                mentions: [candidate.pubkey, "human"],
+              },
+            ]}
+          />
+        </AgentsContext.Provider>
+      </ToastProvider>
+    );
+  };
   /** Reports the viewer sending the mention in `rows` (or a variant) live. */
   const sendMention = (kind = 9, author = viewer, destination = channel.id) => {
     const event = {
@@ -512,6 +515,140 @@ it.each([
     expect(
       screen.queryByRole("region", { name: "Agent connection setup" }),
     ).toBeNull();
+  },
+);
+
+it.each(["dm", "stream", "forum"] as const)(
+  "withdraws setup for a removed %s listing instead of trusting stale props",
+  async (channelType) => {
+    const f = await ownedAgentChannel(channelType, {
+      choicesReady: true,
+      listed: true,
+    });
+    render(f.setup());
+    f.deliverMention();
+    await screen.findByRole("region", { name: "Agent connection setup" });
+    act(() => {
+      f.state.list = { status: "ready", channels: [] };
+      f.notify("list");
+    });
+    expect(
+      screen.queryByRole("region", { name: "Agent connection setup" }),
+    ).toBeNull();
+  },
+);
+
+it("uses the live get fallback for an unlisted DM, never its stale prop", async () => {
+  const f = await ownedAgentChannel("dm", { choicesReady: true, listed: true });
+  let current: ChannelSummary | undefined = f.channel;
+  f.state.list = { status: "ready", channels: [] };
+  const session = {
+    ...f.session,
+    channels: { ...f.session.channels, get: () => current },
+  };
+  render(f.setup(session));
+  await screen.findByRole("region", { name: "Agent connection setup" });
+  act(() => {
+    current = undefined;
+    f.notify("list");
+  });
+  expect(
+    screen.queryByRole("region", { name: "Agent connection setup" }),
+  ).toBeNull();
+});
+
+it.each([
+  { readOnly: true },
+  { cached: true },
+  { archived: true },
+  { viewerRole: "guest" },
+] as const)(
+  "does not offer DM setup with restricted access %j",
+  async (restriction) => {
+    const f = await ownedAgentChannel("dm", { choicesReady: true });
+    render(f.setup(f.session, { ...f.channel, ...restriction }));
+    expect(f.observe).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("region", { name: "Agent connection setup" }),
+    ).toBeNull();
+  },
+);
+
+it("keeps DM peer evidence separate from live viewer membership", async () => {
+  const f = await ownedAgentChannel("dm", { choicesReady: true, listed: true });
+  render(f.setup());
+  await screen.findByRole("region", { name: "Agent connection setup" });
+  const update = (channel: ChannelSummary) =>
+    act(() => {
+      f.state.list = { status: "ready", channels: [channel] };
+      f.notify("list");
+    });
+  update({
+    ...f.channel,
+    viewerMembership: { pubkey: f.viewer, joined: false },
+  });
+  expect(
+    screen.queryByRole("region", { name: "Agent connection setup" }),
+  ).toBeNull();
+  update({
+    ...f.channel,
+    members: [candidate.pubkey],
+    viewerMembership: { pubkey: f.viewer, joined: true },
+  });
+  expect(
+    await screen.findByRole("region", { name: "Agent connection setup" }),
+  ).toBeVisible();
+  update({
+    ...f.channel,
+    members: [],
+    viewerMembership: { pubkey: f.viewer, joined: true },
+  });
+  expect(
+    screen.queryByRole("region", { name: "Agent connection setup" }),
+  ).toBeNull();
+});
+
+it.each(["stream", "forum"] as const)(
+  "tracks explicit viewer membership for %s setup without a parent render",
+  async (channelType) => {
+    const f = await ownedAgentChannel(channelType, {
+      choicesReady: true,
+      listed: true,
+    });
+    render(f.setup());
+    f.deliverMention();
+    await screen.findByRole("region", { name: "Agent connection setup" });
+    act(() => {
+      f.state.list = {
+        status: "ready",
+        channels: [
+          {
+            ...f.channel,
+            viewerMembership: { pubkey: f.viewer, joined: false },
+          },
+        ],
+      };
+      f.notify("list");
+    });
+    expect(
+      screen.queryByRole("region", { name: "Agent connection setup" }),
+    ).toBeNull();
+    act(() => {
+      f.state.list = {
+        status: "ready",
+        channels: [
+          {
+            ...f.channel,
+            members: [candidate.pubkey],
+            viewerMembership: { pubkey: f.viewer, joined: true },
+          },
+        ],
+      };
+      f.notify("list");
+    });
+    expect(
+      await screen.findByRole("region", { name: "Agent connection setup" }),
+    ).toBeVisible();
   },
 );
 

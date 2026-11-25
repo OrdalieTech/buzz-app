@@ -18,9 +18,20 @@ export function useAgentChoices(
   useEffect(() => {
     if (includeLegacy) return source.retain();
   }, [source, includeLegacy]);
-  const archiveIdle = archive && choices.archives.status === "idle";
+  const archivePending =
+    archive &&
+    choices.archives.status !== "ready" &&
+    choices.archives.status !== "unavailable";
   useEffect(() => {
-    if (choices.pending || archiveIdle) source.ensure(includeLegacy, archive);
-  }, [source, includeLegacy, archive, archiveIdle, choices.pending, choices]);
+    if (choices.pending || archivePending)
+      source.ensure(includeLegacy, archive);
+  }, [
+    source,
+    includeLegacy,
+    archive,
+    archivePending,
+    choices.pending,
+    choices,
+  ]);
   return choices;
 }

@@ -6,6 +6,17 @@ import type { AgentProtection } from "../../features/agent-protection/service";
 import { Pi, PiStopped } from "./pi";
 import { deferred, fakeHost, type FakeProcess } from "./pi-testing";
 
+const env = vi.hoisted(() => ({
+  own: new Map<string, boolean | undefined>(),
+  gate: undefined as Promise<void> | undefined,
+}));
+vi.mock("../agents/agent-env", () => ({
+  hasOwnEnv: async (agent: string) => {
+    await env.gate;
+    return env.own.has(agent) ? env.own.get(agent) : false;
+  },
+}));
+
 const handlers = () => ({ tool: vi.fn(), event: vi.fn() });
 const evidence = (worker: FakeProcess, operation: string, params: object) =>
   worker.tool(params, `buzz/security/evidence/${operation}`);
@@ -53,6 +64,7 @@ it("starts the host once, with the install script, and pairs each answer with it
   expect(host.processes).toHaveLength(1);
   const [process] = host.processes;
   expect(process?.id).toBe("pi-sh");
+  expect(process?.options.secrets).toEqual(["agent-env"]);
   expect(process?.options.cwd).toBe("~");
   expect(process?.options.args?.[1]).toBe("pi.sh");
   expect(process?.options.args?.at(-1)).toContain("BUZZ_PI_HOST");
@@ -404,6 +416,7 @@ it("isolates protected agents, contains their runtime code and cancels a native 
     );
     if (!worker) throw new Error("Missing protected worker");
     expect(worker.id).toBe("pi-protected-sh");
+    expect(worker.options.secrets).toBeUndefined();
     expect(
       manifest.host.processes.find((process) => process.id === worker.id),
     ).toMatchObject({
@@ -444,3 +457,283 @@ it("isolates protected agents, contains their runtime code and cancels a native 
     await pi.dispose();
   }
 });
+
+it("starts an agent with its own list in its own host, and chooses again when a host exits", async () => {
+  const ada = "a".repeat(64);
+  const bo = "b".repeat(64);
+  const host = fakeHost({ ping: (params) => ({ agent: params.agent }) });
+  const pi = new Pi(
+    () => host.spawn,
+    handlers(),
+    () => undefined,
+  );
+  env.own.set(ada, true);
+  try {
+    await pi.request("ping", { agent: ada });
+    await pi.request("ping", { agent: bo });
+    expect(host.processes.map((process) => process.options.envAgent)).toEqual([
+      ada,
+      undefined,
+    ]);
+    // Its list is removed while its host runs: the route holds until it exits.
+    env.own.set(ada, false);
+    await pi.request("ping", { agent: ada });
+    expect(host.processes).toHaveLength(2);
+    host.processes[0]?.exit(0);
+    await pi.request("ping", { agent: ada });
+    expect(host.processes).toHaveLength(2);
+    expect(host.requests("ping").at(-1)?.params.agent).toBe(ada);
+    expect(host.processes[1]?.requests.at(-1)?.params.agent).toBe(ada);
+    // The shared host exits after a list is added: the next start reads it.
+    env.own.set(bo, true);
+    host.processes[1]?.exit(0);
+    await pi.request("ping", { agent: bo });
+    expect(host.processes.at(-1)?.options.envAgent).toBe(bo);
+    // An unreadable list starts on the shared host, and is read again when
+    // that host exits.
+    env.own.set(ada, undefined);
+    await pi.request("ping", { agent: ada });
+    expect(host.processes.at(-1)?.options.envAgent).toBeUndefined();
+    env.own.set(ada, true);
+    host.processes.at(-1)?.exit(0);
+    await pi.request("ping", { agent: ada });
+    expect(host.processes.at(-1)?.options.envAgent).toBe(ada);
+  } finally {
+    env.own.clear();
+    await pi.dispose();
+  }
+});
+
+it("moves a restarted agent to its own host on its first list, and back on its last", async () => {
+  const ada = "a".repeat(64);
+  const bo = "b".repeat(64);
+  const host = fakeHost({ ping: (params) => ({ agent: params.agent }) });
+  const pi = new Pi(
+    () => host.spawn,
+    handlers(),
+    () => undefined,
+  );
+  try {
+    await pi.request("ping", { agent: ada });
+    await pi.request("ping", { agent: bo });
+    expect(host.processes).toHaveLength(1);
+    env.own.set(ada, true);
+    await pi.retire(ada);
+    await pi.request("ping", { agent: ada });
+    expect(host.processes.map((process) => process.options.envAgent)).toEqual([
+      undefined,
+      ada,
+    ]);
+    env.own.set(ada, false);
+    await pi.retire(ada);
+    await pi.request("ping", { agent: ada });
+    expect(host.processes).toHaveLength(2);
+    expect(host.processes[1]?.gone).toBe(true);
+    expect(host.processes[0]?.requests.at(-1)?.params.agent).toBe(ada);
+  } finally {
+    env.own.clear();
+    await pi.dispose();
+  }
+});
+
+/** A host whose `acquire` takes the agent's storage lock, as the SQLite
+ * lockfile does: one process at a time, until it closes or exits. */
+function lockingHost() {
+  const locks = new Map<string, FakeProcess>();
+  const held = (agent: string) => {
+    const owner = locks.get(agent);
+    return owner && !owner.gone ? owner : undefined;
+  };
+  const host = fakeHost({
+    acquire: (params, process) => {
+      const agent = String(params.agent);
+      const owner = held(agent);
+      if (owner && owner !== process) throw new Error("storage is locked");
+      locks.set(agent, process);
+      return { by: host.processes.indexOf(process) };
+    },
+    close: (params) => void locks.delete(String(params.agent)),
+  });
+  return host;
+}
+
+it("releases an agent's own host's storage before the shared host opens it", async () => {
+  const ada = "a".repeat(64);
+  const host = lockingHost();
+  const pi = new Pi(
+    () => host.spawn,
+    handlers(),
+    () => undefined,
+  );
+  env.own.set(ada, true);
+  try {
+    await expect(pi.request("acquire", { agent: ada })).resolves.toEqual({
+      by: 0,
+    });
+    env.own.set(ada, false);
+    let retired = false;
+    const retiring = pi.retire(ada).then(() => {
+      retired = true;
+    });
+    const next = pi.request("acquire", { agent: ada });
+    // `end()` is the retirement's last step before it waits for the exit, so
+    // from here on only the exit can let it, and the next host, go on.
+    await vi.waitFor(() => expect(host.processes[0]?.ended).toBe(true));
+    await Promise.resolve();
+    expect(retired).toBe(false);
+    expect(host.processes).toHaveLength(1);
+    host.processes[0]?.exit(0);
+    await retiring;
+    await expect(next).resolves.toEqual({ by: 1 });
+    expect(host.processes[1]?.options.envAgent).toBeUndefined();
+  } finally {
+    await pi.dispose();
+  }
+});
+
+it("ends an own host whose start comes back after its retirement, before the next one opens", async () => {
+  const ada = "a".repeat(64);
+  const host = lockingHost();
+  const started = deferred<void>();
+  let first = true;
+  const pi = new Pi(
+    () => async (id, options) => {
+      const spawned = host.spawn(id, options);
+      if (first) {
+        first = false;
+        await started.promise;
+      }
+      return spawned;
+    },
+    handlers(),
+    () => undefined,
+  );
+  env.own.set(ada, true);
+  try {
+    const late = pi.request("acquire", { agent: ada });
+    late.catch(() => undefined);
+    await vi.waitFor(() => expect(host.processes).toHaveLength(1));
+    env.own.set(ada, false);
+    const retiring = pi.retire(ada);
+    const next = pi.request("acquire", { agent: ada });
+    started.resolve();
+    await vi.waitFor(() => expect(host.processes[0]?.ended).toBe(true));
+    expect(host.processes).toHaveLength(1);
+    host.processes[0]?.exit(0);
+    await retiring;
+    await expect(next).resolves.toEqual({ by: 1 });
+    expect(host.processes[1]?.options.envAgent).toBeUndefined();
+  } finally {
+    await pi.dispose();
+  }
+});
+
+it.each(["shared", "own", "protected"] as const)(
+  "answers two requests at once for one agent (%s host)",
+  async (route) => {
+    const isProtected = route === "protected";
+    if (route === "own") env.own.set("a".repeat(64), true);
+    const ada = "a".repeat(64);
+    const gate: AgentProtection = {
+      key: "a:1",
+      stateKey: "a:1",
+      assertAvailable: vi.fn(),
+      processProtection: { readOnlyPaths: [], hiddenPaths: [] },
+      spawn: async () => {
+        throw new Error("Unused protected runtime");
+      },
+      checkEvidence: vi.fn(),
+      check: vi.fn(),
+    };
+    const host = fakeHost({
+      ping: () => ({ pong: true }),
+      runtime: () => ({
+        file: "/runtime/deps/version/host.mjs",
+        node: "/runtime/node/bin/node",
+        codeRoot: "/runtime/deps",
+        nodeRoot: "/runtime/node",
+        data: "/runtime/state",
+        auth: "/runtime/auth",
+      }),
+    });
+    const pi = new Pi(
+      () => host.spawn,
+      handlers(),
+      () => (isProtected ? gate : undefined),
+    );
+    const answer = deferred<void>();
+    env.gate = answer.promise;
+    try {
+      const both = Promise.all([
+        pi.request("ping", { agent: ada }),
+        pi.request("ping", { agent: ada }),
+      ]);
+      answer.resolve();
+      await expect(both).resolves.toEqual([{ pong: true }, { pong: true }]);
+      // Both ran on one host: the shared one, or the agent's own.
+      expect(host.processes).toHaveLength(isProtected ? 2 : 1);
+      if (route !== "protected")
+        expect(host.processes[0]?.options.envAgent).toBe(
+          route === "own" ? ada : undefined,
+        );
+    } finally {
+      env.own.clear();
+      env.gate = undefined;
+      await pi.dispose();
+    }
+  },
+);
+
+it("starts an agent's own host again after its start fails", async () => {
+  const ada = "a".repeat(64);
+  const host = fakeHost({ ping: () => ({ pong: true }) }, { ready: false });
+  const pi = new Pi(
+    () => host.spawn,
+    handlers(),
+    () => undefined,
+  );
+  env.own.set(ada, true);
+  try {
+    const failed = pi.request("ping", { agent: ada });
+    await vi.waitFor(() => expect(host.processes).toHaveLength(1));
+    host.processes[0]?.exit(1, "Pi could not start\n");
+    await expect(failed).rejects.toThrow("Pi could not start");
+    const retried = pi.request("ping", { agent: ada });
+    await vi.waitFor(() => expect(host.processes).toHaveLength(2));
+    host.processes[1]?.send({ method: "ready", params: {} });
+    await expect(retried).resolves.toEqual({ pong: true });
+    expect(host.processes.map((process) => process.options.envAgent)).toEqual([
+      ada,
+      ada,
+    ]);
+  } finally {
+    await pi.dispose();
+  }
+});
+
+it.each(["retire", "dispose"] as const)(
+  "starts no host for a presence answer that comes after %s",
+  async (end) => {
+    const ada = "a".repeat(64);
+    const host = fakeHost({ ping: () => ({ pong: true }) });
+    const pi = new Pi(
+      () => host.spawn,
+      handlers(),
+      () => undefined,
+    );
+    const answer = deferred<void>();
+    env.gate = answer.promise;
+    env.own.set(ada, true);
+    try {
+      const late = pi.request("ping", { agent: ada });
+      const ending = end === "retire" ? pi.retire(ada) : pi.dispose();
+      answer.resolve();
+      await expect(late).rejects.toThrow("Pi has stopped");
+      await ending;
+      expect(host.processes).toHaveLength(0);
+    } finally {
+      env.gate = undefined;
+      await pi.dispose();
+    }
+  },
+);

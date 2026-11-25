@@ -8,6 +8,7 @@ import { PreferenceRow } from "../../shared/design-system/ui/PreferenceRow";
 import { Select } from "../../shared/design-system/ui/Select";
 import { SettingsGroupExpand } from "../../shared/design-system/ui/SettingsGroup";
 import { type RecommendedCandidate, recommendedSetup } from "./recommended";
+import type { ModelRoute } from "./model-routes";
 
 const effortLabel = (effort: string) =>
   effort === "xhigh"
@@ -104,11 +105,41 @@ export function Checking() {
   );
 }
 
-/** Keep pending/default status visible; settled model details belong in the menu. */
+/** A plugin's model route that Automatic runs on, in place of one model. */
+export function RouteLine({
+  icon: Icon,
+  title,
+  route,
+}: Readonly<{ icon: Mark; title: string; route: ModelRoute }>) {
+  const value = route.description
+    ? `${route.label} · ${route.description}`
+    : route.label;
+  return (
+    <span className="text-caption text-subtle">
+      {Icon && (
+        <span className="inline-flex align-baseline" aria-hidden="true">
+          <Icon size={12} />
+        </span>
+      )}
+      <span className="sr-only">{title}:</span>{" "}
+      <span title={value}>{value}</span>
+    </span>
+  );
+}
+
+/** Keep pending/default status visible; settled model details belong in the
+ * menu. `route` is the harness's Automatic model route, when a plugin offers
+ * one: it picks each turn's model, with `resolved` as its fallback. */
 export function runsOnDetails(
   type: Readonly<{ title: string; icon?: Mark }>,
   resolved: RecommendedCandidate | null | undefined,
+  route?: ModelRoute,
 ) {
+  if (route)
+    return {
+      modelName: route.label,
+      model: <RouteLine icon={type.icon} title={type.title} route={route} />,
+    };
   if (resolved === undefined) return { summary: <Checking /> };
   if (resolved) {
     return {

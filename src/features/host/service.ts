@@ -2,6 +2,7 @@ import { runtimePerformance } from "../developer/runtime-performance";
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import { Service, type Context } from "@deepseek-ai/cordis";
 import type {} from "../../plugins/api";
+import { writeClipboardText } from "../../shared/clipboard";
 import { nativeIdentityEnabled } from "../identity/service";
 import type { SoloRegionBinding } from "../channel-navigation/solo-navigation-contract";
 import { repositoryFolders } from "../communities/repositories";
@@ -121,10 +122,15 @@ export type HostProcessOptions = Readonly<{
   /** Set by agent protection: the agent a protected engine is launched for.
    * Native checks that the agent's saved protection names this plugin. */
   protectedAgent?: Readonly<{ pubkey: string; relay: string }>;
-  /** Secrets native code holds, set in its environment after `env`; one that
-   * is not saved is left unset. Each is only for the processes it belongs
-   * to: `anthropic-api-key` (`ANTHROPIC_API_KEY`) for Buzz's Claude. */
-  secrets?: readonly "anthropic-api-key"[];
+  /** Secrets native code holds; one that is not saved is left unset. Each is
+   * only for the processes it belongs to: `anthropic-api-key`
+   * (`ANTHROPIC_API_KEY`) for Buzz's Claude, set after `env`, and `agent-env`,
+   * the environment variables saved for every local agent, then those of the
+   * local agent `envAgent`, set before `env` so the harness's own win. */
+  secrets?: readonly ("anthropic-api-key" | "agent-env")[];
+  /** The local agent (pubkey) whose own environment variables `agent-env`
+   * adds. Native checks it is a local, unprotected agent here. */
+  envAgent?: string;
   onStdout?(data: string): void;
   onStderr?(data: string): void;
 }>;
@@ -288,6 +294,9 @@ export interface Host {
     agentPubkey: string,
     signal?: AbortSignal,
   ) => Promise<NipOaAuthorization>;
+  /** Copies plain text as Buzz itself does: natively on macOS, where WebKit
+   * often rejects `navigator.clipboard` writes. Needs no manifest grant. */
+  writeClipboardText?: (text: string) => Promise<void>;
 }
 
 declare module "@deepseek-ai/cordis" {
@@ -378,6 +387,10 @@ export class HostService extends Service implements Host {
     return prepareRemoteAgentAuthorization(agentPubkey, signal);
   }
 
+  writeClipboardText(text: string) {
+    return writeClipboardText(text);
+  }
+
   async runCommand(id: string, input?: string): Promise<string | null> {
     const owner = this.ctx.pluginOwner;
     if (!owner || !isTauri()) return null;
@@ -428,6 +441,7 @@ export class HostService extends Service implements Host {
       agentCredential: options.agentCredential ?? false,
       protectedAgent: options.protectedAgent ?? null,
       ...(options.secrets?.length && { secrets: options.secrets }),
+      ...(options.envAgent && { envAgent: options.envAgent }),
       onEvent,
     });
     // The host takes at most 1 MiB a write, so a longer one goes in pieces,

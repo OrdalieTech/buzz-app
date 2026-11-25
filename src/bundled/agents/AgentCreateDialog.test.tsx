@@ -42,6 +42,10 @@ import {
   uploadAvatar,
 } from "../../features/profiles/avatar-upload";
 import { CHECK_MS } from "../../features/agents/recommended";
+import {
+  resetModelRoutesForTests,
+  setModelRouters,
+} from "../../features/agents/model-routes";
 import { AgentCreateDialog } from "./AgentCreateDialog";
 import {
   BuilderlabLogoIcon,
@@ -2252,6 +2256,44 @@ describe("Recommended setup", () => {
     );
   });
 
+  it("starts Custom on the Automatic route when a plugin offers one", async () => {
+    setModelRouters([
+      {
+        id: "test",
+        routes: (id) =>
+          id === "codex"
+            ? {
+                routes: [{ id: "auto-a", label: "Auto A" }],
+                automatic: "auto-a",
+              }
+            : undefined,
+        select: async () => undefined,
+      },
+    ]);
+    try {
+      const { agents, dialog, user } = setup([echo, goose, codex]);
+      await inspectModel(user, dialog, "Auto A");
+      await chooseCustom(user, dialog);
+      expect(harnessSelect(dialog)).toHaveTextContent("Codex");
+      await user.type(within(dialog).getByLabelText("Name"), "Agent A");
+      await user.click(createButton());
+      // The route, not the candidate it would have started on.
+      expect(agents.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "test/codex",
+          config: {
+            notes: "start",
+            instructions: "Be brief.",
+            model: "route:auto-a",
+            effort: "",
+          },
+        }),
+      );
+    } finally {
+      resetModelRoutesForTests();
+    }
+  });
+
   it("lets the owner choose manually while the pick is still running, even with one harness", async () => {
     let finish = (_ready: boolean) => {};
     const slow = harness(
@@ -2512,6 +2554,108 @@ describe("Recommended setup", () => {
           }),
         ),
       );
+    });
+
+    it("holds Automatic's pick that refuses creation, before and at submit", async () => {
+      const REASON = "Protected agents need a saved key.";
+      let answer: () => Promise<string | undefined> = async () => REASON;
+      const listeners = new Set<() => void>();
+      const gated = {
+        ...claude,
+        admitsCreation: {
+          check: () => answer(),
+          subscribe: (listener: () => void) => {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+          },
+        },
+      } as RegisteredAgentType;
+      const { agents, dialog, user } = setup([gated]);
+      await inspectModel(user, dialog, "Model C · High");
+      await user.type(within(dialog).getByLabelText("Name"), "Agent A");
+      // Said and held before submit, though Automatic picked it.
+      expect(await within(dialog).findByText(REASON)).toBeVisible();
+      expect(createButton()).toBeDisabled();
+      submitForm(dialog);
+      expect(agents.create).not.toHaveBeenCalled();
+      // An answer it can't give holds it too, with a retry.
+      answer = async () => {
+        throw new Error("unreadable");
+      };
+      act(() => {
+        for (const listener of listeners) listener();
+      });
+      await user.click(
+        await within(dialog).findByRole("button", { name: "Retry" }),
+      );
+      expect(createButton()).toBeDisabled();
+      // Allowed once it says so; then refused again at submit.
+      answer = async () => undefined;
+      await user.click(within(dialog).getByRole("button", { name: "Retry" }));
+      await waitFor(() => expect(createButton()).toBeEnabled());
+      answer = async () => REASON;
+      await user.click(createButton());
+      expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+        REASON,
+      );
+      expect(agents.create).not.toHaveBeenCalled();
+      answer = async () => undefined;
+      act(() => {
+        for (const listener of listeners) listener();
+      });
+      await waitFor(() => expect(createButton()).toBeEnabled());
+      await user.click(createButton());
+      await waitFor(() => expect(agents.create).toHaveBeenCalledOnce());
+    });
+
+    it("opens the type's own setup from a creation refusal", async () => {
+      const READY = { readiness: "ready" };
+      let refusing = true;
+      const gated = {
+        ...claude,
+        provider: {
+          snapshot: () => READY,
+          subscribe: () => () => undefined,
+          check: () => undefined,
+          DialogBody: () => <p>Claude credentials</p>,
+        },
+        admitsCreation: {
+          check: async () => (refusing ? "Needs a saved key." : undefined),
+          subscribe: () => () => undefined,
+        },
+      } as unknown as RegisteredAgentType;
+      const { dialog, user } = setup([gated]);
+      await inspectModel(user, dialog, "Model C · High");
+      await within(dialog).findByText("Needs a saved key.");
+      await user.click(within(dialog).getByRole("button", { name: "Set up" }));
+      expect(await screen.findByText("Claude credentials")).toBeVisible();
+      // Closing it asks again.
+      refusing = false;
+      await user.keyboard("{Escape}");
+      await waitFor(() =>
+        expect(within(dialog).queryByText("Needs a saved key.")).toBeNull(),
+      );
+    });
+
+    it("offers Retry when a creation gate throws before answering", async () => {
+      const gated = {
+        ...claude,
+        admitsCreation: {
+          check: () => {
+            throw new Error("broken");
+          },
+          subscribe: () => () => undefined,
+        },
+      } as RegisteredAgentType;
+      const { agents, dialog, user } = setup([gated]);
+      await inspectModel(user, dialog, "Model C · High");
+      await user.type(within(dialog).getByLabelText("Name"), "Agent A");
+      expect(
+        await within(dialog).findByRole("button", { name: "Retry" }),
+      ).toBeVisible();
+      expect(createButton()).toBeDisabled();
+      submitForm(dialog);
+      expect(agents.create).not.toHaveBeenCalled();
     });
 
     it("creates nothing when Automatic's pick was signed out since it was found", async () => {

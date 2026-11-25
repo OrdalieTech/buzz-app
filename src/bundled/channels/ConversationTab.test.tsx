@@ -22,12 +22,20 @@ import type { ConversationTab as Tab } from "./useChannelTabState";
 vi.mock("../../features/messages/ThreadPanel", () => ({
   ThreadPanel: ({
     active,
+    messageId,
+    subthreadId,
+    sourceThreadId,
+    shown,
     replyRequest,
     focusRequest,
     revealSelected,
     revealRequest,
   }: {
     active: boolean;
+    messageId: string;
+    subthreadId?: string;
+    sourceThreadId?: string;
+    shown?: boolean;
     replyRequest?: number;
     focusRequest?: number;
     revealSelected?: boolean;
@@ -35,6 +43,10 @@ vi.mock("../../features/messages/ThreadPanel", () => ({
   }) => (
     <aside
       data-active={active}
+      data-message={messageId}
+      data-subthread={subthreadId}
+      data-source-thread={sourceThreadId}
+      data-shown={shown}
       data-reply-request={replyRequest}
       data-focus-request={focusRequest}
       data-reveal-selected={revealSelected}
@@ -53,11 +65,13 @@ vi.mock("./ChannelBody", () => ({
     inlineTarget,
     marksRead,
     onOpenThread,
+    trailing,
   }: {
     holding?: boolean;
     inlineTarget?: { messageId: string };
     marksRead?: boolean;
     onOpenThread(id: string, root: string, intent?: "reply"): void;
+    trailing?: { content(state: object): import("react").ReactNode };
   }) => {
     threadOpeners.push(onOpenThread);
     return (
@@ -67,6 +81,7 @@ vi.mock("./ChannelBody", () => ({
         data-marks-read={marksRead}
       >
         Conversation content
+        {trailing?.content({ expanded: false, toggle() {} })}
       </div>
     );
   },
@@ -237,21 +252,32 @@ it.each(["thread", "conversation"] as const)(
     const mounted = render(<ConversationTab {...props} active={false} />);
     const content = screen.getByLabelText("Conversation in Beta");
     expect(enterChannel).not.toHaveBeenCalled();
-    if (kind === "thread")
+    // A thread's composer follows the tab, as a conversation's does.
+    if (kind === "thread") {
       expect(screen.getByText("Thread content")).toHaveAttribute(
         "data-active",
         "false",
       );
+      expect(screen.getByText("Thread content")).toHaveAttribute(
+        "data-shown",
+        "false",
+      );
+    }
     mounted.rerender(<ConversationTab {...props} active />);
     expect(enterChannel).toHaveBeenCalledExactlyOnceWith(
       "beta",
       document.hasFocus(),
     );
-    if (kind === "thread")
+    if (kind === "thread") {
       expect(screen.getByText("Thread content")).toHaveAttribute(
         "data-active",
         "true",
       );
+      expect(screen.getByText("Thread content")).toHaveAttribute(
+        "data-shown",
+        "true",
+      );
+    }
     mounted.rerender(<ConversationTab {...props} active={false} />);
     expect(leaveChannel).toHaveBeenCalledExactlyOnceWith("beta");
     expect(screen.getByLabelText("Conversation in Beta")).toBe(content);
@@ -618,6 +644,28 @@ it("a conversation tab opens a reply at its message as the thread", () => {
   expect(screen.queryByText("Conversation content")).toBeNull();
 });
 
+it.each(["conversation", "thread"] as const)(
+  "only a channel timeline shows the workspace's trailing content (%s)",
+  (kind) => {
+    const c = openingAt([]);
+    render(
+      <ConversationTab
+        {...c.props}
+        tab={
+          kind === "thread"
+            ? { id: "thread:beta", kind, channelId: "beta", messageId: "root" }
+            : { id: "conversation:beta", kind, channelId: "beta" }
+        }
+        trailing={{ restHeight: 100, content: () => <p>Decision card</p> }}
+      />,
+    );
+    c.settle();
+    expect(screen.queryByText("Decision card") !== null).toBe(
+      kind === "conversation",
+    );
+  },
+);
+
 it("a thread tab asks its reader to reveal for each open at a message, not on restore", () => {
   const c = openingAt([]);
   const tab = {
@@ -642,6 +690,29 @@ it("a thread tab asks its reader to reveal for each open at a message, not on re
   );
   expect(thread).toHaveAttribute("data-reveal-selected", "true");
   expect(thread).toHaveAttribute("data-reveal-request", "2");
+});
+
+it("opens the selected reply within the requested workspace branch", () => {
+  const c = openingAt([]);
+  render(
+    <ConversationTab
+      {...c.props}
+      subthreadId="invocation"
+      tab={{
+        id: "conversation",
+        kind: "thread",
+        channelId: "beta",
+        rootId: "source",
+        messageId: "reply",
+        revealRequest: 1,
+      }}
+    />,
+  );
+  const thread = screen.getByText("Thread content");
+  expect(thread).toHaveAttribute("data-message", "reply");
+  expect(thread).toHaveAttribute("data-subthread", "invocation");
+  expect(thread).toHaveAttribute("data-source-thread", "source");
+  expect(thread).toHaveAttribute("data-reveal-selected", "true");
 });
 
 it("markRead false reaches the reader, and a restored tab does not reveal again", () => {

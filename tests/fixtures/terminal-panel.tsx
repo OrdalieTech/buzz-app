@@ -112,7 +112,7 @@ await scope
   .extend({ pluginOwner: { id: "buzz.terminal", revision: "fixture" } })
   .plugin((ctx) => apply(ctx))
   .await();
-const pluginState = { configuration: { status: "loading" } };
+const pluginState = { configuration: { status: "loading" }, hostOwned: [] };
 const plugins = {
   subscribe: () => () => {},
   snapshot: () => pluginState,

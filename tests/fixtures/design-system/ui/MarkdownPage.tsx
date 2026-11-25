@@ -3,9 +3,6 @@ import { PageHeader } from "./primitives";
 
 const DOCUMENT_ROUTES: Record<string, string> = {
   "src/shared/design-system/DESIGN.md": "/design/design-guide",
-  "src/shared/design-system/MAINTAINING_DESIGN_SYSTEM.md":
-    "/design/maintaining",
-  "src/shared/design-system/AGENTS.md": "/design/agents-guide",
 };
 const REPOSITORY = "https://github.com/block/buzz-app/blob/main/";
 

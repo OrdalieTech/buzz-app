@@ -1,3 +1,4 @@
+import { viewerMember } from "../../features/relay/membership";
 import type { ChannelSummary } from "../../features/relay/contracts";
 
 /** The verified one-to-one DM with this Bestie. Solo chats stay separate. */
@@ -13,7 +14,7 @@ export function bestieChat(
         channel.channelType === "dm" &&
         !channel.cached &&
         !channel.archived &&
-        channel.members?.includes(viewer) &&
+        viewerMember(channel, viewer) &&
         onlyOther(channel.members, viewer) === bestie,
     )
     .sort(

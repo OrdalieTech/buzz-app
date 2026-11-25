@@ -285,6 +285,7 @@ function Preview() {
               content: sentText,
               mentions: sent.at(-1)?.mentions ?? [],
             }}
+            viewer={row.authorId}
             session={previewSession}
             scope={composerScope}
             profile={{ name: "Preview" }}

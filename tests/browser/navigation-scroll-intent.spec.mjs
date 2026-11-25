@@ -9,6 +9,16 @@ test.use({
   historyCounts: { alpha: 1, beta: 1 },
 });
 
+// Workspace migration POSTs two decodes to this URL (readPreferences in
+// session.ts): the legacy workspaces first, as a bare event array, then the
+// current preferences, wrapped with the legacy workspaces they merge. The
+// journeys below let the legacy read finish and hold the current decode. A
+// legacy read that fails leaves the current decode bare too, and nothing then
+// tells the two apart. This also runs in the page, so it closes over nothing.
+const isCurrentPrimaryDecode = (url, body) =>
+  url.endsWith("/api/relay/primary/sidebar-preferences") &&
+  JSON.parse(body ?? "null")?.legacy !== undefined;
+
 for (const cachedStartup of [false, true]) {
   for (const action of [
     "untouched",
@@ -72,7 +82,69 @@ for (const cachedStartup of [false, true]) {
         release = resolve;
       });
       const pendingRoutes = [];
+      // The app gives up on a preferences read after 10 s (readPreferences in
+      // session.ts), and the failed read ends the delay just as release()
+      // would. A slow WebKit runner can reach the wheel below about 10 s after
+      // the reload, and the saved position then lands first: 900 + 1800. This
+      // test is about a held read, not that deadline. Playwright's clock
+      // doesn't cover AbortSignal.timeout, so until Primary's current
+      // preferences decode is issued, 10 s deadlines outlast the test; the
+      // first such request restores the originals, leaving later deadlines
+      // real. The legacy decode that precedes it is neither counted nor held,
+      // and doesn't restore. Its read has a 5 s deadline of its own
+      // (readLegacyWorkspaces), which a loaded runner misses without any hold,
+      // so 5 s deadlines are stretched for the same window. (Deadlines created
+      // before the current decode keep their stretched timer after the
+      // restore, and if that decode never fires the patch dies with the page.)
+      // Each stretched 10 s signal is tagged through AbortSignal.any, so the
+      // guard below fails if the held request's signal didn't carry one (a
+      // moved or renamed deadline), instead of the test silently flaking
+      // again.
+      const stretchDeadlines = (isCurrentDecode) => {
+        const { timeout, any } = AbortSignal;
+        const realFetch = window.fetch;
+        const stretched = new WeakSet();
+        const stretch = { currentDecodes: 0, stretchedDecodes: 0 };
+        window.__sidebarDeadlineStretch = stretch;
+        const restore = () => {
+          AbortSignal.timeout = timeout;
+          AbortSignal.any = any;
+          window.fetch = realFetch;
+        };
+        AbortSignal.timeout = (ms) => {
+          if (ms !== 10_000 && ms !== 5_000)
+            return timeout.call(AbortSignal, ms);
+          const signal = timeout.call(AbortSignal, 120_000);
+          if (ms === 10_000) stretched.add(signal);
+          return signal;
+        };
+        AbortSignal.any = (signals) => {
+          const inputs = [...signals];
+          const signal = any.call(AbortSignal, inputs);
+          if (inputs.some((input) => stretched.has(input)))
+            stretched.add(signal);
+          return signal;
+        };
+        window.fetch = function (input, init) {
+          const url = input instanceof Request ? input.url : String(input);
+          if (isCurrentDecode(url, init?.body)) {
+            stretch.currentDecodes++;
+            const signal =
+              init?.signal ??
+              (input instanceof Request ? input.signal : undefined);
+            if (signal && stretched.has(signal)) stretch.stretchedDecodes++;
+            restore();
+          }
+          return realFetch.call(this, input, init);
+        };
+      };
+      await page.addInitScript(
+        `(${stretchDeadlines})(${isCurrentPrimaryDecode})`,
+      );
       await page.route("**/api/relay/primary/sidebar-preferences", (route) => {
+        const request = route.request();
+        if (!isCurrentPrimaryDecode(request.url(), request.postData()))
+          return route.continue();
         const pending = held.then(() => route.continue());
         pendingRoutes.push(pending);
         return pending;
@@ -83,7 +155,12 @@ for (const cachedStartup of [false, true]) {
         await expect
           .poll(() => sidebar.locator("[data-channel-id]").count())
           .toBeGreaterThan(100);
-        await expect.poll(() => pendingRoutes.length).toBeGreaterThan(0);
+        await expect
+          .poll(
+            () => pendingRoutes.length,
+            "Primary's legacy read finished, so its current decode carried the legacy workspaces and was held",
+          )
+          .toBeGreaterThan(0);
         await expect(panel).toHaveAttribute("aria-busy", "true");
         await expect(
           page.getByText("Updating sidebar details…", { exact: true }),
@@ -124,11 +201,21 @@ for (const cachedStartup of [false, true]) {
             .poll(() => sidebar.evaluate((element) => element.scrollTop))
             .toBe(0);
         }
+        // Every held current decode carried a stretched deadline.
+        expect(
+          await page.evaluate(() => window.__sidebarDeadlineStretch),
+          "Primary's held preferences decode carried the stretched 10 s deadline",
+        ).toEqual({
+          currentDecodes: pendingRoutes.length,
+          stretchedDecodes: pendingRoutes.length,
+        });
         const beforeRefresh = await sidebar.boundingBox();
         const refreshed = page.waitForResponse(
           (response) =>
-            response.url().endsWith("/api/relay/primary/sidebar-preferences") &&
-            response.ok(),
+            isCurrentPrimaryDecode(
+              response.url(),
+              response.request().postData(),
+            ) && response.ok(),
         );
         release();
         await refreshed;

@@ -80,7 +80,7 @@ it("returns every match by default while retaining an explicit limit", async () 
   expect(
     (await searchEmoji("smile", custom)).filter((item) => item.url),
   ).toHaveLength(75);
-  expect(searchCustomEmoji("smile", custom, 12)).toHaveLength(12);
+  expect(searchCustomEmoji("smile", custom, undefined, 12)).toHaveLength(12);
   expect(await searchEmoji("", [])).toEqual([]);
 });
 it("keeps semantic results ahead of loose shortcode matches", async () => {
@@ -137,18 +137,69 @@ it("copies native primitives even when Mart previously mutated the shared dictio
 });
 
 it("Unicode completions use the picker's saved default skin tone", async () => {
-  const [hand] = await searchEmoji("call_me_hand", [], 1, 4);
+  const [hand] = await searchEmoji("call_me_hand", [], undefined, 1, 4);
   expect(hand?.text).toBe("🤙🏽");
   vi.stubGlobal("localStorage", {
     getItem: (key: string) => (key === "emoji-mart.skin" ? "6" : null),
   });
   try {
-    const [saved] = await searchEmoji("call_me_hand", [], 1);
+    const [saved] = await searchEmoji("call_me_hand", [], undefined, 1);
     expect(saved?.text).toBe("🤙🏿");
     // Emoji without tones keep their only form.
-    const [rocket] = await searchEmoji("rocket", [], 1);
+    const [rocket] = await searchEmoji("rocket", [], undefined, 1);
     expect(rocket?.text).toBe("🚀");
   } finally {
     vi.unstubAllGlobals();
   }
+});
+
+it("keeps alias and keyword matches ahead of often chosen fuzzy matches", async () => {
+  const first = async (query: string, uses?: (id: string) => number) =>
+    (await searchEmoji(query, [], uses))[0]?.shortcode;
+  // `hate` and `poop` are a keyword of 😡 and an alias of 💩, and only
+  // subsequences of the chosen shortcodes.
+  for (const [query, fuzzy, match] of [
+    ["hate", "unicode/heart_eyes", "rage"],
+    ["poop", "unicode/person_in_lotus_position", "hankey"],
+  ] as const) {
+    expect(await first(query)).toBe(match);
+    expect(await first(query, (id) => (id === fuzzy ? 8 : 0))).toBe(match);
+  }
+});
+
+it("puts often chosen emoji first within exact, prefix and other matches", async () => {
+  const shortcodes = async (query: string, uses?: (id: string) => number) =>
+    (await searchEmoji(query, [], uses)).map((item) => item.shortcode);
+  const usage = (counts: Record<string, number>) => (id: string) =>
+    counts[id] ?? 0;
+  const plain = await shortcodes("sm");
+  const smirk = await shortcodes("sm", usage({ "unicode/smirk": 2 }));
+  expect(smirk[0]).toBe("smirk");
+  expect(smirk.slice(1)).toEqual(plain.filter((name) => name !== "smirk"));
+  // A strong use cannot lift a weaker match over a prefix match.
+  const sweat = await shortcodes("sm", usage({ "unicode/sweat_smile": 99 }));
+  expect(sweat.indexOf("sweat_smile")).toBeGreaterThan(sweat.indexOf("smiley"));
+  // The exact name stays first; equal counts keep the query order.
+  expect(
+    (await shortcodes("smile", usage({ "unicode/smiley": 5 }))).slice(0, 2),
+  ).toEqual(["smile", "smiley"]);
+  // The typed shortcode leads a separator-insensitive namesake used more.
+  expect(
+    (await shortcodes("icecream", usage({ "unicode/ice_cream": 9 })))[0],
+  ).toBe("icecream");
+  expect(
+    (await shortcodes("ice_cream", usage({ "unicode/icecream": 9 })))[0],
+  ).toBe("ice_cream");
+  expect(
+    await shortcodes("sm", usage({ "unicode/smile": 1, "unicode/smirk": 1 })),
+  ).toEqual(plain);
+  const custom = [
+    { shortcode: "party", url: "https://a.test/party.png" },
+    { shortcode: "parrot", url: "https://a.test/parrot.png" },
+  ];
+  expect(
+    searchCustomEmoji("par", custom, usage({ "custom/party": 1 })).map(
+      (item) => item.shortcode,
+    ),
+  ).toEqual(["party", "parrot"]);
 });

@@ -42,10 +42,21 @@ const templateSession = (({ agentChoices, channels }) => ({
 beforeEach(() => {
   localStorage.clear();
   vi.stubGlobal("crypto", webcrypto);
+  Object.defineProperty(navigator, "locks", {
+    configurable: true,
+    value: {
+      request: async (
+        _name: string,
+        _options: LockOptions,
+        run: (lock: object) => unknown,
+      ) => run({}),
+    },
+  });
 });
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  Reflect.deleteProperty(navigator, "locks");
 });
 
 it("edits a chat's workspace and Canvas with its exact loaded revision", async () => {

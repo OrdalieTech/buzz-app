@@ -51,9 +51,9 @@ export function OverviewPage() {
         </div>
         <p className="text-body text-secondary">
           Name a token by its purpose, emphasis, and state. For guidance on
-          adding or changing a shared decision, read{" "}
-          <Link to="/design/maintaining" className="text-purple-12 underline">
-            Maintaining the system
+          using the system, read the{" "}
+          <Link to="/design/design-guide" className="text-purple-12 underline">
+            Design guide
           </Link>
           .
         </p>

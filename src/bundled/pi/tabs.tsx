@@ -215,6 +215,7 @@ export function createTabs({
     | "transcript"
     | "subscribe"
     | "channelLabel"
+    | "readablePlaces"
     | "subscribeChannels"
   >;
 }>) {
@@ -731,10 +732,12 @@ export function createTabs({
     // the sidebar, without reading Pi again.
     const [, relabel] = useReducer((count: number) => count + 1, 0);
     useEffect(() => runtime.subscribeChannels(agent.key, relabel), [agent.key]);
-    const places = listing.value?.map((place) => ({
-      ...place,
-      ...runtime.channelLabel(agent.key, place.channelId),
-    }));
+    const places =
+      listing.value &&
+      runtime.readablePlaces(agent.key, listing.value).map((place) => ({
+        ...place,
+        ...runtime.channelLabel(agent.key, place.channelId),
+      }));
     // Pi lists its conversations only after the tab shows, so its transcript
     // would open late, under whatever the reader turned to meanwhile. The
     // request is settled without opening it.

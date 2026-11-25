@@ -121,6 +121,7 @@ function fakeRuntime() {
     working: () => working,
     subscribe: () => () => {},
     channelLabel: (_agent: string, channelId: string) => labels.get(channelId),
+    readablePlaces: <T,>(_agent: string, rows: readonly T[]) => [...rows],
     subscribeChannels: (_agent: string, listener: () => void) => {
       listeners.add(listener);
       return () => listeners.delete(listener);

@@ -39,6 +39,7 @@ import {
   type Saved,
   type WriteSide,
 } from "./config-writes";
+import { publishedRoute } from "./synced-route";
 import { discoverTeams, type SyncedTeams } from "./team-config";
 import { type TeamEdit, teamOps } from "./team-ops";
 
@@ -88,12 +89,16 @@ export function fields(
           Object.entries(settings).filter(([name]) => !(name in schema)),
         )
       : {};
+  const own = publishedRoute(pickSettings(schema, config));
   return {
     version: 1,
     agentType: agent.type,
-    settings: { ...kept, ...pickSettings(schema, config) },
+    settings: { ...kept, ...own.settings },
     // Undefined drops a mark the head had: the agent is off Recommended.
     preset: onRecommended(config) ? PRESET : undefined,
+    // Beside `settings`, so versions without routes never see one as a
+    // model; undefined drops the head's.
+    modelRoute: own.modelRoute,
     // Left out, the head's notes stay, so a settings form that drops them
     // never loses a plugin's note.
     // An empty map is published as none (undefined drops the head's), so

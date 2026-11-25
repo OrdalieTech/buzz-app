@@ -3,6 +3,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { bytesToHex } from "nostr-tools/utils";
 import { afterEach, expect, it, vi } from "vitest";
 import { PublishRejected } from "./outbox";
+import { ReadError } from "./errors";
 import { createRelaySession } from "./session";
 import {
   archiveRelay,
@@ -86,6 +87,221 @@ it("is lazy, exact-author, fresh, bounded and background through the actual sess
   expect(h.archives.state(target.pubkey)).toBe("not-archived");
   expect(h.query).toHaveBeenCalledTimes(3);
 });
+it("session recovery respects archive admission delays and stops after success", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  h.live.state({ status: "connected", routes: [] });
+  const first = h.archives.ensure();
+  const request = h.wire.next();
+  request.fail(new ReadError("unavailable", "quota", 429, 60_000));
+  await first;
+  expect(h.archives.snapshot()).toMatchObject({
+    status: "error",
+    transient: true,
+    retryAt: Date.now() + 60_000,
+  });
+  await vi.advanceTimersByTimeAsync(59_999);
+  expect(h.query).toHaveBeenCalledTimes(1);
+  // The existing recovery owner retries on its next capped backoff turn.
+  for (let tick = 0; tick < 10 && !h.wire.pending.length; tick++)
+    await vi.advanceTimersToNextTimerAsync();
+  expect(h.wire.pending).toHaveLength(1);
+  expect(Date.now()).toBeGreaterThanOrEqual(h.archives.snapshot().retryAt ?? 0);
+  h.wire.next().respond([snapshot()]);
+  await h.archives.ensure();
+  expect(h.archives.snapshot().status).toBe("ready");
+  const count = h.query.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(h.query).toHaveBeenCalledTimes(count);
+});
+it("retains an active transient failure across socket loss until HTTP recovery", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  h.live.state({ status: "connected", routes: [] });
+  const first = h.archives.ensure();
+  for (let attempt = 0; attempt < 4; attempt++) {
+    h.wire.next().fail(new ReadError("unavailable", "offline", 503));
+    if (attempt < 3) await vi.advanceTimersToNextTimerAsync();
+  }
+  await first;
+  h.live.state({ status: "retrying", routes: [] });
+  expect(h.archives.snapshot()).toMatchObject({
+    status: "error",
+    transient: true,
+  });
+  await vi.advanceTimersToNextTimerAsync();
+  h.wire.next().respond([snapshot()]);
+  await h.archives.ensure();
+  expect(h.archives.state(target.pubkey)).toBe("archived");
+  expect(h.query).toHaveBeenCalledTimes(5);
+});
+
+it("defers new sidebar recovery reads during socket loss", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  h.live.state({ status: "connected", routes: [] });
+  const first = h.archives.ensure({ background: true });
+  for (let attempt = 0; attempt < 4; attempt++) {
+    h.wire.next().fail(new ReadError("unavailable", "offline", 503));
+    if (attempt < 3) await vi.advanceTimersToNextTimerAsync();
+  }
+  await first;
+  h.live.state({ status: "retrying", routes: [] });
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(h.archives.snapshot()).toMatchObject({
+    status: "error",
+    transient: true,
+  });
+  expect(h.query).toHaveBeenCalledTimes(4);
+  h.live.state({ status: "connected", routes: [] });
+  h.wire.next().respond([snapshot()]);
+  await h.archives.ensure({ background: true });
+  expect(h.archives.state(target.pubkey)).toBe("archived");
+  expect(h.query).toHaveBeenCalledTimes(5);
+});
+
+it("reconciles an active read completed during an outage on reconnect", async () => {
+  const h = harness();
+  h.live.state({ status: "connected", routes: [] });
+  const first = h.archives.ensure({ background: true });
+  const held = h.wire.next();
+  expect(h.archives.ensure()).toBe(first);
+  h.live.state({ status: "retrying", routes: [] });
+  held.respond([snapshot()]);
+  await first;
+  expect(h.archives.state(target.pubkey)).toBe("archived");
+  h.live.state({ status: "connected", routes: [] });
+  expect(h.archives.snapshot().status).toBe("idle");
+  const reconciled = h.archives.ensure({ background: true });
+  h.wire.next().respond([snapshot(2, [])]);
+  await reconciled;
+  expect(h.archives.state(target.pubkey)).toBe("not-archived");
+  expect(h.query).toHaveBeenCalledTimes(2);
+});
+it("retires an in-flight read released across reconnect and rereads once", async () => {
+  const h = harness();
+  h.live.state({ status: "connected", routes: [] });
+  const first = h.archives.ensure({ background: true });
+  const held = h.wire.next();
+  h.live.state({ status: "retrying", routes: [] });
+  h.live.state({ status: "connected", routes: [] });
+  expect(h.archives.snapshot().status).toBe("loading");
+  held.respond([snapshot()]);
+  await first;
+  // Visibility keeps the old list; no consumer may treat it as current.
+  expect(h.archives.snapshot()).toMatchObject({
+    status: "idle",
+    archived: [target.pubkey],
+  });
+  expect(h.archives.state(target.pubkey)).toBe("unknown");
+  expect(h.query).toHaveBeenCalledTimes(1);
+  const reconciled = h.archives.ensure({ background: true });
+  h.wire.next().respond([snapshot(2, [])]);
+  await reconciled;
+  expect(h.archives.state(target.pubkey)).toBe("not-archived");
+  expect(h.archives.snapshot().status).toBe("ready");
+  expect(h.query).toHaveBeenCalledTimes(2);
+});
+it.each(["sidebar", "active"] as const)(
+  "keeps %s recovery demand through a socket drop",
+  async (demand) => {
+    const background = demand === "sidebar";
+    vi.useFakeTimers();
+    const h = harness();
+    h.live.state({ status: "connected", routes: [] });
+    const initial = h.archives.ensure({ background });
+    for (let attempt = 0; attempt < 4; attempt++) {
+      h.wire.next().fail(new ReadError("unavailable", "offline", 503));
+      if (attempt < 3) await vi.advanceTimersToNextTimerAsync();
+    }
+    await initial;
+    expect(h.archives.snapshot()).toMatchObject({
+      status: "error",
+      transient: true,
+    });
+    await vi.advanceTimersToNextTimerAsync();
+    const retry = h.wire.next();
+    expect(h.query).toHaveBeenCalledTimes(5);
+    h.live.state({ status: "retrying", routes: [] });
+    expect(retry.signal?.aborted).toBe(false);
+    if (!background) {
+      retry.respond([snapshot()]);
+      await h.archives.ensure();
+      expect(h.archives.snapshot().status).toBe("ready");
+      expect(h.query).toHaveBeenCalledTimes(5);
+      return;
+    }
+    retry.respond([snapshot()]);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.query).toHaveBeenCalledTimes(5);
+    h.live.state({ status: "connected", routes: [] });
+    const reconciliation = h.archives.ensure({ background: true });
+    const resumed = h.wire.next();
+    expect(h.query).toHaveBeenCalledTimes(6);
+    resumed.respond([snapshot()]);
+    await reconciliation;
+    expect(h.archives.snapshot().status).toBe("ready");
+  },
+);
+it.each(["startup", "reconnect"] as const)(
+  "keeps an archive admission deadline through socket flaps after %s",
+  async (phase) => {
+    vi.useFakeTimers();
+    const h = harness();
+    if (phase === "reconnect")
+      h.live.state({ status: "connected", routes: [] });
+    const first = h.archives.ensure({ background: true });
+    h.wire.next().fail(new ReadError("unavailable", "quota", 429, 60_000));
+    await first;
+    const deadline = Date.now() + 60_000;
+    for (let flap = 0; flap < 4; flap++) {
+      h.live.state({ status: "retrying", routes: [] });
+      h.live.state({ status: "connected", routes: [] });
+      void h.archives.ensure({ background: true });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(h.archives.snapshot().retryAt).toBe(deadline);
+      expect(h.query).toHaveBeenCalledTimes(1);
+    }
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(h.query).toHaveBeenCalledTimes(1);
+    for (let tick = 0; tick < 10 && !h.wire.pending.length; tick++)
+      await vi.advanceTimersToNextTimerAsync();
+    expect(Date.now()).toBeGreaterThanOrEqual(deadline);
+    const retry = h.wire.next();
+    retry.respond([snapshot()]);
+    await h.archives.ensure();
+    expect(h.archives.snapshot().status).toBe("ready");
+  },
+);
+it.each(["background", "active"] as const)(
+  "keeps a fresh admission deadline when a read held across reconnect fails (%s ensure)",
+  async (demand) => {
+    vi.useFakeTimers();
+    const h = harness();
+    h.live.state({ status: "connected", routes: [] });
+    const first = h.archives.ensure({ background: true });
+    const held = h.wire.next();
+    h.live.state({ status: "retrying", routes: [] });
+    h.live.state({ status: "connected", routes: [] });
+    held.fail(new ReadError("unavailable", "quota", 429, 60_000));
+    await first;
+    const deadline = Date.now() + 60_000;
+    expect(h.archives.snapshot()).toMatchObject({
+      status: "error",
+      transient: true,
+      retryAt: deadline,
+    });
+    await h.archives.ensure({ background: demand === "background" });
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(h.query).toHaveBeenCalledTimes(1);
+    for (let tick = 0; tick < 10 && !h.wire.pending.length; tick++)
+      await vi.advanceTimersToNextTimerAsync();
+    expect(Date.now()).toBeGreaterThanOrEqual(deadline);
+    h.wire.next().respond([snapshot()]);
+    await h.archives.ensure();
+    expect(h.archives.state(target.pubkey)).toBe("archived");
+  },
+);
 it.each([null, "invalid"])(
   "does not infer archive authority from relayAuthor (%s)",
   async (authority) => {
@@ -236,34 +452,26 @@ it("rejects rollback across refresh, failure and cache clear; permits the same h
   await read(h, [snapshot(6)]);
   expect(h.archives.snapshot().createdAt).toBe(6);
 });
-it.each(["cache", "disconnect", "access", "dispose"] as const)(
-  "%s invalidation fences late results; only a disconnect keeps known state",
+it.each(["cache", "dispose"] as const)(
+  "%s invalidation fences late results and discards archive visibility",
   async (action) => {
     const h = harness();
     h.live.state({ status: "connected", routes: [] });
-    if (action === "access")
-      h.live.receive([roster(relay, "room", [viewer.pubkey], 1)]);
     await read(h, [snapshot()]);
-    const { readAt } = h.archives.snapshot();
     const pending = h.archives.refresh();
     const req = h.wire.next();
     if (action === "cache") await h.clearCache();
-    else if (action === "disconnect")
-      h.live.state({ status: "retrying", routes: [] });
-    else if (action === "access")
-      h.live.receive([roster(relay, "room", [], 2)]);
     else h.dispose();
     expect(req.signal?.aborted).toBe(true);
-    const kept = action === "disconnect";
-    expect(archiveHides(h.archives, target.pubkey, viewer.pubkey)).toBe(kept);
+    expect(archiveHides(h.archives, target.pubkey, viewer.pubkey)).toBe(false);
     expect(h.archives.state(target.pubkey)).toBe("unknown");
     req.respond([snapshot(2)]);
     await pending;
     expect(h.archives.snapshot()).toMatchObject({
       status: action === "dispose" ? "unavailable" : "idle",
-      archived: kept ? [target.pubkey] : [],
+      archived: [],
     });
-    expect(h.archives.snapshot().readAt).toBe(kept ? readAt : undefined);
+    expect(h.archives.snapshot().readAt).toBeUndefined();
     if (action === "dispose") {
       // Closing is not lack of support: callers must not read it as "none".
       expect(h.archives.supported).toBe(true);
@@ -353,6 +561,120 @@ function writable(fixture: ReturnType<typeof archiveRelay>) {
   owners.push(owner);
   return owner.session.archives;
 }
+it.each(
+  (["archive", "unarchive"] as const).flatMap((action) =>
+    (["consent", "sign", "confirmation"] as const).map((phase) => ({
+      action,
+      phase,
+    })),
+  ),
+)(
+  "socket transitions preserve $action during $phase over healthy HTTP",
+  async ({ action, phase }) => {
+    const fixture = archiveRelay(viewer, relay, [attested(target, viewer)]);
+    if (action === "unarchive") fixture.archiveExternally(target.pubkey);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started!: (signal: AbortSignal | undefined) => void;
+    const entered = new Promise<AbortSignal | undefined>((resolve) => {
+      started = resolve;
+    });
+    const writer = fixture.transport.identityArchive;
+    if (!writer) throw new Error("fixture writer");
+    const sign = writer.sign.bind(writer);
+    writer.sign = async (template, signal) => {
+      if (phase === "sign") {
+        started(signal);
+        await gate;
+      }
+      return sign(template, signal);
+    };
+    let live!: LiveCallbacks;
+    const owner = createRelaySession({
+      ...fixture.transport,
+      async query(filters, signal, ...rest) {
+        if (
+          (phase === "consent" &&
+            filters.some((f) => f.kinds?.includes(13534))) ||
+          (phase === "confirmation" &&
+            filters.some((f) => f.kinds?.includes(13535)))
+        ) {
+          started(signal);
+          await gate;
+        }
+        return fixture.transport.query(filters, signal, ...rest);
+      },
+      subscribe(callbacks) {
+        live = callbacks;
+        return { update() {}, retry() {}, dispose() {} };
+      },
+    });
+    owners.push(owner);
+    live.state({ status: "connected", routes: [] });
+    live.state({ status: "retrying", routes: [] });
+    const outcome = owner.session.archives.request(action, target.pubkey).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    const signal = await entered;
+    try {
+      live.state({ status: "connected", routes: [] });
+      expect(signal?.aborted).toBe(false);
+      live.state({ status: "retrying", routes: [] });
+      expect(signal?.aborted).toBe(false);
+    } finally {
+      release();
+    }
+    expect(await outcome).toBeUndefined();
+    expect(fixture.published).toHaveLength(1);
+    await owner.session.archives.ensure();
+    expect(owner.session.archives.state(target.pubkey)).toBe(
+      action === "archive" ? "archived" : "not-archived",
+    );
+  },
+);
+
+it("an active ensure reads healthy HTTP while the socket is down", async () => {
+  const h = harness();
+  h.live.state({ status: "connected", routes: [] });
+  h.live.state({ status: "retrying", routes: [] });
+  const active = h.archives.ensure();
+  const req = h.wire.next();
+  h.live.state({ status: "connected", routes: [] });
+  expect(req.signal?.aborted).toBe(false);
+  req.respond([snapshot()]);
+  await active;
+  // The reconnect landed mid-read, so the consumer's next demand rereads.
+  expect(h.archives.snapshot()).toMatchObject({
+    status: "idle",
+    archived: [target.pubkey],
+  });
+  const reread = h.archives.ensure();
+  h.wire.next().respond([snapshot()]);
+  await reread;
+  expect(h.archives.state(target.pubkey)).toBe("archived");
+  expect(h.query).toHaveBeenCalledTimes(2);
+});
+
+it("channel-only revocation preserves the pending relay-wide archive read", async () => {
+  const h = harness();
+  h.live.state({ status: "connected", routes: [] });
+  h.live.receive([roster(relay, "room", [viewer.pubkey], 1)]);
+  const pending = h.archives.ensure();
+  const req = h.wire.next();
+  h.live.receive([roster(relay, "room", [], 2)]);
+  expect(req.signal?.aborted).toBe(false);
+  req.respond([snapshot()]);
+  await pending;
+  expect(h.archives.state(target.pubkey)).toBe("archived");
+  expect(
+    h.query.mock.calls.filter(([filters]) =>
+      filters.some((f) => f.kinds?.includes(13535)),
+    ),
+  ).toHaveLength(1);
+});
 it("owner path attaches the target's exact live auth tag and confirms by re-read", async () => {
   const head = attested(target, viewer);
   const fixture = archiveRelay(viewer, relay, [head]);

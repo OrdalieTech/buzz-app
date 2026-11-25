@@ -1,0 +1,113 @@
+@reference "../../shared/styles/globals.css";
+
+.page,
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+.page {
+  height: 100%;
+  min-height: 0;
+}
+.browser {
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+  padding: var(--space-4);
+  container: working-docs-collection / inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.tools {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.tools > :first-child {
+  flex: 1;
+  min-width: 12rem;
+}
+.revision {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.revisionByline {
+  display: flex;
+  gap: var(--space-1);
+  white-space: nowrap;
+}
+.revisionId {
+  flex-shrink: 100;
+}
+.revisionPlaceholder {
+  display: flex;
+  min-height: var(--size-row);
+  align-items: center;
+  gap: var(--space-row-gap);
+  padding: var(--space-2) var(--space-3);
+}
+.revisionPreview {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border-standard);
+  border-radius: var(--radius-control);
+  padding: var(--space-4);
+}
+.hidden {
+  display: none;
+}
+
+.documentPane {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.documentPane > :first-child {
+  flex: 1;
+}
+.editorDock {
+  position: absolute;
+  inset-inline: 0;
+  inset-block-end: var(--space-4);
+  z-index: var(--layer-popover);
+  width: min(calc(100% - 2 * var(--space-4)), 52rem);
+  margin-inline: auto;
+}
+.editorToolbar {
+  @apply floating-surface;
+  --floating-inset: var(--space-2);
+  min-width: 0;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding: var(--space-2);
+}
+.saveAction {
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.sourceBody {
+  flex: 1;
+  min-height: 12rem;
+  display: flex;
+}

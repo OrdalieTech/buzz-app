@@ -10,7 +10,6 @@ import audience from "./audience.md?raw";
 import autonomy from "./autonomy.md?raw";
 import callbacks from "./callbacks.md?raw";
 import commitIdentity from "./commit-identity.md?raw";
-import engineering from "./engineering.md?raw";
 import etiquette from "./etiquette.md?raw";
 import intro from "./intro.md?raw";
 import memory from "./memory.md?raw";
@@ -43,10 +42,11 @@ export type Facts = Readonly<{
   /** Whether each thread is a session of its own, or the whole channel or
    * community is one. */
   scope: "thread" | "channel" | "community";
-  /** What the session is, for a harness that states it: one thread, one
-   * whole conversation (a DM, a personal chat, a huddle or a channel's top
-   * level), or a watch's or timer's run that joins no conversation. Without
-   * it, the Session Model describes the scope alone. */
+  /** What the session is: one thread, one whole conversation (a DM, a
+   * personal chat, a huddle or a channel's top level), or a watch's or
+   * timer's run that joins no conversation. An installed harness that does
+   * not name the conversation leaves it out, and the Session Model then
+   * describes the scope alone. */
   place?: "thread" | "conversation" | "standalone" | undefined;
   /** The agent's workspace, absolute, when the conversation works in a folder
    * of its own instead. */
@@ -54,8 +54,12 @@ export type Facts = Readonly<{
 }>;
 
 export type Section = Readonly<{
-  /** Never changes once released. */
+  /** What saved choices name the section by. A released id is never given
+   * to another section: a rename lists it in `aliases`. */
   id: string;
+  /** The ids it had before a rename. A choice saved under one applies to
+   * the section. */
+  aliases?: readonly string[];
   /** The heading the host prints. Only the opening lines have none. */
   title?: string;
   /** The owner can turn the section off or give their own text. */
@@ -66,6 +70,10 @@ export type Section = Readonly<{
    * a complete text. */
   text: string | ((facts: Facts) => string);
 }>;
+
+/** Changes when a released section's id or title does, or one is removed:
+ * a prompt with another layout has other sections to name. */
+export const LAYOUT = 1;
 
 export const SECTIONS: readonly Section[] = [
   { id: "intro", text: intro },
@@ -107,12 +115,6 @@ export const SECTIONS: readonly Section[] = [
         : workspaceLayout,
   },
   { id: "memory", title: "Agent Memory", owner: true, text: memory },
-  {
-    id: "engineering",
-    title: "Engineering Discipline",
-    owner: true,
-    text: engineering,
-  },
   {
     id: "repo-conventions",
     title: "Working in the Repo",
@@ -163,3 +165,11 @@ export const SECTIONS: readonly Section[] = [
  * text. */
 export const locked = (section: Section) =>
   typeof section.text === "string" && !section.owner && !section.plugin;
+
+/** The section a plugin can replace under `id`, also by an ID the section
+ * had before. */
+export const pluginSection = (id: string) =>
+  SECTIONS.find(
+    (section) =>
+      section.plugin && (section.id === id || section.aliases?.includes(id)),
+  );

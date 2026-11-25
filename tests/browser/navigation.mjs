@@ -1,5 +1,12 @@
 import { expect } from "@playwright/test";
 
+export async function clickSidebarHeadingAction(action) {
+  // The heading must reveal its actions before the pointer can enter them.
+  const section = action.locator("xpath=ancestor::*[@data-sidebar-section][1]");
+  await section.locator("summary").first().hover();
+  await action.click();
+}
+
 export async function pageChoices(page, query = "") {
   await page.getByRole("button", { name: "Search Buzz", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Search Buzz", exact: true });
@@ -193,6 +200,9 @@ export async function chooseColorMode(page, name) {
 // Secondary panels enter with a transform and a parent grid transition.
 // Positions compared across separate reads must wait for both: each read sees
 // a different offset, so a fixed gap between controls can appear to overlap.
+// A covered tab skips rendering (content-visibility: hidden), so an animation
+// inside it, such as a loading mark's fade, does not advance until the tab is
+// shown again. It cannot move anything on screen, so it is not waited for.
 export async function settlePanelMotion(page) {
   await page
     .locator("[data-panel-dock]")
@@ -205,7 +215,10 @@ export async function settlePanelMotion(page) {
           ]
             .filter(
               (animation) =>
-                animation.effect?.getComputedTiming().endTime !== Infinity,
+                animation.effect?.getComputedTiming().endTime !== Infinity &&
+                !animation.effect?.target?.closest?.(
+                  "[data-covered]:not([data-leaving])",
+                ),
             )
             .map((animation) => animation.finished),
         ),

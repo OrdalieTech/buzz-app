@@ -57,6 +57,7 @@ export function videoMetrics(path, { threshold = 0.35, width = 120 } = {}) {
       path,
     ]),
   ).streams[0];
+  if (!probe) throw new Error(`${path}: no video stream found`);
   const height = Math.round((probe.height / probe.width) * width);
   const [num, den] = probe.avg_frame_rate.split("/").map(Number);
   const frameMs = (1000 * den) / num;
@@ -77,6 +78,7 @@ export function videoMetrics(path, { threshold = 0.35, width = 120 } = {}) {
   );
   const size = width * height;
   const count = Math.floor(raw.length / size);
+  if (count === 0) throw new Error(`${path}: captured 0 frames`);
   let blank = 0;
   let run = 0;
   let longest = 0;
@@ -114,7 +116,7 @@ export const TARGETS = {
   blankFrames: { target: 0, ceiling: 5 },
 };
 
-export function summarize(runs) {
+export function summarize(runs, { targets = true } = {}) {
   const arms = [...new Set(runs.map((run) => run.arm))];
   const keys = [
     "gapP95Ms",
@@ -132,13 +134,14 @@ export function summarize(runs) {
         .filter((run) => run.arm === arm)
         .map((run) => run.metrics[key]);
       const value = median(values);
-      const verdict = TARGETS[key]
-        ? value <= TARGETS[key].target
-          ? " (target met)"
-          : value <= TARGETS[key].ceiling
-            ? " (within ceiling)"
-            : " (over ceiling)"
-        : "";
+      const verdict =
+        targets && TARGETS[key]
+          ? value <= TARGETS[key].target
+            ? " (target met)"
+            : value <= TARGETS[key].ceiling
+              ? " (within ceiling)"
+              : " (over ceiling)"
+          : "";
       return `${format(value)} [${format(Math.min(...values))}–${format(Math.max(...values))}]${verdict}`;
     });
     return `| ${key} | ${cells.join(" | ")} |`;

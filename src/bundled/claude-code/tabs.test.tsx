@@ -1,5 +1,6 @@
 import "../../../tests/sonner-dom";
 import {
+  appendFileSync,
   chmodSync,
   mkdirSync,
   mkdtempSync,
@@ -9,6 +10,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { TranscriptFocus } from "../../features/agents/ActivityTranscript";
+import { LIVE_READ_MS } from "../../features/agents/TranscriptPanel";
+import { readerInputs } from "../../features/profiles/target";
 import { AgentTabs } from "../agents/AgentTabs";
 import { useAgentSettingsHost } from "../agents/AgentSettingsHost";
 import type {
@@ -57,7 +61,14 @@ const nativeKey = vi.hoisted(() => {
     if (!/^sk-ant-[A-Za-z0-9_-]+$/.test(value.trim()))
       throw "That is not an Anthropic API key. Create one at console.anthropic.com and paste it here.";
   };
-  return { saved: true, saves: [] as string[], check, save: check };
+  return {
+    saved: true,
+    saves: [] as string[],
+    check,
+    save: check,
+    /** Whether the device-wide list sets `ANTHROPIC_API_KEY`. */
+    device: false,
+  };
 });
 vi.mock("@tauri-apps/api/core", () => ({
   isTauri: () => desktop.tauri,
@@ -65,6 +76,8 @@ vi.mock("@tauri-apps/api/core", () => ({
     // An IPC round trip, as the host's process steps answer after a turn.
     await new Promise((resolve) => setTimeout(resolve, 0));
     if (command === "claude_api_key_status") return nativeKey.saved;
+    if (command === "agent_env_status" && nativeKey.device)
+      return { names: ["ANTHROPIC_API_KEY"] };
     if (command === "claude_api_key_set") {
       const value = args?.value ?? "";
       nativeKey.saves.push(value);
@@ -105,6 +118,7 @@ vi.mock("motion/react", async (actual) => ({
 
 beforeEach(() => {
   desktop.tauri = true;
+  nativeKey.device = false;
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
   // jsdom has no layout observers; the model picker sizes itself with one.
   vi.stubGlobal(
@@ -196,7 +210,10 @@ function applied({
   channels,
   remote = false,
   own = {},
+  startsProtected = false,
 }: {
+  /** Whether a new agent starts protected, from the owner's defaults. */
+  startsProtected?: boolean;
   /** What `claude auth status` reports: the person's own setup, signed out
    * unless `status` is set; it answers once `held` settles, when set. */
   own?: { status?: object; held?: Promise<void> };
@@ -236,28 +253,12 @@ function applied({
     const name = step === "run" ? "claude" : (step ?? id);
     const args = (options.args ?? []).slice(step ? 3 : 0).join(" ");
     // The manifest's listing and search run for real on a copy of `files`.
-    if (name === "list" || name === "starts") return listed(name, options);
-    if (name === "workspace" || name === "read") {
-      const file = files[args];
-      queueMicrotask(() =>
-        name === "workspace"
-          ? options.onStdout?.("/Users/me/.buzz\n")
-          : file === undefined
-            ? options.onStderr?.(`base64: ${args}: No such file or directory`)
-            : options.onStdout?.(btoa(file)),
-      );
-      return {
-        write: async () => undefined,
-        end: async () => undefined,
-        kill: async () => undefined,
-        exited: new Promise<number>((resolve) =>
-          setTimeout(
-            () => resolve(name === "read" && file === undefined ? 1 : 0),
-            0,
-          ),
-        ),
-      };
-    }
+    if (
+      ["list", "starts", "size", "read-page", "read", "workspace"].includes(
+        name,
+      )
+    )
+      return listed(name, options);
     // Buzz's launcher answers 127 when it has no copy.
     const missing = name === "claude" && args === "--version" && !available;
     const streaming = args.includes("--input-format stream-json");
@@ -333,6 +334,9 @@ function applied({
     },
     agents: {
       storage,
+      core: async () => undefined,
+      tools: () => [],
+      startsProtected: async () => startsProtected,
       executionBinding: () => (remote ? { provider: "nexus/blox" } : undefined),
       inspectExecution: vi.fn(async () =>
         remote ? { provider: "nexus/blox" } : undefined,
@@ -345,13 +349,17 @@ function applied({
       },
       snapshot: () => ({ status: "ready", agents: [], running: [] }),
       relay: () =>
-        channels &&
         ({
           snapshot: () => ({
             status: "ready",
-            session: { channels: { list: () => ({ channels }) } },
+            session: {
+              channels: {
+                list: () => ({ channels: channels ?? [] }),
+                get: (id: string) => (channels ? undefined : { id }),
+              },
+            },
           }),
-        } as unknown as RelayData),
+        }) as unknown as RelayData,
       subscribe: () => () => undefined,
     },
     effect: vi.fn(),
@@ -487,6 +495,9 @@ it("lists saved conversations and shows one's transcript, or that it is gone", a
   expect(
     screen.getByText("Two files.", { selector: "summary span" }),
   ).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: /earlier activity/i }),
+  ).toBeNull();
   await user.click(screen.getByRole("button", { name: "Refresh transcript" }));
   await waitFor(() =>
     expect(
@@ -504,6 +515,790 @@ it("lists saved conversations and shows one's transcript, or that it is gone", a
   expect(screen.queryByRole("alert")).toBeNull();
   expect(save).not.toHaveBeenCalled();
 });
+
+const earlierEvent = "e".repeat(64);
+const sessionPrompt = (text: string, event = text) =>
+  JSON.stringify({
+    uuid: text,
+    type: "user",
+    timestamp: "2026-10-09T10:00:00Z",
+    message: {
+      content: `<buzz-event>\n${JSON.stringify({ id: event, content: text })}\n</buzz-event>`,
+    },
+  });
+const sessionReply = (text: string) =>
+  JSON.stringify({
+    uuid: `reply: ${text.slice(0, 40)}`,
+    type: "assistant",
+    timestamp: "2026-10-09T10:01:00Z",
+    message: { content: [{ type: "text", text }] },
+  });
+
+function longTranscript() {
+  localStorage.setItem(
+    "buzz.claude-code.sessions.v1",
+    JSON.stringify({
+      [agent().key]: { channel: { id: "kept", seen: 0, at: 1 } },
+    }),
+  );
+  const file = "./-Users-me--buzz/kept.jsonl";
+  const gap = JSON.stringify({ type: "progress", data: "x".repeat(2 ** 21) });
+  const { home, type, spawn } = installed({
+    channels: [{ id: "channel", name: "channel", channelType: "stream" }],
+    files: {
+      [file]: [
+        sessionPrompt("earlier", earlierEvent),
+        gap,
+        sessionPrompt("newest"),
+      ].join("\n"),
+    },
+  });
+  return {
+    Activity: tab(type, 1),
+    path: join(home, ".claude/projects", file),
+    holdNextFileProcess(...ids: string[]) {
+      const run = spawn.getMockImplementation();
+      if (!run) throw new Error("Missing manifest process fixture");
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const started = new Promise<string>((resolve) => {
+        spawn.mockImplementation(async (id, options) => {
+          if (!ids.includes(id)) return run(id, options);
+          spawn.mockImplementation(run);
+          const process = await run(id, options);
+          const code = await process.exited;
+          resolve(id);
+          return { ...process, exited: held.then(() => code) };
+        });
+      });
+      return { started, release };
+    },
+    fileReads: () =>
+      spawn.mock.calls
+        .map(([id]) => id)
+        .filter((id) => id === "read" || id === "read-page"),
+    gap,
+    startCompaction() {
+      if (!type.sessionControls)
+        throw new Error("Missing Claude session controls");
+      const compact = type.sessionControls.run(
+        agent(),
+        { channelId: "channel" },
+        "compact",
+      );
+      return async () => {
+        const session = spawn.mock.calls.find(([, options]) =>
+          options?.args?.includes("--resume"),
+        )?.[1];
+        if (!session?.onStdout)
+          throw new Error("Claude did not resume the saved session");
+        session.onStdout(
+          '{"type":"result","subtype":"success","session_id":"kept"}\n',
+        );
+        await compact;
+      };
+    },
+  };
+}
+
+it("keeps an untouched tail on working changes until earlier activity is requested", async () => {
+  const { Activity, path, gap, fileReads, startCompaction } = longTranscript();
+  render(<Activity agent={agent()} save={vi.fn()} />);
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: /^View transcript/ }));
+  const summary = { selector: "summary span" };
+  await screen.findByText("newest", summary);
+  const before = fileReads().length;
+  appendFileSync(path, `\n${gap}\n${sessionPrompt("while working")}`);
+  const finish = startCompaction();
+  try {
+    await screen.findByText("while working", summary);
+    expect(screen.queryByText("earlier", summary)).toBeNull();
+    expect(fileReads().slice(before)).toEqual(["read-page"]);
+    appendFileSync(path, `\n${sessionPrompt("after working")}`);
+  } finally {
+    await act(finish);
+  }
+  await screen.findByText("after working", summary);
+  expect(screen.queryByText("earlier", summary)).toBeNull();
+  expect(screen.getByText("Earlier activity is not loaded.")).toBeVisible();
+  expect(fileReads().slice(before)).toEqual(["read-page", "read-page"]);
+  const load = screen.getByRole("button", { name: /load earlier activity/i });
+  chmodSync(path, 0);
+  load.focus();
+  await user.keyboard("{Enter}");
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    /permission denied/i,
+  );
+  expect(screen.getByText("while working", summary)).toBeVisible();
+  expect(document.activeElement).toBe(load);
+  chmodSync(path, 0o600);
+  await user.keyboard("{Enter}");
+  expect(await screen.findByText("earlier", summary)).toBeVisible();
+  expect(load).not.toBeInTheDocument();
+  expect(document.activeElement).toBe(
+    screen.getByRole("button", { name: "Refresh transcript" }),
+  );
+});
+
+it("loads the missing history when a working session grows past the held tail", async () => {
+  const { Activity, path, gap, fileReads, startCompaction } = longTranscript();
+  render(<Activity agent={agent()} save={vi.fn()} />);
+  await userEvent.click(
+    screen.getByRole("button", { name: /^View transcript/ }),
+  );
+  await screen.findByText("Earlier activity is not loaded.");
+  appendFileSync(path, `\n${sessionPrompt("while working")}`);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const finish = startCompaction();
+  try {
+    await vi.waitFor(() =>
+      screen.getByText("while working", { selector: "summary span" }),
+    );
+    const before = fileReads().length;
+    chmodSync(path, 0);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_READ_MS);
+    });
+    await vi.waitFor(() => expect(screen.getByRole("alert")).toBeVisible());
+    expect(screen.getByText(partialHistory)).toBeVisible();
+    expect(fileReads().slice(before)).not.toContain("read");
+    chmodSync(path, 0o600);
+    appendFileSync(path, `\n${gap}\n${sessionPrompt("after the gap")}`);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_READ_MS);
+    });
+    vi.useRealTimers();
+    expect(
+      await screen.findByText("after the gap", { selector: "summary span" }),
+    ).toBeVisible();
+    expect(
+      screen.getByText("earlier", { selector: "summary span" }),
+    ).toBeVisible();
+    expect(screen.queryByText("Earlier activity is not loaded.")).toBeNull();
+  } finally {
+    vi.useRealTimers();
+    await act(finish);
+  }
+});
+
+async function showLongTranscript(
+  Activity: ReturnType<typeof longTranscript>["Activity"],
+) {
+  render(<Activity agent={agent()} save={vi.fn()} />);
+  await userEvent.click(
+    screen.getByRole("button", { name: /^View transcript/ }),
+  );
+}
+
+async function openLongTranscript() {
+  const fixture = longTranscript();
+  await showLongTranscript(fixture.Activity);
+  const load = await screen.findByRole("button", {
+    name: /load earlier activity/i,
+  });
+  const summary = (text: string) =>
+    screen.findByText(text, { selector: "summary span" });
+  return { ...fixture, load, summary };
+}
+
+const transcriptSummary = { selector: "summary span" };
+const partialHistory = "Earlier activity is not loaded.";
+
+async function expectFullPreviewHistory(first = "earlier") {
+  expect(await screen.findByText(first, transcriptSummary)).toBeVisible();
+  expect(screen.getByText("newest", transcriptSummary)).toBeVisible();
+  expect(screen.queryByText(partialHistory)).toBeNull();
+}
+
+function expectTurnStatus(item: HTMLElement, status: string) {
+  const turn = item.closest("article");
+  if (!turn) throw new Error("Missing transcript turn");
+  expect(within(turn).getByText(status)).toBeVisible();
+}
+
+async function openFortyNineTurnTranscript() {
+  const fixture = await openLongTranscript();
+  const { load, path, gap, summary } = fixture;
+  const older = Array.from({ length: 48 }, (_, i) =>
+    sessionPrompt(`older turn ${i + 1}`),
+  );
+  writeFileSync(path, [...older, gap, sessionPrompt("newest")].join("\n"));
+  await userEvent.click(load);
+  expect(await summary("older turn 1")).toBeVisible();
+  return fixture;
+}
+
+it("keeps all 50 held turns when stopping with a two-turn tail", async () => {
+  const { path, startCompaction, fileReads, summary } =
+    await openFortyNineTurnTranscript();
+  const before = fileReads().length;
+  appendFileSync(path, `\n${sessionPrompt("new request")}`);
+  const finish = startCompaction();
+  try {
+    expectTurnStatus(await summary("new request"), "Working");
+    expect(screen.getAllByRole("article")).toHaveLength(50);
+    expect(fileReads().slice(before)).toEqual(["read"]);
+    appendFileSync(path, `\n${sessionReply("final reply")}`);
+  } finally {
+    await act(finish);
+  }
+  expectTurnStatus(await summary("final reply"), "Completed");
+  await expectFullPreviewHistory("older turn 1");
+  expect(screen.getAllByRole("article")).toHaveLength(50);
+  expect(fileReads().slice(before)).toEqual(["read", "read-page"]);
+});
+
+it("reads canonical history when a 51st turn first appears at stop", async () => {
+  const { path, startCompaction, fileReads, summary } =
+    await openFortyNineTurnTranscript();
+  const before = fileReads().length;
+  const latestWindow = "Showing the latest 50 turns.";
+  appendFileSync(path, `\n${sessionPrompt("working request")}`);
+  const finish = startCompaction();
+  try {
+    expectTurnStatus(await summary("working request"), "Working");
+    expect(screen.getAllByRole("article")).toHaveLength(50);
+    expect(screen.queryByText(latestWindow)).toBeNull();
+    appendFileSync(
+      path,
+      `\n${sessionPrompt("request at stop")}\n${sessionReply("reply to the new request")}`,
+    );
+  } finally {
+    await act(finish);
+  }
+  expectTurnStatus(await summary("reply to the new request"), "Completed");
+  await expectFullPreviewHistory("older turn 2");
+  expect(screen.getByText("working request", transcriptSummary)).toBeVisible();
+  expect(screen.getByText("request at stop", transcriptSummary)).toBeVisible();
+  expect(screen.queryByText("older turn 1", transcriptSummary)).toBeNull();
+  expect(screen.getAllByRole("article")).toHaveLength(50);
+  expect(screen.getByText(latestWindow)).toBeVisible();
+  expect(fileReads().slice(before)).toEqual(["read", "read-page", "read"]);
+});
+
+const reportCall = {
+  type: "tool_use",
+  name: "mcp__buzz__send",
+  id: "s",
+  input: { text: "Sample report" },
+};
+
+const toolResult = (id: string, content: string, is_error = false) =>
+  JSON.stringify({
+    uuid: `result-${id}`,
+    type: "user",
+    message: {
+      content: [{ type: "tool_result", tool_use_id: id, content, is_error }],
+    },
+  });
+
+it("updates a tool outside the working tail and resumes polling after a late send result", async () => {
+  const { load, path, gap, fileReads, startCompaction, summary } =
+    await openLongTranscript();
+  await userEvent.click(load);
+  await expectFullPreviewHistory();
+  const calls = JSON.stringify({
+    uuid: "calls",
+    type: "assistant",
+    message: {
+      content: [
+        {
+          type: "tool_use",
+          name: "Read",
+          id: "r",
+          input: { file_path: "/work/sample.txt" },
+        },
+        reportCall,
+      ],
+    },
+  });
+  appendFileSync(path, `\n${calls}\n${gap}\n${sessionReply("draft reply")}\n`);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const poll = async () =>
+    act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_READ_MS);
+    });
+  const finish = startCompaction();
+  try {
+    await vi.waitFor(() =>
+      expectTurnStatus(
+        screen.getByText("draft reply", transcriptSummary),
+        "Working",
+      ),
+    );
+    const tool = document.querySelector<HTMLDetailsElement>(
+      '[data-entry="item:calls:0"] details',
+    );
+    if (!tool) throw new Error("Missing original tool row");
+    expect(tool).toHaveAttribute("data-status", "in_progress");
+    tool.open = true;
+    fireEvent(tool, new Event("toggle"));
+    const before = fileReads().length;
+    appendFileSync(path, `${toolResult("r", "original output")}\n`);
+    await poll();
+    await vi.waitFor(() =>
+      expect(within(tool).getByText("original output")).toBeVisible(),
+    );
+    expect(tool).toHaveAttribute("data-status", "completed");
+    expect(fileReads().slice(before)).not.toContain("read");
+
+    appendFileSync(path, `${toolResult("s", "channel missing", true)}\n`);
+    await poll();
+    await vi.waitFor(() =>
+      expect(
+        screen.getByText(/The message above was not posted: channel missing/),
+      ).toBeVisible(),
+    );
+    expect(
+      fileReads()
+        .slice(before)
+        .filter((id) => id === "read"),
+    ).toHaveLength(1);
+
+    const afterFallback = fileReads().length;
+    appendFileSync(path, `${sessionReply("after the late result")}\n`);
+    await poll();
+    await vi.waitFor(() =>
+      expectTurnStatus(
+        screen.getByText("after the late result", transcriptSummary),
+        "Working",
+      ),
+    );
+    expect(fileReads().slice(afterFallback)).not.toContain("read");
+    appendFileSync(path, `${sessionReply("final oversized reply")}\n`);
+  } finally {
+    vi.useRealTimers();
+    await act(finish);
+  }
+  expectTurnStatus(await summary("final oversized reply"), "Completed");
+  await expectFullPreviewHistory();
+});
+
+it("marks a prior-batch send as posted when its full read returns", async () => {
+  const { path, gap, load, startCompaction, holdNextFileProcess } =
+    await openLongTranscript();
+  await userEvent.click(load);
+  await expectFullPreviewHistory();
+  const call = JSON.stringify({
+    uuid: "report",
+    type: "assistant",
+    message: { content: [reportCall] },
+  });
+  appendFileSync(path, `\n${call}\n${gap}\n`);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const finish = startCompaction();
+  try {
+    const report = () =>
+      screen.getByText("Sample report", transcriptSummary).closest("summary");
+    await vi.waitFor(() => expect(report()).toBeVisible());
+    const read = holdNextFileProcess("read");
+    try {
+      appendFileSync(path, `${toolResult("s", `sent ${"a".repeat(64)}`)}\n`);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(LIVE_READ_MS);
+      });
+      await read.started;
+      expect(report()).not.toHaveTextContent("Posted");
+    } finally {
+      read.release();
+    }
+    await vi.waitFor(() => expect(report()).toHaveTextContent("Posted"));
+    expectTurnStatus(
+      screen.getByText("Sample report", transcriptSummary),
+      "Working",
+    );
+  } finally {
+    vi.useRealTimers();
+    await act(finish);
+  }
+});
+
+it("reads corrected earlier history when work stops with Refresh queued behind a poll", async () => {
+  const {
+    load,
+    path,
+    gap,
+    startCompaction,
+    fileReads,
+    holdNextFileProcess,
+    summary,
+  } = await openLongTranscript();
+  await userEvent.click(load);
+  await expectFullPreviewHistory();
+  const before = fileReads().length;
+  appendFileSync(path, `\n${sessionPrompt("working request")}`);
+  const poll = holdNextFileProcess("read-page");
+  vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  const finish = startCompaction();
+  try {
+    await vi.waitFor(() =>
+      screen.getByText("working request", transcriptSummary),
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_READ_MS);
+    });
+    await poll.started;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh transcript" }));
+    writeFileSync(
+      path,
+      [
+        sessionPrompt("corrected earlier", earlierEvent),
+        gap,
+        sessionPrompt("newest"),
+        sessionPrompt("working request"),
+        sessionReply("reply at stop"),
+      ].join("\n"),
+    );
+  } finally {
+    vi.useRealTimers();
+    try {
+      await act(finish);
+    } finally {
+      await act(async () => poll.release());
+    }
+  }
+  expect(await summary("reply at stop")).toBeVisible();
+  await expectFullPreviewHistory("corrected earlier");
+  expect(screen.queryByText("earlier", transcriptSummary)).toBeNull();
+  expect(fileReads().slice(before)).toEqual(["read", "read-page", "read"]);
+});
+
+it.each([
+  ["Refresh transcript", false],
+  ["Load earlier activity", false],
+  ["Load earlier activity", true],
+] as const)(
+  "keeps the preview visible while %s loads full history (tab away: %s)",
+  async (action, tabAway) => {
+    const { fileReads, holdNextFileProcess, summary } =
+      await openLongTranscript();
+    const newest = await summary("newest");
+    const before = fileReads().length;
+    const expansion = holdNextFileProcess("read", "read-page");
+    const user = userEvent.setup();
+    const control = screen.getByRole("button", { name: action });
+    const refresh = screen.getByRole("button", { name: "Refresh transcript" });
+    const expectedFocus = tabAway ? newest.closest("summary") : refresh;
+    try {
+      control.focus();
+      await user.keyboard("{Enter}");
+      await expansion.started;
+      expect(document.activeElement).toBe(control);
+      if (tabAway) {
+        await user.tab();
+        expect(document.activeElement).toBe(expectedFocus);
+      }
+      expect(newest).toBeVisible();
+      expect(screen.getByText(partialHistory)).toBeVisible();
+    } finally {
+      await act(async () => expansion.release());
+    }
+    await expectFullPreviewHistory();
+    expect(document.activeElement).toBe(expectedFocus);
+    expect(fileReads().slice(before)).toEqual(["read"]);
+  },
+);
+
+it("expands a Claude preview when Refresh queues during its initial read", async () => {
+  const { Activity, fileReads, holdNextFileProcess } = longTranscript();
+  const opening = holdNextFileProcess("read-page");
+  try {
+    await showLongTranscript(Activity);
+    expect(await opening.started).toBe("read-page");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh transcript" }));
+    expect(screen.queryByText("newest", transcriptSummary)).toBeNull();
+    expect(fileReads()).toEqual(["read-page"]);
+  } finally {
+    await act(async () => opening.release());
+  }
+  await expectFullPreviewHistory();
+  expect(fileReads()).toEqual(["read-page", "read"]);
+});
+
+it.each([false, true])(
+  "expands a Claude preview when work stops during Refresh (hidden: %s)",
+  async (hide) => {
+    const {
+      path,
+      gap,
+      fileReads,
+      holdNextFileProcess,
+      startCompaction,
+      summary,
+    } = await openLongTranscript();
+    appendFileSync(path, `\n${sessionPrompt("during refresh")}`);
+    let finish: ReturnType<typeof startCompaction> | undefined =
+      startCompaction();
+    const visibility = vi.spyOn(document, "hidden", "get");
+    try {
+      await summary("during refresh");
+      writeFileSync(
+        path,
+        [
+          sessionPrompt("corrected earlier", earlierEvent),
+          gap,
+          sessionPrompt("newest"),
+          sessionPrompt("during refresh"),
+        ].join("\n"),
+      );
+      const interrupted = holdNextFileProcess("read", "read-page");
+      try {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Refresh transcript" }),
+        );
+        await interrupted.started;
+        expect(screen.getByText(partialHistory)).toBeVisible();
+        appendFileSync(path, `\n${sessionPrompt("after interrupted refresh")}`);
+        if (hide) {
+          visibility.mockReturnValue(true);
+          fireEvent(document, new Event("visibilitychange"));
+        }
+        const beforeStop = fileReads().length;
+        await act(finish);
+        finish = undefined;
+        await act(async () => interrupted.release());
+        if (hide) {
+          expect(fileReads()).toHaveLength(beforeStop);
+          expect(screen.getByText(partialHistory)).toBeVisible();
+          visibility.mockReturnValue(false);
+          fireEvent(document, new Event("visibilitychange"));
+        }
+        expect(await summary("after interrupted refresh")).toBeVisible();
+        await expectFullPreviewHistory("corrected earlier");
+        expect(fileReads().slice(beforeStop)).toEqual(["read"]);
+      } finally {
+        interrupted.release();
+      }
+    } finally {
+      visibility.mockRestore();
+      if (finish) await act(finish);
+    }
+  },
+);
+
+it("advances the 50-turn window on a working poll", async () => {
+  const { load, path, gap, startCompaction, summary } =
+    await openLongTranscript();
+  const older = Array.from({ length: 48 }, (_, i) =>
+    sessionPrompt(`turn ${i}`),
+  );
+  writeFileSync(path, [...older, gap, sessionPrompt("newest")].join("\n"));
+  await userEvent.click(load);
+  await summary("turn 0");
+  appendFileSync(path, `\n${sessionPrompt("during")}`);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const finish = startCompaction();
+  try {
+    await vi.waitFor(() => screen.getByText("during", transcriptSummary));
+    appendFileSync(path, `\n${sessionPrompt("polled")}`);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_READ_MS);
+    });
+    vi.useRealTimers();
+    await summary("polled");
+    expect(screen.queryByText("turn 0", transcriptSummary)).toBeNull();
+    expect(screen.getByText("turn 1", transcriptSummary)).toBeVisible();
+    expect(document.querySelectorAll("[data-transcript] article")).toHaveLength(
+      50,
+    );
+  } finally {
+    vi.useRealTimers();
+    await act(finish);
+  }
+});
+
+it("finishes Load earlier requested during work even when the turn ends", async () => {
+  const { load, path, startCompaction, summary } = await openLongTranscript();
+  appendFileSync(path, `\n${sessionPrompt("during")}`);
+  const finish = startCompaction();
+  await summary("during");
+  fireEvent.click(load);
+  await act(finish);
+  expect(await summary("earlier")).toBeVisible();
+  expect(load).not.toBeInTheDocument();
+});
+
+it("retries each focused opening once after Load earlier fails", async () => {
+  const { Activity, path, fileReads } = longTranscript();
+  const focus = {
+    events: [earlierEvent],
+    inputs: readerInputs(),
+    done: vi.fn(),
+  };
+  const page = (opening?: typeof focus) => (
+    <TranscriptFocus.Provider value={opening}>
+      <Activity agent={agent()} save={vi.fn()} />
+    </TranscriptFocus.Provider>
+  );
+  const { rerender } = render(page());
+  await userEvent.click(
+    screen.getByRole("button", { name: /^View transcript/ }),
+  );
+  const load = await screen.findByRole("button", {
+    name: /load earlier activity/i,
+  });
+  chmodSync(path, 0);
+  await userEvent.click(load);
+  await screen.findByRole("alert");
+  const before = fileReads().length;
+  rerender(page(focus));
+  await waitFor(() => expect(fileReads().length).toBeGreaterThan(before));
+  await waitFor(() => expect(screen.getByRole("alert")).toBeVisible());
+  rerender(page(focus));
+  expect(fileReads().length).toBe(before + 1);
+  chmodSync(path, 0o600);
+  Element.prototype.scrollIntoView = () => {};
+  try {
+    rerender(page({ ...focus }));
+    await waitFor(() => expect(focus.done).toHaveBeenCalled());
+    expect(
+      screen
+        .getByText("earlier", { selector: "summary span" })
+        .closest("details"),
+    ).toHaveProperty("open", true);
+  } finally {
+    Reflect.deleteProperty(Element.prototype, "scrollIntoView");
+  }
+});
+
+it("retries a missing transcript on focus and reuses successfully loaded history", async () => {
+  const { Activity, path, fileReads, startCompaction, holdNextFileProcess } =
+    longTranscript();
+  const focus = {
+    events: [earlierEvent],
+    inputs: readerInputs(),
+    done: vi.fn(),
+  };
+  const page = (opening?: typeof focus) => (
+    <TranscriptFocus.Provider value={opening}>
+      <Activity agent={agent()} save={vi.fn()} />
+    </TranscriptFocus.Provider>
+  );
+  const { rerender } = render(page());
+  await userEvent.click(
+    screen.getByRole("button", { name: /^View transcript/ }),
+  );
+  const load = await screen.findByRole("button", {
+    name: /load earlier activity/i,
+  });
+  await userEvent.click(load);
+  await expectFullPreviewHistory();
+  appendFileSync(path, `\n${sessionPrompt("working request")}`);
+  const finish = startCompaction();
+  expectTurnStatus(
+    await screen.findByText("working request", transcriptSummary),
+    "Working",
+  );
+  appendFileSync(path, `\n${sessionPrompt("new turn at stop")}`);
+  const tail = holdNextFileProcess("read-page");
+  await act(finish);
+  try {
+    await tail.started;
+    rmSync(path);
+  } finally {
+    await act(async () => tail.release());
+  }
+  await screen.findByText(/no transcript for this conversation/);
+  writeFileSync(path, sessionPrompt("restored", earlierEvent));
+  Element.prototype.scrollIntoView = () => {};
+  try {
+    rerender(page(focus));
+    const row = await screen.findByText("restored", {
+      selector: "summary span",
+    });
+    await waitFor(() => expect(focus.done).toHaveBeenCalled());
+    const before = fileReads().length;
+    const second = { ...focus, done: vi.fn() };
+    rerender(page(second));
+    await waitFor(() => expect(second.done).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Refresh transcript" }));
+    expect(row.closest("[aria-busy]")).toHaveAttribute("aria-busy", "true");
+    await waitFor(() =>
+      expect(row.closest("[aria-busy]")).toHaveAttribute("aria-busy", "false"),
+    );
+    expect(fileReads().slice(before)).toEqual(["read"]);
+  } finally {
+    Reflect.deleteProperty(Element.prototype, "scrollIntoView");
+  }
+});
+
+it("opens the replacement session's preview when its first turn starts while hidden", async () => {
+  const { load, path, gap, startCompaction, summary } =
+    await openLongTranscript();
+  await userEvent.click(load);
+  await summary("earlier");
+  const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+  writeFileSync(
+    join(dirname(path), "replacement.jsonl"),
+    [
+      sessionPrompt("replacement history"),
+      gap,
+      sessionPrompt("replacement tail"),
+    ].join("\n"),
+  );
+  localStorage.setItem(
+    "buzz.claude-code.sessions.v1",
+    JSON.stringify({
+      [agent().key]: { channel: { id: "replacement", seen: 0, at: 2 } },
+    }),
+  );
+  let finish!: () => Promise<void>;
+  await act(async () => {
+    finish = startCompaction();
+  });
+  hidden.mockReturnValue(false);
+  fireEvent(document, new Event("visibilitychange"));
+  try {
+    await summary("replacement tail");
+    expect(screen.getByText("Earlier activity is not loaded.")).toBeVisible();
+    expect(
+      screen.queryByText("replacement history", { selector: "summary span" }),
+    ).toBeNull();
+  } finally {
+    await act(finish);
+  }
+});
+
+it.each(["on open", "after preview"])(
+  "shows the earlier focused turn %s",
+  async (when) => {
+    const { Activity } = longTranscript();
+    const focus = {
+      events: [earlierEvent],
+      inputs: readerInputs(),
+      done: vi.fn(),
+    };
+    const page = (focused: boolean) => (
+      <TranscriptFocus.Provider value={focused ? focus : undefined}>
+        <Activity agent={agent()} save={vi.fn()} />
+      </TranscriptFocus.Provider>
+    );
+    Element.prototype.scrollIntoView = () => {};
+    try {
+      const { rerender } = render(page(when === "on open"));
+      await userEvent.click(
+        screen.getByRole("button", { name: /^View transcript/ }),
+      );
+      if (when === "after preview") {
+        await screen.findByText("Earlier activity is not loaded.");
+        expect(
+          screen.queryByText("earlier", { selector: "summary span" }),
+        ).toBeNull();
+        rerender(page(true));
+      }
+      const earlier = await screen.findByText("earlier", {
+        selector: "summary span",
+      });
+      expect(earlier.closest("details")).toHaveProperty("open", true);
+      expect(focus.done).toHaveBeenCalled();
+    } finally {
+      Reflect.deleteProperty(Element.prototype, "scrollIntoView");
+    }
+  },
+);
 
 it("reads an open transcript again in place when its conversation's session changes", async () => {
   const thread = `channel/${"e".repeat(64)}`;
@@ -680,6 +1475,9 @@ it("shows the transcript and that sessions may be missing when some history cann
   expect(
     screen.getByText(/sessions may be missing\. Refresh to try again\./),
   ).toHaveTextContent(/unreadable\.jsonl/);
+  expect(
+    screen.queryByRole("button", { name: /earlier activity/i }),
+  ).toBeNull();
   expect(screen.queryByRole("alert")).toBeNull();
 });
 
@@ -930,6 +1728,45 @@ it("keeps provider readiness quiet and agent sessions out of Settings", async ()
   expect(
     screen.getByText("No other conversations saved in this app yet."),
   ).toBeInTheDocument();
+});
+
+it("tells a protected agent a device-list key isn't enough, and refuses new protected agents", async () => {
+  const NEEDS =
+    "Protected Claude agents need your own Claude sign-in or a saved API key. Keys on the device list don't count.";
+  nativeKey.device = true;
+  const { type } = installed({
+    keySaved: false,
+    startsProtected: true,
+    own: { status: { loggedIn: false } },
+  });
+  const Settings = tab(type, 0);
+  // Ordinary agents still run on the device list, so they say nothing.
+  render(<Settings agent={agent()} save={vi.fn()} />);
+  expect(await screen.findByLabelText("Workspace")).toBeInTheDocument();
+  await expect(type.admitsCreation?.check()).resolves.toBe(NEEDS);
+  expect(screen.queryByText(NEEDS)).toBeNull();
+  cleanup();
+  const guarded = {
+    ...agent(),
+    protection: { provider: "security.test", policy: {} },
+  } as Agent<Config>;
+  render(<Settings agent={guarded} save={vi.fn()} />);
+  const notice = (await screen.findByText(NEEDS)).parentElement as HTMLElement;
+  // Saving a key there admits it at once.
+  const user = userEvent.setup();
+  await user.type(
+    within(notice).getByLabelText("Anthropic API key"),
+    "sk-ant-api03-new",
+  );
+  await user.click(within(notice).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(screen.queryByText(NEEDS)).toBeNull());
+  await expect(type.admitsCreation?.check()).resolves.toBeUndefined();
+});
+
+it("admits new unprotected agents on a device-list key", async () => {
+  nativeKey.device = true;
+  const { type } = installed({ keySaved: false });
+  await expect(type.admitsCreation?.check()).resolves.toBeUndefined();
 });
 
 it("edits the model through the Settings dropdown and preserves agent inheritance", async () => {

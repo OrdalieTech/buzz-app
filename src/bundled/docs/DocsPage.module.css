@@ -1,0 +1,143 @@
+@reference "../../shared/styles/globals.css";
+
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.body,
+.document {
+  overflow: auto;
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-height: 0;
+}
+.body {
+  flex: 1;
+}
+.document {
+  height: 100%;
+  padding-block-start: var(--space-8);
+  overflow-wrap: anywhere;
+}
+.document > * {
+  flex-shrink: 0;
+}
+.document > h2,
+.document > p {
+  margin-block: 0;
+}
+.markdown {
+  min-width: 0;
+}
+
+.byline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.document > .byline {
+  margin-block-start: calc(-1 * var(--space-1));
+}
+.loadingHeader {
+  display: grid;
+  gap: var(--space-3);
+}
+.loadingTitle {
+  display: flex;
+  align-items: center;
+  min-height: calc(1em * var(--text-heading--line-height) + 2px);
+}
+.titleField {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+.titleField > textarea,
+.titleField::after {
+  grid-area: 1 / 1;
+  overflow-wrap: anywhere;
+  /* Match line breaks and allow for native textarea scroll rounding. */
+  padding-inline-end: var(--space-half);
+}
+/* The mirror sizes the field on WebKit versions without field-sizing. */
+.titleField::after {
+  @apply text-heading;
+  content: attr(data-title) "\200b";
+  visibility: hidden;
+  white-space: pre-wrap;
+  border: 1px solid transparent;
+  padding-block-end: var(--space-half);
+}
+.titleField > textarea {
+  height: 100%;
+  overflow: hidden;
+  resize: none;
+}
+.collection,
+.fullView,
+.docView {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+.fullView > section {
+  display: flex;
+  flex-direction: column;
+}
+.fullView > section > header > [class~="panel-header-title"] {
+  flex-basis: 0;
+}
+.fullView > section > header [class~="panel-header-label"] {
+  padding-inline-start: 0;
+}
+.docView {
+  flex: 1;
+}
+.titleList {
+  --size-row: var(--size-control);
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.noMatches {
+  padding-inline: var(--space-control-inset);
+}
+.rowMetadata {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Match the channel timeline's centered reading column. */
+.body > *,
+.document > * {
+  width: min(100%, 52rem);
+  margin-inline: auto;
+}
+:is(.document [role="textbox"], .markdown > *) > :is(p, ul, ol):has(+ p) {
+  margin-block-end: var(--space-3);
+}
+:is(.document [role="textbox"], .markdown > *) > :is(p, ul, ol) + p {
+  margin-block-start: var(--space-3);
+}
+/* A loose list wraps its text in paragraphs. Align its first line with Editing. */
+.markdown > * > :is(ul, ol):first-child > li:first-child > p:first-child {
+  margin-block-start: 0;
+}
+:is(.document [role="textbox"], .markdown) h1 {
+  @apply text-heading;
+}
+:is(.document [role="textbox"], .markdown) h2 {
+  @apply text-body-lg;
+  font-weight: var(--type-weight-medium);
+}
+:is(.document [role="textbox"], .markdown) h3 {
+  @apply text-label;
+}

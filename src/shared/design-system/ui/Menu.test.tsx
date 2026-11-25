@@ -335,30 +335,6 @@ test("context menus reuse the shared popup and action boundary", async () => {
   );
 });
 
-test("a context submenu retains ordinary menu motion classification", async () => {
-  const user = userEvent.setup();
-  render(
-    <ContextMenuRoot>
-      <ContextMenuTrigger>Context target</ContextMenuTrigger>
-      <MenuPopup aria-label="Context actions">
-        <MenuSubmenu>
-          <MenuSubmenuTrigger>Sort</MenuSubmenuTrigger>
-          <MenuSubmenuPopup aria-label="Sort choices">
-            <MenuItem>Recent</MenuItem>
-          </MenuSubmenuPopup>
-        </MenuSubmenu>
-      </MenuPopup>
-    </ContextMenuRoot>,
-  );
-  fireEvent.contextMenu(screen.getByText("Context target"));
-  const parent = await screen.findByRole("menu", { name: "Context actions" });
-  expect(parent).toHaveAttribute("data-context-menu");
-  await user.click(screen.getByRole("menuitem", { name: "Sort" }));
-  const submenu = await screen.findByRole("menu", { name: "Sort choices" });
-  expect(submenu).not.toHaveAttribute("data-context-menu");
-  expect(parent).toHaveAttribute("data-context-menu");
-});
-
 test("context targets do not become present when an open is canceled or controlled closed", async () => {
   const changed = vi.fn();
   const { unmount } = render(

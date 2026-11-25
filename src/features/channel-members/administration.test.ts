@@ -1034,7 +1034,6 @@ it.each([
   "unknown actor",
   "owner target",
   "unknown target",
-  "dm",
   "archived",
   "solo",
   "role edit",
@@ -1054,11 +1053,11 @@ it.each([
   if (failure === "unknown actor") h.setRoles("unknown", "bot");
   if (failure === "owner target") h.setRoles("member", "owner");
   if (failure === "unknown target") h.setRoles("member", "unknown");
-  if (["dm", "archived", "solo"].includes(failure))
+  if (["archived", "solo"].includes(failure))
     h.setEvents([
       h.record(39000, [
         ["d", id],
-        ["t", failure === "dm" ? "dm" : "stream"],
+        ["t", "stream"],
         ...(failure === "archived" ? [["archived", "true"]] : []),
         ...(failure === "solo" ? [["t", SOLO_LABEL]] : []),
       ]),
@@ -1070,6 +1069,47 @@ it.each([
     failure === "role edit" ? change : removeAgent,
   );
   expect(h.sign).not.toHaveBeenCalled();
+});
+function ownedAgentInDm(actor = "member") {
+  const h = ownedAgent(actor);
+  h.setEvents([
+    h.record(39000, [
+      ["d", id],
+      ["t", "dm"],
+    ]),
+    ...h.events().slice(1),
+  ]);
+  return h;
+}
+it.each(["member", "owner"])(
+  "lets a DM %s remove their own verified agent",
+  async (actor) => {
+    const h = ownedAgentInDm(actor);
+    await h.owner.capability.run(id, removeAgent);
+    expect(h.owner.capability.snapshot(id).operation?.status).toBe("confirmed");
+    expect(h.sign.mock.calls[0]?.[0]).toMatchObject({
+      kind: 9001,
+      tags: [
+        ["h", id],
+        ["p", target],
+      ],
+    });
+  },
+);
+it("lets no one remove another's agent or a person from a DM", async () => {
+  const notMine = ownedAgentInDm("owner");
+  notMine.setProfiles([]);
+  await notMine.owner.capability.run(id, removeAgent);
+  const person = ownedAgentInDm("owner");
+  person.setRoles("owner", "member");
+  person.setProfiles([]);
+  await person.owner.capability.run(id, {
+    pubkey: target,
+    expectedRole: "member",
+    role: "remove",
+  });
+  expect(notMine.sign).not.toHaveBeenCalled();
+  expect(person.sign).not.toHaveBeenCalled();
 });
 it.each(["actor left", "target promoted", "access lost"])(
   "rechecks %s before publishing an owned-agent removal",

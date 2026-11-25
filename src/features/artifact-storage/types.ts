@@ -71,7 +71,7 @@ export type ArtifactCollection = {
    * Post-commit local invalidation hints, without content or access authority.
    * Subscribe before scanning; buffer IDs during the scan, then re-read with get.
    * Reset discards the scan/index. Rebuild after reopening or any delivery gap.
-   * Optional on older hosts. See docs/local-artifact-storage.md for recovery.
+   * Optional on older hosts.
    */
   subscribeChanges?(
     listener: (change: ArtifactCollectionChange) => void,

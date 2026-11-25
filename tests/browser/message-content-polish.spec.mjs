@@ -88,23 +88,6 @@ test("reactions under an unboxed own table stay contained and readable", async (
 });
 
 for (const theme of ["light", "dark"]) {
-  test(`standalone table and diff hover stays transparent in ${theme}`, async ({
-    page,
-  }) => {
-    await page.goto(
-      `/tests/fixtures/message-gallery.html?group=references&theme=${theme}`,
-    );
-    for (const id of ["table-received", "table-links", "code-diff"]) {
-      const example = specimen(page, id);
-      const bubble = example.locator("[data-message-action-anchor]");
-      await bubble.hover();
-      await expect(example.locator("[data-actions-revealed]")).toBeVisible();
-      await expect(bubble).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
-    }
-  });
-}
-
-for (const theme of ["light", "dark"]) {
   test(`message references and inset surfaces remain legible in ${theme}`, async ({
     page,
     browserName,

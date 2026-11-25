@@ -24,7 +24,6 @@
 }
 .editorToolbar {
   @apply popover-surface;
-  --floating-radius: var(--radius-row);
   position: absolute;
   inset-block-end: 0;
   inline-size: max-content;
@@ -38,8 +37,30 @@
   max-height: none;
   overflow: visible;
 }
+.editorBody [role="textbox"] p {
+  line-height: inherit;
+}
 .editorBody [role="textbox"] :where(h1, h2, h3, h4, h5, h6) {
   margin: var(--space-4) 0 var(--space-1h);
+}
+/* Document blocks need breathing room beyond the composer's compact defaults. */
+.editorBody [role="textbox"] > :where(p, ul, ol, blockquote, pre) {
+  margin-block: var(--space-4);
+}
+.editorBody [role="textbox"] > p:has(+ :is(ul, ol)) {
+  margin-bottom: var(--space-2);
+}
+.editorBody [role="textbox"] > p + :where(ul, ol) {
+  margin-top: var(--space-2);
+}
+.editorBody [role="textbox"] li + li {
+  margin-top: var(--space-1);
+}
+.editorBody [role="textbox"] > :first-child {
+  margin-top: 0;
+}
+.editorBody [role="textbox"] > :last-child {
+  margin-bottom: 0;
 }
 .sourceEditor {
   flex: 1;
@@ -59,4 +80,33 @@
 .stack[data-formatting] > .editorBody {
   /* Let the last line scroll past the bar, including at enlarged text sizes. */
   padding-block-end: var(--document-toolbar-space);
+}
+
+.field .editorBody [contenteditable] {
+  min-block-size: var(--size-control-lg);
+  max-block-size: var(--document-field-max-height, 16rem);
+  overflow: auto;
+}
+
+.field .editorBody textarea {
+  max-block-size: var(--document-field-max-height, 16rem);
+}
+
+.field:not(.sourceEditor) {
+  border: 1px solid var(--border-standard);
+  border-radius: var(--radius-control);
+  padding: var(--space-2) var(--space-3);
+}
+
+.field[data-disabled]:not(.sourceEditor) {
+  background: var(--affordance-disabled);
+  color: var(--text-unavailable);
+}
+
+.field .editorBody [aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+.field .editorBody [contenteditable] > p + p {
+  margin-block-start: var(--space-2);
 }

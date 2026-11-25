@@ -3,7 +3,7 @@
 // debug build is a different program after every rebuild; the helper is installed
 // outside the repository and kept, so an approval given to it lasts. Debug builds
 // are signed with a local certificate so the helper can tell them from other code.
-// See docs/identity.md, "Local credential helper on macOS".
+// See CONTRIBUTING.md, "Run it".
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {

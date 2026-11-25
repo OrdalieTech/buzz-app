@@ -555,6 +555,16 @@ export function createCommunities(
       if (id) acquire(id);
       update({ selected: id });
     },
+    /** Moves a joined community to the place another holds. The saved
+     * membership order is the switcher's order and its numbered shortcuts'. */
+    reorder(id: string, over: string) {
+      const memberships = [...state.memberships];
+      const from = memberships.findIndex((m) => m.id === id);
+      const to = memberships.findIndex((m) => m.id === over);
+      if (from === -1 || to === -1 || from === to) return;
+      memberships.splice(to, 0, ...memberships.splice(from, 1));
+      update({ memberships });
+    },
     retained({ viewer, communityOrigin }: NavigationScope) {
       const { id } = communityDestination(communityOrigin);
       return viewer === state.viewer &&
@@ -590,10 +600,12 @@ export function createCommunities(
       );
       update(
         {
-          memberships: [
-            ...state.memberships.filter((m) => m.id !== membership.id),
-            membership,
-          ],
+          // A community already held keeps its place; a new one goes last.
+          memberships: state.memberships.some((m) => m.id === membership.id)
+            ? state.memberships.map((m) =>
+                m.id === membership.id ? membership : m,
+              )
+            : [...state.memberships, membership],
           profile: state.profile.name ? state.profile : profile,
           selected: membership.id,
           sync: enqueue(state.sync, relayAddress(membership.id), false),

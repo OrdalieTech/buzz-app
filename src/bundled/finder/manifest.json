@@ -1,0 +1,7 @@
+{
+  "id": "buzz.finder",
+  "name": "Finder",
+  "apiVersion": 1,
+  "description": "Find a message from your own conversations by typing any piece you remember.",
+  "discovery": { "category": "productivity", "tags": ["tasks"] }
+}

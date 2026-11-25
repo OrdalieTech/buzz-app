@@ -5,6 +5,7 @@ import {
   useEffectEvent,
   useId,
   useLayoutEffect,
+  useRef,
   useState,
   useSyncExternalStore,
   type ReactNode,
@@ -13,6 +14,7 @@ import {
 import { createPortal } from "react-dom";
 import { Toaster, toast } from "sonner";
 import { XIcon } from "../icons";
+import { focusWithKeyboard } from "../useKeyboardFocusVisibility";
 import { Button } from "./Button";
 import { IconButton } from "./IconButton";
 
@@ -47,6 +49,26 @@ const attachViewport = (viewport: HTMLElement | null) => {
   return () => {
     viewports.delete(viewport);
   };
+};
+
+const tabbable =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+const focusRing = 4;
+const underToast = (control: Element) => {
+  const box = control.getBoundingClientRect();
+  return [
+    ...document.querySelectorAll(
+      '[data-sonner-toast]:not([data-removed="true"])',
+    ),
+  ].some((card) => {
+    const rect = card.getBoundingClientRect();
+    return (
+      rect.left < box.right + focusRing &&
+      rect.right > box.left - focusRing &&
+      rect.top < box.bottom + focusRing &&
+      rect.bottom > box.top - focusRing
+    );
+  });
 };
 
 /** Keeps the stack below a mounted top-edge surface, such as the shell header.
@@ -87,18 +109,91 @@ export function ToastProvider({
   portalContainer?: HTMLElement | undefined;
 }) {
   const id = useId();
+  // WebKitGTK can crash while compositing an animated blur on a toast.
+  const skipBlur =
+    globalThis.navigator?.platform?.startsWith("Linux") &&
+    navigator.vendor === "Apple Computer, Inc.";
   useEffect(() => {
+    const modalOpen = () =>
+      [
+        ...document.querySelectorAll(
+          '[aria-modal="true"]:not([data-ending-style])',
+        ),
+      ].at(-1);
     // Sonner's global hotkey must not bypass the host's modal focus boundary.
     const guardModal = (event: KeyboardEvent) => {
+      if (event.code !== "F6" || !modalOpen()) return;
+      event.stopPropagation();
+      const cards = [
+        ...document.querySelectorAll(
+          "[data-reachable-over-modal]:not([inert])",
+        ),
+      ].map((card) => card.closest<HTMLElement>("[data-sonner-toast]"));
+      const active = document.activeElement;
+      const current = cards.findIndex((card) => card?.contains(active));
+      const next = cards[current + 1];
+      if (next) focusWithKeyboard(next);
+      else if (current >= 0 && active instanceof HTMLElement) active.blur();
+    };
+    const keepModal = (event: FocusEvent) => {
+      const { target, relatedTarget } = event;
       if (
-        event.code === "F6" &&
-        document.querySelector('[aria-modal="true"]:not([data-ending-style])')
-      ) {
-        event.stopPropagation();
-      }
+        !(target instanceof HTMLElement) ||
+        !(relatedTarget instanceof Element)
+      )
+        return;
+      const card = target.closest("[data-sonner-toast]");
+      const from = relatedTarget.closest("[data-sonner-toast]");
+      if (
+        !card ||
+        card === from ||
+        card.querySelector("[data-reachable-over-modal]") ||
+        !from?.querySelector("[data-reachable-over-modal]") ||
+        document.documentElement.dataset.keyboardNavigation === undefined ||
+        !modalOpen()
+      )
+        return;
+      event.stopPropagation();
+      target.blur();
+    };
+    let noticeOver: Element | undefined;
+    const revealReturn = async (target: HTMLElement, modal: Element) => {
+      await new Promise(requestAnimationFrame);
+      if (
+        document.activeElement !== target ||
+        document.documentElement.dataset.keyboardNavigation === undefined
+      )
+        return;
+      const control = underToast(target)
+        ? [...modal.querySelectorAll<HTMLElement>(tabbable)].find(
+            (candidate) =>
+              !underToast(candidate) &&
+              !candidate.closest('[hidden], [inert], [aria-hidden="true"]') &&
+              candidate.getClientRects().length > 0,
+          )
+        : target;
+      if (control) focusWithKeyboard(control);
+    };
+    const trackReturn = ({ target }: FocusEvent) => {
+      if (!(target instanceof HTMLElement)) return;
+      const card = target.closest("[data-sonner-toast]");
+      if (card)
+        noticeOver = card.querySelector("[data-reachable-over-modal]")
+          ? modalOpen()
+          : undefined;
+      if (card) return;
+      const modal = target.closest('[aria-modal="true"]');
+      if (modal && modal === noticeOver) void revealReturn(target, modal);
+      noticeOver = undefined;
     };
     window.addEventListener("keydown", guardModal, true);
-    return () => window.removeEventListener("keydown", guardModal, true);
+    document.addEventListener("focusin", keepModal, true);
+    document.addEventListener("focusin", trackReturn, true);
+    return () => {
+      window.removeEventListener("keydown", guardModal, true);
+      document.removeEventListener("focusin", keepModal, true);
+      document.removeEventListener("focusin", trackReturn, true);
+    };
   }, []);
   useEffect(
     () => () => {
@@ -121,7 +216,11 @@ export function ToastProvider({
           visibleToasts={Infinity}
           hotkey={["F6"]}
           customAriaLabel="App notifications"
-          className="buzz-toast-viewport"
+          className={
+            skipBlur
+              ? "buzz-toast-viewport buzz-toast-no-blur"
+              : "buzz-toast-viewport"
+          }
         />,
         portalContainer ?? document.body,
       )}
@@ -132,6 +231,7 @@ export function ToastProvider({
 
 type ToastCardProps = {
   exiting?: boolean;
+  reachableOverModal?: boolean | undefined;
   title: string;
   description?: string | undefined;
   /** Optional supporting detail between the message and its actions. */
@@ -145,6 +245,7 @@ type ToastCardProps = {
 
 function ToastCard({
   exiting,
+  reachableOverModal,
   title,
   description,
   details,
@@ -156,8 +257,15 @@ function ToastCard({
 }: ToastCardProps) {
   const titleId = useId();
   const descriptionId = useId();
+  const card = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const item = card.current?.closest<HTMLElement>("[data-sonner-toast]");
+    if (exiting && reachableOverModal && item === document.activeElement)
+      item?.blur();
+  }, [exiting, reachableOverModal]);
   return (
     <div
+      ref={card}
       inert={exiting}
       aria-hidden={exiting}
       role="dialog"
@@ -165,6 +273,7 @@ function ToastCard({
       aria-describedby={description ? descriptionId : undefined}
       data-buzz-ui=""
       data-type={tone}
+      data-reachable-over-modal={reachableOverModal ? "" : undefined}
       className="buzz-toast floating-surface"
     >
       {navigation && (
@@ -250,6 +359,7 @@ export function ToastNotice({
   timeout = 0,
   tone = "error",
   navigation,
+  reachableOverModal,
 }: {
   title: string;
   description?: string;
@@ -261,6 +371,7 @@ export function ToastNotice({
   timeout?: number;
   tone?: Tone;
   navigation?: ToastCardProps["navigation"];
+  reachableOverModal?: boolean;
 }) {
   const id = useId();
   const toasterId = useContext(ToastHost);
@@ -269,6 +380,7 @@ export function ToastNotice({
   );
   const dismissed = useEffectEvent(() => onDismiss?.());
   const dismissible = timeout > 0 || !!onDismiss;
+  const closeNotice = useRef<(() => void) | undefined>(undefined);
   useEffect(() => {
     let active = true;
     let closed = false;
@@ -278,6 +390,7 @@ export function ToastNotice({
       source.update(null);
       dismissed();
     };
+    closeNotice.current = onClose;
     toast.custom(() => <NoticeContent source={source} />, {
       id,
       toasterId,
@@ -287,6 +400,7 @@ export function ToastNotice({
     });
     return () => {
       active = false;
+      closeNotice.current = undefined;
       source.update(null);
       toast.dismiss(id);
     };
@@ -308,9 +422,11 @@ export function ToastNotice({
       children,
       closeLabel,
       navigation,
+      reachableOverModal,
       onClose: dismissible
         ? () => {
             toast.dismiss(id);
+            closeNotice.current?.();
           }
         : undefined,
     });
@@ -325,6 +441,7 @@ export function ToastNotice({
     closeLabel,
     dismissible,
     navigation,
+    reachableOverModal,
   ]);
   return null;
 }

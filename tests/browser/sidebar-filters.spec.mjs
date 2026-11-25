@@ -1,5 +1,5 @@
 import { test, expect } from "./fixture.mjs";
-import { openPage } from "./navigation.mjs";
+import { clickSidebarHeadingAction, openPage } from "./navigation.mjs";
 import { join } from "node:path";
 import { fixtureRelayUrl } from "../relay-config.ts";
 
@@ -74,9 +74,9 @@ test("section filters save activity windows and recover hidden channels", async 
     });
   };
   const menu = async () => {
-    await page
-      .getByRole("button", { name: "More actions for Team", exact: true })
-      .click();
+    await clickSidebarHeadingAction(
+      page.getByRole("button", { name: "More actions for Team", exact: true }),
+    );
     const trigger = page.getByRole("menuitem", { name: "Filter", exact: true });
     await trigger.hover();
     await expect(
@@ -110,7 +110,7 @@ test("section filters save activity windows and recover hidden channels", async 
   await page.keyboard.press("Escape");
   await page.keyboard.press("Escape");
   await active();
-  for (const days of [1, 7, 30, 90]) {
+  for (const days of [1, 3, 7, 30, 90]) {
     const name = `${days} ${days === 1 ? "day" : "days"}`;
     await page.getByRole("radio", { name, exact: true }).click();
     await expect(
@@ -241,9 +241,9 @@ test("section filters save activity windows and recover hidden channels", async 
   await page.emulateMedia({ colorScheme: "dark" });
   await shot("10-dialog-dark");
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
-  await page
-    .getByRole("button", { name: "More actions for Work", exact: true })
-    .click();
+  await clickSidebarHeadingAction(
+    page.getByRole("button", { name: "More actions for Work", exact: true }),
+  );
   await page.getByRole("menuitem", { name: "Filter", exact: true }).hover();
   await page
     .getByRole("menuitemradio", { name: "Active", exact: true })
@@ -281,9 +281,9 @@ test("section filters save activity windows and recover hidden channels", async 
     });
   });
   await page.reload();
-  await page
-    .getByRole("button", { name: "More actions for Work", exact: true })
-    .click();
+  await clickSidebarHeadingAction(
+    page.getByRole("button", { name: "More actions for Work", exact: true }),
+  );
   await page.getByRole("menuitem", { name: "Filter", exact: true }).hover();
   await expect(
     page.getByRole("menuitemradio", { name: "All", exact: true }),
@@ -376,9 +376,9 @@ test("failed activity reads explain the filter and recover on Retry", async ({
   await expect(
     page.getByRole("textbox", { name: "Message #General" }),
   ).toBeVisible();
-  await page
-    .getByRole("button", { name: "More actions for Team", exact: true })
-    .click();
+  await clickSidebarHeadingAction(
+    page.getByRole("button", { name: "More actions for Team", exact: true }),
+  );
   await page.getByRole("menuitem", { name: "Filter", exact: true }).hover();
   await page
     .getByRole("menuitemradio", { name: "Active", exact: true })
@@ -468,9 +468,12 @@ test.describe("filter action focus", () => {
     const work = page.locator('[data-sidebar-section="group:work"]');
     const row = channels.locator('[data-channel-id="delta"]');
     const filter = async (section, title, name) => {
-      await section
-        .getByRole("button", { name: `More actions for ${title}`, exact: true })
-        .click();
+      await clickSidebarHeadingAction(
+        section.getByRole("button", {
+          name: `More actions for ${title}`,
+          exact: true,
+        }),
+      );
       await page.getByRole("menuitem", { name: "Filter", exact: true }).hover();
       await page.getByRole("menuitemradio", { name, exact: true }).click();
     };

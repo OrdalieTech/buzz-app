@@ -40,3 +40,28 @@ export function soloRecipients(
     );
   return agents;
 }
+
+/** Solo, alone with agents: who a draft addresses. A draft that opens with a
+ * tag is for the agents it tags; a tag further in joins the toolbar's agents.
+ * `named` tells a notifying tag from a reference, which never opens one. */
+export function soloAudience<T extends Readonly<{ pubkey: string }>>(
+  text: string,
+  typed: readonly (T & Readonly<{ start: number }>)[],
+  toolbar: readonly T[],
+  named: (pubkey: string) => boolean,
+): { opensWithTag: boolean; recipients: readonly T[] } {
+  const first = typed.reduce<(typeof typed)[number] | undefined>(
+    (earliest, item) =>
+      !earliest || item.start < earliest.start ? item : earliest,
+    undefined,
+  );
+  const opensWithTag =
+    !!first && named(first.pubkey) && !text.slice(0, first.start).trim();
+  const recipients = opensWithTag ? typed : [...toolbar, ...typed];
+  return {
+    opensWithTag,
+    recipients: [
+      ...new Map(recipients.map((item) => [item.pubkey, item])).values(),
+    ],
+  };
+}

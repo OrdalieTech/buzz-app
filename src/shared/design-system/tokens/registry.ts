@@ -425,6 +425,22 @@ export const ROLE_GROUPS: RoleGroup[] = [
         status: "core",
       },
       {
+        token: "bg-surface-message-raised",
+        variable: "--surface-message-raised",
+        pointsAt:
+          "bubble-received-raised: bubble-received light / #383838 dark",
+        use: "Received bubbles inside an Inline sheet, which sits on neutral-raised; the sheet sets it as its surface-message.",
+        status: "core",
+      },
+      {
+        token: "bg-surface-message-raised-hover",
+        variable: "--surface-message-raised-hover",
+        pointsAt:
+          "surface-message-raised mixed 5% toward black in light mode / white in dark mode",
+        use: "Received bubble fill inside an Inline sheet while its actions show.",
+        status: "core",
+      },
+      {
         token: "bg-surface-message-own-hover",
         variable: "--surface-message-own-hover",
         pointsAt:
@@ -922,7 +938,7 @@ export const ROLE_GROUPS: RoleGroup[] = [
         token: "status-availability-online",
         variable: "--status-availability-online",
         pointsAt: "green-10 light / green-10 dark",
-        use: "Online availability label. Accepted contrast exception: below AA in light mode and APCA in both modes; see docs/presence.md.",
+        use: "Online availability label. Accepted contrast exception: below AA in light mode and APCA in both modes.",
         status: "core",
       },
       {

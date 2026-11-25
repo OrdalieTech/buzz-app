@@ -13,6 +13,7 @@ export function createReactionPicker(addEmoji?: AddEmoji) {
     scope,
     disabled,
     select,
+    reacted,
   }: ReactionToolProps) {
     const [open, setOpen] = useState(false);
     const trigger = useRef<HTMLButtonElement>(null);
@@ -64,7 +65,11 @@ export function createReactionPicker(addEmoji?: AddEmoji) {
             session={session}
             scope={scope}
             disabled={disabled}
-            insert={select}
+            // Removing an existing reaction succeeds but is not a use.
+            insert={(emoji) => {
+              const removes = reacted?.(emoji) === true;
+              return select(emoji) && !removes;
+            }}
             addEmoji={addEmoji}
             reaction
             externalTrigger={{

@@ -134,7 +134,7 @@ test("Inbox opens the exact thread, shares read state, and fits the workspace", 
   await expect(rows).toHaveCount(1);
   await expect(rows.first()).toContainText("Inbox DM fixture reply");
   const dmSource = rows.first().locator("[data-inbox-source]");
-  await expect(dmSource).toHaveText("DM · Alice Fixture");
+  await expect(dmSource).toHaveText("DM");
   await expect(dmSource.locator("svg")).toHaveCount(0);
   const dmStyle = await dmSource.evaluate((element) => ({
     background: getComputedStyle(element).backgroundColor,

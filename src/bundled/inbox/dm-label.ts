@@ -1,10 +1,16 @@
 import { formatPublicKey } from "../../shared/identity/public-key";
-import { sortParticipantNames } from "../../features/identity-names/participant-order";
+import {
+  dmNamedParticipants,
+  sortParticipantNames,
+} from "../../features/identity-names/participant-order";
 
 /** One label recipe for Activity rows and details; callers own profile reads. */
 export function dmLabel(
   participants: readonly string[] | undefined,
-  profiles: ReadonlyMap<string, { name?: string | undefined }>,
+  profiles: ReadonlyMap<
+    string,
+    { name?: string | undefined; isAgent?: true | undefined }
+  >,
   resolve: (
     key: string,
     fallback: string,
@@ -16,7 +22,7 @@ export function dmLabel(
   if (!participants.length) return "Notes to self";
   // Sort every name before bounding, so the shown three match other surfaces.
   const names = sortParticipantNames(
-    participants.map((key) =>
+    dmNamedParticipants(participants, profiles).map((key) =>
       resolve(
         key,
         profiles.get(key)?.name ?? formatPublicKey(key) ?? "Unknown person",

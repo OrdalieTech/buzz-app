@@ -1,9 +1,20 @@
+import { lifecycleOffer } from "./channel-lifecycle-protocol";
+import { createInboxReactions } from "./inbox-reactions";
+import { matchesEvent } from "./projection";
 import { afterEach, assert, expect, it, vi } from "vitest";
 import type { ChannelQueries, ChannelSummary } from "./contracts";
 import type { ProfileQueries } from "./profile-directory";
 import { createReadState } from "./read-state";
 import { readJournal, type ReadJournal } from "./read-state-storage";
-import { keypair, message, signed } from "./testing";
+import {
+  keypair,
+  message,
+  metadata,
+  roster as rosterEvent,
+  signed,
+  type Key,
+} from "./testing";
+import { DiscoveryState } from "./discovery";
 import { createUnread } from "./unread";
 
 const owners: ReturnType<typeof createUnread>[] = [];
@@ -17,16 +28,26 @@ function at<T>(values: readonly T[], index: number): T {
   return value;
 }
 
-async function setup(count = 3, profiles?: ProfileQueries) {
+async function setup(
+  count = 3,
+  profiles?: ProfileQueries,
+  project: (channel: ChannelSummary, viewer: string) => ChannelSummary = (
+    channel,
+  ) => channel,
+) {
   const viewer = keypair(),
     peer = keypair();
   const roster: readonly ChannelSummary[] = Array.from(
     { length: count },
-    (_, i) => ({
-      id: `c${i}`,
-      name: `Channel ${i}`,
-      members: [viewer.pubkey],
-    }),
+    (_, i) =>
+      project(
+        {
+          id: `c${i}`,
+          name: `Channel ${i}`,
+          members: [viewer.pubkey],
+        },
+        viewer.pubkey,
+      ),
   );
   const channels: ChannelQueries = {
     list: () => ({ status: "ready" as const, channels: roster }),
@@ -93,6 +114,47 @@ async function setup(count = 3, profiles?: ProfileQueries) {
     reads,
     reset,
   };
+}
+
+async function reactionItems(channel: ChannelSummary, viewer: Key) {
+  const target = message(viewer, channel.id, "My message", 20);
+  const reaction = signed(keypair(), {
+    kind: 7,
+    content: "+",
+    created_at: 21,
+    tags: [
+      ["e", target.id],
+      ["p", viewer.pubkey],
+      ["h", channel.id],
+    ],
+  });
+  const feed = createInboxReactions({
+    viewer: viewer.pubkey,
+    channels: {
+      list: () => ({ status: "ready", channels: [channel] }),
+      subscribeList: () => () => {},
+      window: () => {
+        throw new Error("Reaction feed must not read windows");
+      },
+      subscribeWindow: () => () => {},
+      ensureList() {},
+      ensure() {},
+      loadOlder() {},
+    },
+    reader: {
+      read: async (filters) =>
+        [target, reaction].filter((event) =>
+          filters.some((filter) => matchesEvent(event, filter)),
+        ),
+    },
+    notify: (listener) => listener(),
+  });
+  try {
+    await feed.ensure();
+    return feed.snapshot().items;
+  } finally {
+    feed.dispose();
+  }
 }
 
 it("does not trust workflow-owner metadata without a configured relay identity", async () => {
@@ -274,5 +336,93 @@ it.each([5, 9005])(
     expect(seen).toEqual([[0, 0]]);
     expect(h.state).toHaveBeenCalledTimes(3); // two subscribed + one lazy reentrant read
     expect(h.listeners[2]).not.toHaveBeenCalled();
+  },
+);
+
+it("counts unread for a joined Guest with unloaded peers, while stale and foreign authority cannot admit it", async () => {
+  const h = await setup(1, undefined, (channel, viewer) => {
+    const { members: _peers, ...rest } = channel;
+    return {
+      ...rest,
+      viewerMembership: { pubkey: viewer, joined: true },
+      viewerRole: "guest",
+      readOnly: true,
+    };
+  });
+  expect(h.unread.snapshot(at(h.targets, 0)).observedCount).toBe(1);
+  const guest: ChannelSummary = {
+    id: "11111111-1111-4111-8111-111111111111",
+    name: "Guest",
+    channelType: "stream",
+    owners: [],
+    viewerRole: "guest",
+    readOnly: true,
+    viewerMembership: { pubkey: h.viewer.pubkey, joined: true },
+  };
+  expect(lifecycleOffer(guest, h.viewer.pubkey, false)?.canLeave).toBe(true);
+  expect(await reactionItems(guest, h.viewer)).toHaveLength(1);
+  for (const state of ["denied", "cached", "foreign"] as const) {
+    const h = await setup(1, undefined, (channel, viewer) => ({
+      ...channel,
+      viewerMembership: {
+        pubkey: state === "foreign" ? "another-viewer" : viewer,
+        joined: state !== "denied",
+      },
+      ...(state === "cached" ? { cached: true as const } : {}),
+    }));
+    expect(h.unread.snapshot(at(h.targets, 0)).observedCount).toBeNull();
+  }
+});
+
+it.each(["deny", "omit", "all"] as const)(
+  "keeps a restored public preview out of unread after %s despite its retained roster",
+  async (loss) => {
+    const relay = keypair();
+    let projected: ChannelSummary | undefined;
+    const h = await setup(1, undefined, (channel, viewer) => {
+      const discovery = new DiscoveryState(viewer, relay.pubkey);
+      const details = metadata(relay, channel.id, channel.name, 10, [
+        ["public"],
+        ["t", "stream"],
+      ]);
+      discovery.accept(details);
+      discovery.accept(rosterEvent(relay, channel.id, [viewer], 10));
+      expect(discovery.get(channel.id)?.viewerMembership?.joined).toBe(true);
+      if (loss === "deny") discovery.deny(channel.id);
+      else if (loss === "omit")
+        discovery.retain(new Set(), discovery.rosterVersions());
+      else discovery.denyAll();
+      expect(discovery.canAccess(channel.id)).toBe(false);
+      discovery.resume(channel.id, details);
+      const preview = discovery.get(channel.id);
+      assert(preview);
+      expect(preview.members).toContain(viewer);
+      projected = preview;
+      expect(discovery.canAccess(channel.id)).toBe(true);
+      expect(discovery.canParticipate(channel.id)).toBe(false);
+      return preview;
+    });
+    expect(h.unread.snapshot(at(h.targets, 0)).observedCount).toBeNull();
+    expect(h.unread.inbox().items).toEqual([]);
+    assert(projected);
+    expect(
+      lifecycleOffer(
+        {
+          ...projected,
+          id: "11111111-1111-4111-8111-111111111111",
+          channelType: "stream",
+          owners: [],
+          viewerRole: "guest",
+          readOnly: true,
+        },
+        h.viewer.pubkey,
+        false,
+      ),
+    ).toBeUndefined();
+    expect(await reactionItems(projected, h.viewer)).toEqual([]);
+    expect(projected?.viewerMembership).toEqual({
+      pubkey: h.viewer.pubkey,
+      joined: false,
+    });
   },
 );

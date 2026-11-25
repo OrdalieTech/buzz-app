@@ -1997,6 +1997,71 @@ test.each([
   },
 );
 
+test.each([
+  [40010, 400],
+  [40011, 400],
+  // Other kinds keep the unconfirmed answer.
+  [9000, 503],
+])(
+  "a relay without pins refuses kind %i, answered %i",
+  async (kind, status) => {
+    const h = await harness();
+    let traffic;
+    try {
+      browserFetch(h.base);
+      const transport = await connectBrokerTransport(h.base);
+      traffic = transport.subscribe(callbacks);
+      await until(() => h.requests.length >= 1 && !!traffic.identity());
+      const channel = "00000000-0000-4000-8000-000000000001";
+      const event = await transport.writer.sign(
+        {
+          kind,
+          content: "",
+          created_at: Math.floor(Date.now() / 1000),
+          tags:
+            kind === 9000
+              ? [
+                  ["h", channel],
+                  ["p", "a".repeat(64)],
+                ]
+              : [
+                  ["h", channel],
+                  ["e", "a".repeat(64)],
+                  ["client-id", "local"],
+                ],
+        },
+        new AbortController().signal,
+      );
+      const result = fetch(`${h.base}/api/relay/publish`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Buzz-Live-ID": traffic.identity(),
+        },
+        body: JSON.stringify(event),
+      });
+      await until(() => h.publications.length === 1);
+      await h.sockets[0].receive([
+        "OK",
+        event.id,
+        false,
+        "restricted: unknown event kind",
+      ]);
+      const response = await result;
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual(
+        status === 400
+          ? { error: "restricted: unknown event kind" }
+          : { error: "Socket publication could not be confirmed", sent: false },
+      );
+    } finally {
+      traffic?.dispose();
+      vi.unstubAllGlobals();
+      await h.close();
+    }
+  },
+);
+
 test("publication diagnostics distinguish missing and mismatched live owner without dispatch", async () => {
   const logger = getLogger("relay-broker");
   const reporters = [...logger.options.reporters];

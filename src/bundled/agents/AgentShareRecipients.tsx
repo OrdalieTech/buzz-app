@@ -1,3 +1,4 @@
+import { viewerMember } from "../../features/relay/membership";
 // Who Share sends an agent to: people by direct message, or a channel the
 // viewer belongs to, found with one search as Share access does.
 import { useSyncExternalStore, type Ref } from "react";
@@ -70,7 +71,7 @@ export function AgentShareRecipients({
         !item.cached &&
         !item.archived &&
         ["stream", "forum"].includes(item.channelType ?? "") &&
-        item.members?.includes(session.viewer ?? "") &&
+        viewerMember(item, session.viewer) &&
         !picked.has(item.id) &&
         item.name.toLowerCase().includes(needle),
     )

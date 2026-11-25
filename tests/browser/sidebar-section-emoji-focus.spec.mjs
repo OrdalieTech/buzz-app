@@ -1,5 +1,5 @@
 import { test, expect } from "./fixture.mjs";
-import { openPage } from "./navigation.mjs";
+import { clickSidebarHeadingAction, openPage } from "./navigation.mjs";
 
 // A picked section emoji returns focus to the trigger, which shows the shared
 // dialog-button ring however focus got there.
@@ -11,9 +11,9 @@ test("picked section emoji returns focus to the ringed trigger", async ({
 }) => {
   await page.goto(app.origin);
   await openPage(page, "Messages");
-  await page
-    .getByRole("button", { name: "More actions for Team", exact: true })
-    .click();
+  await clickSidebarHeadingAction(
+    page.getByRole("button", { name: "More actions for Team", exact: true }),
+  );
   const create = page.getByRole("dialog", { name: "New workspace" });
   await page
     .getByRole("menuitem", { name: "Create workspace", exact: true })

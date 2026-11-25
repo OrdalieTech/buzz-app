@@ -20,6 +20,22 @@ import { UPLOAD_FAILURES } from "../relay/attachments";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
 
+function voiceRenderers() {
+  let renderer!: AttachmentRenderer;
+  installVoiceNotes({
+    conversation: {
+      registerTool: () => {},
+      registerAttachment: (value: AttachmentRenderer) => {
+        renderer = value;
+      },
+    },
+  } as unknown as Parameters<NonNullable<typeof installVoiceNotes>>[0]);
+  const entries = [
+    { ...renderer, key: "voice/player", pluginId: "voice", revision: "1" },
+  ];
+  return { snapshot: () => entries, subscribe: () => () => {} };
+}
+
 it.each([false, true])(
   "never enables saving for an uploaded voice draft, including disabled=%s",
   async (disabled) => {
@@ -30,19 +46,7 @@ it.each([false, true])(
         disconnect() {}
       },
     );
-    let renderer!: AttachmentRenderer;
-    installVoiceNotes({
-      conversation: {
-        registerTool: () => {},
-        registerAttachment: (value: AttachmentRenderer) => {
-          renderer = value;
-        },
-      },
-    } as unknown as Parameters<NonNullable<typeof installVoiceNotes>>[0]);
-    const entries = [
-      { ...renderer, key: "voice/player", pluginId: "voice", revision: "1" },
-    ];
-    const registry = { snapshot: () => entries, subscribe: () => () => {} };
+    const registry = voiceRenderers();
     const url = `https://relay.test/media/${"a".repeat(64)}.wav`;
     const source = `buzz-media://localhost/${encodeURIComponent(url)}`;
     const item: DraftAttachment = {
@@ -401,6 +405,79 @@ it.each([
   expect(
     screen.queryByText("Upload failed. Retry or remove it to send."),
   ).toBeNull();
+});
+
+it.each([
+  [undefined, true],
+  [true as const, false],
+])(
+  "offers a failed voice note Retry unless the relay refused its type: unsupported=%s",
+  async (unsupported, retryable) => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    render(
+      <ComposerAttachments
+        items={[
+          {
+            id: "voice",
+            file: new File(["sample"], "voice-note-sample.wav", {
+              type: "audio/wav",
+            }),
+            status: "error",
+            error: "The relay refused this voice note.",
+            voice: { duration: 1, waveform: [0.5] },
+            unsupported,
+          },
+        ]}
+        disabled={false}
+        remove={() => {}}
+        retry={() => {}}
+        media={() => undefined}
+        renderers={voiceRenderers()}
+      />,
+    );
+    await act(async () => {});
+    expect(screen.getByRole("alert").textContent).toBe(
+      unsupported
+        ? "The relay refused this voice note. Remove it to send."
+        : "The relay refused this voice note.",
+    );
+    expect(
+      !!screen.queryByRole("button", { name: "Retry voice note upload" }),
+    ).toBe(retryable);
+  },
+);
+
+it("offers only Remove for a file whose type the relay refused", () => {
+  const remove = vi.fn();
+  render(
+    <ComposerAttachments
+      items={[
+        {
+          id: "refused",
+          file: new File(["MZ"], "setup.exe"),
+          status: "error",
+          error: UPLOAD_FAILURES.type,
+          unsupported: true,
+        },
+      ]}
+      disabled={false}
+      remove={remove}
+      retry={() => {}}
+      media={() => undefined}
+    />,
+  );
+  expect(screen.getByRole("alert").textContent).toBe(
+    "setup.exe: This file type isn’t supported. Remove it to send.",
+  );
+  expect(screen.queryByRole("button", { name: "Retry setup.exe" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Remove setup.exe" }));
+  expect(remove).toHaveBeenCalledExactlyOnceWith("refused");
 });
 
 it("explains errors without service details and disables both recovery actions", () => {

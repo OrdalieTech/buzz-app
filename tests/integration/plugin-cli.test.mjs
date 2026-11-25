@@ -55,11 +55,11 @@ async function project(run) {
       encoding: "utf8",
     });
     assert.equal(generated.status, 0, generated.stdout + generated.stderr);
-    const packed = spawnSync(
-      "pnpm",
-      ["pack", "--pack-destination", directory],
-      { cwd: author, encoding: "utf8" },
-    );
+    const archive = path.join(directory, "buzz-author.tgz");
+    const packed = spawnSync("pnpm", ["pack", "--out", archive], {
+      cwd: author,
+      encoding: "utf8",
+    });
     assert.equal(packed.status, 0, packed.stdout + packed.stderr);
     await rm(author, { recursive: true });
     const scaffold = await readFile(path.join(source, "src/index.tsx"), "utf8");
@@ -67,12 +67,7 @@ async function project(run) {
     assert.doesNotMatch(scaffold, /declare module|interface Context/);
     const installed = spawnSync(
       "pnpm",
-      [
-        "add",
-        "-D",
-        "--ignore-scripts",
-        path.join(directory, "buzz-author-0.0.0-preview.1.tgz"),
-      ],
+      ["add", "-D", "--ignore-scripts", archive],
       {
         cwd: source,
         encoding: "utf8",

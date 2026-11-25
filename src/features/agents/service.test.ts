@@ -1,7 +1,10 @@
+import { createHuddleVoices } from "../huddle/voice";
+import type { RelayData } from "../relay/service";
 import { AcpProcess } from "../agent-harness/acp/process";
 import { GOOSE } from "../../bundled/goose/goose";
 import { fakeSpawn } from "../../bundled/goose/goose-testing";
 import { bundledOwner } from "../../plugins/provenance";
+import type { ModelRouteRequest } from "./model-routes";
 import { UnattestedProfile } from "../relay/identity-archives";
 import { createSidebarPreferencesStore } from "../relay/sidebar-preferences-store";
 import type {
@@ -52,6 +55,7 @@ import { bytesToHex } from "nostr-tools/utils";
 import { finalizeEvent, generateSecretKey } from "nostr-tools";
 import {
   afterEach,
+  assert,
   beforeAll,
   beforeEach,
   describe,
@@ -102,16 +106,30 @@ import {
 } from "../decisions/service";
 import { TypeSafeKey } from "../../bundled/typesafe/key";
 import { typesafeProvider } from "../../bundled/typesafe";
-import { CATCH_UP_PREFIX, MENTIONS, readCheckpoints } from "./catch-up";
+import {
+  CATCH_UP_PREFIX,
+  MENTIONS,
+  PRIVATE_MENTIONS,
+  readCheckpoints,
+  streamKey,
+  writeCheckpoints,
+} from "./catch-up";
 import { CHANNEL_KINDS } from "../relay/live";
 import { fileStore, loadAgentStorage, type AgentStore } from "./state";
-import { readInterrupted, writeInterrupted } from "./interrupted";
+import {
+  INTERRUPTED_PREFIX,
+  readInterrupted,
+  writeInterrupted,
+} from "./interrupted";
+import { saveOwnerSections } from "./prompt-sections";
+import { startingFolder } from "./conversation-folders";
 import { memoryStorage } from "./test-fakes";
 import { SyncedTeams } from "./team-config";
 import { TEAM_MOVES_KEY, TeamMoves } from "./team-migration";
 import { NoTeamChannel, type TeamSent } from "./team-ops";
 import { importedTeamId } from "./config-channels";
 import { STANDALONE_DEADLINE_MS } from "../agent-harness/standalone";
+import { NoticesService, type ShownNotice } from "../notices/service";
 import { readTeams, writeTeams, type AgentRecord } from "./store";
 import { createPluginRequests } from "../../plugins/requests";
 import {
@@ -153,7 +171,9 @@ import {
   recommendationReady,
   recommendedSetup,
   setRuntimeRecommendation,
+  SOURCE_MS,
 } from "./recommended";
+import { projectTemplateId, workspaceCanvas } from "../solo/workspace";
 
 /** The tag that the echo type's default watch matches. */
 const DEPLOY = ["t", "deploy"];
@@ -268,6 +288,10 @@ async function setup({
   /** The example type's id, "echo" unless a test needs a real harness's. */
   typeId = "echo",
   conversationFolders = undefined as true | undefined,
+  conversationSections = undefined as true | undefined,
+  execution = undefined as true | undefined,
+  /** The base prompt sections the example plugin's manifest declares. */
+  promptSections = [] as readonly string[],
   sessions = undefined as AgentType<Config>["sessions"],
 } = {}) {
   const ctx = new Context();
@@ -278,8 +302,14 @@ async function setup({
     settled = true;
     for (const listener of statusListeners) listener();
   };
+  /** The plugins that are active, by id. */
+  const owners = new Map<string, NonNullable<Context["pluginOwner"]>>();
+  /** The plugins that are on and not active: starting, or failed to start. */
+  const inactive = new Set<string>();
   ctx.provide("pluginStatus", {
     isActive: pluginActive,
+    promptSections: (id) => owners.get(id)?.agentPromptSections,
+    on: (id) => owners.has(id) || inactive.has(id),
     subscribe: (listener: () => void) => {
       statusListeners.add(listener);
       const stop = subscribePlugin(listener);
@@ -325,9 +355,13 @@ async function setup({
     binding,
     deviceSettings,
   );
-  const plugin = ctx.extend({
-    pluginOwner: Object.freeze({ id: "example", revision }),
+  const example = Object.freeze({
+    id: "example",
+    revision,
+    agentPromptSections: promptSections,
   });
+  owners.set(example.id, example);
+  const plugin = ctx.extend({ pluginOwner: example });
   const run =
     vi.fn<(delivery: Delivery<Config>) => void | Promise<void>>(answer);
   const type: AgentType<Config> = {
@@ -401,6 +435,8 @@ async function setup({
     ...(resumes ? { resumes } : {}),
     ...(syncedSettings ? { syncedSettings } : {}),
     ...(conversationFolders ? { conversationFolders } : {}),
+    ...(conversationSections ? { conversationSections } : {}),
+    ...(execution ? { execution } : {}),
     ...(sessions ? { sessions } : {}),
   };
   plugin.agents.register(type);
@@ -415,6 +451,8 @@ async function setup({
   return {
     activity,
     service,
+    owners,
+    inactive,
     typesafe,
     /** Ends startup, as when the last plugin finishes starting. */
     settleStartup: settle,
@@ -1894,6 +1932,114 @@ describe("a conversation folder", () => {
     expect(list).toHaveBeenCalledWith(f.agent.key);
   });
 
+  it("waits for a harness that reads its sessions in the background, and is refused when it cannot read them", async () => {
+    let listed: readonly AgentSession[] = [];
+    const loaded = vi.fn(async () => {
+      listed = [thread];
+    });
+    const f = await ready({
+      conversationFolders: true,
+      sessions: {
+        list: () => listed,
+        ready: loaded,
+        subscribe: () => () => {},
+      },
+    });
+    const { agents } = f.plugin;
+    await expect(
+      agents.assignConversationFolder(f.agent.key, thread, "~/work"),
+    ).rejects.toThrow(
+      "This conversation already started in the agent's workspace",
+    );
+    expect(loaded).toHaveBeenCalledWith(f.agent.key, `${channel}/${root}`);
+    // Sessions it cannot read may hold the conversation.
+    loaded.mockRejectedValue(new Error("The agent is not running"));
+    const other = { channelId: channel, root: "f".repeat(64) };
+    await expect(
+      agents.assignConversationFolder(f.agent.key, other, "~/work"),
+    ).rejects.toThrow("The agent is not running");
+    expect(agents.conversationFolder(f.agent.key, other)).toBeUndefined();
+  });
+
+  it("is refused when the conversation's first session starts while the check waits on another's sessions", async () => {
+    const storage = memoryStorage();
+    let hold: Promise<void> | undefined;
+    const entered = vi.fn();
+    const f = await ready({
+      storage,
+      conversationFolders: true,
+      sessions: {
+        // Nothing lists a session that is starting, as a harness reads them.
+        list: () => [],
+        ready: async () => {
+          entered();
+          await hold;
+        },
+        subscribe: () => () => {},
+      },
+    });
+    const { agents } = f.plugin;
+    // The community's storage scope, from a folder given first.
+    const first = { channelId: channel, root: "f".repeat(64) };
+    await agents.assignConversationFolder(f.agent.key, first, "~/work");
+    const [scope] = JSON.parse(
+      (
+        storage.keys().find((key) => key.includes("conversation-folder")) ?? ""
+      ).replace(/^[^:]*:/, ""),
+    ) as string[];
+    let start!: () => void;
+    hold = new Promise<void>((resolve) => {
+      start = resolve;
+    });
+    entered.mockClear();
+    const assigning = agents.assignConversationFolder(
+      f.agent.key,
+      thread,
+      "~/work",
+    );
+    const refused = expect(assigning).rejects.toThrow(
+      "This conversation already started in the agent's workspace",
+    );
+    await vi.waitFor(() => expect(entered).toHaveBeenCalledTimes(1));
+    // The conversation's first launch picks the workspace before the check
+    // ends, and no session lists it yet.
+    await expect(
+      startingFolder(storage, scope ?? "", f.agent.key, `${channel}/${root}`),
+    ).resolves.toBeUndefined();
+    start();
+    await refused;
+    expect(agents.conversationFolder(f.agent.key, thread)).toBeUndefined();
+  });
+
+  it("is refused for a conversation the harness itself holds history for, and when that cannot be read", async () => {
+    const history = vi.fn(async (_agent: Agent, _conversation: string) => true);
+    const f = await ready({
+      conversationFolders: true,
+      sessions: { list: () => [], history, subscribe: () => () => {} },
+    });
+    const { agents } = f.plugin;
+    await expect(
+      agents.assignConversationFolder(f.agent.key, thread, "~/work"),
+    ).rejects.toThrow(
+      "This conversation already started in the agent's workspace",
+    );
+    expect(history).toHaveBeenCalledWith(
+      expect.objectContaining({ key: f.agent.key }),
+      `${channel}/${root}`,
+    );
+    expect(agents.conversationFolder(f.agent.key, thread)).toBeUndefined();
+    // History it cannot read may hold the conversation.
+    history.mockRejectedValue(new Error("goose is unavailable"));
+    await expect(
+      agents.assignConversationFolder(f.agent.key, thread, "~/work"),
+    ).rejects.toThrow("goose is unavailable");
+    // Without any, the conversation is given its folder.
+    history.mockResolvedValue(false);
+    await expect(
+      agents.assignConversationFolder(f.agent.key, thread, "~/work"),
+    ).resolves.toBe("/home/me/work");
+  });
+
   it.each(["solo", "dm"] as const)(
     "is given to a %s conversation whole, refusing a root",
     async (channelType) => {
@@ -1939,7 +2085,7 @@ describe("a conversation folder", () => {
       ).rejects.toThrow("Conversation folders are unavailable in a huddle");
   });
 
-  it("is refused by a harness without folders, such as goose or Pi", async () => {
+  it("is refused by a harness without folders", async () => {
     const f = await ready();
     await expect(
       f.plugin.agents.assignConversationFolder(f.agent.key, thread, "~/work"),
@@ -2159,6 +2305,545 @@ describe("a conversation's instructions", () => {
     expect(saved()).toHaveLength(1);
     await f.service.remove(bot);
     expect(saved()).toEqual([]);
+  });
+});
+
+describe("a conversation's sections", () => {
+  const root = "e".repeat(64);
+  const thread = { channelId: channel, root };
+  const DECLARED = ["working-location", "progress", "publishing", "routing"];
+  const ready = async (options: Parameters<typeof setup>[0] = {}) => {
+    const f = await setup({
+      conversationSections: true,
+      promptSections: DECLARED,
+      ...options,
+    });
+    const agent = await f.service.create({
+      type: "example/echo",
+      name: "Echo",
+    });
+    await vi.waitFor(() => expect(f.native.claim).toHaveBeenCalledWith(bot, 0));
+    await settle();
+    return { ...f, agent };
+  };
+  /** The handle of the agent's first run. */
+  const handle = async (f: Awaited<ReturnType<typeof ready>>) => {
+    f.emit({
+      events: [
+        event("1", {
+          tags: [
+            ["h", channel],
+            ["p", bot],
+          ],
+        }),
+      ],
+    });
+    await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(1));
+    const [delivery] = f.run.mock.calls[0] ?? [];
+    if (!delivery) throw new Error("no run");
+    return delivery.agent;
+  };
+  /** Another plugin that is on and declares the same sections. */
+  const another = (f: Awaited<ReturnType<typeof ready>>) => {
+    const pluginOwner = Object.freeze({
+      id: "other",
+      revision: "one",
+      agentPromptSections: DECLARED,
+    });
+    f.owners.set(pluginOwner.id, pluginOwner);
+    return f.ctx.extend({ pluginOwner }).agents;
+  };
+  const saved = (f: Awaited<ReturnType<typeof ready>>) =>
+    f.storage
+      .keys()
+      .filter((key) => key.startsWith("buzz.agents.conversation-sections"));
+
+  it("are built into a turn's prompt while its community reconnects", async () => {
+    const f = await ready();
+    await f.plugin.agents.setConversationSections(f.agent.key, thread, {
+      "working-location": "Work in the task's folder.",
+    });
+    const agent = await handle(f);
+    // A reconnect keeps the community's storage scope, as the conversation's
+    // folder lookup does.
+    vi.spyOn(f.relay, "snapshot").mockReturnValue({
+      ...f.relay.snapshot(),
+      status: "connecting",
+    });
+    expect(agent.promptSections?.(channel, root)?.plugin?.sections).toEqual({
+      "working-location": "Work in the task's folder.",
+    });
+  });
+
+  it("are set, replaced and cleared by a plugin, and built into the agent's prompt there", async () => {
+    const f = await ready();
+    const { agents } = f.plugin;
+    await expect(
+      f.service.setConversationSections(f.agent.key, thread, { progress: "x" }),
+    ).rejects.toThrow("Only a plugin");
+    await agents.setConversationSections(f.agent.key, thread, {
+      "working-location": "  Work in the task's folder. ",
+      progress: "Report to the task.",
+    });
+    await expect(
+      agents.conversationSections(f.agent.key, thread),
+    ).resolves.toEqual({
+      "working-location": { text: "Work in the task's folder.", applied: true },
+      progress: { text: "Report to the task.", applied: true },
+    });
+    const agent = await handle(f);
+    expect(agent.promptSections?.(channel, root)).toEqual({
+      owner: {},
+      plugin: {
+        id: "example",
+        sections: {
+          "working-location": "Work in the task's folder.",
+          progress: "Report to the task.",
+        },
+      },
+    });
+    // Only that conversation's prompt: no other thread's, and no turn's
+    // outside any conversation, such as a watch's or a timer's.
+    expect(agent.promptSections?.(channel, "f".repeat(64))).toEqual({
+      owner: {},
+    });
+    expect(agent.promptSections?.(channel)).toEqual({ owner: {} });
+    expect(agent.promptSections?.()).toEqual({ owner: {} });
+    // The whole set is replaced.
+    await agents.setConversationSections(f.agent.key, thread, {
+      progress: "Report once.",
+    });
+    expect(agent.promptSections?.(channel, root)?.plugin?.sections).toEqual({
+      progress: "Report once.",
+    });
+    await agents.setConversationSections(f.agent.key, thread, {});
+    await expect(
+      agents.conversationSections(f.agent.key, thread),
+    ).resolves.toBeUndefined();
+    expect(agent.promptSections?.(channel, root)).toEqual({ owner: {} });
+    expect(saved(f)).toEqual([]);
+  });
+
+  it("refuse a section the plugin may not replace, and save nothing of a call with one", async () => {
+    const f = await ready();
+    const set = (sections: Record<string, string>) =>
+      f.plugin.agents.setConversationSections(f.agent.key, thread, sections);
+    // The plugin's manifest lists four others.
+    await expect(set({ autonomy: "Ask first." })).rejects.toThrow(
+      'does not declare the agent prompt section "autonomy"',
+    );
+    await expect(set({ progress: "Fine.", trust: "x" })).rejects.toThrow(
+      'A plugin cannot replace the agent prompt section "trust"',
+    );
+    expect(saved(f)).toEqual([]);
+    await set({ progress: "Fine." });
+    expect(saved(f)).toHaveLength(1);
+  });
+
+  it("are refused by a harness without them", async () => {
+    const f = await ready({ conversationSections: undefined });
+    await expect(
+      f.plugin.agents.setConversationSections(f.agent.key, thread, {
+        progress: "x",
+      }),
+    ).rejects.toThrow("Echo agents do not support conversation sections");
+  });
+
+  it("are not used once the agent has a type without them", async () => {
+    const f = await ready();
+    await f.plugin.agents.setConversationSections(f.agent.key, thread, {
+      progress: "Report to the task.",
+    });
+    const run = vi.fn();
+    f.plugin.agents.register({
+      id: "plain",
+      title: "Plain",
+      defaults: () => ({ config: {} }),
+      run,
+    });
+    await f.service.retype(f.agent.key, "example/plain");
+    await expect(
+      f.plugin.agents.conversationSections(f.agent.key, thread),
+    ).resolves.toEqual({
+      progress: { text: "Report to the task.", applied: false },
+    });
+    f.emit({
+      events: [
+        event("1", {
+          tags: [
+            ["h", channel],
+            ["p", bot],
+          ],
+        }),
+      ],
+    });
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+    const [delivery] = run.mock.calls[0] ?? [];
+    expect(delivery.agent.promptSections?.(channel, root)?.plugin).toBe(
+      undefined,
+    );
+  });
+
+  it("are refused for one community session, and unused once an agent has one", async () => {
+    let scope: "thread" | "community" = "thread";
+    const f = await ready({
+      sessionControls: {
+        state: () => "idle",
+        run: async () => {},
+        scope: () => scope,
+      } as never,
+    });
+    const { agents } = f.plugin;
+    await agents.setConversationSections(f.agent.key, thread, {
+      progress: "Report to the task.",
+    });
+    const agent = await handle(f);
+    // The owner gives the agent one session for its whole community, which
+    // takes in every conversation's turns.
+    scope = "community";
+    expect(agent.promptSections?.(channel, root)).toEqual({ owner: {} });
+    await expect(
+      agents.conversationSections(f.agent.key, thread),
+    ).resolves.toEqual({
+      progress: {
+        text: "Report to the task.",
+        applied: false,
+        reason: "community",
+      },
+    });
+    await expect(
+      agents.setConversationSections(f.agent.key, thread, { progress: "x" }),
+    ).rejects.toThrow("A community session has one prompt");
+    scope = "thread";
+    expect(agent.promptSections?.(channel, root)?.plugin?.sections).toEqual({
+      progress: "Report to the task.",
+    });
+  });
+
+  it("follow the place rules of a conversation's instructions", async () => {
+    const whole = await ready({
+      sessionControls: {
+        state: () => "idle",
+        run: async () => {},
+        scope: () => "channel",
+      } as never,
+    });
+    await expect(
+      whole.plugin.agents.setConversationSections(whole.agent.key, thread, {
+        progress: "x",
+      }),
+    ).rejects.toThrow("give its sections without a root");
+    const f = await ready();
+    await expect(
+      f.plugin.agents.setConversationSections(sibling, thread, {
+        progress: "x",
+      }),
+    ).rejects.toThrow("No such local agent on this device");
+    await expect(
+      f.plugin.agents.conversationSections(sibling, thread),
+    ).resolves.toBeUndefined();
+    const list = f.session.channels.list();
+    vi.spyOn(f.session.channels, "list").mockReturnValue({
+      ...list,
+      channels: list.channels.map((row) =>
+        row.id === channel
+          ? { ...row, description: huddleDescription(crypto.randomUUID()) }
+          : row,
+      ),
+    });
+    await expect(
+      f.plugin.agents.setConversationSections(f.agent.key, thread, {
+        progress: "x",
+      }),
+    ).rejects.toThrow("Conversation sections are unavailable in a huddle");
+  });
+
+  it("have one managing plugin, until that plugin is off", async () => {
+    const f = await ready();
+    const other = another(f);
+    await f.plugin.agents.setConversationSections(f.agent.key, thread, {
+      progress: "Report to the task.",
+    });
+    for (const sections of [{ progress: "Mine." }, {}])
+      await expect(
+        other.setConversationSections(f.agent.key, thread, sections),
+      ).rejects.toThrow("Another plugin manages this conversation");
+    // Nor does it read what the managing plugin gave.
+    await expect(
+      other.conversationSections(f.agent.key, thread),
+    ).resolves.toBeUndefined();
+    // It manages another conversation of the same agent.
+    await other.setConversationSections(
+      f.agent.key,
+      { channelId: channel, root: "f".repeat(64) },
+      { progress: "Mine." },
+    );
+    const agent = await handle(f);
+    expect(agent.promptSections?.(channel, root)?.plugin?.id).toBe("example");
+    // While it restarts or after it failed to start, its record is not used,
+    // and stays its own: it is still on.
+    const example = f.owners.get("example");
+    f.owners.delete("example");
+    f.inactive.add("example");
+    expect(agent.promptSections?.(channel, root)).toEqual({ owner: {} });
+    await expect(
+      f.plugin.agents.conversationSections(f.agent.key, thread),
+    ).resolves.toEqual({
+      progress: { text: "Report to the task.", applied: false },
+    });
+    for (const sections of [{ progress: "Mine." }, {}])
+      await expect(
+        other.setConversationSections(f.agent.key, thread, sections),
+      ).rejects.toThrow("Another plugin manages this conversation");
+    if (example) f.owners.set("example", example);
+    f.inactive.delete("example");
+    expect(agent.promptSections?.(channel, root)?.plugin?.id).toBe("example");
+    // Turned off, its record is not used, and the other plugin takes over.
+    f.owners.delete("example");
+    expect(agent.promptSections?.(channel, root)).toEqual({ owner: {} });
+    await other.setConversationSections(f.agent.key, thread, {
+      progress: "Mine.",
+    });
+    expect(agent.promptSections?.(channel, root)?.plugin).toEqual({
+      id: "other",
+      sections: { progress: "Mine." },
+    });
+  });
+
+  it("are claimed by the plugin whose first save is still being written", async () => {
+    const f = await ready();
+    const other = another(f);
+    // The first save shows at once and is held while it is written.
+    const set = f.storage.set.bind(f.storage);
+    let release = () => {};
+    const written = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(f.storage, "set").mockImplementationOnce(async (key, value) => {
+      const done = set(key, value);
+      await written;
+      return done;
+    });
+    const first = f.plugin.agents.setConversationSections(f.agent.key, thread, {
+      progress: "Report to the task.",
+    });
+    await vi.waitFor(() => expect(saved(f)).toHaveLength(1));
+    try {
+      for (const sections of [{ progress: "Mine." }, {}])
+        await expect(
+          other.setConversationSections(f.agent.key, thread, sections),
+        ).rejects.toThrow("Another plugin manages this conversation");
+      // A turn still takes no text that is not saved yet.
+      const agent = await handle(f);
+      expect(agent.promptSections?.(channel, root)?.plugin).toBeUndefined();
+    } finally {
+      release();
+    }
+    await first;
+    const agent = await handle(f);
+    expect(agent.promptSections?.(channel, root)?.plugin).toEqual({
+      id: "example",
+      sections: { progress: "Report to the task." },
+    });
+  });
+
+  it("stay claimed by their plugin until its removal is saved", async () => {
+    // The device's file write for the removal is held, then fails.
+    let write: Promise<void> | undefined;
+    let entered = () => {};
+    const storage = fileStore(new Map(), async () => {
+      if (!write) return;
+      entered();
+      await write;
+    });
+    const f = await ready({ storage });
+    const other = another(f);
+    await f.plugin.agents.setConversationSections(f.agent.key, thread, {
+      progress: "Report to the task.",
+    });
+    let fail = () => {};
+    write = new Promise<void>((_, reject) => {
+      fail = () => reject(new Error("Disk full"));
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const clear = f.plugin.agents.setConversationSections(
+      f.agent.key,
+      thread,
+      {},
+    );
+    await started;
+    try {
+      // The removal shows at once, and the other plugin still may not take over.
+      expect(saved(f)).toHaveLength(0);
+      for (const sections of [{ progress: "Mine." }, {}])
+        await expect(
+          other.setConversationSections(f.agent.key, thread, sections),
+        ).rejects.toThrow("Another plugin manages this conversation");
+    } finally {
+      fail();
+    }
+    await expect(clear).rejects.toThrow("Disk full");
+    write = undefined;
+    expect(saved(f)).toHaveLength(1);
+    // It still manages the conversation, and its record is still used.
+    const agent = await handle(f);
+    expect(agent.promptSections?.(channel, root)?.plugin).toEqual({
+      id: "example",
+      sections: { progress: "Report to the task." },
+    });
+    await expect(
+      other.setConversationSections(f.agent.key, thread, { progress: "Mine." }),
+    ).rejects.toThrow("Another plugin manages this conversation");
+    // Once its removal is saved, the other plugin can take over.
+    await f.plugin.agents.setConversationSections(f.agent.key, thread, {});
+    await other.setConversationSections(f.agent.key, thread, {
+      progress: "Mine.",
+    });
+    expect(agent.promptSections?.(channel, root)?.plugin).toEqual({
+      id: "other",
+      sections: { progress: "Mine." },
+    });
+  });
+
+  it("use only the sections the plugin's manifest declares now", async () => {
+    const f = await ready();
+    await f.plugin.agents.setConversationSections(f.agent.key, thread, {
+      "working-location": "Work in the task's folder.",
+      progress: "Report to the task.",
+    });
+    // The plugin's update declares one section fewer.
+    const pluginOwner = Object.freeze({
+      id: "example",
+      revision: "two",
+      agentPromptSections: ["progress"],
+    });
+    f.owners.set(pluginOwner.id, pluginOwner);
+    const agent = await handle(f);
+    expect(agent.promptSections?.(channel, root)?.plugin?.sections).toEqual({
+      progress: "Report to the task.",
+    });
+    await expect(
+      f.ctx
+        .extend({ pluginOwner })
+        .agents.conversationSections(f.agent.key, thread),
+    ).resolves.toEqual({
+      "working-location": {
+        text: "Work in the task's folder.",
+        applied: false,
+      },
+      progress: { text: "Report to the task.", applied: true },
+    });
+  });
+
+  it("say when the owner's choice for a section wins", async () => {
+    const f = await ready();
+    await f.plugin.agents.setConversationSections(f.agent.key, thread, {
+      "working-location": "Work in the task's folder.",
+      progress: "Report to the task.",
+    });
+    await saveOwnerSections(f.storage, { progress: { mode: "off" } });
+    await expect(
+      f.plugin.agents.conversationSections(f.agent.key, thread),
+    ).resolves.toEqual({
+      "working-location": { text: "Work in the task's folder.", applied: true },
+      progress: {
+        text: "Report to the task.",
+        applied: false,
+        reason: "owner",
+      },
+    });
+    // The builder gets both, and prints the owner's.
+    const agent = await handle(f);
+    expect(agent.promptSections?.(channel, root)).toEqual({
+      owner: { progress: { mode: "off" } },
+      plugin: {
+        id: "example",
+        sections: {
+          "working-location": "Work in the task's folder.",
+          progress: "Report to the task.",
+        },
+      },
+    });
+  });
+
+  it("keep Working location from an agent on an execution target, which has no conversation folders", async () => {
+    const f = await ready({ execution: true, retire: vi.fn(async () => {}) });
+    await f.plugin.agents.setConversationSections(f.agent.key, thread, {
+      "working-location": "Work in the task's folder.",
+      progress: "Report to the task.",
+    });
+    const adapter = f.ctx.extend({
+      pluginOwner: {
+        id: "internal",
+        revision: "one",
+        agentExecution: ["example/echo"],
+      },
+    });
+    adapter.agents.registerExecution({
+      id: "remote",
+      harnesses: ["example/echo"],
+      connect: vi.fn(),
+    });
+    await adapter.agents.bindExecution(f.agent.key, { id: "remote" });
+    await expect(
+      f.plugin.agents.conversationSections(f.agent.key, thread),
+    ).resolves.toEqual({
+      "working-location": {
+        text: "Work in the task's folder.",
+        applied: false,
+        reason: "target",
+      },
+      progress: { text: "Report to the task.", applied: true },
+    });
+    const agent = await handle(f);
+    expect(agent.promptSections?.(channel, root)?.plugin?.sections).toEqual({
+      progress: "Report to the task.",
+    });
+  });
+
+  it("are kept for a protected agent, whose prompt uses none", async () => {
+    const identities: AgentIdentity[] = [];
+    const f = await ready({ identities, protection: true });
+    await f.plugin.agents.setConversationSections(f.agent.key, thread, {
+      progress: "Report to the task.",
+    });
+    const sections = () =>
+      f.plugin.agents.handle(bot)?.promptSections?.(channel, root);
+    expect(sections()?.plugin?.id).toBe("example");
+    const identity = identities[0];
+    if (!identity) throw new Error("Missing native identity");
+    identities[0] = {
+      ...identity,
+      protection: { provider: "example", policy: {} },
+      protectionRevision: 1,
+    };
+    await f.service.refresh();
+    await vi.waitFor(() =>
+      expect(f.service.find(bot)?.protection).toBeDefined(),
+    );
+    expect(sections()).toEqual({ owner: {} });
+    expect(saved(f)).toHaveLength(1);
+    await expect(
+      f.plugin.agents.conversationSections(f.agent.key, thread),
+    ).resolves.toEqual({
+      progress: {
+        text: "Report to the task.",
+        applied: false,
+        reason: "protected",
+      },
+    });
+  });
+
+  it("are dropped when the agent is deleted", async () => {
+    const f = await ready();
+    await f.plugin.agents.setConversationSections(f.agent.key, thread, {
+      progress: "Report to the task.",
+    });
+    expect(saved(f)).toHaveLength(1);
+    await f.service.remove(bot);
+    expect(saved(f)).toEqual([]);
   });
 });
 
@@ -3543,6 +4228,281 @@ it("passes the model and effort its owner asked for, and no other", async () => 
   ]);
 });
 
+it("lets the harness ask a model route as its turn starts, once", async () => {
+  const { service, run, emit, ctx } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  const select = vi.fn(async () => ({
+    model: "deep",
+    effort: "max",
+    rationale: "Hard task",
+  }));
+  ctx
+    .extend({
+      pluginOwner: bundledOwner(
+        Object.freeze({ id: "org.example", revision: "bundled" }),
+      ),
+    })
+    .agents.registerModelRouter({
+      id: "router",
+      routes: (harness) =>
+        harness === "echo"
+          ? { routes: [{ id: "auto", label: "Auto" }] }
+          : undefined,
+      select,
+    });
+  const asked = (id: string, pubkey: string) =>
+    event(id, {
+      pubkey,
+      tags: [
+        ["h", channel],
+        ["p", bot],
+        ["model", bot, "route:auto"],
+      ],
+    });
+  emit({ events: [asked("1d1e", viewer)] });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+  const delivery = run.mock.calls[0]?.[0];
+  // Nothing is chosen until the harness starts a turn: a steer never asks.
+  expect(delivery?.model).toBeUndefined();
+  expect(delivery?.effort).toBeUndefined();
+  expect(select).not.toHaveBeenCalled();
+  await expect(delivery?.route?.()).resolves.toEqual({
+    model: "deep",
+    effort: "max",
+  });
+  await expect(delivery?.route?.()).resolves.toEqual({
+    model: "deep",
+    effort: "max",
+  });
+  expect(select).toHaveBeenCalledTimes(1);
+  expect(select).toHaveBeenCalledWith(
+    expect.objectContaining({
+      harness: "echo",
+      route: "auto",
+      models: [
+        expect.objectContaining({ id: "fast" }),
+        expect.objectContaining({ id: "deep" }),
+      ],
+    }),
+  );
+  // Anyone else's mention never reaches the router.
+  emit({ events: [asked("57ee", "f".repeat(64))] });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+  expect(run.mock.calls[1]?.[0]?.route).toBeUndefined();
+});
+
+it("lets the owner stop a model route while it chooses, running nothing", async () => {
+  const { service, run, emit, ctx, activity } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  let asked: AbortSignal | undefined;
+  const select = vi.fn(
+    ({ signal }: { signal: AbortSignal }) =>
+      new Promise<undefined>((_, reject) => {
+        asked = signal;
+        signal.addEventListener("abort", () => reject(signal.reason));
+      }),
+  );
+  ctx
+    .extend({
+      pluginOwner: bundledOwner(
+        Object.freeze({ id: "org.example", revision: "bundled" }),
+      ),
+    })
+    .agents.registerModelRouter({
+      id: "router",
+      routes: (harness) =>
+        harness === "echo"
+          ? { routes: [{ id: "auto", label: "Auto" }] }
+          : undefined,
+      select,
+    });
+  // As a harness does, it asks the route as its turn starts.
+  let choosing: Promise<unknown> | undefined;
+  run.mockImplementationOnce(async ({ route }) => {
+    choosing = route?.();
+    await choosing;
+  });
+  emit({
+    events: [
+      event("1d1e", {
+        pubkey: viewer,
+        tags: [
+          ["h", channel],
+          ["p", bot],
+          ["model", bot, "route:auto"],
+        ],
+      }),
+    ],
+  });
+  await vi.waitFor(() => expect(select).toHaveBeenCalled());
+  const work = activity.reader.work()[0];
+  if (!work) throw new Error("no work");
+  expect(work.stoppable).toBe(true);
+  await activity.reader.interrupt?.(work);
+  await expect(choosing).resolves.toBeUndefined();
+  expect(asked?.aborted).toBe(true);
+});
+
+it("gives a model route the turn's context and its conversation's last routed turn", async () => {
+  const earlier = (
+    id: string,
+    at: number,
+    pubkey: string,
+    tags: string[][] = [["h", dm]],
+  ) => event(id, { pubkey, created_at: at, tags });
+  const thread = "a1".padEnd(64, "0");
+  const { service, run, emit, ctx, session } = await setup({
+    history: [earlier("e1", 50, viewer), earlier("e2", 60, bot)],
+  });
+  await service.create({ type: "example/echo", name: "Echo" });
+  const seen: unknown[] = [];
+  const select = vi.fn(async (request: ModelRouteRequest) => {
+    seen.push({
+      context: await request.context(),
+      history: await request.history(),
+    });
+    return { model: "deep", effort: "max" };
+  });
+  ctx
+    .extend({
+      pluginOwner: bundledOwner(
+        Object.freeze({ id: "org.example", revision: "bundled" }),
+      ),
+    })
+    .agents.registerModelRouter({
+      id: "router",
+      routes: (harness) =>
+        harness === "echo"
+          ? { routes: [{ id: "auto", label: "Auto" }] }
+          : undefined,
+      select,
+    });
+  const asked = (id: string, at: number, tags: string[][] = []) =>
+    event(id, {
+      pubkey: viewer,
+      created_at: at,
+      tags: [["h", dm], ["p", bot], ["model", bot, "route:auto"], ...tags],
+    });
+  emit({
+    events: [
+      asked("1d1e", 70, [
+        [
+          "imeta",
+          "url https://x.test/a.png",
+          "m image/png",
+          "size 12",
+          "filename a.png",
+        ],
+      ]),
+    ],
+  });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
+  await run.mock.calls[0]?.[0]?.route?.();
+  // A DM's top-level message reads the DM's earlier messages.
+  expect(seen[0]).toEqual({
+    context: {
+      trigger: "mention",
+      conversation: "dm",
+      channelHistory: true,
+      skills: [],
+      attachments: [{ name: "a.png", type: "image/png", size: 12 }],
+    },
+    history: [
+      { pubkey: viewer, content: "hello e1", createdAt: 50 },
+      { pubkey: bot, content: "hello e2", createdAt: 60 },
+    ],
+  });
+  // The next turn in the DM knows what the route chose last, and when.
+  emit({ events: [asked("2d2e", 80)] });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+  await run.mock.calls[1]?.[0]?.route?.();
+  expect(seen[1]).toMatchObject({
+    context: {
+      attachments: [],
+      previous: {
+        route: "auto",
+        model: "deep",
+        effort: "max",
+        chosenAt: expect.any(Number),
+        endedAt: expect.any(Number),
+      },
+    },
+  });
+  // A reply in a thread reads the thread up to its own message.
+  emit({
+    events: [
+      event("3d3e", {
+        pubkey: viewer,
+        created_at: 90,
+        tags: [
+          ["h", channel],
+          ["p", bot],
+          ["e", thread, "", "reply"],
+          ["model", bot, "route:auto"],
+        ],
+      }),
+    ],
+  });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
+  const reply = (id: string, at: number) =>
+    earlier(id, at, bot, [
+      ["h", channel],
+      ["e", thread, "", "reply"],
+    ]);
+  // The thread as the relay has it now: a reply came after the message.
+  vi.mocked(session.read).mockResolvedValueOnce([
+    earlier("a1", 50, viewer, [["h", channel]]),
+    reply("a2", 85),
+    reply("a3", 95),
+  ]);
+  await run.mock.calls[2]?.[0]?.route?.();
+  expect(seen[2]).toMatchObject({
+    context: { thread: true },
+    history: [
+      { pubkey: viewer, content: "hello a1", createdAt: 50 },
+      { pubkey: bot, content: "hello a2", createdAt: 85 },
+    ],
+  });
+});
+
+it("offers model routes only to agents whose turns can run on them", async () => {
+  const { service, ctx } = await setup();
+  const agent = await service.create({ type: "example/echo", name: "Echo" });
+  ctx
+    .extend({
+      pluginOwner: bundledOwner(
+        Object.freeze({ id: "org.example", revision: "bundled" }),
+      ),
+    })
+    .agents.registerModelRouter({
+      id: "router",
+      routes: (harness) =>
+        harness === "echo"
+          ? { routes: [{ id: "auto", label: "Auto" }] }
+          : undefined,
+      select: async () => undefined,
+    });
+  const type = service.types().find((item) => item.key === "example/echo");
+  const ids = async (listed: Agent) =>
+    (await type?.models?.(listed))?.models.map(({ id }) => id);
+  expect(await ids(agent)).toContain("route:auto");
+  // On another execution target it runs on that one's models.
+  expect(
+    await ids({ ...agent, executionBinding: { provider: "example.vm" } }),
+  ).not.toContain("route:auto");
+});
+
+it("lists model routes only from bundled plugins", async () => {
+  const { plugin } = await setup();
+  expect(() =>
+    plugin.agents.registerModelRouter({
+      id: "router",
+      routes: () => undefined,
+      select: async () => undefined,
+    }),
+  ).toThrow();
+});
+
 it("ignores the model and effort asked of an agent on Automatic", async () => {
   // A synthetic recommendation for the example type.
   setRuntimeRecommendation({
@@ -3680,6 +4640,209 @@ it("asks the first plugin that recommends, and waits for plugins to start before
     expect(recommendedSetup().candidates).toEqual([]);
   } finally {
     setRuntimeRecommendation(undefined);
+    warn.mockRestore();
+  }
+});
+
+it("gives the first bundled plugin's harness list to gateway routes, and keeps the access check's when none calls", async () => {
+  const select = vi.spyOn(gatewayRoutes, "selectHarnesses");
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const start = () => {
+    const ctx = new Context();
+    let settled = false;
+    const listeners = new Set<() => void>();
+    ctx.provide("pluginStatus", {
+      isActive: () => true,
+      subscribe: (listener: () => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      settled: () => settled,
+    });
+    const client = fakeCommunities(fakeRelay());
+    new AgentsService(ctx, client.communities, fakeNative(), memoryStorage());
+    const selection = select.mock.lastCall?.[0];
+    if (!selection) throw new Error("No harness selection");
+    const owner = (id: string) =>
+      ctx.extend({
+        pluginOwner: bundledOwner(Object.freeze({ id, revision: "bundled" })),
+      });
+    const settle = () => {
+      settled = true;
+      for (const listener of listeners) listener();
+    };
+    return { owner, settle, selection };
+  };
+  try {
+    // The first plugin to call is asked at once; its list, deduplicated.
+    const first = start();
+    const other = vi.fn();
+    first
+      .owner("org.example")
+      .agents.gatewayHarnesses(() => ["codex", "goose", "codex"]);
+    first.owner("org.other").agents.gatewayHarnesses(other);
+    await expect(first.selection).resolves.toEqual(["codex", "goose"]);
+    expect(other).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("org.other's gateway harnesses are ignored"),
+    );
+    expect(() =>
+      first.owner("org.bad").agents.gatewayHarnesses("nope" as never),
+    ).toThrow(/needs a function/);
+    // Only the runtime's bundled mark counts.
+    expect(() =>
+      first
+        .owner("org.example")
+        .extend({
+          pluginOwner: Object.freeze({ id: "org.poser", revision: "bundled" }),
+        })
+        .agents.gatewayHarnesses(other),
+    ).toThrow(/only to bundled plugins/);
+
+    // None calling once plugins have started: the access check's list
+    // stands, and a later call is too late.
+    const second = start();
+    second.settle();
+    await expect(second.selection).resolves.toBeUndefined();
+    second.owner("org.late").agents.gatewayHarnesses(other);
+    expect(other).not.toHaveBeenCalled();
+
+    // Anything but a list of harness names, or a failure, enables none.
+    for (const answer of [
+      () => "codex",
+      () => ["Codex"],
+      () => Array.from({ length: 33 }, (_, i) => `h${i}`),
+      () => Promise.reject(new Error("unreadable")),
+      () => undefined,
+    ]) {
+      const next = start();
+      next.owner("org.example").agents.gatewayHarnesses(answer);
+      await expect(next.selection).resolves.toEqual([]);
+    }
+
+    // A late answer enables none, and its signal aborts; plugins that never
+    // finish starting with none calling keep the access check's list. Both
+    // are bounded by one deadline from start-up.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const stuck = start();
+    await vi.advanceTimersByTimeAsync(SOURCE_MS);
+    await expect(stuck.selection).resolves.toBeUndefined();
+    stuck.owner("org.late").agents.gatewayHarnesses(other);
+    expect(other).not.toHaveBeenCalled();
+    const sparse = start();
+    // biome-ignore lint/suspicious/noSparseArray: a hole must not pass
+    sparse.owner("org.example").agents.gatewayHarnesses(() => [, "codex"]);
+    await expect(sparse.selection).resolves.toEqual([]);
+    const late = start();
+    let signal!: AbortSignal;
+    late.owner("org.example").agents.gatewayHarnesses((given) => {
+      signal = given;
+      return new Promise(() => {});
+    });
+    await vi.advanceTimersByTimeAsync(SOURCE_MS);
+    await expect(late.selection).resolves.toEqual([]);
+    expect(signal.aborted).toBe(true);
+  } finally {
+    vi.useRealTimers();
+    select.mockRestore();
+    warn.mockRestore();
+  }
+});
+
+/** A promise and its resolver, for a test to settle when it chooses. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+it("waits for a gateway harness list only through bundled start-up, and gives a late call's answer its own time", async () => {
+  const select = vi.spyOn(gatewayRoutes, "selectHarnesses");
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const start = () => {
+    const ctx = new Context();
+    let bundled = false;
+    const listeners = new Set<() => void>();
+    ctx.provide("pluginStatus", {
+      isActive: () => true,
+      subscribe: (listener: () => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      // An installed plugin never finishes starting.
+      settled: () => false,
+      bundledSettled: () => bundled,
+    });
+    const client = fakeCommunities(fakeRelay());
+    new AgentsService(ctx, client.communities, fakeNative(), memoryStorage());
+    const selection = select.mock.lastCall?.[0];
+    if (!selection) throw new Error("No harness selection");
+    const owner = ctx.extend({
+      pluginOwner: bundledOwner(
+        Object.freeze({ id: "org.example", revision: "bundled" }),
+      ),
+    });
+    const settleBundled = () => {
+      bundled = true;
+      for (const listener of listeners) listener();
+    };
+    return { ctx, owner, settleBundled, selection };
+  };
+  try {
+    // Bundled plugins started with none calling: the access check's list
+    // stands at once, whatever installed plugins are doing.
+    const quick = start();
+    let known = false;
+    void quick.selection.then(() => {
+      known = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(known).toBe(false);
+    quick.settleBundled();
+    await expect(quick.selection).resolves.toBeUndefined();
+
+    // A call late in start-up still gets `SOURCE_MS` for its answer.
+    const late = start();
+    await vi.advanceTimersByTimeAsync(SOURCE_MS - 1_000);
+    const answer = deferred<string[]>();
+    let signal!: AbortSignal;
+    late.owner.agents.gatewayHarnesses((given) => {
+      signal = given;
+      return answer.promise;
+    });
+    await vi.advanceTimersByTimeAsync(SOURCE_MS - 1);
+    expect(signal.aborted).toBe(false);
+    answer.resolve(["pi"]);
+    await expect(late.selection).resolves.toEqual(["pi"]);
+    expect(signal.aborted).toBe(true);
+
+    // But no more than that.
+    const slow = start();
+    let slowSignal!: AbortSignal;
+    slow.owner.agents.gatewayHarnesses((given) => {
+      slowSignal = given;
+      return new Promise(() => {});
+    });
+    await vi.advanceTimersByTimeAsync(SOURCE_MS);
+    await expect(slow.selection).resolves.toEqual([]);
+    expect(slowSignal.aborted).toBe(true);
+
+    // Stopped while its answer is pending: the wait is over at once.
+    const stopped = start();
+    let stoppedSignal!: AbortSignal;
+    stopped.owner.agents.gatewayHarnesses((given) => {
+      stoppedSignal = given;
+      return new Promise(() => {});
+    });
+    void stopped.ctx.fiber.dispose();
+    await expect(stopped.selection).resolves.toEqual([]);
+    expect(stoppedSignal.aborted).toBe(true);
+  } finally {
+    vi.useRealTimers();
+    select.mockRestore();
     warn.mockRestore();
   }
 });
@@ -5064,6 +6227,25 @@ it("claims an agent as it comes into view, and releases it as it leaves, without
   native.claim.mockClear();
   connect(true);
   await vi.waitFor(() => expect(native.claim).toHaveBeenCalledWith(bot, 0));
+});
+
+it("gives a harness the owner's base section choices as they are saved now", async () => {
+  const { service, plugin, storage } = await setup();
+  await service.create({ type: "example/echo", name: "Echo" });
+  await vi.waitFor(() => expect(plugin.agents.handle(bot)).toBeDefined());
+  const choices = () => plugin.agents.handle(bot)?.promptSections?.();
+  expect(choices()).toEqual({ owner: {} });
+  await saveOwnerSections(storage, {
+    progress: { mode: "off" },
+    etiquette: { mode: "custom", text: "Be brief." },
+  });
+  // Read at each call, so the next prompt has them without a restart.
+  expect(choices()).toEqual({
+    owner: {
+      progress: { mode: "off" },
+      etiquette: { mode: "custom", text: "Be brief." },
+    },
+  });
 });
 
 it("hands a plugin its own agents outside any run, while this copy runs them", async () => {
@@ -6520,6 +7702,254 @@ describe("an agent in several communities", () => {
     expect(native.setType).toHaveBeenCalledWith(bot, "other/relay");
     expect(service.find(bot)?.type).toBe("other/relay");
   });
+
+  const restarter = (ctx: Context) =>
+    ctx.extend({
+      pluginOwner: bundledOwner(
+        Object.freeze({ id: "buzz.agents", revision: "bundled" }),
+      ),
+    }).agents;
+
+  it("restarts an agent by retiring each of its memberships, for bundled plugins only", async () => {
+    const retire = vi.fn(async (_key: string) => {});
+    const { ctx, plugin } = await joined({ retire });
+    await expect(plugin.agents.restartAgent(bot)).rejects.toThrow(
+      "available only to bundled plugins",
+    );
+    expect(retire).not.toHaveBeenCalled();
+    await restarter(ctx).restartAgent(bot);
+    expect(retire.mock.calls.map(([key]) => key).sort()).toEqual(
+      [bot, away].sort(),
+    );
+  });
+
+  it("refuses to restart an agent while a turn is working or a call is open", async () => {
+    const retire = vi.fn(async (_key: string) => {});
+    const voice = vi.fn(async (_seat: AgentVoiceSeat<Config>) => ({
+      input: vi.fn(),
+      close: vi.fn(),
+    }));
+    const { service, ctx, run, second } = await joined({ retire, voice });
+    const agents = restarter(ctx);
+    let finish = () => {};
+    run.mockImplementationOnce(async ({ workingUntil }) =>
+      workingUntil(new Promise<void>((resolve) => (finish = resolve))),
+    );
+    second.emit({ events: [mention("there")] });
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+    await expect(agents.restartAgent(bot)).rejects.toThrow(
+      "Echo is answering; restart it when it finishes",
+    );
+    finish();
+    await vi.waitFor(() =>
+      expect(service.sessionState(away, { channelId: channel })).not.toBe(
+        "working",
+      ),
+    );
+    const agent = service.find(bot);
+    const open = service
+      .types()
+      .find((type) => type.key === "example/echo")?.voice;
+    if (!agent || !open) throw new Error("Missing voice fixture");
+    const call = new AbortController();
+    await open({
+      agent,
+      conversation: { channelId: channel },
+      signal: call.signal,
+      output: async () => {},
+      ended: () => {},
+    });
+    await expect(agents.restartAgent(bot)).rejects.toThrow(
+      "Echo is in a call; restart it when the call ends",
+    );
+    expect(retire).not.toHaveBeenCalled();
+    call.abort();
+    await agents.restartAgent(bot);
+    expect(retire).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses a restart while a Huddle seat is opening, and a seat while it restarts", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const retire = vi.fn(() => held);
+    const { ctx } = await joined({ retire });
+    const agents = restarter(ctx);
+    // A seat reserved before its bridge opens, as the Huddle owner does.
+    const end = agents.reserveVoice(bot);
+    await expect(agents.restartAgent(bot)).rejects.toThrow(
+      "Echo is in a call; restart it when the call ends",
+    );
+    expect(retire).not.toHaveBeenCalled();
+    end();
+    const restarting = agents.restartAgent(bot);
+    await vi.waitFor(() => expect(retire).toHaveBeenCalled());
+    expect(() => agents.reserveVoice(bot)).toThrow(
+      "This agent is restarting or changing provider",
+    );
+    release();
+    await restarting;
+    agents.reserveVoice(bot)();
+  });
+
+  /** The real Huddle owner seating `agent`, whose bridge opens only when
+   * `opened` resolves; reservation and restart are the service's own. */
+  function huddleOwner(agents: Agents, agent: Agent, opened: Promise<void>) {
+    const owner = "owner";
+    const destination = {
+      viewer: owner,
+      scope: "scope",
+      relayUrl: "https://relay.example.test",
+      channelId: "parent",
+      channelName: "Parent",
+    };
+    const seated = {
+      ...agent,
+      owner,
+      place: "here" as const,
+      relay: destination.relayUrl,
+    };
+    const quiet = () => () => {};
+    const bridge = {
+      available: true,
+      open: vi.fn(() => opened),
+      close: vi.fn(async () => {}),
+      touch: vi.fn(async () => {}),
+      send: vi.fn(async () => {}),
+    };
+    const report = vi.fn();
+    const relayed = {
+      status: "ready",
+      scope: "scope",
+      viewer: owner,
+      session: {
+        channels: {
+          get: () => ({
+            id: "room",
+            name: "Room",
+            members: [owner, agent.pubkey],
+          }),
+          subscribeList: quiet,
+          resolve: async () => {},
+        },
+      },
+    };
+    const relay = {
+      snapshot: () => relayed,
+      subscribe: quiet,
+    } as unknown as RelayData;
+    const start = () =>
+      createHuddleVoices(
+        {
+          snapshot: () => ({
+            phase: "connected",
+            id: "call",
+            room: "room",
+            muted: false,
+            participants: [owner],
+            destination,
+          }),
+          subscribe: quiet,
+          voiceListening: () => {},
+          voiceThinking: () => {},
+        },
+        {
+          snapshot: () => ({
+            status: "ready",
+            running: [seated],
+          }),
+          subscribe: quiet,
+          types: () => [
+            {
+              key: agent.type,
+              voice: async () => ({ input() {}, close() {} }),
+            },
+          ],
+          reserveVoice: (key: Agent["key"]) => agents.reserveVoice(key),
+        } as unknown as Agents,
+        relay,
+        bridge,
+        report,
+      );
+    return { bridge, report, start };
+  }
+
+  it("refuses a restart while the Huddle owner's bridge is still opening", async () => {
+    const retire = vi.fn(async (_key: string) => {});
+    const { ctx, service } = await joined({ retire });
+    const agents = restarter(ctx);
+    const agent = service.find(bot);
+    if (!agent) throw new Error("Missing agent");
+    let open!: () => void;
+    const opened = new Promise<void>((resolve) => (open = resolve));
+    const huddle = huddleOwner(agents, agent, opened);
+    const stop = huddle.start();
+    try {
+      await vi.waitFor(() => expect(huddle.bridge.open).toHaveBeenCalled());
+      // The bridge is still opening: the seat holds.
+      await expect(agents.restartAgent(bot)).rejects.toThrow(
+        "Echo is in a call; restart it when the call ends",
+      );
+      expect(retire).not.toHaveBeenCalled();
+      open();
+      await settle();
+      await expect(agents.restartAgent(bot)).rejects.toThrow("in a call");
+      expect(retire).not.toHaveBeenCalled();
+      // The seat ends with the call; the restart goes ahead.
+      await stop();
+      await agents.restartAgent(bot);
+      expect(retire).toHaveBeenCalled();
+    } finally {
+      open();
+      await stop();
+    }
+  });
+
+  it("opens no Huddle seat while the agent restarts", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const retire = vi.fn(() => held);
+    const { ctx, service } = await joined({ retire });
+    const agents = restarter(ctx);
+    const agent = service.find(bot);
+    if (!agent) throw new Error("Missing agent");
+    const restarting = agents.restartAgent(bot);
+    const huddle = huddleOwner(agents, agent, Promise.resolve());
+    let stop: (() => Promise<void>) | undefined;
+    try {
+      await vi.waitFor(() => expect(retire).toHaveBeenCalled());
+      stop = huddle.start();
+      await vi.waitFor(() =>
+        expect(huddle.report).toHaveBeenCalledWith(
+          "call",
+          expect.stringContaining("restarting or changing provider"),
+        ),
+      );
+      expect(huddle.bridge.open).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await restarting;
+      await stop?.();
+    }
+  });
+
+  it("admits no turn while an agent restarts", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const retire = vi.fn(() => held);
+    const { ctx, run, second } = await joined({ retire });
+    const restarting = restarter(ctx).restartAgent(bot);
+    await vi.waitFor(() => expect(retire).toHaveBeenCalled());
+    second.emit({ events: [mention("during-restart")] });
+    await settle();
+    expect(run).not.toHaveBeenCalled();
+    release();
+    await restarting;
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+  });
 });
 
 it("keeps an agent running while its community reconnects, and stops it on disconnect or leave", async () => {
@@ -7729,6 +9159,77 @@ it("refuses a blank name before making anything", async () => {
   ).rejects.toThrow("Name the agent");
   expect(native.create).not.toHaveBeenCalled();
   expect(service.snapshot().agents).toEqual([]);
+});
+
+it("refuses an agent type with more skill folders than the composer can list", async () => {
+  const { plugin, service } = await setup();
+  const type = {
+    id: "skills",
+    title: "Skills",
+    defaults: () => ({ config: {} }),
+    run: vi.fn(),
+  };
+  expect(() =>
+    plugin.agents.register({
+      ...type,
+      skillFolders: Array.from({ length: 9 }, (_, n) => `~/.skills/${n}`),
+    }),
+  ).toThrow("skillFolders");
+  const skillFolders = Array.from({ length: 8 }, (_, n) => `~/.skills/${n}`);
+  plugin.agents.register({ ...type, skillFolders });
+  expect(
+    service.types().find((entry) => entry.key === "example/skills")
+      ?.skillFolders,
+  ).toEqual(skillFolders);
+});
+
+it("keeps the skill folders an agent type registered when the caller changes its list later", async () => {
+  const { plugin, service } = await setup();
+  const skillFolders = ["~/.skills/a"];
+  plugin.agents.register({
+    id: "skills",
+    title: "Skills",
+    defaults: () => ({ config: {} }),
+    run: vi.fn(),
+    skillFolders,
+  });
+  skillFolders.push("~/.skills/b");
+  expect(
+    service.types().find((entry) => entry.key === "example/skills")
+      ?.skillFolders,
+  ).toEqual(["~/.skills/a"]);
+});
+
+it("drops blank skill folder entries on registration and refuses sparse lists", async () => {
+  const { plugin, service } = await setup();
+  const type = {
+    id: "skills",
+    title: "Skills",
+    defaults: () => ({ config: {} }),
+    run: vi.fn(),
+  };
+  const sparse = new Array<string>(2);
+  sparse[0] = "~/.skills/a";
+  expect(() =>
+    plugin.agents.register({ ...type, skillFolders: sparse }),
+  ).toThrow("skillFolders");
+  plugin.agents.register({
+    ...type,
+    skillFolders: [" ~/.skills/a ", "", "   ", "~/.skills/b"],
+  });
+  expect(
+    service.types().find((entry) => entry.key === "example/skills")
+      ?.skillFolders,
+  ).toEqual(["~/.skills/a", "~/.skills/b"]);
+  plugin.agents.register({
+    ...type,
+    id: "blank-skills",
+    skillFolders: [" ", ""],
+  });
+  expect(
+    service.types().find((entry) => entry.key === "example/blank-skills")
+      ?.skillFolders,
+  ).toEqual([]);
 });
 
 it("returns the created agent after the community changes mid-create", async () => {
@@ -9737,7 +11238,12 @@ const nowSeconds = () => Math.floor(Date.now() / 1000);
 /** The saved checkpoints of watch streams, without the mention streams'. */
 const watchCheckpoints = (storage: Parameters<typeof readCheckpoints>[0]) =>
   Object.entries(readCheckpoints(storage))
-    .filter(([key]) => (JSON.parse(key) as unknown[])[1] !== MENTIONS)
+    .filter(
+      ([key]) =>
+        ![MENTIONS, PRIVATE_MENTIONS].includes(
+          (JSON.parse(key) as unknown[])[1] as string,
+        ),
+    )
     .map(([, checkpoint]) => checkpoint);
 
 it.each([false, true])(
@@ -9938,18 +11444,26 @@ describe("a turn closing or reloading the app stopped", () => {
     for (const key of from.keys()) next.setItem(key, from.get(key) ?? "");
     return next;
   };
+  const placementFor = (asked: RelayEvent) => {
+    const source = { channelId: channel, root: asked.id };
+    return { source, conversation: source };
+  };
   /** An app that stopped while Echo worked on `asked`, as it left storage. */
-  const stopped = async (asked: RelayEvent) => {
+  const stopped = async (asked: RelayEvent, beforeRouting = false) => {
     const first = await setup({ identities: [echo], resumes: true });
-    first.run.mockImplementationOnce(({ workingUntil }) =>
-      workingUntil(working()),
+    first.run.mockImplementationOnce(
+      async ({ routeConversation, workingUntil }) => {
+        if (!beforeRouting) await routeConversation?.(placementFor(asked));
+        workingUntil(working());
+      },
     );
     first.emit({ events: [asked], channelId: channel });
     await vi.waitFor(() => expect(first.run).toHaveBeenCalledOnce());
     await settle();
-    expect(readInterrupted(first.storage)).toEqual({
-      [bot]: { [asked.id]: channel },
-    });
+    if (!beforeRouting)
+      expect(readInterrupted(first.storage)).toEqual({
+        [bot]: { [asked.id]: channel },
+      });
     first.connect(false);
     return reopen(first.storage);
   };
@@ -9999,6 +11513,112 @@ describe("a turn closing or reloading the app stopped", () => {
     await settle();
     expect(third.run).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])(
+    "requires a durable native fallback only when a routing plugin matches (%s)",
+    async (matches) => {
+      const asked = mention();
+      const store = memoryStorage();
+      const app = await setup({
+        storage: {
+          ...store,
+          async set(key, value) {
+            if (key.startsWith(INTERRUPTED_PREFIX))
+              throw new Error("Disk full");
+            await store.set(key, value);
+          },
+        },
+        identities: [echo],
+        resumes: true,
+      });
+      if (matches)
+        await app.ctx
+          .extend({ pluginOwner: { id: "tasks", revision: "one" } })
+          .plugin((plugin) => {
+            plugin.agents.registerSessionRouter({
+              id: "tasks",
+              ready: async () => {},
+              matches: () => true,
+              route: async () => undefined,
+              prepare: async () => undefined,
+            });
+          })
+          .await();
+      const answered = vi.fn();
+      app.run.mockImplementationOnce(async ({ routeConversation }) => {
+        await routeConversation?.(placementFor(asked));
+        answered();
+      });
+
+      app.emit({ events: [asked], channelId: channel });
+      await vi.waitFor(() =>
+        expect(app.activity.reader.work()[0]?.state).toBe(
+          matches ? "error" : "done",
+        ),
+      );
+      expect(answered).toHaveBeenCalledTimes(matches ? 0 : 1);
+    },
+  );
+
+  it.each(["legacy", "native", "pending"] as const)(
+    "keeps the %s placement decision through Resume and Retry",
+    async (state) => {
+      const asked = mention();
+      const storage =
+        state === "legacy"
+          ? memoryStorage()
+          : await stopped(asked, state === "pending");
+      if (state === "legacy")
+        await writeInterrupted(storage, bot, { [asked.id]: channel });
+      const app = await setup({
+        storage,
+        identities: [echo],
+        resumes: true,
+        history: [asked],
+      });
+      const task = { root: asked.id, parent: "d".repeat(64) };
+      await app.ctx
+        .extend({ pluginOwner: { id: "tasks", revision: "one" } })
+        .plugin((plugin) => {
+          plugin.agents.registerSessionRouter({
+            id: "tasks",
+            ready: async () => {},
+            matches: () => true,
+            route: async () => task,
+            prepare: async () => undefined,
+          });
+        })
+        .await();
+      const placements: Array<typeof task | undefined> = [];
+      const route = async ({ routeConversation }: Delivery) => {
+        placements.push(await routeConversation?.(placementFor(asked)));
+      };
+      app.run.mockImplementationOnce(async (delivery) => {
+        await route(delivery);
+        throw new Error("Provider unavailable");
+      });
+      app.run.mockImplementationOnce(route);
+
+      await vi.waitFor(() =>
+        expect(names(app.service.snapshot().interrupted)).toEqual(["Echo"]),
+      );
+      app.service.resumeInterrupted();
+      await vi.waitFor(() =>
+        expect(app.activity.reader.work()[0]).toMatchObject({
+          state: "error",
+          retryable: true,
+        }),
+      );
+      const expected = state === "pending" ? task : undefined;
+      expect(placements).toEqual([expected]);
+      app.activity.reader.retry?.(app.activity.reader.work()[0] as LocalWork);
+      await vi.waitFor(() =>
+        expect(app.activity.reader.work()[0]?.state).toBe("done"),
+      );
+      expect(placements).toEqual([expected, expected]);
+      expect(readInterrupted(storage)).toEqual({});
+    },
+  );
 
   it("previews its saved turns with Resume's fresh read, changing nothing", async () => {
     const asked = mention();
@@ -10167,6 +11787,43 @@ describe("a turn closing or reloading the app stopped", () => {
     }
   });
 
+  it("is read again at once by a replacement session after a failed read", async () => {
+    const asked = mention();
+    const second = await setup({
+      storage: await stopped(asked),
+      identities: [echo],
+      resumes: true,
+      history: [asked],
+    });
+    await settle();
+    const read = vi.mocked(second.session.readRemote);
+    const original = read.getMockImplementation() as NonNullable<
+      ReturnType<typeof read.getMockImplementation>
+    >;
+    let failed = false;
+    read.mockImplementation(async (filters, options) => {
+      if (!filters[0]?.ids || failed) return original(filters, options);
+      failed = true;
+      throw new Error("relay down");
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      second.service.resumeInterrupted();
+      await vi.waitFor(() => expect(failed).toBe(true));
+      await settle();
+      expect(second.run).not.toHaveBeenCalled();
+      expect(readInterrupted(second.storage)).toEqual({
+        [bot]: { [asked.id]: channel },
+      });
+      second.connect(false);
+      second.connect(true);
+      await vi.waitFor(() => expect(second.run).toHaveBeenCalledOnce());
+      expect(resumedOf(second.run)).toEqual(["Echo, go on (resumed)"]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("is left to the copy of the app that holds the agent", async () => {
     const asked = mention();
     const other = await setup({
@@ -10241,7 +11898,7 @@ describe("a turn closing or reloading the app stopped", () => {
     finish();
     await settle();
     expect(readInterrupted(storage)).toEqual({
-      [sibling]: { [asked.id]: channel },
+      [sibling]: { [asked.id]: { channel, placement: "pending" } },
     });
   });
 
@@ -11022,6 +12679,232 @@ it("does not catch up after a restart on a message it already heard live", async
     vi.useRealTimers();
   }
 });
+
+it("saves interleaved replay once per tick and recovers without redelivering it", async () => {
+  vi.useFakeTimers({ toFake: ["Date"], now: 1_700_000_000_000 });
+  const start = nowSeconds();
+  const storage = memoryStorage();
+  const save = vi.spyOn(storage, "set");
+  const first = await setup({ storage, identities: [echo] });
+  try {
+    await first.service.save(bot, {
+      attentionEnabled: true,
+      attention: {
+        "watch/chat": {
+          ...chat["watch/chat"],
+          authors: [author.pubkey],
+          channels: [channel, lobby],
+        },
+        "watch/channel": null,
+      },
+    });
+    const agent = first.service.find(bot);
+    assert.exists(agent);
+    const checkpoints = [channel, lobby].map((id) =>
+      streamKey(agent.key, "watch/chat", id),
+    );
+    await vi.waitFor(() =>
+      expect(
+        checkpoints.map((key) => readCheckpoints(storage)[key]?.through),
+      ).toEqual([start, start]),
+    );
+    vi.setSystemTime((start + 1) * 1000);
+    const other = keypair();
+    const sent = Array.from({ length: 120 }, (_, index) => {
+      const channelId = index % 2 ? lobby : channel;
+      const matches = index < 10 && channelId === channel;
+      return {
+        channelId,
+        replay: true as const,
+        events: [
+          eventDto(
+            message(
+              matches ? author : other,
+              channelId,
+              matches ? `matched ${index / 2}` : `other ${index}`,
+              start + 1,
+            ),
+          ),
+        ],
+      };
+    });
+    for (let index = 0; index < sent.length; index += 12) {
+      save.mockClear();
+      for (const batch of sent.slice(index, index + 12)) first.emit(batch);
+      await settle();
+      expect(
+        save.mock.calls.filter(([key]) => key.startsWith(CATCH_UP_PREFIX)),
+      ).toHaveLength(1);
+    }
+    expect(heard(first.run)).toEqual([
+      "matched 0",
+      "matched 1",
+      "matched 2",
+      "matched 3",
+      "matched 4",
+    ]);
+    expect(
+      checkpoints
+        .flatMap(
+          (key) =>
+            readCheckpoints(storage)[key]?.heard?.map(({ id }) => id) ?? [],
+        )
+        .sort(),
+    ).toEqual(sent.flatMap(({ events }) => events.map(({ id }) => id)).sort());
+    save.mockClear();
+    for (const batch of sent.slice(0, 12)) first.emit(batch);
+    await settle();
+    expect(heard(first.run)).toHaveLength(5);
+    expect(
+      save.mock.calls.filter(([key]) => key.startsWith(CATCH_UP_PREFIX)),
+    ).toHaveLength(0);
+
+    first.connect(false);
+    vi.setSystemTime((start + 2) * 1000);
+    const second = await setup({
+      storage,
+      identities: [echo],
+      history: [
+        ...sent.flatMap(({ events }) => events),
+        posted("unheard", start + 1),
+      ],
+    });
+    try {
+      await vi.waitFor(() => expect(heard(second.run)).toEqual(["unheard"]));
+    } finally {
+      await second.ctx.fiber.dispose();
+    }
+  } finally {
+    await first.ctx.fiber.dispose();
+    vi.useRealTimers();
+  }
+});
+
+it.each([false, true])(
+  "replays only unsaved events after a native checkpoint failure (another writer: %s)",
+  async (anotherWriter) => {
+    vi.useFakeTimers({ toFake: ["Date"], now: 1_700_000_000_000 });
+    const start = nowSeconds();
+    const disk = new Map<string, string>();
+    const entered = runnerGate();
+    const release = runnerGate();
+    let writeFromPeer: (() => Promise<void>) | undefined;
+    let failNext = false;
+    const save = vi.fn(async (key: string, value: string | null) => {
+      if (key.startsWith(CATCH_UP_PREFIX) && failNext) {
+        failNext = false;
+        entered.resolve();
+        await release.promise;
+        throw new Error("Transient write failure");
+      }
+      if (value === null) disk.delete(key);
+      else disk.set(key, value);
+    });
+    const open = () =>
+      fileStore(new Map(disk), save, undefined, async (key) => {
+        const value = disk.get(key) ?? null;
+        // A peer can save after a native read took its snapshot and before a
+        // retry uses that snapshot.
+        if (key.startsWith(CATCH_UP_PREFIX)) await writeFromPeer?.();
+        return value;
+      });
+    const storage = open();
+    const first = await setup({
+      storage,
+      identities: [echo],
+    });
+    try {
+      await first.service.save(bot, {
+        attentionEnabled: true,
+        attention: { ...chat, "watch/channel": null },
+      });
+      const agent = first.service.find(bot);
+      assert.exists(agent);
+      const checkpoint = streamKey(agent.key, "watch/chat", channel);
+      const progress = () => readCheckpoints(open())[checkpoint];
+      await vi.waitFor(() => expect(progress()?.through).toBe(start));
+      vi.setSystemTime((start + 1) * 1000);
+      const saved = posted("saved", start + 1);
+      first.emit({ replay: true, channelId: channel, events: [saved] });
+      await vi.waitFor(() =>
+        expect(progress()?.heard?.map(({ id }) => id)).toEqual([saved.id]),
+      );
+      vi.setSystemTime((start + 3) * 1000);
+      const events = [
+        posted("first", start + 2),
+        posted("second", start + 3),
+      ] as const;
+      save.mockClear();
+      failNext = true;
+      first.emit({
+        replay: true,
+        channelId: channel,
+        events: [...events, events[0]],
+      });
+      await entered.promise;
+      const newer = posted("newer", start + 4);
+      const settled = anotherWriter ? [saved, ...events, newer] : [saved];
+      if (anotherWriter) {
+        const peer = open();
+        const previous = readCheckpoints(peer);
+        writeFromPeer = async () => {
+          writeFromPeer = undefined;
+          await writeCheckpoints(
+            peer,
+            {
+              ...previous,
+              [checkpoint]: {
+                through: start,
+                heard: settled.map(({ id, created_at }) => ({
+                  id,
+                  created_at,
+                })),
+              },
+            },
+            previous,
+          );
+        };
+      }
+      release.resolve();
+      await vi.waitFor(() =>
+        expect(heard(first.run)).toEqual(["saved", "first", "second"]),
+      );
+      // A failed native write rolls the local copy back before its rejection
+      // reaches the service. Drain its promise callbacks before counting.
+      await settle();
+      await writeFromPeer?.();
+      expect(
+        save.mock.calls.filter(([key]) => key.startsWith(CATCH_UP_PREFIX)),
+      ).toHaveLength(anotherWriter ? 2 : 1);
+      expect(progress()?.heard?.map(({ id }) => id)).toEqual(
+        settled.map(({ id }) => id),
+      );
+
+      first.connect(false);
+      vi.setSystemTime((start + 5) * 1000);
+      const second = await setup({
+        storage: open(),
+        identities: [echo],
+        history: [saved, ...events, newer, posted("unheard", start + 5)],
+      });
+      try {
+        await vi.waitFor(() =>
+          expect(heard(second.run)).toEqual(
+            anotherWriter
+              ? ["unheard"]
+              : ["first", "second", "newer", "unheard"],
+          ),
+        );
+      } finally {
+        await second.ctx.fiber.dispose();
+      }
+    } finally {
+      release.resolve();
+      await first.ctx.fiber.dispose();
+      vi.useRealTimers();
+    }
+  },
+);
 
 it.each([
   { label: "every message matches", rate: 5, matching: 5, only: false },
@@ -14526,6 +16409,76 @@ it("shows a request whose run failed before handing anything over as failed, wit
   }
 });
 
+it("keeps signed task requests retryable without starting an incompatible adapter", async () => {
+  const owner = keypair();
+  const f = await setup({
+    resumes: true,
+    identities: [{ ...echo, owner: owner.pubkey }],
+  });
+  const snapshot = f.communities.snapshot.bind(f.communities);
+  vi.spyOn(f.communities, "snapshot").mockImplementation(() => ({
+    ...snapshot(),
+    viewer: owner.pubkey,
+  }));
+  f.signIn(owner.pubkey);
+  f.confirm(channel, [owner.pubkey, bot]);
+  await vi.waitFor(() =>
+    expect(f.service.snapshot().running.map((agent) => agent.pubkey)).toContain(
+      bot,
+    ),
+  );
+  const root = message(owner, channel, "Discussion", nowSeconds());
+  const request = eventDto(
+    message(owner, channel, "Take this task", root.created_at + 1, [
+      ["e", root.id, "", "reply"],
+      ["p", bot],
+      ["buzz:invocation-intent", "1", bot],
+    ]),
+  );
+  try {
+    f.emit({ events: [request], channelId: channel });
+    await vi.waitFor(() =>
+      expect(f.activity.reader.work()[0]).toMatchObject({
+        messageId: request.id,
+        state: "error",
+        retryable: true,
+        error: expect.stringContaining("Invocation routing is unavailable"),
+      }),
+    );
+    expect(f.run).not.toHaveBeenCalled();
+    const failed = f.activity.reader.work()[0];
+    if (!failed) throw new Error("Missing task failure");
+    f.activity.reader.retry?.(failed);
+    expect(f.activity.reader.work()[0]).toMatchObject({
+      messageId: request.id,
+      state: "waiting",
+    });
+    await vi.waitFor(() =>
+      expect(f.activity.reader.work()[0]).toMatchObject({
+        messageId: request.id,
+        state: "error",
+        retryable: true,
+      }),
+    );
+    expect(f.run).not.toHaveBeenCalled();
+
+    const ordinary = eventDto(
+      message(owner, channel, "Ordinary mention", root.created_at + 2, [
+        ["e", root.id, "", "reply"],
+        ["p", bot],
+      ]),
+    );
+    f.emit({ events: [ordinary], channelId: channel });
+    await vi.waitFor(() => expect(f.run).toHaveBeenCalledOnce());
+    expect(f.run.mock.calls[0]?.[0].trigger).toMatchObject({
+      type: "mention",
+      event: { id: ordinary.id },
+    });
+  } finally {
+    await f.ctx.fiber.dispose();
+  }
+});
+
 it("retries a failed request as the same mention, which stays seen and is saved as working only while it runs", async () => {
   const f = await setup({ resumes: true });
   await f.service.create({ type: "example/echo", name: "Echo" });
@@ -14537,13 +16490,15 @@ it("retries a failed request as the same mention, which stays seen and is saved 
   });
   let finish!: () => void;
   f.run.mockRejectedValueOnce(new Error("Provider unavailable"));
-  f.run.mockImplementationOnce(({ workingUntil }) =>
+  f.run.mockImplementationOnce(async ({ routeConversation, workingUntil }) => {
+    const source = { channelId: channel, root: asked.id };
+    await routeConversation?.({ source, conversation: source });
     workingUntil(
       new Promise<void>((resolve) => {
         finish = resolve;
       }),
-    ),
-  );
+    );
+  });
   f.emit({ events: [asked], channelId: channel });
   try {
     await vi.waitFor(() =>
@@ -15794,7 +17749,10 @@ it("gives a run its owner's channel templates with the owner's agents each adds"
   ]);
 });
 
-it("binds run-only Solo placement to the owner, community and just-created confirmed chat", async () => {
+/** A new private conversation that names the owner. */
+const withOwner = { members: [viewer], open: false };
+
+it("binds run-only placement to the owner, community and just-created confirmed chat", async () => {
   const f = await setup();
   const preferences = {
     refresh: vi.fn(async () => {}),
@@ -15835,18 +17793,18 @@ it("binds run-only Solo placement to the owner, community and just-created confi
   });
   await f.service.create({ type: "example/echo", name: "Echo" });
   const handle = await handleOf(f.run, f.emit);
-  const workspace = handle.soloWorkspaces;
+  const workspace = handle.workspaces;
   if (!workspace) throw new Error("Missing run workspace capability");
   try {
-    expect(f.plugin.agents.handle(bot)?.soloWorkspaces).toBeUndefined();
+    expect(f.plugin.agents.handle(bot)?.workspaces).toBeUndefined();
     expect(await workspace.list()).toEqual([{ id: "work", name: "Work" }]);
-    await expect(workspace.prepare("work", [], "new-chat")).rejects.toThrow(
-      "Include your owner",
-    );
     await expect(
-      workspace.prepare("unknown", [viewer], "new-chat"),
-    ).rejects.toThrow("No such Solo workspace");
-    const file = await workspace.prepare("work", [viewer], "new-chat");
+      workspace.prepare("work", { members: [], open: false }, "new-chat"),
+    ).rejects.toThrow("Your owner can't see");
+    await expect(
+      workspace.prepare("unknown", withOwner, "new-chat"),
+    ).rejects.toThrow("No such workspace");
+    const file = await workspace.prepare("work", withOwner, "new-chat");
     await expect(file("old-chat")).rejects.toThrow("No new chat from this run");
     await handle.publish({
       kind: 9007,
@@ -15876,7 +17834,7 @@ it("binds run-only Solo placement to the owner, community and just-created confi
       { signal: expect.any(AbortSignal) },
     );
     await expect(file("new-chat")).rejects.toThrow("already attempted");
-    const stale = await workspace.prepare("work", [viewer], "new-chat");
+    const stale = await workspace.prepare("work", withOwner, "new-chat");
     f.connect(false);
     await expect(stale("new-chat")).rejects.toThrow();
     await expect(workspace.list()).rejects.toThrow();
@@ -15886,17 +17844,118 @@ it("binds run-only Solo placement to the owner, community and just-created confi
   }
 });
 
+/** A session with workspace `work` and relay state for conversation `chat`. */
+function workspaceSession(
+  f: Awaited<ReturnType<typeof setup>>,
+  members: readonly string[] = [bot, viewer],
+) {
+  const authority = "f".repeat(64);
+  const assign = vi.fn(async () => {});
+  const kit = { status: "ready", entries: [] as unknown[] };
+  Object.assign(f.session.agentChoices, {
+    snapshot: () => ({ identities: [] }),
+  });
+  Object.assign(f.session, {
+    channelKit: {
+      available: true,
+      refresh: async () => {},
+      snapshot: () => kit,
+    },
+    relayAuthor: authority,
+    snapshotRead: vi.fn(async (filters: readonly ReadFilter[]) => {
+      const d = ["d", filters[0]?.["#d"]?.[0] ?? ""];
+      return [
+        event("meta", {
+          kind: 39000,
+          pubkey: authority,
+          tags: [d, ["t", "stream"], ["private"], ["P", bot]],
+        }),
+        event("roster", {
+          kind: 39002,
+          pubkey: authority,
+          tags: [d, ...members.map((key) => ["p", key])],
+        }),
+      ];
+    }),
+    sidebarPreferences: {
+      refresh: async () => {},
+      writable: true,
+      snapshot: () => ({
+        status: "ready",
+        data: { sections: [{ id: "work", name: "Work" }], assignments: {} },
+      }),
+      assign,
+    },
+  });
+  return { assign, kit };
+}
+
+it("keeps a workspace's local folders out of a Solo chat with anyone else", async () => {
+  const f = await setup();
+  const { kit } = workspaceSession(f);
+  const marked = workspaceCanvas({ folders: ["/repo"], canvas: "Rules" });
+  kit.entries = [
+    {
+      eventId: "head",
+      record: {
+        value: {
+          type: "template",
+          id: await projectTemplateId("work"),
+          canvas: marked,
+          agents: [],
+          teamIds: [],
+        },
+      },
+    },
+  ];
+  await f.service.create({ type: "example/echo", name: "Echo" });
+  const handle = await handleOf(f.run, f.emit);
+  try {
+    const canvas = async (members: string[]) =>
+      (await handle.workspaces?.defaults("work", { solo: true, members }))
+        ?.canvas;
+    expect(await canvas([viewer, bot])).toBe(marked);
+    expect(await canvas([viewer, other])).toBe("Rules");
+  } finally {
+    await f.ctx.fiber.dispose();
+  }
+});
+
+it.each([
+  ["a channel its owner is in", [bot, viewer], "filed"],
+  ["a private channel its owner isn't in", [bot], "Your owner can't see"],
+])(
+  "moves only conversations its owner can see: %s",
+  async (_, members, outcome) => {
+    const f = await setup();
+    const { assign } = workspaceSession(f, members);
+    await f.service.create({ type: "example/echo", name: "Echo" });
+    const handle = await handleOf(f.run, f.emit);
+    try {
+      const moving = handle.workspaces?.move("chat", "work");
+      if (outcome === "filed") {
+        await expect(moving).resolves.toEqual({ status: "filed" });
+        expect(assign).toHaveBeenCalledOnce();
+      } else {
+        await expect(moving).rejects.toThrow(outcome);
+        expect(assign).not.toHaveBeenCalled();
+      }
+    } finally {
+      await f.ctx.fiber.dispose();
+    }
+  },
+);
+
 it.each([
   "cached preferences",
   "read-only preferences",
   "owner missing",
   "caller missing",
   "wrong creator",
-  "not Solo",
   "region",
   "wrong authority",
   "wrong coordinate",
-])("refuses Solo placement for unconfirmed authority: %s", async (failure) => {
+])("refuses placement for unconfirmed authority: %s", async (failure) => {
   const f = await setup();
   const authority = "f".repeat(64);
   const assign = vi.fn(async () => {});
@@ -15927,8 +17986,6 @@ it.each([
     metadata.tags = metadata.tags.map((tag) =>
       tag[0] === "P" ? ["P", other] : tag,
     );
-  if (failure === "not Solo")
-    metadata.tags = metadata.tags.filter(([, value]) => value !== "buzz.solo");
   if (failure === "region")
     metadata.tags.push(["t", "buzz.region:example:work"]);
   if (failure === "wrong authority") roster.pubkey = other;
@@ -15955,19 +18012,19 @@ it.each([
       failure === "cached preferences" ||
       failure === "read-only preferences"
     ) {
-      await expect(handle.soloWorkspaces?.list()).rejects.toThrow(
-        "Solo workspaces are unavailable",
+      await expect(handle.workspaces?.list()).rejects.toThrow(
+        "Workspaces are unavailable",
       );
       await expect(
-        handle.soloWorkspaces?.prepare("work", [viewer], "new-chat"),
-      ).rejects.toThrow("Solo workspaces are unavailable");
+        handle.workspaces?.prepare("work", withOwner, "new-chat"),
+      ).rejects.toThrow("Workspaces are unavailable");
       expect(f.session.snapshotRead).not.toHaveBeenCalled();
       expect(assign).not.toHaveBeenCalled();
       return;
     }
-    const file = await handle.soloWorkspaces?.prepare(
+    const file = await handle.workspaces?.prepare(
       "work",
-      [viewer],
+      withOwner,
       "new-chat",
     );
     await handle.publish({
@@ -16011,7 +18068,7 @@ it("fences workspace discovery when its community binding changes during the rea
   });
   await f.service.create({ type: "example/echo", name: "Echo" });
   const handle = await handleOf(f.run, f.emit);
-  const pending = handle.soloWorkspaces?.list();
+  const pending = handle.workspaces?.list();
   const refused = expect(pending).rejects.toThrow();
   try {
     await started.promise;
@@ -16073,7 +18130,7 @@ it("keeps overlapping prepared creates independently fileable through the run", 
   });
   await f.service.create({ type: "example/echo", name: "Echo" });
   const handle = await handleOf(f.run, f.emit);
-  const ws = handle.soloWorkspaces;
+  const ws = handle.workspaces;
   if (!ws) throw new Error("Missing run capability");
   const create = (id: string) =>
     handle.publish({
@@ -16086,10 +18143,10 @@ it("keeps overlapping prepared creates independently fileable through the run", 
       ],
     });
   try {
-    const first = await ws.prepare("work", [viewer], "first");
+    const first = await ws.prepare("work", withOwner, "first");
     await create("first");
     // First tool is still confirming metadata when the second publishes.
-    const second = await ws.prepare("work", [viewer], "second");
+    const second = await ws.prepare("work", withOwner, "second");
     await create("second");
     const pending = first("first");
     await Promise.race([
@@ -16166,9 +18223,9 @@ it.each(["authority", "assignment"])(
     await f.service.create({ type: "example/echo", name: "Echo" });
     const handle = await handleOf(f.run, f.emit);
     try {
-      const file = await handle.soloWorkspaces?.prepare(
+      const file = await handle.workspaces?.prepare(
         "work",
-        [viewer],
+        withOwner,
         "chat",
         signal.signal,
       );
@@ -16263,9 +18320,9 @@ it.each(["filed", "deleted", "retired"])(
     await f.service.create({ type: "example/echo", name: "Echo" });
     const handle = await handleOf(f.run, f.emit);
     try {
-      const file = await handle.soloWorkspaces?.prepare(
+      const file = await handle.workspaces?.prepare(
         "work",
-        [viewer],
+        withOwner,
         "new-chat",
         call.signal,
       );
@@ -16411,6 +18468,72 @@ describe("Attention plugin sources", () => {
           type: "attention",
           text: expect.stringContaining("watch-classifier"),
         });
+    },
+  );
+  it.each(["switches", "refuses the switch"])(
+    "delivers a completed source's accepted wake when retype %s",
+    async (outcome) => {
+      const jev = fakeJev();
+      const decision = runnerGate<DecisionResult>();
+      jev.decide.mockReturnValueOnce(decision.promise);
+      const { service, run, plugin, native, watching } = await sourceFixture({
+        jev,
+      });
+      const replacement = vi.fn(async () => {});
+      plugin.agents.register({
+        id: "replacement",
+        title: "Replacement",
+        defaults: () => ({ config: {} }),
+        run: replacement,
+      });
+      const produce = vi.fn(
+        async ({ emit }: Parameters<AttentionSource["run"]>[0]) => {
+          emit("final command output");
+        },
+      );
+      plugin.agents.addAttentionSource({ id: "command", run: produce });
+      try {
+        await service.create({ type: "example/echo", name: "Echo" });
+        await service.save(bot, {
+          attentionEnabled: true,
+          attention: {
+            ...watches,
+            "watch/pr": {
+              ...watches["watch/pr"],
+              classifier: {
+                questions: { relevant: { question: "Relevant?" } },
+              },
+            },
+          },
+        });
+        await vi.waitFor(() =>
+          expect(service.find(bot)?.sourceRuns?.["watch/pr"]).toBeDefined(),
+        );
+        if (outcome === "switches") {
+          await service.retype(bot, "example/replacement");
+        } else {
+          native.setType.mockRejectedValueOnce(new Error("Switch refused"));
+          await expect(
+            service.retype(bot, "example/replacement"),
+          ).rejects.toThrow("Switch refused");
+        }
+        decision.resolve(answered(0.9));
+        const receiving = outcome === "switches" ? replacement : run;
+        await vi.waitFor(() =>
+          expect(receiving).toHaveBeenCalledExactlyOnceWith(
+            expect.objectContaining({
+              trigger: expect.objectContaining({
+                type: "attention",
+                text: expect.stringContaining("final command output"),
+              }),
+            }),
+          ),
+        );
+        expect(produce).toHaveBeenCalledOnce();
+      } finally {
+        decision.resolve(answered(0.9));
+        await watching?.dispose();
+      }
     },
   );
   it("reserves a classified source's queue slot until delivery", async () => {
@@ -19734,6 +21857,8 @@ describe("full external agent access", () => {
     return {
       ...f,
       write,
+      send,
+      server,
       message,
       names,
       call: (name: string, args: object) =>
@@ -19745,16 +21870,16 @@ describe("full external agent access", () => {
     };
   }
 
-  it("withholds local-run Solo workspace filing from external connections", async () => {
+  it("withholds local-run workspace filing from external connections", async () => {
     const f = await fixture();
     try {
       const names = await f.names();
       expect(names).toContain("settings_set");
       const publish = vi.spyOn(f.native, "publish");
-      const discover = await f.call("solo_workspace_list", {});
+      const discover = await f.call("workspace_list", {});
       expect(discover.result.isError).toBe(true);
       expect(discover.result.content[0]?.text).toBe(
-        "Solo workspaces are unavailable on this host",
+        "Workspaces are unavailable on this host",
       );
       const create = await f.call("channel_create", {
         name: "Triage",
@@ -19765,7 +21890,7 @@ describe("full external agent access", () => {
       });
       expect(create.result.isError).toBe(true);
       expect(create.result.content[0]?.text).toBe(
-        "Solo workspaces are unavailable on this host",
+        "Workspaces are unavailable on this host",
       );
       expect(publish).not.toHaveBeenCalled();
     } finally {
@@ -19813,6 +21938,126 @@ describe("full external agent access", () => {
         "result.isError",
         true,
       );
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("ends a plugin tool's wait when the agent cancels that call or the connection closes", async () => {
+    const f = await fixture();
+    try {
+      const started = runnerGate();
+      let waiting = 0;
+      const tasks = f.ctx.extend({
+        pluginOwner: Object.freeze({ id: "buzz.tasks", revision: "one" }),
+      });
+      await tasks.plugin({
+        inject: ["agents"],
+        apply: (plugin: Context) =>
+          plugin.agents.addTool({
+            name: "tasks_wait",
+            description: "Wait for its call to end.",
+            inputSchema: { type: "object" },
+            call: (client) =>
+              new Promise((_, reject) => {
+                const { signal } = client;
+                if (!signal) reject(new Error("no signal"));
+                else
+                  signal.addEventListener("abort", () => reject(signal.reason));
+                if (++waiting === 2) started.resolve();
+              }),
+          }),
+      });
+      const wait = (id: number) =>
+        f.send({
+          id,
+          method: "tools/call",
+          params: { name: "tasks_wait", arguments: {} },
+        });
+      const cancel = (requestId: number) =>
+        f.send({ method: "notifications/cancelled", params: { requestId } });
+      const first = wait(101);
+      const second = wait(102);
+      await started.promise;
+      await cancel(999);
+      await cancel(101);
+      expect(await first).toMatchObject({
+        id: 101,
+        result: {
+          isError: true,
+          content: [{ text: "The agent cancelled this request" }],
+        },
+      });
+      await f.server.close();
+      await expect(second).rejects.toThrow("This agent connection has closed");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("lets a plugin's tool wait for its owner's answer to a notice, which the agent's cancel withdraws", async () => {
+    const f = await fixture();
+    try {
+      const notices = new NoticesService(f.ctx);
+      const files = f.ctx.extend({
+        pluginOwner: Object.freeze({ id: "example.files", revision: "one" }),
+      });
+      await files.plugin({
+        inject: ["agents"],
+        apply: (plugin: Context) =>
+          plugin.agents.addTool({
+            name: "files_delete",
+            description: "Delete a file, once the owner allows it.",
+            inputSchema: { type: "object" },
+            async call(client) {
+              const answer = await plugin.reflect.get("notices")?.show(
+                {
+                  title: "Let Echo delete a.txt?",
+                  actions: [{ id: "once", label: "Allow once" }],
+                },
+                { signal: client.signal },
+              );
+              return `answered ${answer}`;
+            },
+          }),
+      });
+      const shown = () =>
+        new Promise<ShownNotice>((resolve) => {
+          const stop = notices.subscribe(() => {
+            const [notice] = notices.snapshot();
+            if (notice) {
+              stop();
+              resolve(notice);
+            }
+          });
+        });
+      const asked = shown();
+      const call = f.call("files_delete", {});
+      const notice = await asked;
+      expect(notices.snapshot()).toHaveLength(1);
+      expect(notice).toMatchObject({
+        title: "Let Echo delete a.txt?",
+        plugin: "example.files",
+      });
+      notice.pick("once");
+      expect((await call).result).toMatchObject({
+        content: [{ text: "answered once" }],
+      });
+      expect(notices.snapshot()).toEqual([]);
+      const reasked = shown();
+      const cancelled = f.send({
+        id: 901,
+        method: "tools/call",
+        params: { name: "files_delete", arguments: {} },
+      });
+      await reasked;
+      expect(notices.snapshot()).toHaveLength(1);
+      await f.send({
+        method: "notifications/cancelled",
+        params: { requestId: 901 },
+      });
+      expect(notices.snapshot()).toEqual([]);
+      await cancelled;
     } finally {
       await f.cleanup();
     }
@@ -20420,6 +22665,103 @@ it.each(["command"])(
       }),
     );
     await watching?.dispose();
+  },
+);
+
+it.each(["starting", "running", "refused", "refused after notification"])(
+  "reconciles a command watch after a %s harness switch",
+  async (state) => {
+    const { service, plugin, ctx, native, watching } = await setup();
+    const kill = vi.fn(async () => {});
+    let exit!: (code: number | null) => void;
+    const exited = new Promise<number | null>((resolve) => {
+      exit = resolve;
+    });
+    const starting = runnerGate();
+    if (state !== "starting") starting.resolve();
+    const spawn = vi.fn(heldCommand).mockImplementationOnce(async () => {
+      await starting.promise;
+      return { ...(await heldCommand()), exited, kill };
+    });
+    ctx.provide("host", {
+      spawn,
+      serveMcp: async () => ({
+        url: "http://127.0.0.1/mcp",
+        headers: [],
+        closed: new Promise<void>(() => {}),
+        close: async () => {},
+      }),
+    });
+    plugin.agents.register({
+      id: "replacement",
+      title: "Replacement",
+      defaults: () => ({ config: {} }),
+      run: async () => {},
+    });
+    const core = plugin.extend({
+      pluginOwner: { id: "buzz.agents", revision: "bundled" },
+    });
+    registerAttention({ agents: core.agents });
+    try {
+      await service.create({ type: "example/echo", name: "Echo" });
+      await service.save(bot, {
+        attentionEnabled: true,
+        attention: {
+          "watch/saved": {
+            type: "source",
+            provider: "attention/command",
+            interest_id: "default",
+            enabled: true,
+            config: { command: ["check"] },
+          },
+        },
+      });
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(1));
+      const watch = service.find(bot)?.attention["watch/saved"];
+
+      if (state === "refused" || state === "refused after notification") {
+        const entered = runnerGate();
+        const change = runnerGate();
+        native.setType.mockImplementationOnce(async () => {
+          entered.resolve();
+          await change.promise;
+        });
+        const result = expect(
+          service.retype(bot, "example/replacement"),
+        ).rejects.toThrow("Switch refused");
+        await entered.promise;
+        try {
+          if (state === "refused after notification")
+            await service.saveTeam({
+              name: "Crew",
+              instructions: "",
+              members: [bot],
+            });
+        } finally {
+          change.reject(new Error("Switch refused"));
+          await result;
+        }
+        await settle();
+        expect(service.find(bot)?.type).toBe("example/echo");
+        expect(kill).not.toHaveBeenCalled();
+        expect(spawn).toHaveBeenCalledTimes(1);
+        return;
+      }
+
+      await service.retype(bot, "example/replacement");
+
+      starting.resolve();
+      expect(service.find(bot)?.attention["watch/saved"]).toBe(watch);
+      await vi.waitFor(() => expect(kill).toHaveBeenCalledTimes(1));
+      await settle();
+      expect(spawn).toHaveBeenCalledTimes(1);
+      exit(null);
+      await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(2));
+    } finally {
+      starting.resolve();
+      exit(null);
+      await watching?.dispose();
+    }
   },
 );
 
@@ -22759,8 +25101,13 @@ describe("agent gateway gate", () => {
     });
   });
 
-  /** Live routes for `bot`, probing through a request the test answers. */
-  function liveRoutes() {
+  /** Live routes for `bot`, probing through a request the test answers.
+   * `prepare` runs before the membership is fed, such as to give the routes
+   * a plugin's selection; `origin` is the membership's community. */
+  function liveRoutes(
+    prepare?: (routes: GatewayRoutes) => void,
+    origin = "wss://relay.example.test",
+  ) {
     const id = "22222222-2222-4222-8222-222222222222";
     const routes = new GatewayRoutes(() => ({
       version: 2,
@@ -22784,10 +25131,11 @@ describe("agent gateway gate", () => {
           ),
         ),
     );
+    prepare?.(routes);
     routes.bindRequest(request);
     routes.setMembership({
       key: bot as never,
-      origin: "wss://relay.example.test",
+      origin,
       owner: viewer,
       pubkey: bot,
       community: { id, session: {} },
@@ -22816,6 +25164,228 @@ describe("agent gateway gate", () => {
 
   const PENDING =
     "Buzz is still checking this agent's gateway access. Try again in a moment.";
+
+  /** `liveRoutes` with this launch's plugin selection pending until the
+   * test settles it, the runner reading the selection from these routes. */
+  function selectedRoutes(origin?: string) {
+    const selection = deferred<readonly string[] | undefined>();
+    const live = liveRoutes(
+      (routes) => routes.selectHarnesses(selection.promise),
+      origin,
+    );
+    const { routes } = live;
+    const spies = [
+      vi
+        .spyOn(gatewayRoutes, "selecting", "get")
+        .mockImplementation(() => routes.selecting),
+      vi
+        .spyOn(gatewayRoutes, "selectionForTurn")
+        .mockImplementation((wait) => routes.selectionForTurn(wait)),
+      vi
+        .spyOn(gatewayRoutes, "excludes")
+        .mockImplementation((harness) => routes.excludes(harness)),
+      vi
+        .spyOn(gatewayRoutes, "routeFor")
+        .mockImplementation((key) => routes.routeFor(key)),
+    ];
+    return {
+      ...live,
+      select: selection.resolve,
+      restore: () => {
+        for (const spy of spies) spy.mockRestore();
+      },
+    };
+  }
+  /** Lets pending promise callbacks run. */
+  const flushed = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("waits for the plugin's list first, then runs a harness it leaves out at once, while its access check stalls", async () => {
+    const live = selectedRoutes();
+    try {
+      // No check goes out before the list is known.
+      expect(live.request).not.toHaveBeenCalled();
+      const f = await mentioned(true);
+      await flushed();
+      expect(f.run).not.toHaveBeenCalled();
+      live.select(["pi"]);
+      // The list leaves `relay` out: the turn runs without waiting for the
+      // check, which is still unanswered.
+      await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(1));
+      expect(live.request).toHaveBeenCalledTimes(1);
+      expect(ready).not.toHaveBeenCalled();
+      const delivery = f.run.mock.calls[0]?.[0];
+      expect(delivery).not.toHaveProperty("gateway");
+      expect(delivery).not.toHaveProperty("gatewayFallback");
+      expect(f.activity.reader.work()[0]).not.toHaveProperty("notice");
+    } finally {
+      live.restore();
+    }
+  });
+
+  it("neither waits for nor rechecks an access check after a 403 for a harness the plugin's list leaves out", async () => {
+    const live = selectedRoutes();
+    try {
+      live.select(["pi"]);
+      await vi.waitFor(() => expect(live.request).toHaveBeenCalledTimes(1));
+      live.answer(403);
+      await vi.waitFor(() =>
+        expect(live.routes.routeFor(bot as never)).toMatchObject({
+          reason: "auth",
+        }),
+      );
+      const f = await mentioned(true);
+      await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(1));
+      await flushed();
+      expect(live.request).toHaveBeenCalledTimes(1);
+      expect(ready).not.toHaveBeenCalled();
+      const delivery = f.run.mock.calls[0]?.[0];
+      expect(delivery).not.toHaveProperty("gateway");
+      expect(delivery).not.toHaveProperty("gatewayFallback");
+      expect(f.activity.reader.work()[0]).not.toHaveProperty("error");
+    } finally {
+      live.restore();
+    }
+  });
+
+  it("routes a harness the plugin's list names once the list and then its access check settle, within the turn's wait", async () => {
+    const live = selectedRoutes();
+    try {
+      const f = await mentioned(true);
+      await flushed();
+      live.select(["relay"]);
+      await vi.waitFor(() => expect(live.request).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(ready).toHaveBeenCalledTimes(1));
+      expect(f.run).not.toHaveBeenCalled();
+      live.answer(200, "{}");
+      await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(1));
+      expect(f.run.mock.calls[0]?.[0]?.gateway?.route).toMatchObject({
+        kind: "eligible",
+        harnesses: ["relay"],
+      });
+    } finally {
+      live.restore();
+    }
+  });
+
+  it("fails a turn whose plugin list is still unknown when the wait ends, without sending an access check", async () => {
+    const cap = capReached();
+    const live = selectedRoutes();
+    try {
+      const f = await mentioned(true);
+      await vi.waitFor(() =>
+        expect(f.activity.reader.work()[0]).toMatchObject({
+          state: "error",
+          error: PENDING,
+        }),
+      );
+      expect(f.run).not.toHaveBeenCalled();
+      expect(live.request).not.toHaveBeenCalled();
+    } finally {
+      live.restore();
+      cap.mockRestore();
+    }
+  });
+
+  it("doesn't hold an unlisted community's turn for the plugin's list", async () => {
+    const live = selectedRoutes("wss://unlisted.example.test");
+    try {
+      expect(live.routes.routeFor(bot as never).kind).toBe("external");
+      const f = await mentioned(true);
+      await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(1));
+      expect(gatewayRoutes.selectionForTurn).not.toHaveBeenCalled();
+      expect(f.run.mock.calls[0]?.[0]).not.toHaveProperty("gateway");
+      expect(f.activity.reader.work()[0]).not.toHaveProperty("notice");
+    } finally {
+      live.restore();
+    }
+  });
+
+  const SELECTION_PENDING =
+    "Ran without gateway attribution: Buzz was still deciding which agents use the gateway.";
+  /** Mentions the attribution-only agent again, as `id`. */
+  const mentionAgain = (f: Awaited<ReturnType<typeof mentioned>>, id: string) =>
+    f.emit({
+      events: [
+        event(id, {
+          pubkey: viewer,
+          tags: [
+            ["h", channel],
+            ["p", bot],
+          ],
+        }),
+      ],
+      channelId: channel,
+    });
+
+  it("runs an attribution-only turn at once while the plugin's list is unknown, noting that, and quietly once the list enables none", async () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const live = selectedRoutes();
+    try {
+      const f = await mentioned("attribution");
+      await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(1));
+      expect(timeout).not.toHaveBeenCalledWith(TURN_READINESS_WAIT_MS);
+      expect(ready).not.toHaveBeenCalled();
+      const first = f.run.mock.calls[0]?.[0];
+      expect(first).not.toHaveProperty("gateway");
+      // Says only that the list was unknown: no access check went out.
+      expect(first?.gatewayFallback).toEqual({
+        reason: "readiness_pending",
+        notice: SELECTION_PENDING,
+      });
+      expect(f.activity.reader.work()[0]).toMatchObject({
+        notice: SELECTION_PENDING,
+      });
+      expect(live.request).not.toHaveBeenCalled();
+      // The list, late, enables none: nothing went to the gateway, and the
+      // next turn is quiet.
+      live.select([]);
+      await vi.waitFor(() =>
+        expect(live.routes.routeFor(bot as never).kind).toBe("external"),
+      );
+      expect(live.request).not.toHaveBeenCalled();
+      mentionAgain(f, "attr-after-empty");
+      await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(2));
+      expect(f.run.mock.calls[1]?.[0]).not.toHaveProperty("gatewayFallback");
+      expect(
+        f.activity.reader
+          .work()
+          .filter((work) => "notice" in work)
+          .map((work) => work.messageId),
+      ).toEqual([mention.id]);
+    } finally {
+      live.restore();
+      timeout.mockRestore();
+    }
+  });
+
+  it("runs an attribution-only turn quietly once the plugin's list leaves its harness out, whatever the access check", async () => {
+    const live = selectedRoutes();
+    try {
+      live.select(["pi"]);
+      await vi.waitFor(() => expect(live.request).toHaveBeenCalledTimes(1));
+      // The check is still unanswered: the route is pending.
+      const f = await mentioned("attribution");
+      await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(1));
+      expect(ready).not.toHaveBeenCalled();
+      expect(f.run.mock.calls[0]?.[0]).not.toHaveProperty("gatewayFallback");
+      expect(f.activity.reader.work()[0]).not.toHaveProperty("notice");
+    } finally {
+      live.restore();
+    }
+  });
+
+  it("runs an unlisted community's attribution-only turn quietly while the plugin's list is unknown", async () => {
+    const live = selectedRoutes("wss://unlisted.example.test");
+    try {
+      expect(live.routes.selecting).toBe(true);
+      const f = await mentioned("attribution");
+      await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(1));
+      expect(f.run.mock.calls[0]?.[0]).not.toHaveProperty("gatewayFallback");
+      expect(f.activity.reader.work()[0]).not.toHaveProperty("notice");
+    } finally {
+      live.restore();
+    }
+  });
 
   it("fails a turn whose access check outlasts the wait, before any type code runs, so a late 403 finds nothing dispatched", async () => {
     const cap = capReached();
@@ -23228,6 +25798,31 @@ describe("agent gateway gate", () => {
     await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(1));
     expect(f.run.mock.calls[0]?.[0]).not.toHaveProperty("gateway");
     expect(f.run.mock.calls[0]?.[0]).not.toHaveProperty("gatewayFallback");
+  });
+
+  it("runs a harness the plugin's list leaves out unchanged, even when the access check refused", async () => {
+    const excludes = vi.spyOn(gatewayRoutes, "excludes").mockReturnValue(true);
+    try {
+      for (const capable of [true, "attribution"] as const)
+        for (const route of [
+          { ...blockedRoute, reason: "auth" as const },
+          { ...blockedRoute, reason: "readiness_pending" as const },
+          blockedRoute,
+          eligible,
+        ]) {
+          ready.mockResolvedValue(route);
+          const f = await mentioned(capable);
+          await vi.waitFor(() => expect(f.run).toHaveBeenCalledTimes(1));
+          expect(excludes).toHaveBeenCalledWith("relay");
+          const delivery = f.run.mock.calls[0]?.[0];
+          expect(delivery).not.toHaveProperty("gateway");
+          expect(delivery).not.toHaveProperty("gatewayFallback");
+          expect(f.activity.reader.work()[0]).not.toHaveProperty("notice");
+          gatewayRoutes.removeMembership(bot as never);
+        }
+    } finally {
+      excludes.mockRestore();
+    }
   });
 
   it("hands an eligible route and the turn's frozen context to a type that routes through the gateway", async () => {

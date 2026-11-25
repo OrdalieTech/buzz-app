@@ -39,6 +39,10 @@ import "../../src/shared/styles/globals.css";
 
 const strictWindows = new URLSearchParams(location.search).has("threadWindow");
 const nestedWindow = new URLSearchParams(location.search).has("nestedWindow");
+// The thread's height in px. Without it the thread is as tall as its content
+// allows, which a journey cannot set.
+const threadHeight =
+  Number(new URLSearchParams(location.search).get("threadHeight")) || undefined;
 // A long conversation name above the thread, as an Inbox tab would supply.
 const threadParent = new URLSearchParams(location.search).has("threadParent")
   ? {
@@ -606,6 +610,23 @@ function Fixture() {
   const root = roots[selected];
   if (!root) throw new Error("Missing fixture selection");
   const channelId = channelOf(root);
+  const thread = (
+    <ThreadPanel
+      extensions={extensions}
+      session={owner.session}
+      scope={scope}
+      channelId={channelId}
+      channelName={channelId}
+      messageId={exactChild ?? root.id}
+      revealSelected={exactChild !== undefined}
+      close={() => select(0)}
+      parent={threadParent}
+      onOpenLink={(url) => {
+        report.links.push(url);
+        return !url.includes("unhandled");
+      }}
+    />
+  );
   return (
     <>
       <div style={{ display: "flex", width: 900, height: 240 }}>
@@ -694,23 +715,20 @@ function Fixture() {
             channelName={channelId}
           />
         )}
-        {!review && (
-          <ThreadPanel
-            extensions={extensions}
-            session={owner.session}
-            scope={scope}
-            channelId={channelId}
-            channelName={channelId}
-            messageId={exactChild ?? root.id}
-            revealSelected={exactChild !== undefined}
-            close={() => select(0)}
-            parent={threadParent}
-            onOpenLink={(url) => {
-              report.links.push(url);
-              return !url.includes("unhandled");
-            }}
-          />
-        )}
+        {!review &&
+          (threadHeight ? (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateRows: "minmax(0, 1fr)",
+                height: threadHeight,
+              }}
+            >
+              {thread}
+            </div>
+          ) : (
+            thread
+          ))}
       </div>
       {review && (
         <MediaReviewViewer

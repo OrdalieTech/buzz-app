@@ -9,6 +9,9 @@ import {
   rememberAgentsPreference,
   setRememberAgentsPreference,
 } from "../features/messages/mention-preferences";
+import { ownerChoices } from "../features/agents/prompt-sections";
+import type { Agents } from "../features/agents/service";
+import { localStore } from "../features/agents/store";
 import {
   bindKeepAwake,
   keepAwakePreference,
@@ -65,6 +68,58 @@ it("offers keeping the Mac awake only where the app can, with a wait after agent
   expect(keepAwakePreference()).toEqual({ mode: "auto", after: 480 });
   expect(localStorage.getItem("buzz-keep-awake.v1")).toBe(
     JSON.stringify({ mode: "auto", after: 480 }),
+  );
+});
+
+it("shows the base instructions, kept in the agents' storage", async () => {
+  const user = userEvent.setup();
+  const types = [
+    { key: "buzz.codex/codex", mayRestartForBaseInstructions: () => true },
+  ];
+  const listeners = new Set<() => void>();
+  let snapshot: {
+    status: string;
+    running: { key: string; type: string }[];
+  } = {
+    status: "loading",
+    running: [],
+  };
+  const storage = localStore();
+  render(
+    <AgentSettings
+      keepAwakeAvailable={false}
+      agents={
+        {
+          subscribe: (listener: () => void) => {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+          },
+          types: () => types,
+          snapshot: () => snapshot,
+          storage,
+        } as unknown as Agents
+      }
+    />,
+    { wrapper: ToastProvider },
+  );
+  await user.click(screen.getByRole("button", { name: /^Show all \(\d+\)$/ }));
+  await user.click(screen.getByRole("button", { name: "Progress" }));
+  const warning = /Older Codex conversations on this device/;
+  expect(screen.queryByText(warning)).not.toBeInTheDocument();
+  act(() => {
+    snapshot = {
+      status: "ready",
+      running: [{ key: "agent", type: "buzz.codex/codex" }],
+    };
+    for (const listener of listeners) listener();
+  });
+  expect(screen.getByText(warning)).toBeVisible();
+  await user.click(
+    screen.getByRole("button", { name: "Options for Progress" }),
+  );
+  await user.click(await screen.findByRole("menuitem", { name: "Disable" }));
+  await waitFor(() =>
+    expect(ownerChoices(storage)).toEqual({ progress: { mode: "off" } }),
   );
 });
 

@@ -1,3 +1,3 @@
 - **Work in the open.** Your tool calls and reasoning are invisible to humans — narrate progress as you go to the `agents` audience, and never go dark between "picked up" and "done." If you didn't post it, it didn't happen.
 - Use the `everyone` audience for milestones teammates must act on: picked up, blocked + need input, PR up, done.
-- For anything that will take a while, send one `everyone` message right away saying what you are about to do, then a final message when you're done. Send more than that only when it matters.
+- For anything that will take a while, send one `everyone` message right away saying what you are about to do, then one final message when you're done: a `details` message when the result needs more than a few sentences, otherwise an `everyone` one. Send more than that only when it matters.

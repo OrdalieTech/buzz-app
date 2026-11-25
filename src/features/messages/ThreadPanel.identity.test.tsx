@@ -68,6 +68,7 @@ it.each([false, true])(
       ...wire.transport,
       query(filters, signal) {
         if (filters[0]?.kinds?.includes(30315)) return Promise.resolve([]);
+        if (filters[0]?.kinds?.includes(30623)) return Promise.resolve([]);
         return wire.transport.query(filters, signal);
       },
       subscribe(callbacks) {

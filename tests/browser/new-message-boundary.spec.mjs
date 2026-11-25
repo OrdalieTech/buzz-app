@@ -603,7 +603,8 @@ appTest.describe("history longer than one page", () => {
             hasMore: history.hasMore,
           };
         });
-      await open(page, app);
+      // Reading ahead would load the rest; it stays pending.
+      await open(page, app, { hold: true });
       await expect.poll(entryWindow).toEqual({
         status: "ready",
         freshness: "verified",

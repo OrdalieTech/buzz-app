@@ -1,9 +1,9 @@
 // What an agent type reads of an agent's community beyond the agent's own
 // handle: the channel a turn is in, the conversation before it, the names of
-// the people in it, and the agent's memory. The desktop app reads these
-// through the owner's connection to the community; a standalone host reads
-// them as the agent. Both give a type the same answers, so the type runs the
-// same code in either.
+// the people in it, and the agent's memory. The desktop uses the owner's
+// connection and agent-authenticated reads for conversations the owner cannot
+// read; a standalone host reads as the agent. Both give a type the same
+// answers, so the type runs the same code in either.
 import type { Memories } from "../../buzz-mcp/client";
 import type { Profile } from "../relay/contracts";
 import { validVerifiedName } from "../relay/verified-profile";
@@ -56,6 +56,9 @@ export type AgentReads = Readonly<{
   profile(pubkey: string): RelayEvent | undefined;
   /** The community's name and kind for a channel, if it lists the channel now. */
   channelLabel(id: string): ChannelLabel | undefined;
+  /** Whether the owner's own connection can read the channel, as opposed to
+   * one only the agent can. Owner-facing views show only these. */
+  ownerReadable(id: string): boolean;
   /** Tells `listener` when the community's channel list changes, so
    * `channelLabel` may answer differently. */
   subscribeChannels(listener: () => void): () => void;
@@ -130,6 +133,9 @@ export function ownerReads(
         }
       );
     },
+    ownerReadable: (id: string) =>
+      session.channels.list().channels.some((item) => item.id === id) ||
+      !!session.channels.get?.(id),
     subscribeChannels: (listener: () => void) =>
       session.channels.subscribeList(listener),
     workflowAuthority: () => session.workflowAuthority,
@@ -160,24 +166,29 @@ export function workflowMarked(event: RelayEvent, owner: string) {
   );
 }
 
+const OWN_RETRY_MS = 1_000;
+const OWN_RETRY_MAX_MS = 15_000;
+
 /** `ownerReads` of the agent's own community and owner, once the community is
  * ready, has listed its channels and knows the kind of `channelId`, which a
  * turn needs to tell where to answer: now when it has, or after the reconnect
  * under way, through a new session in the same community and owner if that
- * replaces the old one. Rejects when the community ends up another one or another owner's, is
+ * replaces the old one. A channel the owner cannot see is read through the
+ * agent's own reads as they are at each check, which it asks, with backoff,
+ * to resolve the channel while they do not know its kind. Rejects when the community ends up another one or another owner's, is
  * disconnected or fails in a way the service does not recover from by itself,
  * or when `signal` aborts first. It waits for the service's own notifications
- * and never reconnects. */
+ * and never reconnects. Its errors name what waits, `what`. */
 export function readyOwnerReads(
   relay: RelayData | undefined,
   agent: Readonly<{ relay: string; owner: string; pubkey: string }>,
   signal: AbortSignal,
   channelId?: string,
+  what = "Workflow request",
+  agentReads?: () => AgentReads | undefined,
 ): Promise<AgentReads> {
   const unavailable = () =>
-    new Error(
-      "Workflow request could not start: its community is no longer connected.",
-    );
+    new Error(`${what} could not start: its community is no longer connected.`);
   let origin: string;
   try {
     origin = communityDestination(agent.relay).url;
@@ -210,7 +221,7 @@ export function readyOwnerReads(
           channels.get?.(channelId)
         )?.channelType
       )
-        return pending;
+        return own(channelId) ?? pending;
       return ownerReads(relay, agent.pubkey);
     }
     if (
@@ -221,6 +232,46 @@ export function readyOwnerReads(
       return pending;
     return undefined;
   };
+  let stopOwn = () => {};
+  let watched: AgentReads | undefined;
+  let asking = false;
+  let finished = false;
+  let askAgain = OWN_RETRY_MS;
+  let retryOwn: ReturnType<typeof setTimeout> | undefined;
+  let check = () => {};
+  /** The agent's current reads once they know the channel's kind; until then
+   * they are watched and asked to resolve it, one lookup at a time and again,
+   * backing off until the deadline, after one that left it unknown: whichever
+   * reads are current then, so a reader made afresh at each check cannot ask
+   * any faster. */
+  const own = (id: string) => {
+    const reads = agentReads?.();
+    if (!reads) return undefined;
+    if (reads.channelLabel(id)?.channelType) return reads;
+    if (reads !== watched) {
+      stopOwn();
+      watched = reads;
+      stopOwn = reads.subscribeChannels(() => check());
+    }
+    if (!asking && retryOwn === undefined) {
+      asking = true;
+      const unresolved = () => {
+        asking = false;
+        if (finished) return;
+        if (signal.aborted || reads.channelLabel(id)?.channelType) return;
+        retryOwn = setTimeout(() => {
+          retryOwn = undefined;
+          check();
+        }, askAgain);
+        askAgain = Math.min(askAgain * 2, OWN_RETRY_MAX_MS);
+      };
+      void reads
+        .channel(id)
+        .then(unresolved, unresolved)
+        .finally(() => check());
+    }
+    return undefined;
+  };
   return new Promise((resolve, reject) => {
     let stop = () => {};
     let stopList = () => {};
@@ -228,18 +279,22 @@ export function readyOwnerReads(
     const finish = () => {
       stop();
       stopList();
+      finished = true;
+      stopOwn();
+      clearTimeout(retryOwn);
       signal.removeEventListener("abort", aborted);
     };
     const aborted = () => {
       finish();
       reject(
         new Error(
-          "Workflow request could not start: its community did not reconnect before the delivery deadline.",
+          `${what} could not start: its community did not reconnect before the delivery deadline.`,
           { cause: signal.reason },
         ),
       );
     };
-    const check = () => {
+    check = () => {
+      if (finished) return;
       const reads = settled();
       if (reads !== pending) {
         finish();

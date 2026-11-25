@@ -47,10 +47,24 @@ export class PluginRuntime {
     this.load = load;
     root.provide("pluginStatus", {
       isActive: this.isActive,
+      promptSections: (id) => {
+        const entry = this.entries.get(id);
+        return entry && this.isActive(id, entry.plugin.revision)
+          ? entry.plugin.manifest.host?.agentPromptSections
+          : undefined;
+      },
+      on: (id) => id in this.states,
       subscribe: this.subscribe,
       settled: () =>
         !configuring() &&
         Object.values(this.states).every(({ status }) => status !== "starting"),
+      bundledSettled: () =>
+        !configuring() &&
+        [...this.entries].every(
+          ([id, { plugin }]) =>
+            plugin.source !== "bundled" ||
+            this.states[id]?.status !== "starting",
+        ),
     });
     this.timeoutMs = timeoutMs;
   }
@@ -160,6 +174,9 @@ export class PluginRuntime {
         ]),
         agentExecution: Object.freeze([
           ...(entry.plugin.manifest.host?.agentExecution ?? []),
+        ]),
+        agentPromptSections: Object.freeze([
+          ...(entry.plugin.manifest.host?.agentPromptSections ?? []),
         ]),
       });
       // The loader runs only the host's own module for a bundled source.

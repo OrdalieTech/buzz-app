@@ -99,7 +99,10 @@ export function memberAuthority(
     throw new Error(
       "Member roles are inconsistent. Refresh members and roles.",
     );
-  const activeChannel = type !== "dm" && archived !== "true";
+  const live = archived !== "true";
+  // A DM is identified by its people: the relay lets no one remove another
+  // person, but lets an owner remove their own agent.
+  const activeChannel = type !== "dm" && live;
   const solo = !!soloLabels(channelIdentity(metadata).labels);
   return Object.freeze({
     roles: Object.freeze(roles),
@@ -113,7 +116,7 @@ export function memberAuthority(
       elevated.get(viewer) === "owner",
     canRemove: activeChannel && elevated.has(viewer),
     canRemoveOwnedAgent:
-      activeChannel && !solo && !!roles[viewer] && roles[viewer] !== "unknown",
+      live && !solo && !!roles[viewer] && roles[viewer] !== "unknown",
     system: type === "system",
   });
 }

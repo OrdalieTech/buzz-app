@@ -3,11 +3,22 @@
 // composer, only their session controls where those apply, and a pick saved
 // for one before it switched is left out.
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AgentsContext } from "../agents/react";
 import { setRuntimeRecommendation } from "../agents/recommended";
-import type { Agents } from "../agents/service";
+import {
+  noteRoutedTurn,
+  resetModelRoutesForTests,
+} from "../agents/model-routes";
+import type { Agents, Models } from "../agents/service";
 import type { ProfileQueries } from "../relay/profile-directory";
 import { ComposerModels, type DraftPicks } from "./ComposerModels";
 
@@ -25,6 +36,7 @@ beforeEach(() =>
 );
 afterEach(() => {
   setRuntimeRecommendation(undefined);
+  resetModelRoutesForTests();
   cleanup();
 });
 
@@ -55,10 +67,11 @@ function renderFor(
     session?: boolean;
     /** A new top-level message, where a thread's session can't be acted on. */
     startsThread?: boolean;
+    models?: Models;
   } = {},
 ) {
   const pubkey = "a".repeat(64);
-  const models = vi.fn(async () => catalog);
+  const models = vi.fn(async () => options.models ?? catalog);
   const snapshot = {
     status: "ready",
     agents: [
@@ -204,4 +217,69 @@ it("keeps the picker for a marked agent in a build that recommends nothing for i
   expect(
     await screen.findByRole("button", { name: /^Model and effort/ }),
   ).toBeVisible();
+});
+
+it("shows what an agent's route chose for its latest turn", async () => {
+  const { pubkey } = renderFor(
+    "claude-code",
+    { model: "route:auto-balanced" },
+    {
+      models: {
+        current: "route:auto-balanced",
+        models: [
+          { id: "route:auto-balanced", label: "Auto Balanced", efforts: [] },
+          ...catalog.models,
+        ],
+      },
+    },
+  );
+  const readable = { channelId: "c".repeat(64), ownerReadable: () => true };
+  act(() =>
+    noteRoutedTurn(
+      pubkey,
+      {
+        route: { id: "auto-balanced", label: "Auto Balanced" },
+        label: "Model B · High",
+        rationale: "A hard task",
+      },
+      readable,
+    ),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", { name: /^Model and effort/ }),
+  );
+  const chosen = await screen.findByText("Latest turn: Model B · High");
+  expect(chosen).toBeVisible();
+  expect(chosen).toHaveAttribute("title", "Auto Balanced: A hard task");
+  // Why it chose, read from a conversation its owner cannot read, stays out.
+  act(() =>
+    noteRoutedTurn(
+      pubkey,
+      {
+        route: { id: "auto-balanced", label: "Auto Balanced" },
+        label: "Model A · Low",
+        rationale: "From a private DM",
+      },
+      { ...readable, ownerReadable: () => false },
+    ),
+  );
+  expect(await screen.findByText("Latest turn: Model A · Low")).toHaveAttribute(
+    "title",
+    "Auto Balanced",
+  );
+  // A long model id may wrap after its dots and underscores.
+  act(() =>
+    noteRoutedTurn(
+      pubkey,
+      {
+        route: { id: "auto-balanced", label: "Auto Balanced" },
+        label: "tools_x.goose.model-b · High",
+      },
+      readable,
+    ),
+  );
+  const line = await screen.findByText(
+    "Latest turn: tools_x.goose.model-b · High",
+  );
+  expect(line.querySelectorAll("wbr")).toHaveLength(3);
 });

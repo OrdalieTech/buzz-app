@@ -117,6 +117,31 @@ it("reports native write failure without a retry loop and accepts a later curren
   await h.dock.refresh();
   expect(h.set.mock.calls).toEqual([[false], [true], [true]]);
 });
+it("a re-read starts behind a check already in flight, so that check's earlier answer does not stand", async () => {
+  const h = setup("default");
+  await h.dock.refresh();
+  h.dock.setUnread(true);
+  // A focus check sent while the system prompt was still unanswered.
+  const earlier = deferred<IndicatorPermission>();
+  h.permission.mockImplementationOnce(() => earlier.promise);
+  h.host.dispatchEvent(new Event("focus"));
+  let reread: Promise<void>;
+  try {
+    await vi.waitFor(() => expect(h.permission).toHaveBeenCalledTimes(2));
+    // Allowed. Two re-reads asked for meanwhile share one native read.
+    h.permission.mockResolvedValue("enabled");
+    reread = h.dock.reread();
+    void h.dock.reread();
+    expect(h.permission).toHaveBeenCalledTimes(2);
+  } finally {
+    earlier.resolve("denied");
+  }
+  await reread;
+  expect(h.permission.mock.calls).toEqual([[false], [false], [false]]);
+  expect(h.dock.snapshot().permission).toBe("enabled");
+  await vi.waitFor(() => expect(h.set).toHaveBeenLastCalledWith(true));
+  expect(h.set.mock.calls).toEqual([[false], [true]]);
+});
 it("keeps an explicit request when a focus check was already pending", async () => {
   const h = setup("default");
   await h.dock.refresh();

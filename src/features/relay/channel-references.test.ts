@@ -37,11 +37,13 @@ async function setup() {
   let clock = 1_000_000;
   const wire = scriptedTransport(viewer.pubkey, relay.pubkey);
   let receive!: (events: readonly RelayEvent[]) => void;
+  let denied!: (channelId: string, reason: string) => void;
   const owner = createRelaySession(
     {
       ...wire.transport,
       subscribe(callbacks) {
         receive = callbacks.receive;
+        denied = callbacks.denied;
         return { update() {}, retry() {}, dispose() {} };
       },
     },
@@ -69,6 +71,7 @@ async function setup() {
     owner,
     next,
     emit: (events: readonly RelayEvent[]) => receive(events),
+    deny: (id: string) => denied(id, "restricted: not a channel member"),
     tick: (ms: number) => {
       clock += ms;
     },
@@ -99,6 +102,19 @@ it("describes a joined channel locally and never reads for it", async () => {
     name: "mine",
     joined: true,
     members: 1,
+  });
+});
+
+it("describes a public channel as not joined after denial, though its old roster still lists the viewer", async () => {
+  const h = await setup();
+  h.deny(MINE);
+  h.channels.refer?.(MINE);
+  // The lookup confirms the public preview but returns no roster for the viewer.
+  await h.lookup([MINE], [open(MINE, "mine")]);
+  expect(h.channels.get?.(MINE)?.members).toContain(viewer.pubkey);
+  expect(h.channels.describe?.(MINE)).toMatchObject({
+    state: "found",
+    joined: false,
   });
 });
 

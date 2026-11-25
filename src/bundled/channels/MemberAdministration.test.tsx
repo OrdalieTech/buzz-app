@@ -68,13 +68,18 @@ async function setup(
   messageNavigation = true,
   initialReads?: { names?: Promise<void>; roster?: Promise<void> },
   ownership?: "own" | "other" | "invalid",
-  visibility: "private" | "public" | "solo" | "view-only-solo" = "private",
+  visibility:
+    | "private"
+    | "public"
+    | "solo"
+    | "view-only-solo"
+    | "dm" = "private",
   targetPicture?: string,
   targetProfiled = true,
 ) {
   const solo = visibility === "solo" || visibility === "view-only-solo";
   const visibilityFlag =
-    visibility === "solo"
+    visibility === "solo" || visibility === "dm"
       ? "private"
       : visibility === "view-only-solo"
         ? "public"
@@ -130,7 +135,7 @@ async function setup(
       content: "",
       tags: [
         ["d", id],
-        ["t", "stream"],
+        ["t", visibility === "dm" ? "dm" : "stream"],
         [visibilityFlag],
         ...(solo ? [["t", "buzz.solo"]] : []),
         ...(visibility === "view-only-solo" ? [["join_role", "guest"]] : []),
@@ -915,6 +920,50 @@ it("keeps removal in a View only Solo chat without showing role choices", async 
   ).toBeInTheDocument();
   expect(screen.queryAllByRole("menuitemradio")).toHaveLength(0);
 });
+it.each([
+  ["their own agent", true, "own", true],
+  ["another's agent", true, "other", false],
+  ["a person", false, undefined, false],
+] as const)(
+  "in a DM, offers removal of %s only when the viewer owns it",
+  async (_, agent, ownership, removable) => {
+    const t = await setup(
+      "member",
+      "member",
+      true,
+      undefined,
+      agent,
+      undefined,
+      false,
+      true,
+      undefined,
+      ownership,
+      "dm",
+    );
+    await t.user.click(
+      screen.getByRole("button", { name: /^Actions for Morgan/ }),
+    );
+    await screen.findByRole("menuitem", { name: "View profile" });
+    if (!removable) {
+      expect(
+        screen.queryByRole("menuitem", { name: /^Remove/ }),
+      ).not.toBeInTheDocument();
+      return;
+    }
+    await t.user.click(
+      await screen.findByRole("menuitem", { name: "Remove from DM" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Remove agent from DM",
+    });
+    await t.user.click(
+      within(dialog).getByRole("button", { name: "Remove agent" }),
+    );
+    await vi.waitFor(() =>
+      expect(t.publish.mock.calls[0]?.[0]).toMatchObject({ kind: 9001 }),
+    );
+  },
+);
 it("presents verified roles, protects owners/self, and confirms a separate deliberate role intent", async () => {
   const t = await setup();
   await expectProfileOnly(t.user, "Carl");

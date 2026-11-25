@@ -34,6 +34,14 @@ const output = (value: unknown) =>
         .join("\n")
     : display(value);
 
+export function recordedTurnStart(record: Json): string {
+  const payload = object(record.payload);
+  return record.type === "turn_context" ||
+    (record.type === "event_msg" && payload?.type === "task_started")
+    ? str(payload?.turn_id)
+    : "";
+}
+
 /** The rollout lines restoring tools reads, parsed: turn starts, completed
  * items and tool calls with their outputs. */
 export function recordedLines(text: string): Json[] {
@@ -49,9 +57,8 @@ export function recordedLines(text: string): Json[] {
     const type = str(object(record?.payload)?.type);
     if (
       record &&
-      (record.type === "turn_context" ||
-        (record.type === "event_msg" &&
-          (type === "task_started" || type === "item_completed")) ||
+      (recordedTurnStart(record) ||
+        (record.type === "event_msg" && type === "item_completed") ||
         (record.type === "response_item" &&
           /^(custom_tool_call|function_call)(_output)?$/.test(type)))
     )
@@ -85,15 +92,10 @@ export function restoreRecordedTools(
   for (const record of typeof file === "string" ? recordedLines(file) : file) {
     const payload = object(record?.payload);
     if (!payload) continue;
-    if (
-      record?.type === "turn_context" ||
-      (record?.type === "event_msg" && payload.type === "task_started")
-    ) {
-      const next = str(payload.turn_id);
-      if (next && next !== turnId) {
-        turnId = next;
-        active.clear();
-      }
+    const next = recordedTurnStart(record);
+    if (next && next !== turnId) {
+      turnId = next;
+      active.clear();
     }
     const draft = drafts.get(str(payload.turn_id) || turnId);
     if (record?.type === "event_msg" && payload.type === "item_completed") {

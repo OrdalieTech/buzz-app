@@ -65,9 +65,10 @@ is only the verified event `pubkey`, never a URL, manifest claim, or unsigned fi
 An installed signed plugin may update only under the same manifest ID and
 publisher key; it cannot downgrade to unsigned or roll back to an unsigned
 revision. An existing unsigned installation may be replaced with a signed
-release. Users decide whether to trust a publisher; a valid signature from any
-publisher key satisfies this verification policy. Signing does not sandbox
-plugin code.
+release. Users decide whether to trust a publisher; without a local trust policy,
+a valid signature from any publisher key satisfies this verification policy. A
+client may restrict runnable plugins to user-registered publisher keys (Buzz:
+[plugin trust](../plugin-trust.md)). Signing does not sandbox plugin code.
 
 The file pair can be distributed through a folder or Git repository without a
 relay. Any later relay publication requires relay support for kind `1064`.

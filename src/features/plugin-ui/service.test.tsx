@@ -10,6 +10,10 @@ import { pluginUi } from "./service";
 
 afterEach(cleanup);
 
+const fail = (message: string): never => {
+  throw new Error(message);
+};
+
 /** Reads `ui` the way a plugin does: optionally, from its own context. */
 async function readUi(host: Context) {
   let ui: PluginUi | undefined;
@@ -168,6 +172,83 @@ it("lets a plugin build a form in a dialog from host controls", async () => {
   await vi.waitFor(() => expect(document.body.style.overflowY).toBe(""));
 });
 
+it("lets a plugin offer actions in a host menu that leads to a dialog", async () => {
+  const { Dialog, Button } = pluginUi;
+  const Menu = pluginUi.Menu ?? fail("Menu was not provided");
+  const snoozed = vi.fn();
+  const user = userEvent.setup();
+  function Card() {
+    const [confirming, setConfirming] = useState(false);
+    return h(
+      // A card that clips its overflow, like a scrolling sheet.
+      "article",
+      { "data-testid": "card", style: { overflow: "hidden", height: 24 } },
+      h(Menu, {
+        "aria-label": "More",
+        align: "end",
+        items: [
+          { label: "Snooze", onSelect: snoozed },
+          { label: "Archive", onSelect: snoozed, disabled: true },
+          {
+            label: "Dismiss without answering",
+            tone: "destructive",
+            onSelect: () => setConfirming(true),
+          },
+        ],
+      }),
+      h(
+        Dialog,
+        {
+          open: confirming,
+          onOpenChange: setConfirming,
+          title: "Dismiss item?",
+          actions: h(Button, { onClick: () => setConfirming(false) }, "Cancel"),
+        },
+        "The agent will see you chose not to answer.",
+      ),
+    );
+  }
+  render(h(Card));
+  const trigger = screen.getByRole("button", { name: "More" });
+
+  // Keyboard: open, move with the arrows, and choose by typeahead.
+  trigger.focus();
+  await user.keyboard("{Enter}");
+  const menu = await screen.findByRole("menu", { name: "More" });
+  // Rendered outside the card, so the card's overflow cannot clip it.
+  expect(screen.getByTestId("card")).not.toContainElement(menu);
+  const item = (name: string) => screen.getByRole("menuitem", { name });
+  await vi.waitFor(() => expect(item("Snooze")).toHaveFocus());
+  await user.keyboard("{ArrowDown}");
+  await vi.waitFor(() => expect(item("Snooze")).not.toHaveFocus());
+  await user.keyboard("s");
+  await vi.waitFor(() => expect(item("Snooze")).toHaveFocus());
+  // A disabled item does nothing and keeps the menu open.
+  await user.click(item("Archive"));
+  expect(snoozed).not.toHaveBeenCalled();
+  expect(menu).toBeInTheDocument();
+  await user.keyboard("s");
+  await vi.waitFor(() => expect(item("Snooze")).toHaveFocus());
+  await user.keyboard("{Enter}");
+  expect(snoozed).toHaveBeenCalledExactlyOnceWith();
+  await vi.waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+  expect(trigger).toHaveFocus();
+
+  // A destructive item opens a confirmation; Escape returns to the trigger.
+  await user.click(trigger);
+  await user.click(
+    await screen.findByRole("menuitem", { name: "Dismiss without answering" }),
+  );
+  await screen.findByRole("dialog", { name: "Dismiss item?" });
+  await vi.waitFor(() =>
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus(),
+  );
+  await user.keyboard("{Escape}");
+  await vi.waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(screen.queryByRole("menu")).toBeNull();
+  expect(trigger).toHaveFocus();
+});
+
 it("treats plain-JS values of the wrong type as absent", async () => {
   const loose = pluginUi as unknown as Record<
     keyof PluginUi,
@@ -182,6 +263,15 @@ it("treats plain-JS values of the wrong type as absent", async () => {
       h(loose.Input, { "aria-label": "Name", disabled: 1, maxLength: "4" }),
       h(loose.Switch, { label: "Alerts", disabled: 1, checked: "yes" }),
       h(loose.Switch, { label: null, "aria-label": "Sync" }),
+      h(loose.Menu, {
+        label: "Actions",
+        icon: "x",
+        items: [
+          null,
+          { label: 5 },
+          { label: "Go", onSelect: "x", disabled: 1 },
+        ],
+      }),
     ),
   );
   const go = screen.getByRole("button", { name: "Go" });
@@ -194,4 +284,9 @@ it("treats plain-JS values of the wrong type as absent", async () => {
   expect(alerts).not.toHaveAttribute("aria-disabled");
   expect(alerts).not.toBeChecked();
   expect(screen.getByRole("switch", { name: "Sync" })).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Actions" }));
+  const item = await screen.findByRole("menuitem");
+  expect(item).toHaveAccessibleName("Go");
+  expect(item).not.toHaveAttribute("aria-disabled");
+  await user.click(item);
 });

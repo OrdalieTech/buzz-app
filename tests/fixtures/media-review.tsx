@@ -7,6 +7,7 @@ import emojiManifest from "../../src/bundled/emoji/manifest.json";
 import { useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { useKeyboardFocusVisibility } from "../../src/shared/design-system/useKeyboardFocusVisibility";
+import { ActivityIndicatorPresentation } from "../../src/features/conversation/typing-presentation";
 import type { Attachment } from "../../src/features/relay/contracts";
 import { AttachmentImage } from "../../src/features/messages/AttachmentImage";
 import { MediaAttachment } from "../../src/features/messages/MediaAttachment";
@@ -38,7 +39,8 @@ window.addEventListener("pagehide", () => {
 // Isolated, ephemeral signing and publication. Nothing goes to the live relay.
 const viewer = keypair(),
   relay = keypair(),
-  designer = keypair();
+  designer = keypair(),
+  helper = keypair();
 const attachment = {
   url: "https://fixture.test/sample.mp4",
   name: "Review clip.mp4",
@@ -83,6 +85,16 @@ const emptyThread = new URLSearchParams(location.search).has("empty");
 const compactTimestamps = new URLSearchParams(location.search).has(
   "timestamps",
 );
+// A working agent in the review thread: its conversation indicator, or with
+// `agent-update` its recorded step after the viewer's own comment. With
+// `agent-update=own` the step follows a comment the agent wrote itself. `steps`
+// seeds a finished step of the same run first, `own-steps` does so after the
+// agent's own comment, and `agents` makes that finished step another agent's.
+// `between` puts the step between two of the viewer's comments, and `link`
+// gives the step a link in its details. A `fixture-agent-done` event ends the
+// agent's work; `fixture-agent-step` delivers the run's next step.
+const agentWorking = new URLSearchParams(location.search).has("agent-working");
+const agentUpdate = new URLSearchParams(location.search).get("agent-update");
 const events = [
   rootMessage,
   message(
@@ -103,7 +115,58 @@ const events = [
     3,
     [["e", rootMessage.id, "", "reply"]],
   ),
-  profile(designer, { name: "Alex", picture: portraitUrl }),
+  ...(agentUpdate?.startsWith("own")
+    ? [
+        message(designer, "video-preview", "I'll recheck the second cut.", 4, [
+          ["e", rootMessage.id, "", "reply"],
+        ]),
+      ]
+    : []),
+  ...(agentUpdate === "steps" ||
+  agentUpdate === "own-steps" ||
+  agentUpdate === "agents"
+    ? [
+        message(
+          agentUpdate === "agents" ? helper : designer,
+          "video-preview",
+          "Opening the clip",
+          5,
+          [
+            ["e", rootMessage.id, "", "reply"],
+            ["audience", "agents"],
+          ],
+        ),
+      ]
+    : []),
+  ...(agentUpdate !== null
+    ? [
+        message(
+          designer,
+          "video-preview",
+          agentUpdate === "link"
+            ? "Rechecking the second cut against https://example.org/cut"
+            : "Rechecking the second cut",
+          6,
+          [
+            ["e", rootMessage.id, "", "reply"],
+            ["audience", "agents"],
+          ],
+        ),
+      ]
+    : []),
+  ...(agentUpdate === "between"
+    ? [
+        message(viewer, "video-preview", "Thanks, that reads well.", 7, [
+          ["e", rootMessage.id, "", "reply"],
+        ]),
+      ]
+    : []),
+  profile(designer, {
+    name: "Alex",
+    picture: portraitUrl,
+    ...(agentWorking ? { is_agent: true } : {}),
+  }),
+  profile(helper, { name: "Sam", is_agent: true }),
   profile(viewer, { name: "You" }),
 ];
 // Keep selected and unselected reaction chips visible in the dark viewer fixture.
@@ -162,12 +225,22 @@ const owner = createRelaySession(
             ],
           }),
         ]);
+      const step = () => {
+        const next = message(designer, "video-preview", "Writing it up", 8, [
+          ["e", rootMessage.id, "", "reply"],
+          ["audience", "agents"],
+        ]);
+        events.push(next);
+        callbacks.receive([next]);
+      };
       window.addEventListener("fixture-typing", typing);
+      window.addEventListener("fixture-agent-step", step);
       return {
         update() {},
         retry() {},
         dispose() {
           window.removeEventListener("fixture-typing", typing);
+          window.removeEventListener("fixture-agent-step", step);
         },
       };
     },
@@ -180,7 +253,11 @@ const owner = createRelaySession(
       return filters.flatMap((filter) => {
         if (filter.kinds?.includes(39002) || filter.kinds?.includes(39000))
           return [
-            roster(relay, "video-preview", [viewer.pubkey, designer.pubkey]),
+            roster(relay, "video-preview", [
+              viewer.pubkey,
+              designer.pubkey,
+              helper.pubkey,
+            ]),
             metadata(relay, "video-preview", "Video preview"),
           ];
         if (filter.ids)
@@ -208,6 +285,43 @@ const owner = createRelaySession(
 await owner.session.read([
   { kinds: [39002, 39000], "#d": ["video-preview"], limit: 10 },
 ]);
+const working = {
+  status: "listening" as const,
+  records: [],
+  turns: [],
+  typing: [],
+  trimmed: 0,
+  local: [
+    {
+      scope: "video-preview",
+      agent: designer.pubkey,
+      channelId: "video-preview",
+      messageId: rootMessage.id,
+      threadRootId: rootMessage.id,
+      thread: true,
+      state: "working" as const,
+      startedAt: Date.now(),
+      step: { tool: "Rechecking rather than replying from memory" },
+    },
+  ],
+};
+let agentWork = working;
+const session = agentWorking
+  ? {
+      ...owner.session,
+      agentActivity: {
+        snapshot: () => agentWork,
+        subscribe(listener: () => void) {
+          const done = () => {
+            agentWork = { ...working, local: [] };
+            listener();
+          };
+          window.addEventListener("fixture-agent-done", done);
+          return () => window.removeEventListener("fixture-agent-done", done);
+        },
+      },
+    }
+  : owner.session;
 function Fixture() {
   useKeyboardFocusVisibility();
   const [review, setReview] = useState<
@@ -257,7 +371,7 @@ function Fixture() {
       {new URLSearchParams(location.search).has("thread") ? (
         <div style={{ height: 650 }}>
           <ThreadPanel
-            session={owner.session}
+            session={session}
             extensions={extensions}
             scope="video-preview"
             channelId="video-preview"
@@ -304,20 +418,24 @@ function Fixture() {
         </div>
       )}
       {review !== undefined && (
-        <MediaReviewViewer
-          attachment={review.attachment}
-          session={owner.session}
-          extensions={extensions}
-          scope="video-preview"
-          channelId="video-preview"
-          channelName="Video preview"
-          messageId={review.messageId ?? rootMessage.id}
-          initialTime={review.time}
-          hasComments={!emptyThread}
-          restoreFocus={trigger}
-          onOpenLink={() => false}
-          close={() => setReview(undefined)}
-        />
+        // As the app's conversation does: a recorded working step replaces the
+        // conversation indicator instead of repeating it.
+        <ActivityIndicatorPresentation>
+          <MediaReviewViewer
+            attachment={review.attachment}
+            session={session}
+            extensions={extensions}
+            scope="video-preview"
+            channelId="video-preview"
+            channelName="Video preview"
+            messageId={review.messageId ?? rootMessage.id}
+            initialTime={review.time}
+            hasComments={!emptyThread}
+            restoreFocus={trigger}
+            onOpenLink={() => false}
+            close={() => setReview(undefined)}
+          />
+        </ActivityIndicatorPresentation>
       )}
     </main>
   );

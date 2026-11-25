@@ -1,6 +1,12 @@
+import { isPlainCommandArrow } from "../shared/keyboard-key";
 import { isTauri } from "@tauri-apps/api/core";
 import { isApplePlatform } from "../features/shortcuts/format";
-import type { ShortcutsService } from "../features/shortcuts/service";
+import { inEditable } from "../features/shortcuts/bindings";
+import type { ComposerInputElement } from "../features/messages/composer-dom";
+import type {
+  BindingOverrides,
+  ShortcutsService,
+} from "../features/shortcuts/service";
 import type { Appearance } from "../shared/theme/service";
 import { statusShortcut } from "../features/user-status/status-shortcut";
 import {
@@ -56,8 +62,13 @@ export function registerAppShortcuts(
   ready: boolean,
   /** Reloads every community in place, keeping running agents. */
   reload: () => void,
+  overrides?: BindingOverrides,
 ) {
   const apple = isApplePlatform(navigator.platform);
+  // macOS Buzz → Settings… owns ⌘, as Close owns ⌘W, so the page leaves the
+  // default chord to the menu and handles only a rebound one.
+  const menuSettings = isTauri() && apple;
+  let fromMenu = false;
   const remove = [
     shortcuts.registerHost({
       id: "focus-composer",
@@ -104,7 +115,9 @@ export function registerAppShortcuts(
       binding: { key: ",", mod: true },
       order: HOST_SHORTCUT_ORDER.settings,
       allowInEditable: true,
-      when: () => ready,
+      when: () =>
+        ready &&
+        (fromMenu || !menuSettings || !!overrides?.resolve("settings")),
       run: openSettings,
     }),
     ...(
@@ -218,7 +231,14 @@ export function registerAppShortcuts(
   }
   // macOS Buzz → Settings… runs the Open Settings shortcut, with its own
   // eligibility.
-  const settings = () => shortcuts.runHost("settings");
+  const settings = () => {
+    fromMenu = true;
+    try {
+      shortcuts.runHost("settings");
+    } finally {
+      fromMenu = false;
+    }
+  };
   window.addEventListener("buzz:open-settings", settings);
   remove.push(() => window.removeEventListener("buzz:open-settings", settings));
   return () => {
@@ -351,6 +371,19 @@ export function registerNavigationShortcuts(
   shortcuts: ShortcutsService,
   navigation: import("../features/navigation/controller").Navigation,
 ) {
+  const apple = isApplePlatform(navigator.platform);
+  const canNavigate = (event: KeyboardEvent) => {
+    if (!apple || !isPlainCommandArrow(event) || !inEditable(event))
+      return true;
+    // Command arrows keep their editing meaning except in an empty composer.
+    return event.composedPath().some((target) => {
+      const input = target as ComposerInputElement;
+      return (
+        input.matches?.("[data-composer-input]") &&
+        input.isEmptyForShortcuts?.()
+      );
+    });
+  };
   const remove = [
     shortcuts.registerHost({
       id: "home",
@@ -378,21 +411,33 @@ export function registerNavigationShortcuts(
       id: "navigation-back",
       title: "Go back",
       order: HOST_SHORTCUT_ORDER.navigationBack,
-      binding: { key: "[", mod: true },
+      binding: apple
+        ? [
+            { key: "[", mod: true },
+            { key: "ArrowLeft", mod: true },
+          ]
+        : { key: "[", mod: true },
       allowInEditable: true,
-      // Back closes a dialog that is its own visit (docs/navigation-history.md).
+      // Back closes a dialog that is its own visit.
       allowInVisit: true,
       when: () => navigation.snapshot().canGoBack,
+      whenKeyboard: canNavigate,
       run: navigation.back,
     }),
     shortcuts.registerHost({
       id: "navigation-forward",
       title: "Go forward",
       order: HOST_SHORTCUT_ORDER.navigationForward,
-      binding: { key: "]", mod: true },
+      binding: apple
+        ? [
+            { key: "]", mod: true },
+            { key: "ArrowRight", mod: true },
+          ]
+        : { key: "]", mod: true },
       allowInEditable: true,
       allowInVisit: true,
       when: () => navigation.snapshot().canGoForward,
+      whenKeyboard: canNavigate,
       run: navigation.forward,
     }),
   ];

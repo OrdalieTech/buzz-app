@@ -1,16 +1,20 @@
 # Writing a Buzz plugin
 
-A plugin is a folder with `manifest.json` and one self-contained ES module `plugin.js` that exports `inject` (array of service names) and `apply(ctx)`. It is trusted, unsandboxed code that runs inside the Buzz desktop app. `apply` must finish activating within 10 seconds. API v1 allows one file: no CSS, no assets, no runtime imports (React comes from `ctx.react`; JSX runtime and bundler chunks do not work). The host loads the module from a blob URL, so any `import` of a bare or relative path fails.
+A plugin is a folder with `manifest.json` and one self-contained ES module, `plugin.js`, that exports `inject` (the service names it needs) and `apply(ctx)`. It runs as ordinary, unsandboxed code inside the Buzz desktop app. `apply` must finish within 10 seconds.
+
+API v1 loads one file from a blob URL: no CSS, no assets and no runtime imports. React comes from `ctx.react`, so use classic `React.createElement`; the automatic JSX runtime and bundler chunks don't work.
+
+**Every specific here is a preview and can change between versions.** The reference is the code: the author types in [`src/plugins/author.ts`](https://github.com/block/buzz-app/blob/main/src/plugins/author.ts) and the bundled plugins in [`src/bundled/`](https://github.com/block/buzz-app/tree/main/src/bundled). [Plugins](https://github.com/block/buzz-app/blob/main/docs/plugins.md) says which parts change least. It describes the latest Buzz, which can have services this app doesn't.
 
 ## Workflow
 
-1. Write a small first version as plain JS in a folder in your workspace: `React.createElement` via `ctx.react`, no build step. TypeScript/JSX is optional and only worth it if you set up your own bundler that emits a single `plugin.js` with classic JSX and no runtime imports. `buzzodz plugin init` exists only with a buzz-app checkout.
-2. First install needs the owner. Ask them to open **Settings → Plugins → Manage plugins**, choose **Add**, then **Browse** under Add from folder, pick your folder, review the host access shown and select **Install plugin**. It must be **Browse**: a dragged-in folder is copied, so it has no folder to reload. New plugins are enabled by default (the review has an opt-out).
-3. After that, edit the files in the same folder and call the `plugin_reload` tool with the manifest id. It briefly stops the plugin, loads the new files, waits for activation and, if the new code fails to start, restores the revision that was running. Read its `application` result (`applied` | `saved` | `failed`, with `nextStep`) instead of guessing. Call `plugin_status` (optionally with `id`) to see state, errors and the pages, panels, sidebar sections and agent tools it registered. Reload also applies `name`, `description` and `discovery` changes; a changed `id` is refused (install it as a new plugin).
-4. If you change `manifest.host` (host access), reload refuses. The owner must review the change via the plugin's **Update** in Settings → Plugins.
-5. Verify what the user will see. Keep the first version small, then refine.
+1. Write a small first version as plain JS in a folder in your workspace, with no build step. A bundler is worth it only if it emits a single `plugin.js` with classic JSX and no runtime imports.
+2. The owner installs it the first time. Either call `plugin_request` with `action` `install` and the folder's absolute path as `repository`, or ask them to open **Settings → Plugins → Manage plugins**, choose **Add**, then **Browse** under Add from folder. It must be **Browse**: a dragged-in folder is copied, so there's nothing to reload.
+3. After that, edit the files and call `plugin_reload` with the manifest id. If the new code fails to start, the running revision comes back. Read its `application` result (`applied`, `saved` or `failed`, with `nextStep`). `plugin_status` shows state, errors and what the plugin registered.
+4. Reload refuses a changed `manifest.host` or `id`. The owner applies a host change with the plugin's **Update** in Settings; a new id is a new plugin.
+5. Check what the user will see, then refine.
 
-## Minimal template (a primary page)
+## Minimal template
 
 `manifest.json`
 ```json
@@ -42,246 +46,134 @@ export function apply(ctx) {
 
 ## Contract rules
 
-- Manifest keys: `id`, `name`, `apiVersion` (must be `1`), optional `description` (1-280 bytes), `discovery` (`category` slug, up to 16 `tags`), `host`. Other top-level keys, and unknown keys inside `host`, are rejected.
-- Plugin `id`: starts with a lowercase letter, then lowercase letters, digits, `.` and `-` only, at most 80 bytes, no empty segments (no `..`, `-.`, trailing `.`). No underscores. Ids of bundled plugins are reserved. `name`: 1-80 bytes. Updates match on `id`.
-- Contribution ids (page, panel, shortcut, settings card, sidebar section and its actions): `/^[a-z0-9][a-z0-9._-]*$/`, unique within the plugin. Hosts add the plugin identity, so ids are local.
-- Module evaluation must be pure: no work at top level. Do everything in `apply`. Enabled plugins activate even if their page is never opened.
-- Declare every service you use in `inject` (for example `["react", "pages", "shortcuts"]`). `apply` runs only once all are available. `sidebarSections`, `subjectLift`, `pluginInstaller`, `seen` and `ui` are optional services: read them with `ctx.reflect.get("name")` (returns `undefined` on older hosts) instead of listing them in `inject`.
-- Own every timer, listener, subscription or process with `ctx.effect(() => { start(); return () => stop(); })`. Cleanup runs on disable, replacement and app teardown. React effects inside components clean up when the page unmounts.
-- Everything you register is owned by the plugin and removed when it is disabled or replaced. A `register` call that throws on invalid fields fails activation; the error appears in Settings and `plugin_status`.
-- React state resets when the revision changes (a reload remounts the selected page). The module is evaluated once per revision per app session, so module-level variables survive a disable and enable of the same revision. Use [Seen](plugin-architecture.md#remembering-one-time-experiences) to remember a one-time experience. `ctx.artifactStorage` is a structured IndexedDB store for synced artifacts.
-- Page and panel components render in React error boundaries, but loops and global side effects are not contained.
+- **Manifest:** `id`, `name`, `apiVersion` (`1`), and optional `description`, `discovery` and `host`. Unknown keys reject the whole folder.
+- **Plugin id:** lowercase letters, digits, `.` and `-`, starting with a letter, at most 80 bytes, no empty segments, no underscores. Bundled plugins' ids are reserved. Updates match on `id`.
+- **Contribution ids** (pages, panels, shortcuts and so on) match `/^[a-z0-9][a-z0-9._-]*$/` and are unique within the plugin.
+- **No work at module top level.** Do everything in `apply`. Enabled plugins activate even when their page is never opened.
+- **Declare every service in `inject`.** `apply` runs only once all are available, so a missing one means it never runs; check `plugin_status` after installing. Optional services (`sidebarSections`, `subjectLift`, `notices`, `pluginInstaller`, `seen`, `ui`, `communityJoin`) aren't listed in `inject`: read them with `ctx.reflect.get("name")`, which returns `undefined` on hosts without them.
+- **Own everything you start** with `ctx.effect(() => { start(); return () => stop(); })`. Everything you register through `ctx` is removed when the plugin is disabled or replaced.
+- **State:** React state resets on reload. The module is evaluated once per revision per app session. Use the `seen` service to remember a one-time experience.
+- **Errors:** an invalid `register` call fails activation, and the error shows in Settings and `plugin_status`. Pages and panels render in error boundaries, but loops and global side effects aren't contained.
 
-## Extension points
+## Services
 
-| Inject | Registers | Call and required fields |
+Each line is the main call. Read the types for every field.
+
+| Inject | For | Main call |
 | --- | --- | --- |
-| `pages` | A page | `ctx.pages.register({ id, title, component, primary?, placement?, icon?, badge?, sidebar?, companion?, layout? })`. `id` must match the id pattern, `title` non-empty, `component` a function. `placement`: `"sidebar"` (default) or `"dock"` (only for `primary` pages; `"topbar"` and `"toolbar"` are accepted aliases for `"dock"`). `icon`: `data:image/...` URL. `badge`: component shown beside the nav entry. `sidebar`: component receiving `{ target, children }` that replaces the conversation sidebar (wrap content in `className="shell-sidebar-default"`). `layout`: `"document"` or `"workspace"`. |
-| `panels` | A panel for a link/target string | `ctx.panels.register({ id, title, matches(target) => boolean, component, order?, launcher?, channelLauncher?, channelPlacement?, keepOpen? })`. `component` receives `{ target, close, context?, channelContext? }`. Inside `component`, call `ctx.panels.useTabTitle(label, icon?)` (a React hook; no-op outside a panel tab; check `typeof ctx.panels.useTabTitle === "function"` on older hosts) to name the tab per target; `title` stays the fallback. `launcher: { icon: string, target: string }` adds a top-bar button (use `matches: () => false` for launcher-only). `channelLauncher` is a component for the channel header (`channelPlacement`: `"bottom"` default, `"side"`, `"tab"`). |
-| `accountActions` | Account menu action | `ctx.accountActions.register({ id, title, icon?, component, placement? })`. The component receives `{ open, onOpenChange }`. Omit `placement` for the plugin section after Settings; use `"before-settings"` for a profile-related action directly above Settings. The host owns menu order, focus, and dismissal. |
-| `settingsCards` | A Settings destination | `ctx.settingsCards.register({ id, title, component, group?, personal?, identityRow? })`. `component` receives `{ active(), community?, navigation? }`; `navigation.target.route` can carry bounded, versioned presentation data for the card. Opening a route must never submit an operation. Optional `identityRow` receives `{ active() }` and contributes a compact account-status link inside Identity. Reuse the plugin’s existing session; check `active()` before navigation or an action. The row retires with its owning registration. Omit `icon` (it is a host icon component). The host supplies navigation and the content column, not a heading. |
-| `sidebarSections` (optional) | A section in the Team sidebar | `ctx.reflect.get("sidebarSections")?.register({ version: 1, id, title, icon, rows: { snapshot, subscribe }, select, actions? })`. `snapshot()` returns a stable array of `{ id, label, icon?, badge?, count?, status? }` until data changes, then notify subscribers. `select(row)` returns an open target such as `{ version: 1, kind: "home" }`. Actions: `{ id, label, icon: ReactElement, onSelect }`. |
-| `conversation` | Composer/message UI | `registerAccessory({ id, title, component, order?, placement? })` (read-only UI above the composer; props `{ session, scope, channelId, threadRootId?, canOpen, open }`; `placement`: `"composer"`, `"message"`, `"response"`). `registerMessage({ id, title, matches(message), component })`, `registerMessageAction({ id, title, matches(message, session), component })`, `registerIdentityMark({ id, title, component })` (presentation after a person's name in @mention suggestions; props `{ pubkey, profiles }`, where `profiles.snapshot().get(pubkey)?.verified` carries community verification), `registerLink({ id, title, matches(url), component })`, `registerLinkPreview({ id, title, matches(url), order?, component })` (a card below the message for one of its HTTPS links; props `{ url, messageId, open, opener }`, where `opener` opens other targets such as your panel; lowest `order` wins, so claim your URLs below the default web card's `100`), `registerTool({ id, title, component })`. |
-| `agents` | Tools and hooks for agents | `ctx.agents.addTool({ name, description, inputSchema, call })`. `name` matches `/^[a-z][a-z0-9_]{0,63}$/`, is unique across plugins and not a Buzz tool name (prefix it with your plugin: `notes_get`). `inputSchema` is a JSON-serializable object with `type: "object"`. `async call(client, context, args)` resolves to a string (or `{ data, type, text? }`) and runs as the agent; a throw is shown to the agent as a tool error. Changing a tool's name, description or schema restarts some agent sessions, so edit deliberately. `ctx.agents.addInstructions({ id, text, when? })` gives every turn of the agents this copy runs, or those `when(agent)` accepts, a `<plugin-instructions>` section with `text` (at most 4096 UTF-8 bytes after trimming); it is sent with every turn, so keep it short. `ctx.agents.registerHook({ id, harness, event, run })` needs `host.agentHooks`. `ctx.agents.wake(agentKey, { channel, root?, topLevel?, text })` wakes a local agent (`root` is a 64-hex event id; `topLevel: true` instead wakes it at a channel's top level). With `host.files`, `ctx.agents.assignConversationFolder(agentKey, { channelId, root? }, path)` gives one conversation of a local Claude or Codex agent its own working folder before its first turn; see [Agents](agents.md). `ctx.agents.setConversationInstructions(agentKey, { channelId, root? }, text)` gives a local agent standing instructions in one conversation, shown on each of its turns there in an `<owner-instructions>` section (at most 8192 UTF-8 bytes after trimming; `""` clears them); `ctx.agents.conversationInstructions(agentKey, place)` resolves with the text. |
-| `shortcuts` | In-app key bindings | `ctx.shortcuts.register({ id, title, binding, run, when?, order?, allowInEditable?, allowInModal?, repeat? })`. `binding` is `{ key, mod?, shift?, alt?, ctrl? }` or an array; `mod` is Command on macOS, Control elsewhere. `key` is the logical key, case-insensitive (Space is `" "`). Skipped in text fields and modals unless opted in. |
-| `navigation` | Open destinations | `await ctx.navigation.open(target)` returns `{ status: "opened" \| "failed" \| "superseded" \| "cancelled" }`. Targets: `{ version: 1, kind: "plugin", pluginId, pageId?, params? }`, `{ version: 1, kind: "home" }`, `{ version: 1, kind: "settings", section? }`. |
-| `communityJoin` (optional) | Join a community the person chose in your UI | `ctx.reflect.get("communityJoin")?.open(address)` with a `wss://` or `https://` community address, for example one your plugin just created. It opens the app's join dialog, which connects at once; the person still completes admission and the profile step there, and nothing is saved before they do. An address already saved just selects that community. It returns `false` when the address is not a community origin (for example it has a path or credentials) or no identity is ready to join with (hand the address off another way), otherwise `true`; it reports no completion. Call it only from a live, user-initiated action. |
-| `notifications` | OS notification category | `const { submit } = ctx.notifications.register({ id, label })`, then `await submit({ sourceKey, target, title?, body? })` where `target` is an open target. The host bounds and flattens the text. |
-| `browser` | Embedded website (macOS desktop only) | `ctx.browser.available` (boolean) and `ctx.react.createElement(ctx.browser.View, { url, storage?, label? })` inside a panel component. HTTP(S) only. |
-| `decisions` | Typed judgments about text | `await ctx.decisions.decide({ state, questions, timeoutMs?, community? })`. `questions` maps 1 to 32 answer names to `{ type: "yes_no", instructions }`, `{ type: "choice", instructions, options }` (value -> when to pick it) or `{ type: "score", instructions, levels }` (lowest first). `timeoutMs` is in milliseconds (1000-30000). `community` is the relay URL the text came from; Builderlab fails without it (in an agent tool: `ctx.agents.snapshot().running.find((a) => a.key === client.key)?.relay`; in a channel panel: `channelContext.relayUrl`). Resolves `{ outcome: "answered", model, answers }` (for example `answers.urgent.probability`) or `{ outcome: "failed", reason }`; never rejects. By default Builderlab or TypeSafe answers, with Jev. |
-| `seen` (optional) | One-time experiences for the current identity | Use `const seen = ctx.reflect.get("seen")`. Show a hint only when `seen?.has(key) === false`. Call `seen?.mark(key)` when the experience happens and `seen?.subscribe(listener)` to observe changes. |
-| `host` | Commands, HTTPS, processes, files | Requires `manifest.host` grants; see below. |
-| `ui` (optional) | The host's own controls | `const ui = ctx.reflect.get("ui")`, then, if `ui?.Button`, `React.createElement(ui.Button, { variant: "prominent", onClick }, "Save")`. `Button` (`variant`: `prominent`, `subtle`, `ghost`, `destructive`; `size`: `sm`, `md`; `loading`, `disabled`, `type`, `form`, `title`, `aria-label`), `Input` (`value`, `defaultValue`, `onValueChange(value)`, `type`: `text`, `password`; `placeholder`, `name`, `id`, `disabled`, `readOnly`, `maxLength`, `aria-label`), `Field` (`label`, `description?`, `error?`, `optional?`; labels the one `Input` inside it), `Switch` (`checked`, `defaultChecked`, `onCheckedChange(checked)`, `disabled`, `name`, `id`, and `label` or `aria-label`; it applies immediately, so never put it behind Save) and `Dialog` (`open`, `onOpenChange(open)`, `title`, `description?`, `actions?`, `size`: `compact`, `default`; `dismissOnOutsideClick?`, set `false` for a form holding a draft; `preventClose?`; it opens on its first body control, else its first action, and returns focus to the opener on close). For a form, put the fields in a `form` with an `id` and give the Save action `type: "submit"` and `form` set to that `id`, so Save and Enter both submit. Validate in the submit handler and show a `Field` error after a Save attempt, not on open. Other props and values are ignored. Like other services, it is a preview. Fall back to plain host-styled elements when `ui` or a component is missing. |
-| `subjectLift` (optional) | Lift a message image's subject | `const lift = ctx.reflect.get("subjectLift")`. `lift?.supports(source)`, then `await lift.lift(source, signal?)` resolves a transparent PNG `File` ready for `session.emoji.upload`, or rejects with a reason. `source` is `session.media(attachment.url)`. macOS 14+ only; see the plugin architecture's Subject lift contract. |
-| `pluginInstaller` (optional) | Ask the owner to install another plugin, compare a listed release, check installation status, or access retained update reviews | `requestInstall(...)` resolves `"installed" \| "updated" \| "cancelled" \| "unavailable"` and never installs silently. Status and release-comparison methods are described below. `updates` is an optional, host-retained capability; see [Plugin architecture](plugin-architecture.md#plugin-installer). |
+| `pages` | A page, optionally in navigation | `ctx.pages.register({ id, title, component, primary? })` |
+| `panels` | A side panel for a link or target | `ctx.panels.register({ id, title, matches(target), component })` |
+| `settingsCards` | A Settings destination | `ctx.settingsCards.register({ id, title, component })`. The host supplies navigation and the column, not a heading. |
+| `accountActions` | An account menu entry | `ctx.accountActions.register({ id, title, component })` |
+| `sidebarSections` (optional) | A Team sidebar section | `register({ version: 1, id, title, icon, rows, select })` |
+| `conversation` | Composer and message UI | `registerAccessory`, `registerMessage`, `registerMessageAction`, `registerLink`, `registerLinkPreview` (a link-preview renderer that needs setup first adds `status()`, `subscribe(listener)` and `settings`, its Settings card id; while `status()` is `"needs-setup"` the host draws a card that opens that Settings card), `registerSendGate`, and host components under `ctx.conversation.ui` (Markdown, DocumentEditor, ImageViewer, MembersDialog, Workspace) |
+| `agents` | Agent tools and instructions | `ctx.agents.addTool({ name, description, inputSchema, call })`; `addInstructions({ id, text })`; `wake`; hooks need `host.agentHooks` |
+| `shortcuts` | Key bindings | `ctx.shortcuts.register({ id, title, binding, run })` |
+| `navigation` | Open a destination | `await ctx.navigation.open({ version: 1, kind: "plugin", pluginId, pageId? })` |
+| `notifications` | OS notifications | `ctx.notifications.register({ id, label }).submit({ sourceKey, target, title?, body? })` |
+| `decisions` | Typed judgments about text | `await ctx.decisions.decide({ state, questions, community })`. It never rejects. |
+| `speech` | Speech to text | `ctx.speech.listen({ community, onText, onPause?, onEnd, onError? })` returns `{ stop, cancel }`; failures arrive on `onError`. To be a provider, `ctx.speech.registerProvider(...)`, below. |
+| `browser` | An embedded website (macOS) | `ctx.browser.View` inside a panel |
+| `notices` (optional) | A notice on any page, with up to three buttons | `await ctx.reflect.get("notices")?.show({ title, description?, actions? }, { signal? })` resolves with the picked action's `id`, or `undefined` if dismissed or aborted. Proceed only on an allow `id`. Pass a tool call's `client.signal` to ask the owner before it runs. |
+| `ui` (optional) | The host's own controls | `Button`, `Input`, `Field`, `Switch`, `Dialog`, and `Menu` (newer hosts: check `ui.Menu`). `Menu` takes `items` (`label`, `onSelect`, `tone: "destructive"`, `disabled`), a `label` or `aria-label`, `icon` and `align`. Fall back to plain elements when missing. |
+| `host` | Commands, HTTPS, processes, files | Needs `manifest.host`, below |
 
-The installation-status and release-comparison methods may be missing on older
-hosts even when `pluginInstaller` is available, so feature-check each method
-before calling it. `getInstallationStatus` returns `"installed"` when the
-manifest ID is in the ready catalog, `"absent"` when it is not, and
-`"unavailable"` while the catalog is not ready. Installed status is independent
-of whether the plugin is enabled, contributes UI, or came from a particular
-install source.
+Agent tool names match `/^[a-z][a-z0-9_]{0,63}$/` and are unique across plugins; prefix them with your plugin. Changing a tool's name, description or schema restarts some agent sessions. `addInstructions` text is sent on every turn, so keep it short.
 
-The optional `compareInstallationRelease` accepts one immutable Git or URL
-source plus its native release revision and publisher; it returns only
-`"current"`, `"different"`, `"review"` or `"unknown"` for caller-supplied
-values, not raw installed metadata. `"different"` means the release does not match,
-not that it is newer; use it as an update only when your catalog independently proves release order
-and authority. See the [full comparison contract](plugin-architecture.md#plugin-installer)
-for source, publisher and unknown-state rules. The status subscription is also a
-release/source identity invalidation signal: the callback may repeat
-`"installed"`, so re-read the comparison. Subscribe first, then read the current
-status to avoid missing a change between the read and subscription. Own the
-subscription with `ctx.effect`:
+In a Solo region, check `ui.headerMenuActions === true` before passing
+`headerMenuActions` to `ui.Workspace` or `ui.ChannelGroup`. Each **Actions**
+entry has a unique `id`, a `label`, and an `onSelect` callback.
+`onSelect` can return a promise. The host reports callback failures in the
+heading.
 
-```js
-const installer = ctx.reflect.get("pluginInstaller");
-if (typeof installer?.getInstallationStatus === "function") {
-  const status = installer.getInstallationStatus("example.hello");
-  // Use "installed", "absent" or "unavailable"; a missing method is not "absent".
-}
+In a Solo channel group, entries follow **View channel details**. An optional
+`icon` supplies decorative artwork and `hint` adds short help on focus or hover.
+The host rechecks the row’s channel membership before calling `onSelect`.
 
-ctx.effect(() => {
-  const installer = ctx.reflect.get("pluginInstaller");
-  if (typeof installer?.subscribeInstallationStatus !== "function") return;
-  const unsubscribe = installer.subscribeInstallationStatus(
-    "example.hello",
-    (status) => {
-      // Status may repeat "installed" when its release/source identity changes.
-      // Re-read current status and any release comparison.
-    },
-  );
-  if (typeof installer.getInstallationStatus === "function") {
-    const current = installer.getInstallationStatus("example.hello");
-    // Read the current status after subscribing.
-  }
-  return unsubscribe;
-});
-```
+With `placement: "team-row"`, the channel group uses the native
+Team menu and ignores these entries.
 
-The table above covers the services most plugins use. The full contract for every service, with TypeScript types and examples, is in [Plugin architecture](https://github.com/block/buzz-app/blob/main/docs/plugin-architecture.md); the types are exported from [`src/plugins/author.ts`](https://github.com/block/buzz-app/blob/main/src/plugins/author.ts). Read it before you use a service that is not in this table. It describes the latest Buzz, which can have services this app does not. If a service in `inject` is missing, `apply` never runs, so check `plugin_status` after you install.
+Check `ctx.conversation.workspaceSlots?.headerActions === true` when you
+render, before passing `headerActions` to `ui.Workspace`. The Channels
+workspace renders those controls in the main tab's toolbar, before the
+three-dot menu. The flag is absent on an older host or when the active
+workspace provider does not declare the slot; keep the controls in your page
+then. Use compact icon buttons with an `aria-label` and `title`, and set
+`aria-pressed` or `aria-expanded` on a toggle. A plugin that replaces the
+workspace with `registerWorkspace(component, { slots })` names the optional
+props its component renders.
 
-## Reusing the member picker
+Check `ctx.conversation.workspaceSlots?.trailing === true` in the same way
+before passing `trailing` to `ui.Workspace`. The Channels workspace shows that
+content as a card over the
+bottom of the channel timeline, in its own scroll layer: scrolling over the
+card grows it, then slides it up. Render the whole card at rest too, since
+growing scrolls it into view: let `expanded` change labels, not what the card
+holds. Keep its controls in view with `position: sticky; bottom: 0` and an
+opaque background, and draw its outline with a box shadow rather than a bottom
+border.
 
-Installed plugins can render `ctx.conversation.ui.MembersDialog` and
-`ctx.conversation.ui.GeneralAccess` through the host React instance. Inject
-`react`, `conversation` and `relay`; runtime imports from app source are not
-supported. The type-only author package exports `ChannelMembersDialogProps`,
-`ChannelGeneralAccessProps`, `GeneralAccessPolicy` and `MemberChange`.
+Check `ctx.conversation.workspaceSlots?.aside === true` before passing `aside`
+to `ui.Workspace`. The host places it in a box of `asideWidth` (default 320)
+over the history's end edge, left of its scrollbar. Docked, it runs from the
+history's top to the reader's bottom, and the history's rows and the composer
+keep to the width beside it; when the reader would get too narrow, it floats
+over the history instead, above the composer. The box
+draws nothing in either mode: draw your own card, let it size to its content,
+and scroll inside it when it is taller than the box. Only your content takes
+pointer input, so the wheel beside or below it scrolls the history. A popover
+escapes over the history only from a portal, as `ui.Menu`'s does.
+Drive it from your own header control with `asideOpen` and
+`onAsideOpenChange`: docked, it shows by default; floating, it shows only once
+opened. The host closes it as it floats, restores the docked state when the
+reader widens, and closes the overlay on Escape or a press elsewhere in the
+reader, reporting each change. Without that control a floating aside stays
+closed. `onAsideFloatingChange` tells you whether it floats, for example to
+close it after a pick. Messages under the overlay are not marked read.
 
-```js
-// Inside a plugin component, using a session from ctx.relay.snapshot():
-const h = ctx.react.createElement;
-return h(ctx.conversation.ui.MembersDialog, {
-  key: session.scope + ":" + channelId,
-  session, channelId, trigger, close,
-  title: "Share access",
-  nonMemberLabel: "Not in this record",
-  shareLink: "buzz://plugin?id=example.records&record=design",
-  memberActions: {
-    canAdd: canManageRecord,
-    pending: recordAccessPending,
-    // Own stricter policy, write confirmation and readback here.
-    change: (change, signal) => updateRecordMember(change, signal),
-  },
-  accessSettings: h(ctx.conversation.ui.GeneralAccess, {
-    capability: recordAccess,
-    recovery: session.recovery,
-    channelId,
-    policy: {
-      subject: "record",
-      allowPublic: false,
-      visibilityDescription: (visibility) => visibility === "public"
-        ? "Everyone in this community can read this record and its revisions."
-        : "Only record members can read this record.",
-    },
-  }),
-});
-```
+For `ctx.agents.ui.Transcript`, give each turn a unique `turnId` that stays the same across reads. Return a new turn when it changes. Leave previously returned turns and their items untouched.
 
-The plugin owns opening/closing and the trigger ref for focus return; render the
-picker only while open. Keep it keyed to session/channel. Addressable openings
-must follow the [navigation contract](navigation-history.md); the component does
-not register a destination. Keep external operations in their existing owner if
-navigation can hide the dialog. The public picker props cover session/channel,
-trigger/close, title/description, non-member label, member actions, access settings
-and share link; host navigation and visit-lifetime props remain internal.
+## Speech providers
 
-`memberActions` routes individual additions, role changes and removals through
-the plugin, retaining host role checks; team additions and host-owned addition
-recovery are hidden. Retained host recovery state stays with its session owner. Its `canAdd`
-can restrict additions and `pending` blocks member mutations and local dismissal.
-The picker also locks while its callback is unresolved, shows callback errors,
-and passes an AbortSignal retired on unmount or session/channel change. The
-callback must confirm writes and refresh signed member roles before resolving;
-uncertain writes need recovery in the plugin's access settings, without resending
-blindly. These UI policies do not replace relay authorization.
+The host owns speech to text end to end: the microphone, a WebRTC peer
+connection with one audio track and an `oai-events` data channel, the
+transcript, pauses and the end of a listen. A provider only answers the call.
+`ctx.speech.registerProvider({ id, label, description, status, subscribe,
+connect, Settings? })` adds it to Settings > Speech to text, and the user
+chooses it there. Builderlab is the default; audio never goes to a provider
+the user didn't choose.
 
-`nonMemberLabel` sets both the visible heading and accessible name of search
-results that are not members. With `memberActions`, the default is "Not yet
-added"; built-in channel/chat wording is unchanged. A blank label uses that
-default too.
+`connect({ offer, community?, maxSeconds?, timeoutMs }, { signal })` gets the
+host's SDP offer and resolves with `{ outcome: "answered", sdp, maxSeconds? }`,
+an OpenAI Realtime transcription session's SDP answer, or `{ outcome: "failed",
+reason }`. The session must send Realtime transcription events (`…delta`,
+`…completed`, `input_audio_buffer.committed`) and leave turn detection off: the
+host commits the audio at each pause and at the end. `status()` reports
+`ready`, `checking`, `unconfirmed` or `needs-setup`, and `Settings` is its
+sign-in or setup UI.
 
-`accessSettings` replaces built-in General access (`null` hides it). The optional
-GeneralAccess policy supplies a generic subject and visibility-change disclosure;
-`allowPublic: false` removes Public participation while keeping Private and View
-only. Existing Public access is displayed as Public; reducing it confirms that
-the picker cannot restore it. Its capability retains signed fresh-read, save and
-uncertain-write recovery behavior. With the session's `channelDetails` and a
-`channel` summary, current access shows from that summary without a read; a
-capability without `summaryAccess` reads its own details. Switching to Private
-also warns that people who already joined keep access until removed, without
-naming a host screen. Pass
-`mayHaveGuestMembers: false` only when signed roles verify there are no Guests;
-this suppresses the View only reader warning, never the Public member warning.
-Copy link uses `shareLink` and grants no access. With `memberActions`, it is hidden
-unless the plugin supplies a nonempty `shareLink`; it never falls back to the backing
-channel. Without plugin-managed actions, the channel/chat link remains the default.
-Other omitted overrides preserve chat/channel behavior. Hosts predating this extension lack the two UI entries; check their
-presence before offering sharing when supporting those hosts.
+## Migration writes
 
-## Controlled document editing
+Check `ctx.relay.snapshot().session.supportsMigrationWrites === true` before
+starting an import that needs migration labels. Older hosts omit this property.
+The property confirms that the host signs the label. Relay support for throttling
+depends on the connected community.
 
-`ctx.conversation.ui.DocumentEditor` reuses Buzz's editor, persistent formatting
-toolbar, link dialog and Markdown conversion. Inject `react` and `conversation`;
-no editor or React runtime imports are needed. The type-only author package
-exports `DocumentEditorProps`, `DocumentEditorHandle` and
-`DocumentEditorSelection`. Older hosts lack this entry; check its presence before
-offering editing when supporting those hosts.
+Pass `migration: "example-import"` in `session.channelCreation.create(input)`
+and in `session.memberAdditions.add(channelId, pubkey, options)`. The host signs
+`["migration", source]` on channel creation (kind 9007) and membership additions
+(kind 9000). The source must be a nonempty string. The tag classifies workload.
+The normal access checks still apply.
 
-The plugin controls `value`/`onChange` (Markdown), `editing`, `source`/
-`onSourceChange`, and `linkOpen`/`onLinkOpenChange`. Supply `maxLength` as the
-serialized editing budget and `onSave` for Cmd/Ctrl+Enter. `disabled` locks editor
-and formatting actions while the plugin's save or access policy requires it.
-Rich editing also observes the host's 100,000-character Markdown limit; source
-mode uses the supplied `maxLength`.
-Adopt accepted changes in local state synchronously and persist them separately.
-Keeping `value` unchanged declines a change; both modes restore that accepted
-value, including when returning from source to rich text.
-The component performs no relay writes and stores no drafts; saving, byte limits,
-conflicts, permissions and pending navigation remain the plugin's responsibility.
-Rich mode uses CommonMark paragraph and hard-break semantics like the document
-reader: Enter starts a paragraph and Shift+Enter inserts a hard break (lists and
-code retain their existing structural editing). The serialized length budget uses
-the same document format as `onChange`. Copy/paste retains that structure in both
-plain Markdown and the app's rich HTML payload, including hard breaks and loose
-lists. Normal plain-text paste reads Markdown; paste-as-plain-text keeps the
-existing literal-text behavior.
-Type one to six hashes followed by a space at the start of a paragraph to
-create a heading. Loaded and pasted Markdown headings retain their level.
-Shift+Enter in H3–H6 behaves like Enter, since those headings are single-line in Markdown.
-In H1 and H2, a hard break appears in saved Markdown once more heading content follows it.
-Supported top-level GFM tables appear as grids in rich mode and retain their
-Markdown through surrounding edits. Edit their cells in source mode. Copy and
-Cut on selected grid text both copy the selection. Tables pasted or wrapped
-into a list or quote keep their enclosing Markdown as source. Tables also stay
-visible as source when their combined cell count exceeds the reader's display limit.
-
-```js
-const [value, onChange] = ctx.react.useState("A **document**.");
-const [source, onSourceChange] = ctx.react.useState(false);
-const [linkOpen, onLinkOpenChange] = ctx.react.useState(false);
-const editor = ctx.react.useRef(null);
-return ctx.react.createElement(ctx.conversation.ui.DocumentEditor, {
-  ref: editor,
-  value, onChange, source, onSourceChange, linkOpen, onLinkOpenChange,
-  editing: true,
-  disabled: saving,
-  maxLength: 32768,
-  onSave: saveDocument,
-  label: "Record body",
-  placeholder: "Write your record…",
-  destinations: [{ label: "Reference", href: "buzz://plugin?id=example.records&record=reference" }],
-});
-```
-
-The formatting bar floats along the bottom of the editor. To position it in
-your own pane, pass a `toolbarTarget` at the bottom edge of the content. The
-bar opens above that slot over the content. Put the editor inside the pane's
-scroll container. During formatted editing, the editor reserves scroll padding
-on the nearest ancestor that can scroll vertically so the caret and keyboard
-selection can stay above the bar.
-Use the host's controls and link dialog directly. Optional `destinations`
-are loaded choices for the existing link dialog; their URLs still pass the host
-link validator. Typing `[[` opens that dialog only when `destinations` is nonempty;
-without choices, brackets are ordinary text. Read-mode `children` can render `conversation.ui.Markdown` with `scale: "document"`
-for the shared document heading hierarchy.
-Supported formatting loads into the editor; unsupported syntax remains editable
-literal source, including verbatim line breaks through both clipboard flavors.
-Switching to `source: true` exposes the controlled Markdown value.
-
-The optional ref has `focusEnd()`, `selection()` and `focusSelection(selection)`.
-`selection()` returns `{start, end, source}` only while the field has focus.
-Offsets refer to the current field's text: rich-mode offsets are projected text,
-and source-mode offsets are Markdown. They are not byte offsets. The plugin owns
-restoring the corresponding mode before restoring a selection. Key the editor
-by document identity when switching documents so internal selection, undo history
-and link-dialog intent belong to that document.
+The host batches membership additions by source. A migration batch that fails
+delivery stops and reports the error. If a successful batch only adds some of
+its members, the host keeps the source on individual additions for the rest.
+Both calls report relay migration throttling with an error that starts with
+`rate-limited:`. Pause the import before issuing another write when you see it.
 
 ## Host access (`manifest.host`)
 
-Everything beyond the services above must be declared in `manifest.json`; the owner reviews it at install. Undeclared commands, origins, processes and file access are refused by the host. Limits: at most 16 each of `commands`, `processes`, `networkOrigins`, `agentHooks`. Program names are bare names (`[A-Za-z0-9._-]`, at most 80 bytes, no paths), at most 16 args of 1024 bytes each.
+Declare in `manifest.json` the commands, processes, network origins and files your plugin uses, then add `"host"` to `inject`. The host's own APIs only do what's declared, so this is how they get wired up. It isn't a security boundary: plugin code runs in the app and can reach past it.
 
 ```json
 {
@@ -289,7 +181,7 @@ Everything beyond the services above must be declared in `manifest.json`; the ow
   "name": "Status",
   "apiVersion": 1,
   "host": {
-    "commands": [{ "id": "status", "program": "git", "args": ["status", "--short"], "maxOutputBytes": 65536 }],
+    "commands": [{ "id": "status", "program": "git", "args": ["status", "--short"] }],
     "networkOrigins": ["https://api.example.com"],
     "processes": [{ "id": "agent", "program": "example-agent" }],
     "files": true
@@ -297,116 +189,36 @@ Everything beyond the services above must be declared in `manifest.json`; the ow
 }
 ```
 
-Add `"host"` to `inject`, then:
+- `await ctx.host.runCommand("status", input?)` runs a declared command with no shell and a 5 s deadline. It returns stdout, or `null` on failure. The command's environment has `BUZZ_PLUGIN_ID`, the calling plugin's manifest id. It names a well-behaved plugin, not proof: an unsandboxed plugin can call the host command with another plugin's id.
+- `await ctx.host.request({ url, method?, headers?, body? })` calls a declared HTTPS origin and returns `{ status, headers, body }`. Plain `fetch` to other origins is blocked, so use this.
+- `await ctx.host.writeClipboardText?.(text)` copies plain text the way Buzz does. It needs no grant; check it exists.
+- `ctx.host.spawn?.(id, { args?, onStdout? })` starts a declared process (desktop only).
+- `files: true` enables `ctx.host.readFile` and `ctx.host.resolveDirectory`.
 
-- `await ctx.host.runCommand("status", input?)` runs a declared command (no shell, 5 s deadline, stdin only if `maxInputBytes` is declared). It returns stdout (4096 bytes by default, up to `maxOutputBytes`, at most 1048576), or `null` on failure or when output exceeds the bound. A command may declare `artifact: { path, sha256, siblings?: [{ name, sha256 }] }` (an absolute or `~/…` path, lowercase SHA-256 hex, and files beside it that must match too) to run only those verified bytes, never a program on PATH; `program` is then just its label and the declared `args` are passed to it. Interpreters and programs it calls by name are still found on PATH, so give it an absolute shebang such as `#!/bin/sh` and call programs by absolute path.
-- `await ctx.host.request({ url, method?, headers?, body?, timeoutMs? })` returns `{ status, headers, body }` and throws on an undeclared origin or timeout. `url` must use an exact declared HTTPS origin (origin only in the manifest: scheme + host, no path or trailing slash). No redirects, no cookies. Plain `fetch` to other origins is blocked by the app's content security policy, so use this.
-- `ctx.host.spawn?.(id, { args?, cwd?, env?, onStdout?, onStderr? })` starts a declared `processes` entry (desktop only; check it exists). Returns `{ write, end, kill, exited }`. Your `args` follow the declared ones.
-- `files: true` enables `ctx.host.readFile(path, { cwd? })` (bytes, at most 50 MB), `ctx.host.resolveDirectory(path, { create? })` and `ctx.agents.assignConversationFolder`. Other grants: `mcp: true` (`host.serveMcp`), `managedFiles: true`, `publicImages: true` (`host.requestBytes` may also read PNG, JPEG, GIF, WebP and AVIF images from any public HTTPS site, one hop at a time; check each redirect's `Location` yourself), `publicPages: true` (`host.readPage(url)` returns a public HTTPS page's title, description, site name, image and icon, never its HTML; redirects come back as `location`), `agentHooks: ["plugin/kind", ...]` (agent type keys such as `buzz.claude-code/claude-code`).
+Other grants (`mcp`, `managedFiles`, `publicImages`, `publicPages`, `agentHooks`, `agentPromptSections`) are in the types. A host that doesn't know a `host` field refuses the whole manifest.
 
 ## UI
 
-- `ctx.conversation.ui.Workspace` shows a permanent conversation in a plugin page.
-  Check that it exists before use. Channels supplies it through
-  `registerWorkspace`, with the same provider lifetime as `ui.Tabs`.
-  Set the page's `layout` to `"workspace"`. Pass
-  `{ id, session, scope, target, label, intro?, actions?, detail?, latestRequest? }`.
-  `target` is `{ channelId, threadId?, messageId? }`: omit `threadId` for the
-  channel timeline, or supply it for a thread. `messageId` selects a message.
-  Pass a fresh `AbortSignal` as `latestRequest` to open the transcript at the
-  latest message, including when selecting the same conversation again. Scope
-  the signal to that opening. Omit it on Back or Forward. An aborted signal is
-  ignored, and an explicit `target.messageId` takes precedence.
-  `intro` supplies content at the start of history. It scrolls with the messages.
-  `actions` supplies
-  entries in the header's three-dot menu and the tab's context menu, with
-  `{ label, run() }`. `detail: { target, rootId? }` initially selects a panel
-  in the right pane. The host owns the reader, composer, tabs, and panel frame.
-  The page owns its route, content lookup, labels, and actions.
-  Set `conversationNavigation: true` on the page to keep the Messages sidebar
-  and dock selection without adding a primary navigation row.
-- A panel can set `addressable: true` to accept conversation `detail` targets.
-  It then uses the host's Back/Forward and explicit Close behavior. The host
-  resolves the target again on each visit. The panel must check current access
-  and support restoration without replaying writes. This option does not grant
-  access. Contextual channel tools keep their existing placement and lifetime.
-- Use `ctx.reflect.get("ui")` controls for buttons, fields, switches and dialogs rather than styling your own. Prefer host classes and tokens over custom chrome: `className="ui-card"` for a card surface, `var(--space-panel-inset)` and `var(--space-2)` for spacing, `shell-sidebar-default` for a page-sidebar root. Plain `h1`, `h2`, `h3`, `p` and `button` get host default styling. Use inline styles for layout; separate CSS is not supported.
-- The bundled `buzz.profiles/profile` contribution's component advertises `supportsPersonInfoContent: true` when it accepts an optional `renderPersonInfo(content)` prop. The hook applies to people; agent profiles, including owned-agent Settings and Activity, are outside this contract. A specializing panel can use that function to compose the existing Info content with its own content in DOM order. Keep the supplied content's native controls intact. The hook affects Info only; the host retains the header, tabs, focus region and Channels view. Check the capability before claiming normal profile targets on older hosts.
-- A specializing reader opts in with `component.profileHistory = true`; canonical profile targets then inherit profile Back/Forward and explicit Close behavior in conversation tabs. Match the existing profile address rather than inventing a separate history store; unmarked catch-all panels and contextual channel panels retain their own behavior.
-- The host already supplies the shell, navigation, active state, error boundaries and (for panels and Settings) the outer surface, header or content column. Do not add your own page frame, header-level navigation, overlays, global stylesheet, theme or reset. Page content owns its interior padding and scrolling. Panels sit inside a host card: render only the body.
-- Avoid fixed widths; the page may be narrow. Use `width: "100%"`, flex and wrapping. Colors: use host tokens (`var(--...)`) rather than hard-coded values so light and dark themes both work. Rely only on the `core` roles in the design system's token registry (`src/shared/design-system/tokens/registry.ts`); other custom properties and the controls' own classes and `data-*` attributes are internal.
-
-### Host Markdown and panel workspaces
-
-Inject `conversation` to render `ctx.conversation.ui.Markdown` with
-`{ content, session?, openLink?, scale? }`. The shared host styles own headings,
-spacing, code frames and tables. `scale` defaults to `"message"`; choose
-`"document"` for a page or editor read view. This is the host document renderer: GFM,
-Buzz-rich links, credential-free HTTP(S) links, no executable HTML, and images
-shown as alt text. Oversized or deeply nested input falls back to literal text
-using the same bounds as Shared notes. `session` supplies community-aware link
-names and the receiving community/viewer for default Buzz link navigation. The
-host resolves supported Buzz forms and opens them through its navigation service.
-An optional `openLink(url)` override must synchronously return true if your page
-handled the destination locally; false falls through to host navigation. Without
-a usable session/navigation service, Buzz links keep the host's unavailable-link
-behavior. Existing URL safety and external browser handling remain host-owned.
-
-Inject `panels` to use these host members:
-
-- `ctx.panels.ui.Workspace({ items, value, select, label?, actions?, focusOnMount? })`
-  is the existing tab workspace. Each item has `{ id, label, content, icon?, close?, toolbar? }`; content remains
-  mounted while another tab is selected. `close` may return false to retain a
-  tab, for example while edits need confirmation. The host owns tab controls,
-  focus and nested detail presentation; your page owns selection, admission,
-  closing and Back/Forward visits. It does not create a second history owner.
-- `ctx.panels.useTabTitle(label, icon?)` publishes a document's live title
-  inside a host workspace (including registered panels opened by Channels).
-  Feature-detect this hook on older hosts before calling it.
-- `ctx.panels.ui.useSplit(scope, name, defaultWidth?, min?, primary?)` returns
-  `{ ref, style, handle }`. Attach `ref` and `style` to your layout container,
-  place `handle` beside its secondary pane, and use CSS variable
-  `--secondary-panel-width` for that pane's width. Your page owns responsive
-  layout and scrolling. Use the current session's `scope` and a stable name
-  prefixed with your plugin ID. Plugin widths have a separate host namespace;
-  plugin-ID prefixes keep different plugins from sharing a name. Width is saved per scope/name and follows saves
-  from other windows; undefined scope keeps it in memory. Double-click resets
-  the preferred width. `primary`, when supplied, is `{ defaultWidth, maxRatio }`.
-
-```js
-export const inject = ["react", "conversation", "panels", "pages"];
-export function apply(ctx) {
-  const React = ctx.react;
-  function Reader() {
-    ctx.panels.useTabTitle?.("Guide");
-    return React.createElement(ctx.conversation.ui.Markdown, {
-      content: "## A guide\n\n**Shared rendering**",
-      openLink: () => false,
-    });
-  }
-  ctx.pages.register({
-    id: "reader", title: "Guide", primary: true, layout: "workspace",
-    component: () => React.createElement(ctx.panels.ui.Workspace, {
-      items: [{ id: "guide", label: "Guide", content: React.createElement(Reader) }],
-      value: "guide", select: () => {},
-    }),
-  });
-}
-```
-
-These are runtime values on injected services, never imports from app source.
-`@buzz/author` exports only types, including `MarkdownProps`,
-`PanelWorkspaceItem`, `PanelWorkspaceProps` and `PanelSplit`. Hosts predating
-these members cannot run plugins that require them; check for availability and
-show an upgrade explanation if supporting older hosts.
+- The host supplies the shell, navigation, error boundaries, and the outer surface of panels and Settings. Don't add your own page frame, overlays, global styles or theme. Panels sit in a host card, so render only the body. Pages own their padding and scrolling.
+- Use the `ui` controls for buttons, fields, switches, dialogs and action menus. Use `className="ui-card"` for a card, `var(--space-panel-inset)` and `var(--space-2)` for spacing, and inline styles for layout. Plain `h1`–`h3`, `p` and `button` get host styling.
+- Use host color tokens (`var(--...)`) so light and dark themes both work. Rely only on the `core` roles in `src/shared/design-system/tokens/registry.ts`; other custom properties, classes and `data-*` attributes are internal.
+- Avoid fixed widths; pages can be narrow.
+- The legacy `buzz.relay-notes/notes` page uses the host's Notes icon even when installed as an external plugin.
+- A canonical plugin page link can open beside a conversation if the named
+  plugin registers a matching panel with `addressable: true`. Links fall back
+  to the plugin page if the panel does not qualify.
+- Call `ctx.panels.useTabTitle(label, icon?, actions?)` inside a panel to set
+  its tab title. Optional `{ label, run }` actions appear in its context menu
+  while the panel is mounted. Keep the actions array stable across renders.
+- For `ctx.agents.ui.Transcript`, set `endedAt` on a finished turn, or supply `outcome` if its end time is unknown. Use `at: 0` for an unknown item timestamp. Omit `completedAt` when a tool's start time is unknown.
 
 ## Common mistakes
 
-- Adding `import ... from "react"` or any runtime import, or compiling JSX with the automatic runtime (`react/jsx-runtime`). Use `ctx.react` and classic `React.createElement`.
-- Forgetting a service in `inject` (`ctx.pages` is undefined and activation fails) or listing optional services (`sidebarSections`, `subjectLift`, `pluginInstaller`, `ui`) there instead of using `ctx.reflect.get`.
-- Doing work at module top level (it must be pure) or using `ctx.react` outside `apply`.
-- Starting timers, listeners or subscriptions without `ctx.effect` cleanup, so they leak across reloads.
-- A bundler emitting several chunks, CSS, or asset files. Only one `plugin.js` is loaded.
-- Editing `manifest.host` and expecting `plugin_reload` to apply it; it refuses until the owner approves the update in Settings.
-- Invalid ids (uppercase, underscores in the plugin id, a page id starting with `-`), or an unknown manifest key, which rejects the whole folder.
-- Expecting React state to survive a reload, or a plugin added by drag and drop to be reloadable.
+- Any runtime import, including `react` or `react/jsx-runtime`.
+- A service missing from `inject`, or an optional one listed there instead of read with `ctx.reflect.get`.
+- Work at module top level, or `ctx.react` used outside `apply`.
+- Timers, listeners or subscriptions without `ctx.effect`, so they leak across reloads.
+- A bundler emitting several chunks, CSS or assets. Only `plugin.js` loads.
+- Expecting `plugin_reload` to apply a `manifest.host` change.
+- Invalid ids, or an unknown manifest key.
+- Expecting React state to survive a reload, or a dragged-in folder to be reloadable.

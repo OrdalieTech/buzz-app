@@ -1,6 +1,8 @@
 import { nativeHookOutput } from "../hook-output";
 import { CODEX_HOOK_EVENTS } from "./hook-bridge";
 import { repositoriesContext } from "../../features/communities/repositories";
+import { communityDestination } from "../../features/communities/destination";
+import { relayPartition } from "../../features/relay/partition";
 import { isTauri } from "@tauri-apps/api/core";
 import { pubkeyOf } from "../../features/agents/membership";
 import { ownerReads, readyOwnerReads } from "../../features/agents/reads";
@@ -16,9 +18,12 @@ import { reviewModel } from "./security-review";
 import {
   candidatesFor,
   followRecommended,
+  onAutomatic,
   recommendationReady,
 } from "../../features/agents/recommended";
+import { activeRoute, routeLabel } from "../../features/agents/model-routes";
 import { AppServer, listModels } from "./rpc";
+import { CODEX_ROUTES, HARNESS } from "./gateway";
 /** How often Buzz's copy of Codex looks for a new release. */
 const UPDATE_MS = 6 * 60 * 60_000;
 export const inject = ["agents", "host", "agentProtection"];
@@ -48,7 +53,9 @@ export const apply: PluginModule["apply"] = (ctx) => {
   const typeKey = `${ctx.pluginOwner?.id ?? "buzz.codex"}/${TYPE_ID}`;
   const runtime = new CodexRuntime(
     start,
-    (key) => ownerReads(ctx.agents.relay(key), pubkeyOf(key)),
+    (key) =>
+      ctx.agents.conversationReads?.(key) ??
+      ownerReads(ctx.agents.relay(key), pubkeyOf(key)),
     (key, signal) => ctx.agents.core(key, signal),
     ctx.agents.storage,
     (raw, remote) => providerController.resolve(raw, remote),
@@ -83,7 +90,15 @@ export const apply: PluginModule["apply"] = (ctx) => {
     (pubkey) => ctx.agents.handle(pubkey),
     ctx.host.resolveDirectory?.bind(ctx.host),
     (agent, signal, channelId) =>
-      readyOwnerReads(ctx.agents.relay(agent.key), agent, signal, channelId),
+      readyOwnerReads(
+        ctx.agents.relay(agent.key),
+        agent,
+        signal,
+        channelId,
+        undefined,
+        () => ctx.agents.conversationReads?.(agent.key),
+      ),
+    CODEX_ROUTES,
   );
   // Failed turns' notices link to where Codex signs in.
   runtime.explain = (notice) =>
@@ -171,8 +186,18 @@ export const apply: PluginModule["apply"] = (ctx) => {
     ctx.agents.inspectExecution(key),
   );
   ctx.agents.register<Config>({
+    mayRestartForBaseInstructions: ({ key, owner, relay }) =>
+      !ctx.agents.executionBinding(key) &&
+      runtime.mayRestartForBaseInstructions(
+        key,
+        ctx.agents.relay(key)?.snapshot().scope ??
+          relayPartition(communityDestination(relay).url, owner),
+      ),
     id: TYPE_ID,
     conversationFolders: true,
+    conversationSections: true,
+    notes: true,
+    skillFolders: ["$CODEX_HOME/skills", "~/.agents/skills"],
     voice: async (seat) => {
       if (typeof RTCPeerConnection !== "function")
         throw new Error("Voice is unsupported on this device");
@@ -188,6 +213,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
     hooks: { events: CODEX_HOOK_EVENTS },
     retire: (pubkey) => runtime.retire(pubkey),
     protection: true,
+    gateway: { harness: HARNESS, mode: "attribution" },
     title: "Codex",
     icon: CodexLogoIcon,
     description:
@@ -258,12 +284,19 @@ export const apply: PluginModule["apply"] = (ctx) => {
       ];
     },
     migrationWarning: "Any commands Codex left running will stop.",
-    summary: (agent) =>
-      followRecommended(
+    summary: (agent) => {
+      const { model } = followRecommended(
         agent.config,
         config(agent.config),
         providerController.recommended(),
-      ).model || "Codex",
+      );
+      return (
+        activeRoute(TYPE_ID, model, onAutomatic(agent.config, TYPE_ID))
+          ?.label ??
+        routeLabel(TYPE_ID, model) ??
+        (model || "Codex")
+      );
+    },
     recommends: (candidate) => providerController.recommends(candidate),
     ...(spawn &&
       readFile && {

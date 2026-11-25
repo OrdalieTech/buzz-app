@@ -44,12 +44,21 @@ test("thread stays beside the channel whenever both panes fit", async ({
     exact: true,
   });
   await expect(thread).toBeVisible();
+  const resize = page.getByRole("separator", {
+    name: "Resize main and secondary panels",
+  });
+  await resize.focus();
+  await resize.press("End");
+  await thread
+    .getByRole("textbox", { name: "Reply to thread", exact: true })
+    .fill("A thread draft");
 
   for (const [width, scale, mode] of [
     [1000, 1, "light"],
     [900, 0.8, "dark"],
     [1440, 1.5, "light"],
   ]) {
+    const layout = `${width}px, scale ${scale}, ${mode} mode`;
     await page.evaluate(
       ({ scale, mode }) => {
         localStorage.setItem("buzz-font-scale.v1", String(scale));
@@ -65,9 +74,21 @@ test("thread stays beside the channel whenever both panes fit", async ({
       "font-size",
       `${16 * scale}px`,
     );
+    await frames(page);
+    await animationsSettled(page.locator(":has(> [data-panel-dock])"));
     const bounds = await channel.boundingBox();
     const pane = await thread.boundingBox();
-    expect(bounds.x + bounds.width).toBeLessThanOrEqual(pane.x);
+    expect(
+      bounds.x + bounds.width,
+      `Channel and thread separation at ${layout}`,
+    ).toBeLessThanOrEqual(pane.x);
+    expect(
+      pane.x + pane.width,
+      `Thread right edge at ${layout}`,
+    ).toBeLessThanOrEqual(width);
+    await thread
+      .getByRole("button", { name: "Send message", exact: true })
+      .click({ trial: true });
     await expect(input).toHaveText(draft.trimEnd());
     await channel
       .getByRole("button", { name: "Send message", exact: true })
@@ -97,6 +118,163 @@ test("thread stays beside the channel whenever both panes fit", async ({
   await expect(
     page.getByRole("separator", { name: "Resize main and secondary panels" }),
   ).toBeHidden();
+});
+
+test("thread splitter tracks the conversation reserve as interface size changes", async ({
+  page,
+  app,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await open(page, app);
+  await page.getByRole("separator", { name: "Resize sidebar" }).press("Home");
+  const conversation = page.getByRole("article", {
+    name: "Conversation",
+    exact: true,
+  });
+  const root = app.histories
+    .get("primary/alpha")
+    .find((row) => row.content.startsWith("Thread root"));
+  await conversation
+    .locator(`[data-message-id="${root.id}"]`)
+    .getByRole("button", { name: /^View thread:/ })
+    .click();
+  const resize = page.getByRole("separator", {
+    name: "Resize main and secondary panels",
+  });
+  await expect(resize).toBeVisible();
+  const surface = page.getByRole("region", { name: "Channels", exact: true });
+  await surface.evaluate((element) => {
+    element.style.inlineSize = `${element.clientWidth}px`;
+  });
+  const board = page.locator(":has(> [data-panel-dock])");
+  const measure = async (step) => {
+    await frames(page);
+    await animationsSettled(board);
+    await frames(page);
+    const geometry = await resize.evaluate((handle) => {
+      const dock = handle.parentElement;
+      const workspace = dock.parentElement;
+      const { x, right, width } = dock.getBoundingClientRect();
+      return {
+        available: workspace.clientWidth,
+        min: Number(handle.getAttribute("aria-valuemin")),
+        max: Number(handle.getAttribute("aria-valuemax")),
+        now: Number(handle.getAttribute("aria-valuenow")),
+        pane: { x, right, width },
+        main: workspace
+          .querySelector('[aria-label="Conversation"]')
+          .getBoundingClientRect().width,
+      };
+    });
+    console.log(`Thread splitter ${step}: ${JSON.stringify(geometry)}`);
+    return geometry;
+  };
+
+  await expect(page.locator("html")).toHaveCSS("font-size", "16px");
+  await resize.press("ArrowLeft");
+  const normal = await measure("100% submax");
+  expect(normal.max).toBe(normal.available - 320);
+  expect(normal.now).toBeLessThan(normal.max);
+
+  await page.evaluate(() => {
+    document.documentElement.style.setProperty("--buzz-text-scale", "1.5");
+  });
+  await expect(page.locator("html")).toHaveCSS("font-size", "24px");
+  const scaled = await measure("150% submax (root change only)");
+  expect.soft(scaled.available).toBe(normal.available);
+  expect.soft(scaled.now).toBe(normal.now);
+  expect.soft(scaled.max).toBe(scaled.available - 480);
+
+  await surface.evaluate((element) => {
+    element.style.removeProperty("inline-size");
+  });
+  await measure("150% unpinned submax");
+  await resize.press("End");
+  const end = await measure("150% End");
+  expect.soft(end.now).toBe(Math.round(end.pane.width));
+  expect.soft(end.max).toBe(end.now);
+  expect.soft(end.pane.right).toBeLessThanOrEqual(1440);
+  expect.soft(end.main).toBeCloseTo(480);
+
+  await resize.press("Home");
+  await measure("150% Home");
+
+  const thread = page.getByRole("complementary", {
+    name: "Thread",
+    exact: true,
+  });
+  await thread
+    .getByRole("textbox", { name: "Reply to thread", exact: true })
+    .fill("A thread draft");
+  for (const [viewport, scale] of [
+    [808, 0.8],
+    [872, 0.9],
+    [808, 12.825 / 16],
+  ]) {
+    await page.evaluate((scale) => {
+      document.documentElement.style.setProperty("--buzz-text-scale", scale);
+    }, String(scale));
+    await page.setViewportSize({ width: viewport, height: 900 });
+    await expect(page.locator("html")).toHaveCSS(
+      "font-size",
+      `${16 * scale}px`,
+    );
+    const sidebar = page.getByRole("separator", { name: "Resize sidebar" });
+    await sidebar.press("Home");
+    await expect(sidebar).toHaveAttribute(
+      "aria-valuenow",
+      await sidebar.getAttribute("aria-valuemin"),
+    );
+    await expect(resize).toBeVisible();
+    await resize.press("End");
+    const narrow = await measure(`${scale * 100}% ${viewport}px End`);
+    if (scale === 12.825 / 16) {
+      const precision = await board.evaluate((workspace) => {
+        const container = workspace.closest('[aria-label="Channels"]');
+        const insets = (element) => {
+          const style = getComputedStyle(element);
+          return [
+            style.paddingLeft,
+            style.paddingRight,
+            style.borderLeftWidth,
+            style.borderRightWidth,
+          ].map(Number.parseFloat);
+        };
+        const probe = document.createElement("div");
+        probe.style.cssText = "position:absolute;width:100cqw;height:0";
+        workspace.append(probe);
+        const cqw = probe.getBoundingClientRect().width;
+        probe.remove();
+        return {
+          fontSize: getComputedStyle(document.documentElement).fontSize,
+          queryContainer: getComputedStyle(container).containerType,
+          containerWidth: container.getBoundingClientRect().width,
+          containerInsets: insets(container),
+          boardWidth: workspace.getBoundingClientRect().width,
+          boardInsets: insets(workspace),
+          clientWidth: workspace.clientWidth,
+          cqw,
+        };
+      });
+      console.log(`Thread fractional workspace: ${JSON.stringify(precision)}`);
+      expect(precision.fontSize).toBe("12.825px");
+      expect(precision.queryContainer).toBe("inline-size");
+      expect(precision.containerInsets).toEqual([0, 0, 0, 0]);
+      expect(precision.boardInsets).toEqual([0, 0, 0, 0]);
+      expect(precision.containerWidth).toBe(539.546875);
+      expect(precision.boardWidth).toBe(precision.cqw);
+      expect(precision.boardWidth).toBe(precision.containerWidth);
+      expect(precision.clientWidth).toBe(540);
+    }
+    expect.soft(narrow.min).toBeLessThanOrEqual(narrow.now);
+    expect.soft(narrow.now).toBe(narrow.max);
+    expect.soft(narrow.max).toBe(Math.round(narrow.pane.width));
+    expect.soft(narrow.pane.right).toBeLessThanOrEqual(viewport);
+    await thread
+      .getByRole("button", { name: "Send message", exact: true })
+      .click({ trial: true });
+    await expect(resize).toBeVisible();
+  }
 });
 
 // Browser-only: child-only activity layout and composer resizing must preserve

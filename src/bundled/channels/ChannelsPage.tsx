@@ -1,3 +1,4 @@
+import { viewerMember } from "../../features/relay/membership";
 import { useChannelHistoryFocus } from "./useChannelHistoryFocus";
 import type { Conversation } from "../../features/conversation/service";
 import { StartLinkedChat, canStartLinkedChat } from "./StartLinkedChat";
@@ -17,6 +18,8 @@ import { SoloDraft } from "../../features/solo/SoloDraft";
 import { useChannelNavigation } from "../../features/channel-navigation/ChannelNavigationState";
 import { soloSuccessor } from "../../features/channel-navigation/solo-successor";
 import { historyPanel, useConversationTabs } from "./useConversationTabs";
+import type { MessageLinkOrigin } from "../../features/messages/MessageRow";
+import { useComposerWrites } from "../../features/messages/composer-writes";
 import { focusDock, useCoveredByDock } from "./useCoveredByDock";
 import tabStyles from "./ChannelTabs.module.css";
 import panelStyles from "../../features/panels/Panels.module.css";
@@ -25,12 +28,35 @@ import { useToastNotification } from "../../shared/design-system/ui/Toast";
 import { useReturnHighlight } from "../../features/messages/use-return-highlight";
 import { useMessageOpening } from "../../features/messages/use-message-opening";
 import { ChannelBody } from "./ChannelBody";
+import { InlineThreadSheet } from "./InlineThreadSheet";
+import {
+  canonicalInline,
+  inlineDismissal,
+  inlineToTab,
+  layerDismissal,
+  layerVisit,
+  routedInline,
+} from "./inline-address";
+import {
+  LayerAddressContext,
+  type LayerAddress,
+  type OpenLayer,
+  type PanelLayer as PanelLayerAddress,
+} from "../../features/messages/view-layer";
+import { LayerReader } from "../../features/messages/LayerReader";
+import {
+  setReplyTarget,
+  threadDraftKey,
+} from "../../features/messages/reply-target";
+import { composesIn, type InlineHost, placeIn } from "./placement";
+import type { Seen } from "../../features/seen/service";
 import {
   type ConversationTab,
   entryPane,
   panelTabId,
   rootOfTab,
   tabPane,
+  threadTab,
   useChannelTabState,
 } from "./useChannelTabState";
 import { ChannelMembersDialog } from "./ChannelMembersDialog";
@@ -117,6 +143,7 @@ import { PanelWorkspace } from "../../features/panels/PanelWorkspace";
 import { usePanelSplit } from "../../features/panels/usePanelSplit";
 import { PanelDock } from "../../features/panels/PanelDock";
 import { COMPANION_SPLIT, PanelFrame } from "../../features/panels/PanelFrame";
+import { diagnosticsAvailable } from "../../features/developer/mode";
 import { OutboxStatus } from "./OutboxStatus";
 import { RelayTimings } from "./RelayTimings";
 import { LiveStatus } from "./LiveStatus";
@@ -137,6 +164,7 @@ import { useSidebarPreferences } from "./useSidebarPreferences";
 import { channelHasUnread } from "./useSidebarFilters";
 import { inFieldOutsideComposer } from "./conversation-rows";
 import styles from "./Channels.module.css";
+import { BOARD_MAIN_MIN_REM } from "./panel-split";
 import type { CommunityReader } from "../../features/communities/service";
 import { avatarMedia } from "../../shared/avatar-source";
 
@@ -163,6 +191,7 @@ export function ChannelsPage({
   archive,
   read,
   membership,
+  seen,
 }: {
   extensions?: ConversationExtensions | undefined;
   chatMenus?: Conversation["chatMenus"] | undefined;
@@ -180,6 +209,8 @@ export function ChannelsPage({
   /** The open conversation's Mark as read, for the Escape shortcut. */
   read?: ReadShortcut | undefined;
   companion?: ReactNode;
+  /** Records one-time experiences, such as the inline thread intro. */
+  seen?: Seen | undefined;
 }) {
   const session = useRelayConnection(relay);
   const openSwitcher = useContext(OpenCommunitySwitcher);
@@ -333,6 +364,7 @@ export function ChannelsPage({
           agents={agents}
           communities={communities}
           membership={membership}
+          seen={seen}
         />
       )}
     </section>
@@ -364,6 +396,7 @@ function ChannelWorkspace({
   archive,
   read,
   membership,
+  seen,
 }: {
   extensions?: ConversationExtensions | undefined;
   chatMenus?: Conversation["chatMenus"] | undefined;
@@ -381,6 +414,7 @@ function ChannelWorkspace({
   panels: Panels;
   archive?: ArchiveShortcut | undefined;
   read?: ReadShortcut | undefined;
+  seen?: Seen | undefined;
 }) {
   const messageDraft =
     navigation?.target.kind === "page"
@@ -492,7 +526,7 @@ function ChannelWorkspace({
   );
   const threadTrigger = useRef<HTMLElement | null>(null);
   const [sent, setSent] = useState<{ channelId: string; id: string }>();
-  const { channels, profiles } = useChannelLabels(
+  const { channels, joined, profiles } = useChannelLabels(
     list.channels.filter(
       (channel) =>
         // Wait for metadata so temporary rooms never flash as unnamed channels.
@@ -797,6 +831,26 @@ function ChannelWorkspace({
     }
   }, [cached, current, navigation]);
   const currentId = current?.id;
+  // The conversation's inline thread and open details: dialogs on its visit.
+  const addressed =
+    navigator && navigation?.target.kind === "conversation"
+      ? navigation.target
+      : undefined;
+  // Inline threads draw over the composer, which these conversations lack,
+  // as does a connection that can only read: its composer has no box.
+  const { readingOnly } = useComposerWrites(
+    queries,
+    currentId,
+    current?.channelType === "solo",
+  );
+  const composes = composesIn(current, readingOnly);
+  const inlineRoot =
+    addressed?.inline &&
+    addressed.channelId === currentId &&
+    composes &&
+    current?.channelType !== "solo"
+      ? addressed.inline
+      : undefined;
   useEffect(() => {
     setMembersChannel((id) => (id === currentId ? id : undefined));
   }, [currentId]);
@@ -1325,6 +1379,24 @@ function ChannelWorkspace({
      * launcher's side panel keeps the visibility it had before the close. */
     paneOpen: boolean;
   }>(undefined);
+  /** A local tab has no routed address, so the return of the dismissal made
+   * from visit `from` would restore the selection `fallback` had over it.
+   * Keep it for that matching return only, never for later navigation. */
+  const keepTabForReturn = (
+    from: string,
+    fallback: OpenTarget,
+    id: string,
+    pane: "main" | "side",
+    paneOpen: boolean,
+  ) => {
+    keptTabReturn.current = {
+      from,
+      target: targetKey(fallback),
+      id,
+      pane,
+      paneOpen,
+    };
+  };
   const dismissContent = (
     visits: readonly string[],
     fallback: OpenTarget,
@@ -1347,18 +1419,14 @@ function ChannelWorkspace({
       visits.includes(current.id) &&
       keptTab?.kind !== "thread" &&
       !(keptEntry && historyPanel(keptEntry))
-    ) {
-      // A local survivor has no routed address. Preserve it only for this
-      // dismissal's matching return, never for unrelated later navigation.
-      keptTabReturn.current = {
-        from: current.id,
-        target: targetKey(fallback),
-        id: keep,
+    )
+      keepTabForReturn(
+        current.id,
+        fallback,
+        keep,
         pane,
-        paneOpen:
-          !!(keptTab || keptEntry || keep === "settings") || tabState.paneOpen,
-      };
-    }
+        !!(keptTab || keptEntry || keep === "settings") || tabState.paneOpen,
+      );
     navigator.dismiss(visits, fallback);
     // A later close can retire more visits before the return lands, moving
     // where it lands.
@@ -1394,14 +1462,28 @@ function ChannelWorkspace({
   useEffect(() => {
     if (mediaReview && !showingMediaReview) setMediaReview(undefined);
   }, [mediaReview, showingMediaReview]);
+  // The fullscreen media viewer takes over the page.
+  const fullscreenMedia = showingMediaReview;
+  // Panels a thread tab's links open can become dialogs on that tab's view;
+  // `openInView`, below, decides.
+  const inView =
+    useRef<
+      (
+        opening: PanelOpening,
+        view: Readonly<{ channelId: string; rootId?: string | undefined }>,
+      ) => boolean
+    >(undefined);
   const secondary = useConversationTabs({
+    openInView: (opening, view) => inView.current?.(opening, view) ?? false,
     state: tabState,
     relay,
     session: queries,
     panels,
     current,
     scope,
-    channels,
+    // Sidebar visibility is not access: a tab shows an archived or hidden
+    // channel the viewer has joined.
+    channels: joined,
     profiles,
     conversationIcon,
     // A Solo chat beside another conversation keeps its own header actions.
@@ -1432,7 +1514,7 @@ function ChannelWorkspace({
     // composer reads a draft only when it mounts, so a side thread kept
     // mounted under the hidden dock would still show the text the viewer
     // replaced. Main-pane threads keep their place and state, as before.
-    hostPanes: showingMediaReview ? ["main"] : undefined,
+    hostPanes: fullscreenMedia ? ["main"] : undefined,
     navigation: navigator,
     routed: routedThread,
     onVisitPanel: visitPanel,
@@ -1634,11 +1716,59 @@ function ChannelWorkspace({
     panelTrigger,
     splitTrigger,
   } = secondary;
+  // What this page can hold inline, the one input to every opening's
+  // placement. Read when something opens, so it never re-renders rows.
+  const inlineHost = useRef<InlineHost>({
+    addressed: false,
+    channelId: undefined,
+    composes: false,
+    threadsInPane: false,
+  });
+  inlineHost.current = {
+    addressed: !!navigator && addressed?.channelId === currentId,
+    channelId: currentId,
+    composes: !!composes && current?.channelType !== "solo",
+    threadsInPane: !!threadPane,
+  };
+  // Read as a visit is applied, so tab changes don't reapply it.
+  const routingTabs = useRef(tabState.tabs);
+  routingTabs.current = tabState.tabs;
   useLayoutEffect(() => {
     // Navigation temporarily withdraws the old presentation while preparing
     // the next destination. That handoff must not dismiss saved thread tabs.
     if (!navigation || navigation.signal.aborted) return;
     if (draft || composingMessage) open(undefined);
+    // A thread opened by its address, as from a link to it or the sidebar,
+    // reads inline over this conversation as one opened from its row does,
+    // unless a tab already shows it; Open in channel does too. The visit
+    // becomes that conversation with the thread inline; the message it named,
+    // if a reply, is not singled out in the thread. Only a known root goes inline: the
+    // timeline's, or the address's hint. A bare link to a message outside
+    // the timeline still opens its tab, which reads it or says it's gone.
+    const routedTarget = navigation.target;
+    if (
+      routedThread &&
+      (exact?.rootId || requestedThread) &&
+      routedTarget.kind === "conversation" &&
+      !routedTarget.detail &&
+      !routedTarget.panel &&
+      !routedTarget.forward &&
+      !routedTarget.layer &&
+      placeIn(
+        { kind: "thread" },
+        inlineHost.current,
+        { channelId: routedThread.channelId },
+        routingTabs.current.some(
+          (tab) =>
+            tab.kind === "thread" &&
+            tab.channelId === routedThread.channelId &&
+            rootOfTab(tab) === routedThread.rootId,
+        ),
+      ) === "inline"
+    ) {
+      if (navigation.resolve(routedInline(routedTarget, routedThread.rootId)))
+        return;
+    }
     // Each visit is applied once: Back/Forward switch tabs, never close them,
     // and a closed tab is not reopened by a re-render of the same visit. A
     // message still resolving its placement waits rather than recording.
@@ -1667,6 +1797,37 @@ function ChannelWorkspace({
           : undefined;
       if (returned && navigation.entryId !== returned.from)
         pendingReturn.current = undefined;
+      // A layer over a thread tab names that tab as its view, so its visit
+      // selects the tab, as a thread's own visit does, reopening it if gone.
+      // The visit's own thread or panel, if it names another, is applied
+      // first and keeps its tab.
+      const layer =
+        navigation.target.kind === "conversation" &&
+        navigation.target.layer?.rootId !== navigation.target.inline
+          ? navigation.target.layer
+          : undefined;
+      const hostChannel = layer?.channelId ?? currentId;
+      const hostTab =
+        layer?.rootId && hostChannel
+          ? threadTab(routingTabs.current, hostChannel, layer.rootId)
+          : undefined;
+      const host =
+        layer?.rootId && hostChannel
+          ? {
+              channelId: hostChannel,
+              messageId:
+                hostTab?.kind === "thread" ? hostTab.messageId : layer.rootId,
+              rootId: layer.rootId,
+            }
+          : undefined;
+      const over =
+        host &&
+        !(
+          routedThread?.channelId === host.channelId &&
+          routedThread.rootId === host.rootId
+        )
+          ? host
+          : undefined;
       tabState.enterVisit(
         `${navigation.entryId}:${detail ? "detail" : routedThread ? "thread" : "channel"}`,
         detail && !detailReply ? undefined : routedThread,
@@ -1674,6 +1835,7 @@ function ChannelWorkspace({
         detail && currentId
           ? { channelId: currentId, target: detail.target }
           : undefined,
+        over,
       );
       // A re-render while the return is pending must not reapply the detail
       // that was just closed.
@@ -1687,6 +1849,8 @@ function ChannelWorkspace({
         if (entry && historyPanel(entry)) {
           open(entry, false, detailSource ? "side" : undefined);
           if (detailSource && !detailReply) tabState.selectMain(undefined);
+          // The panel's tab is open again; the layer's view stays in front.
+          if (over) tabState.selectThread(over.channelId, over.rootId);
         } else navigation.complete({ status: "failed", reason: "unavailable" });
       }
       // Reselect it over the restored selection and give it its own visit.
@@ -1751,10 +1915,13 @@ function ChannelWorkspace({
     handoff?.activityThread,
     exact?.request,
     exact?.inTimeline,
+    exact?.rootId,
+    requestedThread,
     routedThread,
     detailReply,
     detailSource,
     tabState.enterVisit,
+    tabState.selectThread,
     tabState.select,
     tabState.selectMain,
     tabState.setPaneOpen,
@@ -1776,6 +1943,16 @@ function ChannelWorkspace({
       mounted.current = false;
     };
   }, []);
+  const hasThreadTab = useCallback(
+    (channelId: string, rootId: string) =>
+      tabState.tabs.some(
+        (tab) =>
+          tab.kind === "thread" &&
+          tab.channelId === channelId &&
+          rootOfTab(tab) === rootId,
+      ),
+    [tabState.tabs],
+  );
   const openChannelThread = useCallback(
     (
       channelId: string,
@@ -1792,6 +1969,38 @@ function ChannelWorkspace({
       tabState.leaveVisit();
       // Retire transient details first; selecting the thread is the last word.
       open(undefined);
+      const target = navigator?.snapshot().entry.target;
+      // Inline opens the thread over this conversation's composer, unless it
+      // already has a tab, which is focused instead: never both.
+      if (
+        navigator &&
+        target?.kind === "conversation" &&
+        placeIn(
+          { kind: "thread" },
+          inlineHost.current,
+          { channelId },
+          hasThreadTab(channelId, threadRootId),
+        ) === "inline"
+      ) {
+        // Reply on a row answers its thread, so a reply the thread's draft
+        // was aimed at before is dropped, as a tab's reply request drops it.
+        if (intent === "reply")
+          setReplyTarget(
+            queries,
+            scope,
+            threadDraftKey(channelId, threadRootId),
+            undefined,
+          );
+        if (target.inline !== threadRootId)
+          void navigator.open({
+            version: 1,
+            kind: "conversation",
+            scope: target.scope,
+            channelId,
+            inline: threadRootId,
+          });
+        return;
+      }
       // Every opening keeps existing work: a new thread adds a tab and an
       // open one is selected wherever it was placed.
       tabState.openThreadTab(
@@ -1801,7 +2010,6 @@ function ChannelWorkspace({
         intent,
         threadPane,
       );
-      const target = navigator?.snapshot().entry.target;
       if (
         navigator &&
         viewer &&
@@ -1827,14 +2035,198 @@ function ChannelWorkspace({
     [
       navigator,
       viewer,
+      queries,
       scope,
       open,
       setSettings,
       threadPane,
+      hasThreadTab,
       tabState.openThreadTab,
       tabState.leaveVisit,
     ],
   );
+  // A thread is never inline and in a tab at once: its tab wins.
+  const inlineThread =
+    inlineRoot && currentId && !hasThreadTab(currentId, inlineRoot)
+      ? inlineRoot
+      : undefined;
+  // The inline thread's and the layer's openings and closings, as
+  // transforms of the visit on screen (inline-address.ts).
+  const closeInline = (rootId: string) => {
+    const dismissal = inlineDismissal(
+      navigator?.snapshot().entry.target,
+      rootId,
+    );
+    if (dismissal) navigator.dismiss(dismissal.visits, dismissal.fallback);
+  };
+  const resolveInlineRoot = (from: string, root: string) => {
+    const dismissal = canonicalInline(
+      navigator?.snapshot().entry.target,
+      from,
+      root,
+    );
+    if (dismissal) navigator.dismiss(dismissal.visits, dismissal.fallback);
+  };
+  // Move to side panel hands the thread over: its tab opens in place of its
+  // inline visits. The draft is keyed by thread, so it follows, and the reply
+  // it is aimed at is kept with it: the tab focuses the reply box as it is.
+  const moveInlineToTab = (rootId: string) => {
+    const target = navigator?.snapshot().entry.target;
+    const dismissal = inlineToTab(target, rootId);
+    if (!dismissal || target?.kind !== "conversation") return;
+    tabState.leaveVisit();
+    tabState.openThreadTab(target.channelId, rootId, rootId, "focus", "side");
+    navigator.dismiss(dismissal.visits, dismissal.fallback);
+  };
+  // A layer (details or a panel) opens over the composer of the view it was
+  // opened in; the address names that view, so reload and Back/Forward know
+  // where it goes. Opening another replaces it with a visit of its own.
+  const showLayer = useCallback(
+    (layer: OpenLayer) => {
+      const target = navigator?.snapshot().entry.target;
+      if (!navigator || target?.kind !== "conversation") return;
+      void navigator.open(layerVisit(target, layer));
+    },
+    [navigator],
+  );
+  /** ✕, Escape or a send: the layer's visits retire, and what was under it
+   * stays. `fallback` lands somewhere else instead, as Open as tab does.
+   * `only` names the layer meant, and closes nothing once another is open. */
+  const dismissLayer = useCallback(
+    (fallback?: OpenTarget, only?: OpenLayer) => {
+      const dismissal = layerDismissal(
+        navigator?.snapshot().entry.target,
+        fallback,
+        only,
+      );
+      if (navigator && dismissal)
+        navigator.dismiss(dismissal.visits, dismissal.fallback);
+    },
+    [navigator],
+  );
+  // Under inline, a panel opened from a view's message becomes a dialog on
+  // that view: the conversation, its inline thread, or a thread tab. False
+  // when it opens as a tab instead.
+  const openInView = (
+    opening: PanelOpening,
+    view: Readonly<{ channelId: string; rootId?: string | undefined }>,
+  ) => {
+    if (
+      placeIn(
+        { kind: "panel", panel: opening.panel },
+        inlineHost.current,
+        view,
+        secondary.hasPanelTab(opening),
+      ) !== "inline"
+    )
+      return false;
+    setSettings(undefined);
+    panelTrigger.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    showLayer({
+      target: opening.target,
+      ...(opening.rootId ? { threadId: opening.rootId } : {}),
+      channelId: view.channelId,
+      ...(view.rootId ? { rootId: view.rootId } : {}),
+    });
+    return true;
+  };
+  inView.current = openInView;
+  // Draws the addressed panel layer. Its own links stay in its view; Open as
+  // tab hands it to a tab.
+  const renderLayer = (layer: PanelLayerAddress) => {
+    const panel = panels.resolve(layer.target);
+    if (!panel) return undefined;
+    const opening: PanelOpening = {
+      channelId: layer.channelId,
+      ...(layer.threadId ? { rootId: layer.threadId } : {}),
+      panel,
+      target: layer.target,
+    };
+    const content = secondary.renderLayerPanel(opening, {
+      navigate: (target) => {
+        const next = panelOpening(
+          panels,
+          layer.channelId,
+          target,
+          layer.threadId,
+        );
+        if (!next) return false;
+        if (!openInView(next, layer)) open(next, true);
+        return true;
+      },
+      close: () => dismissLayer(),
+    });
+    if (!content) return undefined;
+    return {
+      title: panel.title,
+      content,
+      openAsTab: () => {
+        const entry = navigator?.snapshot().entry;
+        if (entry?.target.kind !== "conversation") return;
+        const target = entry.target;
+        const { layer: _layer, ...under } = target;
+        if (historyPanel(opening)) {
+          // The tab's own address replaces the layer's, as Move to side
+          // panel does for a thread.
+          dismissLayer({
+            version: 1,
+            kind: "conversation",
+            scope: target.scope,
+            channelId: opening.channelId,
+            detail: {
+              target: opening.target,
+              ...(opening.rootId ? { rootId: opening.rootId } : {}),
+            },
+          });
+          open(opening, true);
+          return;
+        }
+        // A panel with no address leaves the visit beneath the layer, whose
+        // return lands later and restores the tabs it had. The new tab is
+        // kept over them, in the pane it opened in.
+        open(opening, true);
+        const id = panelTabId(opening);
+        keepTabForReturn(
+          entry.id,
+          under,
+          id,
+          tabState.getMainSelected() === id ? "main" : "side",
+          true,
+        );
+        dismissLayer(under);
+      },
+    };
+  };
+  const renderLayerRef = useRef(renderLayer);
+  renderLayerRef.current = renderLayer;
+  const layerTarget = addressed?.layer;
+  const layerChannel = addressed?.channelId;
+  const layerAddress = useMemo<LayerAddress | undefined>(() => {
+    if (!navigator || !layerChannel) return undefined;
+    const channelId = layerTarget?.channelId ?? layerChannel;
+    return {
+      open:
+        layerTarget &&
+        (layerTarget.messageId !== undefined
+          ? {
+              messageId: layerTarget.messageId,
+              channelId,
+              rootId: layerTarget.rootId,
+            }
+          : {
+              target: layerTarget.target,
+              threadId: layerTarget.threadId,
+              channelId,
+              rootId: layerTarget.rootId,
+            }),
+      show: showLayer,
+      dismiss: (layer) => dismissLayer(undefined, layer),
+      renderPanel: (layer) => renderLayerRef.current(layer),
+    };
+  }, [navigator, layerTarget, layerChannel, showLayer, dismissLayer]);
   const openThread = useCallback(
     (messageId: string, threadRootId: string, intent?: "reply") => {
       if (currentId)
@@ -1912,6 +2304,11 @@ function ChannelWorkspace({
       routedThread: !!routedThread,
     };
   }, [currentId, routedThread]);
+  // Read when a link is chosen, so tab changes don't re-render every row.
+  const linkTabs = useRef(tabState.tabs);
+  useLayoutEffect(() => {
+    linkTabs.current = tabState.tabs;
+  });
   const openLink = useCallback(
     (
       url: string,
@@ -1919,10 +2316,13 @@ function ChannelWorkspace({
         fromThread = false,
         returnFocus,
         rootId,
+        view,
       }: {
         fromThread?: boolean;
         returnFocus?: HTMLElement | undefined;
         rootId?: string;
+        /** The view of the message the link is in, when it is in one. */
+        view?: MessageLinkOrigin["view"];
       } = {},
     ) => {
       const { current, navigation } = destination.current;
@@ -1948,10 +2348,32 @@ function ChannelWorkspace({
               !item.cached &&
               !item.readOnly &&
               !item.archived &&
-              item.members?.includes(queries.viewer ?? ""),
+              viewerMember(item, queries.viewer),
           );
       if (linkedChat && linkedChat.id !== current?.id) {
         const id = `conversation:${linkedChat.id}`;
+        // Inline opens no tabs: the link goes to the chat.
+        if (
+          navigator &&
+          viewer &&
+          placeIn(
+            { kind: "chat" },
+            inlineHost.current,
+            { channelId: linkedChat.id },
+            linkTabs.current.some((tab) => tab.id === id),
+          ) === "inline"
+        ) {
+          void navigator.open({
+            version: 1,
+            kind: "conversation",
+            channelId: linkedChat.id,
+            scope: {
+              viewer,
+              communityOrigin: scope.slice(0, -(viewer.length + 1)),
+            },
+          });
+          return true;
+        }
         tabState.setTabs((tabs) =>
           tabs.some((tab) => tab.id === id)
             ? tabs
@@ -1960,7 +2382,15 @@ function ChannelWorkspace({
         tabState.select(id);
         return true;
       }
-      if (isBuzzLink(url) && navigator && viewer) {
+      // A plugin may expose the same document as a page and an addressable
+      // panel. Only its own panel can keep its link beside this conversation.
+      const linkedPanel =
+        parsed?.format === "plugin" ? panels.resolve(url) : undefined;
+      const pluginPanel =
+        parsed?.format === "plugin" &&
+        linkedPanel?.pluginId === parsed.pluginId &&
+        linkedPanel.addressable;
+      if (isBuzzLink(url) && navigator && viewer && !pluginPanel) {
         const target = buzzLinkTarget(url, {
           viewer,
           communityOrigin: scope.slice(0, -(viewer.length + 1)),
@@ -1984,6 +2414,12 @@ function ChannelWorkspace({
       }
       const { channelId, routedThread } = linkContext.current;
       const next = channelId && panelOpening(panels, channelId, url, rootId);
+      if (
+        next &&
+        view &&
+        inView.current?.(next, { channelId, rootId: view.rootId })
+      )
+        return true;
       if (next) {
         setSettings(undefined);
         panelTrigger.current =
@@ -2053,7 +2489,7 @@ function ChannelWorkspace({
     !requestedMessage &&
     !requestedThread &&
     !membersOpen &&
-    !showingMediaReview &&
+    !fullscreenMedia &&
     (navigation?.focus ?? navigator?.snapshot().attempt.focus) !== "preserve" &&
     tabState.tabs.some(
       (tab) =>
@@ -2061,15 +2497,16 @@ function ChannelWorkspace({
         tab.id === selectedTab &&
         tab.channelId === currentId,
     );
-  // While the companion is in the dock it keeps its width and bounds from
-  // other pages; threads alone keep their own split.
+  // The companion shares its saved width with other pages; threads keep their own split.
   const split = usePanelSplit(
     scope,
     companion ? COMPANION_SPLIT.name : "channels",
     companion ? COMPANION_SPLIT.defaultWidth : undefined,
     companion ? COMPANION_SPLIT.min : undefined,
+    undefined,
+    BOARD_MAIN_MIN_REM,
   );
-  const docked = !!showingPanel && !showingMediaReview;
+  const docked = !!showingPanel && !fullscreenMedia;
   // A floating dock covers the conversation, even the strip beside a card:
   // keep focus, typing, reading and assistive technology out of it.
   const conversation = useRef<HTMLElement>(null);
@@ -2143,46 +2580,56 @@ function ChannelWorkspace({
       onOpenLink={openLink}
       close={closeSettings}
     >
-      <UnreadOptions session={queries} channelId={current?.id} />
-      <LiveStatus
-        live={queries.live}
-        channelId={current?.id}
-        partialRoster={list.coverage === "partial"}
-        diagnostics
-      />
-      <p>
-        {list.coverage === "partial" ? "Partial roster" : "Roster"} ·{" "}
-        {channels.length} channels
-      </p>
-      <Button type="button" onClick={() => queries.channels.refreshList?.()}>
-        Refresh channels
-      </Button>
-      {preferences.error && <p>Saved groups and stars: {preferences.error}</p>}
-      {preferences.status !== "unsupported" && (
-        <Button
-          type="button"
-          disabled={preferences.status === "loading"}
-          onClick={preferences.reload}
-        >
-          Refresh groups and stars
-        </Button>
-      )}
-      {current && (
-        <Button
-          type="button"
-          onClick={() => queries.channels.refresh?.(current.id)}
-        >
-          Refresh messages
-        </Button>
-      )}
-      {queries.outbox ? (
-        <OutboxStatus
-          outbox={queries.outbox}
-          profiling={queries.profiling}
-          memberAdditions={queries.memberAdditions}
-        />
-      ) : (
-        <RelayTimings profiling={queries.profiling} />
+      {diagnosticsAvailable && (
+        <>
+          <UnreadOptions session={queries} channelId={current?.id} />
+          <LiveStatus
+            live={queries.live}
+            channelId={current?.id}
+            partialRoster={list.coverage === "partial"}
+            diagnostics
+          />
+          <p>
+            {list.coverage === "partial" ? "Partial roster" : "Roster"} ·{" "}
+            {channels.length} channels
+          </p>
+          <Button
+            type="button"
+            onClick={() => queries.channels.refreshList?.()}
+          >
+            Refresh channels
+          </Button>
+          {preferences.error && (
+            <p>Saved groups and stars: {preferences.error}</p>
+          )}
+          {preferences.status !== "unsupported" && (
+            <Button
+              type="button"
+              disabled={preferences.status === "loading"}
+              onClick={preferences.reload}
+            >
+              Refresh groups and stars
+            </Button>
+          )}
+          {current && (
+            <Button
+              type="button"
+              onClick={() => queries.channels.refresh?.(current.id)}
+            >
+              Refresh messages
+            </Button>
+          )}
+          {queries.outbox ? (
+            <OutboxStatus
+              outbox={queries.outbox}
+              profiling={queries.profiling}
+              memberAdditions={queries.memberAdditions}
+              pins={queries}
+            />
+          ) : (
+            <RelayTimings profiling={queries.profiling} />
+          )}
+        </>
       )}
     </ChannelSettingsPanel>
   );
@@ -2321,7 +2768,7 @@ function ChannelWorkspace({
     current?.viewerRole === "guest" &&
       !current.cached &&
       !membersOpen &&
-      !showingMediaReview,
+      !fullscreenMedia,
     contentReadyChannel === currentId,
   );
   // The conversation: full width for Solo, or the first main-pane tab.
@@ -2448,6 +2895,8 @@ function ChannelWorkspace({
           <ConversationComposer
             key={`composer:${current.id}`}
             onFocusedRemoval={focusArchivedHistory}
+            // Another main tab covers it while it stays mounted.
+            shown={secondary.selectedMain === "conversation"}
             autoFocus={
               // Remote unarchive restores controls within the reader's current visit.
               !(continuingVisit && committedVisit.current?.archived) &&
@@ -2494,6 +2943,26 @@ function ChannelWorkspace({
             focusRequest={composerFocus}
           />
         )}
+      {inlineThread && current && (
+        <InlineThreadSheet
+          key={inlineThread}
+          session={queries}
+          channel={current}
+          rootId={inlineThread}
+          messageId={addressed?.inlineMessage}
+          // A layer over the thread grows the thread to fit it.
+          tall={
+            !!layerTarget &&
+            layerTarget.rootId === inlineThread &&
+            !layerTarget.channelId
+          }
+          seen={seen}
+          close={() => closeInline(inlineThread)}
+          moveToTab={() => moveInlineToTab(inlineThread)}
+          onResolvedRoot={(root) => resolveInlineRoot(inlineThread, root)}
+        />
+      )}
+      {current && <LayerReader channelId={current.id} />}
     </div>
   );
   const workspace = (
@@ -2773,9 +3242,7 @@ function ChannelWorkspace({
                               channel.cached ||
                               (channel.readOnly &&
                                 channel.viewerRole !== "guest") ||
-                              !channel.members?.includes(
-                                queries.viewer ?? "",
-                              ) ||
+                              !viewerMember(channel, queries.viewer) ||
                               !panels.snapshot().includes(panel) ||
                               !panel.channelMenu?.eligible(channel, queries)
                             )
@@ -2875,7 +3342,7 @@ function ChannelWorkspace({
         keepMounted={
           tabState.entries.length > 0 ||
           (!!hasPanel && !tabState.paneOpen) ||
-          (!!hasPanel && !!showingMediaReview)
+          (!!hasPanel && !!fullscreenMedia)
         }
         className={styles.panelStack}
         resizeHandle={split.handle}
@@ -2950,33 +3417,35 @@ function ChannelWorkspace({
   return (
     // The review reads thread-tab links like the workspace.
     <LinkThreadTabContext value={openLinkedThread}>
-      <ConversationChannel
-        session={queries}
-        scope={scope}
-        extensions={extensions}
-        channel={current}
-        interactions={{
-          onOpenLink: openLink,
-          canOpenLink,
-          onOpenMediaReview: openMediaReview,
-        }}
-        mediaReview={
-          showingMediaReview && {
-            ...showingMediaReview,
-            restoreFocus: mediaReviewTrigger,
-            close: () => setMediaReview(undefined),
-          }
-        }
-      >
-        <ForwardMessageProvider
+      <LayerAddressContext value={layerAddress}>
+        <ConversationChannel
           session={queries}
           scope={scope}
-          navigation={navigator}
-          renderDialog
+          extensions={extensions}
+          channel={current}
+          interactions={{
+            onOpenLink: openLink,
+            canOpenLink,
+            onOpenMediaReview: openMediaReview,
+          }}
+          mediaReview={
+            showingMediaReview && {
+              ...showingMediaReview,
+              restoreFocus: mediaReviewTrigger,
+              close: () => setMediaReview(undefined),
+            }
+          }
         >
-          {workspace}
-        </ForwardMessageProvider>
-      </ConversationChannel>
+          <ForwardMessageProvider
+            session={queries}
+            scope={scope}
+            navigation={navigator}
+            renderDialog
+          >
+            {workspace}
+          </ForwardMessageProvider>
+        </ConversationChannel>
+      </LayerAddressContext>
       {soloMoveNotices}
     </LinkThreadTabContext>
   );

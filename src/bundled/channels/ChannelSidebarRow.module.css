@@ -26,41 +26,55 @@
   z-index: 1;
 }
 /* Keep the menu trigger compact enough for the row. */
-.row:has([data-solo-row-action]) {
+.row:has(:is([data-channel-row-action], [data-solo-row-action])) {
   --solo-row-action-size: calc(var(--space-6) + var(--space-1));
 }
-.row [data-solo-row-action] {
+.row :is([data-channel-row-action], [data-solo-row-action]) {
   flex-shrink: 0;
   width: var(--solo-row-action-size);
   height: var(--solo-row-action-size);
   min-height: 0;
 }
 @media (hover: hover) and (pointer: fine) {
-  .row [data-solo-row-action] {
+  .row :is([data-channel-row-action], [data-solo-row-action]) {
+    position: absolute;
+    inset-inline-end: var(--channel-row-fill-end, 0%);
     opacity: 0;
+  }
+  .row [data-channel-row-action] {
     pointer-events: none;
   }
-  .row:hover [data-solo-row-action],
-  .row:has(:focus-visible) [data-solo-row-action],
-  .row [data-solo-row-action][aria-expanded="true"] {
+  .row:hover [data-channel-row-action],
+  .row [data-solo-row-action]:hover,
+  :where(html[data-keyboard-navigation])
+    .row:has(:focus-visible)
+    :is([data-channel-row-action], [data-solo-row-action]),
+  .row
+    :is(
+      [data-channel-row-action],
+      [data-solo-row-action]
+    )[aria-expanded="true"] {
     opacity: 1;
     pointer-events: auto;
   }
+  /* Shared keeps its hit area when the menu appears beside it. */
+  .row:has([data-solo-shared])
+  :is([data-channel-row-action], [data-solo-row-action]) {
+    inset-inline-end: var(--size-control-sm);
+  }
   /* Keep badges in their usual column until the trailing menu appears.
      Move the badge visually so the title's layout stays fixed. */
-  .row:has([data-solo-row-action]) {
-    & [data-solo-row-action] {
-      position: absolute;
-      inset-inline-end: var(--channel-row-fill-end, 0%);
-    }
-    /* Shared keeps its hit area when the menu appears beside it. */
-    &:has([data-solo-shared]) [data-solo-row-action] {
-      inset-inline-end: var(--size-control-sm);
-    }
+  .row:has(:is([data-channel-row-action], [data-solo-row-action])) {
     &:is(
-        :hover,
-        :has(:focus-visible),
-        :has([data-solo-row-action][aria-expanded="true"])
+        :hover:has([data-channel-row-action]),
+        :has([data-solo-row-action]:hover),
+        html[data-keyboard-navigation] .row:has(:focus-visible),
+        :has(
+          :is(
+              [data-channel-row-action],
+              [data-solo-row-action]
+            )[aria-expanded="true"]
+        )
       ) {
       & .badges {
         position: relative;
@@ -78,18 +92,23 @@
   }
 }
 .row:is(:hover, :has([data-context-menu-present])):not(
-  [data-selected]
+  [data-selected],
+  :has([data-spring-loaded="on"])
 )::before {
   background: var(--affordance-panel-hover);
 }
-.row[data-selected] {
+/* A spring-loaded file drag selects the row until it opens or blinks off. */
+.row:is([data-selected], :has([data-spring-loaded="on"])) {
   --text-row: var(--text-sidebar-selected);
   --text-subtle: var(--text-sidebar-selected);
   --text-metadata: var(--text-sidebar-selected);
   color: var(--text-sidebar-selected);
 }
-.row[data-selected]::before {
+.row:is([data-selected], :has([data-spring-loaded="on"]))::before {
   background: var(--surface-sidebar-selected);
+}
+.row:has([data-spring-loaded]) {
+  transition: none;
 }
 .row .select [data-buzz-ui][data-variant="row"] {
   background: transparent;

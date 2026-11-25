@@ -79,7 +79,7 @@ export function ProfileChannels({
               ? `No matching channels with a known visible type; other memberships could not be classified.${list.coverage === "partial" ? " More channels may exist outside the loaded list." : ""}`
               : list.coverage === "partial"
                 ? "No matching channels in the loaded list; more channels may exist."
-                : "No visible channels with verified membership for this identity."}
+                : "No channels found."}
           </p>
         )}
         {!!channels.length && (

@@ -70,6 +70,7 @@ export function buzzStart(entries: readonly Json[]) {
   const root = field("Session scope") === "thread" && field("Thread root");
   return {
     agent: field("Agent"),
+    ...(field("Session scope") === "community" ? { community: true } : {}),
     ...(channel
       ? { channelId: channel.match(/\(#([^)]+)\)$/)?.[1] ?? channel }
       : {}),
@@ -294,7 +295,9 @@ function combine(
     id,
     ...(start?.channelId ? { channelId: start.channelId } : {}),
     ...(start?.root ? { root: start.root } : {}),
-    ...(main.title ? { title: main.title } : {}),
+    // A community session's generated title may describe any channel it
+    // served, not only the one it started in.
+    ...(main.title && !start?.community ? { title: main.title } : {}),
     startedAt: Math.min(...times.map((time) => time.first)),
     lastAt: Math.max(...times.map((time) => time.last)),
     gaps,

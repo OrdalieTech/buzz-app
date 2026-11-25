@@ -1,4 +1,5 @@
 import {
+  channelContext,
   mergeReadStates,
   READ_STATE_KEYS,
   type ReadState,
@@ -44,6 +45,9 @@ const SCOPED_SHARE = 0.75;
  * catch-up marks, then message marks. The rest goes by local interaction order,
  * which wins over event time so reading old history still synchronizes.
  * Every override group and its direct frontier is protected; pressure can never lose a floor.
+ * A whole-channel override reads only its own channel's frontier. Only a
+ * message or thread override, which an older journal may still hold, can
+ * inherit another frontier, so only then is all possible ancestry protected.
  *
  * Marks that `covered` proves redundant are dropped only after the budget has
  * chosen what to keep, and only when their covering mark was kept. The freed
@@ -68,10 +72,9 @@ export function retainRead(
       overrides: state.overrides,
     });
   }
-  // Overrides make inherited ancestry load-bearing (see below); keep everything then.
-  const coveredBy = Object.keys(protectedState.overrides).length
-    ? undefined
-    : covered;
+  const overrides = Object.keys(protectedState.overrides);
+  // Inherited ancestry is load-bearing (see below); keep everything then.
+  const coveredBy = inheritsAncestry(overrides) ? undefined : covered;
   const encoder = new TextEncoder();
   let used = encoder.encode(
     JSON.stringify({ v: 1, client_id: clientId, contexts: {} }),
@@ -111,10 +114,10 @@ export function retainRead(
     }
   }
   // Encrypted registers do not carry trustworthy ancestry. Preserve every possible
-  // inherited channel/thread frontier while any override exists: pruning a parent
-  // could otherwise reactivate a child register. Only frontier-only msg hints,
-  // and row marks, which no register inherits, are free.
-  if (Object.keys(protectedState.overrides).length) {
+  // inherited channel/thread frontier while a message or thread override exists:
+  // pruning a parent could otherwise reactivate a child register. Only
+  // frontier-only msg hints, and row marks, which no register inherits, are free.
+  if (inheritsAncestry(overrides)) {
     for (const [key, value] of frontiers) {
       if (
         retained.has(key) ||
@@ -200,6 +203,7 @@ export function retainRead(
     // after it has already replaced another mark.
     const covers = new Map<string, string>();
     for (const [key, value] of retained) {
+      if (key in protectedState.overrides) continue;
       const cover = keptCover(key, value);
       if (cover !== undefined) covers.set(key, cover);
     }
@@ -237,6 +241,9 @@ export function retainRead(
     ),
   };
 }
+/** Whether an override can inherit a frontier other than its own. */
+const inheritsAncestry = (overrides: Iterable<string>) =>
+  [...overrides].some((key) => !channelContext(key));
 /** `retainRead` when the caller keeps no recency, such as a publication. */
 export function retainReadState(
   states: readonly ReadState[],
@@ -257,8 +264,9 @@ export const READ_RESERVE_BYTES = 512 * 1024;
  * on this installation, so a mark that capacity drops raises the floor to its
  * own time rather than making what it read unread again. The reserve keeps
  * the newest marks, so the floor rises as little as it can. A mark at or
- * below the floor reads nothing more and is dropped, unless overrides make
- * inherited marks load-bearing.
+ * below the floor reads nothing more and is dropped, unless it is an
+ * override's own mark or a message or thread override makes inherited marks
+ * load-bearing.
  */
 export function retainLocalRead(
   states: readonly ReadState[],
@@ -271,16 +279,18 @@ export function retainLocalRead(
   const overrides = new Set(
     states.flatMap((state) => Object.keys(state.overrides)),
   );
-  const below = (value: number) => !overrides.size && value <= floor;
+  const inherits = inheritsAncestry(overrides);
+  const below = (key: string, value: number) =>
+    !inherits && !overrides.has(key) && value <= floor;
   const frontiers = new Map(
-    Object.entries(reserve).filter(([, value]) => !below(value)),
+    Object.entries(reserve).filter(([key, value]) => !below(key, value)),
   );
   const returning: Record<string, number> = {};
   const current: ReadState[] = [];
   for (const state of states) {
     const kept: Record<string, number> = {};
     for (const [key, value] of Object.entries(state.frontiers)) {
-      if (below(value)) continue;
+      if (below(key, value)) continue;
       kept[key] = value;
       const previous = frontiers.get(key);
       if (previous !== undefined) returning[key] = previous;
@@ -310,8 +320,8 @@ export function retainLocalRead(
   // in the journal: keep it and it only takes room from real reads. A cover
   // reads through at least the time of what it covers, so newest first,
   // then broader scope at equal times, accepts it before what it covers.
-  // Overrides make inherited ancestry load-bearing; keep everything then.
-  const coveredBy = overrides.size ? undefined : covered;
+  // Inherited ancestry is load-bearing; keep everything then.
+  const coveredBy = inherits ? undefined : covered;
   const redundant = (key: string, value: number) => {
     const cover = coveredBy?.(key, (other) =>
       other === key
@@ -325,7 +335,7 @@ export function retainLocalRead(
     );
   };
   const protectedKey = (key: string) =>
-    overrides.size > 0 && !key.startsWith("msg:") && !key.startsWith("seen:");
+    inherits && !key.startsWith("msg:") && !key.startsWith("seen:");
   // Keep inherited floors first (a subset of the already bounded reserve), then
   // the newest read marks, so a drop raises the floor as little as it can.
   // Row hints read nothing: keep them last and never raise the floor for them.
@@ -357,7 +367,7 @@ export function retainLocalRead(
     ) {
       // Protected-first ordering is not newest-first: a dropped message can
       // be newer than every retained ancestor. Never raise the floor then.
-      if (overrides.size) {
+      if (inherits) {
         if (protectedKey(key))
           throw new Error(
             "Read override ancestry capacity reached; saved floors retained",

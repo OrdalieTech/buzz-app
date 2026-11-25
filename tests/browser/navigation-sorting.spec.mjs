@@ -1,7 +1,7 @@
 import { test, expect } from "./fixture.mjs";
 import { animationsSettled } from "./animations.mjs";
 import { open } from "./timeline.mjs";
-import { openPage } from "./navigation.mjs";
+import { clickSidebarHeadingAction, openPage } from "./navigation.mjs";
 import { openChannelDetails } from "./channel-details.mjs";
 
 test.use({ productionBroker: true, savedSidebar: true, sortingSidebar: true });
@@ -506,9 +506,9 @@ test("keeps a stationary selected row visible while its neighbors exchange place
   });
   const motion = await holdSidebarMotion(page);
   try {
-    await section
-      .getByRole("button", { name: "More actions for Team" })
-      .click();
+    await clickSidebarHeadingAction(
+      section.getByRole("button", { name: "More actions for Team" }),
+    );
     await page
       .getByRole("menu", { name: "More actions for Team", exact: true })
       .getByRole("menuitem", { name: "Sort", exact: true })
@@ -598,7 +598,9 @@ test("retargets an unfinished slide without jumping or losing focus", async ({
   await open(page, app);
   const section = page.locator('[data-sidebar-section="channels"]');
   const rows = section.locator("[data-channel-id]");
-  await section.getByRole("button", { name: "More actions for Team" }).click();
+  await clickSidebarHeadingAction(
+    section.getByRole("button", { name: "More actions for Team" }),
+  );
   await page
     .getByRole("menu", { name: "More actions for Team", exact: true })
     .getByRole("menuitem", { name: "Sort", exact: true })
@@ -846,7 +848,7 @@ test("section sort applies immediately, rolls back on failure, and persists retr
   );
   expect(activity).toEqual([]);
   async function openSort() {
-    await trigger.click();
+    await clickSidebarHeadingAction(trigger);
     await expect(channels.locator("details")).toHaveAttribute("open", "");
     await page
       .getByRole("menu", { name: "More actions for Team", exact: true })
@@ -1005,7 +1007,9 @@ test("section sort applies immediately, rolls back on failure, and persists retr
   await expect(
     page.getByRole("menu", { name: "More actions for Team", exact: true }),
   ).not.toBeVisible();
-  await work.getByRole("button", { name: "More actions for Work" }).click();
+  await clickSidebarHeadingAction(
+    work.getByRole("button", { name: "More actions for Work" }),
+  );
   await page
     .getByRole("menu", { name: "More actions for Work", exact: true })
     .getByRole("menuitem", { name: "Sort", exact: true })
@@ -1041,7 +1045,9 @@ test("section sort applies immediately, rolls back on failure, and persists retr
   ).toBeEnabled();
   await page.keyboard.press("Escape");
   await expect(cedar).toBeFocused();
-  await work.getByRole("button", { name: "More actions for Work" }).click();
+  await clickSidebarHeadingAction(
+    work.getByRole("button", { name: "More actions for Work" }),
+  );
   await page
     .getByRole("menu", { name: "More actions for Work", exact: true })
     .getByRole("menuitem", { name: "Sort", exact: true })
@@ -1089,9 +1095,9 @@ test("retires Recent failures on A–Z and recovers selected ordering on retry",
   const alphaOrder = await order();
   const menu = page.getByRole("menu", { name: "Sort Team", exact: true });
   async function openSort() {
-    await channels
-      .getByRole("button", { name: "More actions for Team" })
-      .click();
+    await clickSidebarHeadingAction(
+      channels.getByRole("button", { name: "More actions for Team" }),
+    );
     await page
       .getByRole("menu", { name: "More actions for Team", exact: true })
       .getByRole("menuitem", { name: "Sort", exact: true })
@@ -1331,9 +1337,9 @@ test.describe("sorting with lifecycle visibility", () => {
     await expect(archiveNotice).toBeVisible();
     await expect(composer).toHaveCount(0);
     // Opening Sort proves saved preference decoding and sidebar startup settled.
-    await channels
-      .getByRole("button", { name: "More actions for Team" })
-      .click();
+    await clickSidebarHeadingAction(
+      channels.getByRole("button", { name: "More actions for Team" }),
+    );
     await page
       .getByRole("menu", { name: "More actions for Team", exact: true })
       .getByRole("menuitem", { name: "Sort", exact: true })

@@ -3,7 +3,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { createElement, useEffect, type ReactNode } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { MessageEditScope, useMessageEditScope } from "./MessageEditScope";
-import { readingPositioned, useReading } from "./use-reading";
+import { ReadingCovers, readingPositioned, useReading } from "./use-reading";
 import type { RelaySession } from "../relay/session";
 
 afterEach(() => {
@@ -32,6 +32,8 @@ function setup({
   enabled = true,
   concealed = false,
   focus = "element" as "element" | "composer" | "parent" | "outside" | "header",
+  trailing = undefined as (() => number | undefined) | undefined,
+  covers = (() => []) as () => readonly DOMRect[],
 } = {}) {
   vi.useFakeTimers();
   vi.spyOn(document, "hasFocus").mockReturnValue(focused);
@@ -130,6 +132,7 @@ function setup({
       catchUpMessageId,
       rootId,
       enabled,
+      trailing,
     },
     reactStrictMode: strict,
     wrapper: ({ children }: { children: ReactNode }) =>
@@ -141,7 +144,7 @@ function setup({
           MessageEditScope,
           null,
           createElement(Composer, { input: composer }),
-          children,
+          createElement(ReadingCovers, { value: covers }, children),
         ),
       ),
   });
@@ -205,6 +208,7 @@ function setup({
         catchUpMessageId,
         rootId,
         enabled,
+        trailing,
       }),
     setLatest: (id: string) =>
       view.rerender({
@@ -216,6 +220,7 @@ function setup({
         catchUpMessageId,
         rootId,
         enabled,
+        trailing,
       }),
     unmount: view.unmount,
   };
@@ -720,6 +725,21 @@ it("a new latest message keeps observation and catches up after its row is measu
     undefined,
   );
 });
+it("a folded preview of the latest message catches up without being observed as read", async () => {
+  const h = setup({ latestMessageId: "folded" });
+  const preview = row("preview", 100, 200);
+  delete preview.dataset.messageId;
+  preview.dataset.previewMessageId = "folded";
+  h.setRows([row("visible", 0, 100), preview]);
+  h.mutation();
+  vi.advanceTimersToNextFrame();
+  await vi.advanceTimersByTimeAsync(300);
+  expect(h.dwelled()?.observe).toHaveBeenCalledExactlyOnceWith(["visible"]);
+  expect(h.dwelled()?.catchUp).toHaveBeenCalledExactlyOnceWith(
+    "folded",
+    undefined,
+  );
+});
 it("a historical viewport or a bottom reached only at dwell end cannot catch up", async () => {
   const h = setup({ latestMessageId: "visible" });
   vi.spyOn(h.element, "scrollHeight", "get").mockReturnValue(1000);
@@ -739,6 +759,51 @@ it("a historical viewport or a bottom reached only at dwell end cannot catch up"
   );
 });
 
+it("rows under trailing content are covered, not read", () => {
+  const h = setup({ trailing: () => 300 });
+  h.setRows([row("visible", 100, 200), row("covered", 250, 350)]);
+  h.mutation();
+  vi.advanceTimersToNextFrame();
+  vi.advanceTimersByTime(300);
+  expect(h.dwelled()?.observe).toHaveBeenCalledExactlyOnceWith(["visible"]);
+});
+it.each([
+  [300, true],
+  [250, false],
+])(
+  "the latest row catches up only above trailing content's top (top=%i)",
+  async (top, caught) => {
+    const h = setup({ latestMessageId: "latest", trailing: () => top });
+    h.setRows([row("latest", 200, 290)]);
+    h.mutation();
+    vi.advanceTimersToNextFrame();
+    await vi.advanceTimersByTimeAsync(300);
+    if (caught)
+      expect(h.dwelled()?.catchUp).toHaveBeenCalledExactlyOnceWith(
+        "latest",
+        undefined,
+      );
+    else expect(h.dwelled()?.catchUp).not.toHaveBeenCalled();
+  },
+);
+
+it("rows under a floating overlay are not read until it closes and dwell wakes", () => {
+  let boxes = [new DOMRect(300, 220, 200, 200)];
+  const h = setup({ latestMessageId: "covered", covers: () => boxes });
+  h.setRows([row("visible", 100, 200), row("covered", 250, 350)]);
+  h.mutation();
+  vi.advanceTimersToNextFrame();
+  vi.advanceTimersByTime(300);
+  expect(h.dwelled()?.observe).toHaveBeenCalledExactlyOnceWith(["visible"]);
+  expect(h.dwelled()?.catchUp).not.toHaveBeenCalled();
+  boxes = [];
+  readingPositioned(h.element);
+  vi.advanceTimersByTime(300);
+  expect(h.dwelled()?.catchUp).toHaveBeenCalledExactlyOnceWith(
+    "covered",
+    undefined,
+  );
+});
 it("settled notification starts dwell without changed rows, focus or geometry", () => {
   const h = setup({ focus: "header", settled: false });
   vi.advanceTimersByTime(300);

@@ -36,6 +36,7 @@ import {
 } from "./mention-draft";
 import { messageLinkParts } from "./message-link-parts";
 import { setMessageAutocorrectPreference } from "./autocorrect-preference";
+import { setMarkdownAsTypedPreference } from "./markdown-input-preference";
 import { profileMentionParts } from "./profile-mentions";
 import {
   serializeNode,
@@ -186,7 +187,7 @@ it("keeps exactly one typed colon when the conversion exceeds the limit", () => 
   act(() =>
     expect(
       h.input.insertText("too long", undefined, { start: 0, end: 2 }, ":"),
-    ).toBe(true),
+    ).toBe("typed"),
   );
   expect(h.input).toHaveValue(":x:");
   expect([h.input.selectionStart, h.input.selectionEnd]).toEqual([3, 3]);
@@ -582,6 +583,41 @@ it("converts typed **Hello** on the closing delimiter, keeps later typing plain 
   act(() => h.input.reset(saved));
   expect(h.input.querySelector("strong")).toHaveTextContent("Hello");
   expect(h.markdown()).toBe("**Hello**");
+});
+
+it("keeps typed Markdown as literal source while this device opts out of conversion, live", async () => {
+  try {
+    act(() => setMarkdownAsTypedPreference(true));
+    const h = mount();
+    await h.user.keyboard("`x` ~~y~~{Enter}- one{Enter}> q{Enter}```");
+    expect(h.input.querySelector("code, s, ul, blockquote, pre")).toBeNull();
+    expect(h.markdown()).toBe("`x` ~~y~~\n- one\n> q\n```");
+    // Formatting shortcuts do nothing, as the toolbar is hidden.
+    for (const key of ["b", "i"])
+      expect(fireEvent.keyDown(h.input, { key, ctrlKey: true })).toBe(false);
+    // The link chord isn't consumed, so app shortcuts such as Search still get it.
+    expect(fireEvent.keyDown(h.input, { key: "k", ctrlKey: true })).toBe(true);
+    await h.user.keyboard("z");
+    expect(h.input.querySelector("strong, em")).toBeNull();
+    expect(h.markdown()).toBe("`x` ~~y~~\n- one\n> q\n```z");
+    // The unclosed literal fence would make later lines code; start over.
+    act(() => h.input.reset(mentionDraft("")));
+    await h.user.keyboard("**Hello**");
+    expect(h.input.querySelector("strong")).toBeNull();
+    expect(h.markdown()).toBe("**Hello**");
+    act(() => setMarkdownAsTypedPreference(false));
+    await h.user.keyboard(" **on**");
+    expect(h.input.querySelector("strong")).toHaveTextContent("on");
+    expect(h.markdown()).toBe("**Hello** **on**");
+    // A saved draft restores its literal source literal and its marks marked.
+    const saved = JSON.parse(JSON.stringify(h.draft()));
+    act(() => h.input.reset(saved));
+    expect(h.input.querySelectorAll("strong")).toHaveLength(1);
+    expect(h.markdown()).toBe("**Hello** **on**");
+  } finally {
+    act(() => setMarkdownAsTypedPreference(false));
+    localStorage.removeItem("buzz-message-markdown-as-typed.v1");
+  }
 });
 
 it("one undo after a typed code span restores the closing backtick too", async () => {

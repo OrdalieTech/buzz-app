@@ -127,18 +127,8 @@ const pages = [
   }),
   createRoute({
     getParentRoute: () => design,
-    path: "maintaining",
-    component: () => <SystemDocumentPage document="maintaining" />,
-  }),
-  createRoute({
-    getParentRoute: () => design,
     path: "design-guide",
     component: () => <SystemDocumentPage document="design" />,
-  }),
-  createRoute({
-    getParentRoute: () => design,
-    path: "agents-guide",
-    component: () => <SystemDocumentPage document="agents" />,
   }),
 ];
 if (!window.location.hash || window.location.hash === "#/") {

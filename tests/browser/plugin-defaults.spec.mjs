@@ -33,6 +33,7 @@ test("cold app startup pins fresh defaults and activates opt-in Bestie setup", a
     "buzz.reminders": false,
     "buzz.workflows": false,
     "buzz.bestie": true,
+    "com.squareup.docs": false,
   });
   // Add the account only after first-run defaults are durable. This exercises
   // real plugin activation after community setup without pre-seeding preferences.
@@ -51,6 +52,7 @@ test("cold app startup pins fresh defaults and activates opt-in Bestie setup", a
     "buzz.reminders": false,
     "buzz.workflows": false,
     "buzz.bestie": true,
+    "com.squareup.docs": false,
   });
   await openPage(fresh, "Messages");
   const destination = fresh
@@ -69,7 +71,7 @@ test("cold app startup pins fresh defaults and activates opt-in Bestie setup", a
 
 // Exercise the client-record heuristic before any plugin settings exist,
 // without the shared page's init script manufacturing explicit preferences.
-test("an untouched client profile keeps its previous plugin defaults across reopen", async ({
+test("an untouched client profile keeps its defaults and can opt in to Docs", async ({
   context,
   app,
 }) => {
@@ -112,9 +114,26 @@ test("an untouched client profile keeps its previous plugin defaults across reop
       "buzz.reminders": true,
       "buzz.workflows": true,
       "buzz.bestie": false,
+      "com.squareup.docs": false,
     });
     await closeSettings(upgraded);
   }
+  const docs = upgraded
+    .getByRole("navigation", { name: "Apps dock" })
+    .getByRole("tab", { name: "Docs", exact: true });
+  await expect(docs).toHaveCount(0);
+  await plugins(upgraded);
+  const action = pluginAction(upgraded, "Docs");
+  await expect(action).toHaveAccessibleName("Enable Docs");
+  await action.click();
+  await expect(action).toHaveAccessibleName("Disable Docs");
+  await upgraded.reload();
+  await expect(action).toHaveAccessibleName("Disable Docs");
+  await closeSettings(upgraded);
+  await docs.click();
+  await expect(
+    upgraded.getByRole("region", { name: "Docs", exact: true }),
+  ).toBeVisible();
 });
 
 // The shared fixture has partial settings and models an existing installation.

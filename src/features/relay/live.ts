@@ -1627,6 +1627,8 @@ export function subscribeRelayTraffic(
       authenticated &&
       typeof data[1] === "string" &&
       (wires.has(data[1]) || syncWires.has(data[1]));
+    const deliver = (event: VerifiedEvent, provenance: LiveProvenance) =>
+      callbacks.receive([event], provenance);
     const drain = async () => {
       const native = verify.native;
       if (!native) return;
@@ -1651,12 +1653,55 @@ export function subscribeRelayTraffic(
           const events = new Map(
             [...prepared.keys()].map((data, index) => [data, checked[index]]),
           );
-          // Keep the batch in the queue through callbacks: a callback can close
-          // the connection, and its resume must include any undelivered frames.
+          let eventsToDeliver: VerifiedEvent[] = [];
+          let provenance: LiveProvenance | undefined;
+          let previousWire: unknown;
+          let previousChannel: string | undefined;
+          let previousTyping = false;
+          const collect: typeof deliver = (event, source) => {
+            provenance ??= source;
+            eventsToDeliver.push(event);
+          };
+          const flush = () => {
+            if (eventsToDeliver.length)
+              callbacks.receive(eventsToDeliver, provenance);
+            eventsToDeliver = [];
+            provenance = undefined;
+          };
+          // Keep the slice queued through delivery so a callback that closes
+          // the connection cannot move the resume cursor past pending frames.
           for (const frame of batch) {
+            const { data } = frame;
+            const checked = events.get(data);
+            const wire = data[1] as string;
+            // Chat and typing need no target evidence from the same batch.
+            // Keep their order relative to each other, and flush before any
+            // other frame can change routing or call into the session.
+            const typing = checked?.kind === 20002;
+            const homes =
+              checked &&
+              (typing || [9, 40002, 40008].includes(checked.kind)) &&
+              !syncWires.has(wire)
+                ? checked.tags.filter(([name]) => name === "h")
+                : [];
+            const channel = homes.length === 1 ? homes[0]?.[1] : undefined;
+            if (
+              !channel ||
+              wire !== previousWire ||
+              channel !== previousChannel ||
+              typing !== previousTyping
+            )
+              flush();
             if (!valid()) return;
-            receive(frame.data, events.get(frame.data));
-            if (!valid()) return;
+            previousWire = wire;
+            previousChannel = channel;
+            previousTyping = typing;
+            receive(data, checked, channel ? collect : deliver);
+          }
+          if (!valid()) return;
+          flush();
+          if (!valid()) return;
+          for (const frame of batch) {
             incoming.shift();
             incomingBytes -= frame.bytes;
             pendingSince = incoming[0]?.receivedAt;
@@ -1817,7 +1862,11 @@ export function subscribeRelayTraffic(
         if (!draining) void drain();
       });
     };
-    function receive(data: unknown[], checked?: RelayEvent) {
+    function receive(
+      data: unknown[],
+      checked?: RelayEvent,
+      deliverEvent = deliver,
+    ) {
       if (!valid()) return;
       const sync =
         typeof data[1] === "string" ? syncWires.get(data[1]) : undefined;
@@ -1878,7 +1927,7 @@ export function subscribeRelayTraffic(
         const destination =
           tags.length === 1
             ? tags[0]?.[1]
-            : !tags.length && [39000, 39002].includes(incoming.kind)
+            : !tags.length && [39000, 39002, 30623].includes(incoming.kind)
               ? incoming.tags.find(([name]) => name === "d")?.[1]
               : undefined;
         const channelId =
@@ -1937,10 +1986,11 @@ export function subscribeRelayTraffic(
             }
           // A reply or a deletion changes a thread summary, which the relay
           // never stores, so no replay carries it.
+          // A pin list (30623) names pins, not replies; its store reads it
+          // again on catch-up.
           else if (
-            targets.length ||
-            incoming.kind === 5 ||
-            incoming.kind === 9005
+            incoming.kind !== 30623 &&
+            (targets.length || incoming.kind === 5 || incoming.kind === 9005)
           )
             owesRepair(route, owners);
         }
@@ -1968,8 +2018,8 @@ export function subscribeRelayTraffic(
           )
             callbacks.telemetry?.(incoming, observer);
         } else if (incoming.kind !== OBSERVER_KIND) {
-          callbacks.receive(
-            [incoming],
+          deliverEvent(
+            incoming,
             Object.freeze({
               phase: replaying ? "replay" : "live",
               ...(channelId

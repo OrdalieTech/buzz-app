@@ -317,6 +317,7 @@ it("delivers every captured frame through the real seat during a slow bridge sen
         ],
       }),
       subscribe,
+      reserveVoice: () => () => {},
       types: () => [
         {
           key: "codex",

@@ -1,6 +1,6 @@
 import type { Navigation } from "../../features/navigation/controller";
 import { retainTabVisits } from "../../features/messages/tab-visit-lifetime";
-import { threadPlacementPreference } from "../../features/messages/thread-preferences";
+import { threadTabPane } from "../../features/messages/thread-preferences";
 import {
   useCallback,
   useLayoutEffect,
@@ -522,8 +522,7 @@ export function channelTabs(session: RelaySession, navigation?: Navigation) {
         return false;
       store.update(keyOf("messages", channelId), (state) => {
         // Solo chats have no main tab workspace.
-        const pane =
-          channel.channelType === "solo" ? "side" : threadPlacementPreference();
+        const pane = channel.channelType === "solo" ? "side" : threadTabPane();
         const opened = withThread(
           state,
           channelId,
@@ -640,7 +639,7 @@ export function useChannelTabState(
       messageId: string,
       rootId: string,
       intent?: ThreadIntent,
-      pane: TabPane = threadPlacementPreference(),
+      pane: TabPane = threadTabPane(),
       unreadSince?: number,
     ) =>
       update((state) =>
@@ -701,7 +700,10 @@ export function useChannelTabState(
     [update],
   );
   // Apply one history visit once. Thread visits select their thread; other
-  // visits restore the tabs they last had. Nothing is ever closed.
+  // visits restore the tabs they last had. Nothing is ever closed. A layer
+  // read over a thread tab the visit doesn't name selects that `host` last,
+  // in the pane it is in, reopening it if gone. The host is never recorded
+  // as the visit's thread, so closing its tab retires no visit.
   const enterVisit = useCallback(
     (
       visit: string,
@@ -714,6 +716,7 @@ export function useChannelTabState(
       /** A new visit keeps the current selection instead of the conversation. */
       keep = false,
       detail?: { channelId: string; target: string },
+      host?: { channelId: string; messageId: string; rootId: string },
     ) =>
       update((state) => {
         if (state.visit === visit) return state;
@@ -751,23 +754,33 @@ export function useChannelTabState(
                 }
               : state.routedVisits,
         };
-        if (thread)
-          return withThread(
-            next,
-            thread.channelId,
-            thread.messageId,
-            thread.rootId,
-            "select",
-            thread.pane ?? threadPlacementPreference(),
-            false,
-            !!detail && thread.pane === "main",
-          );
         const saved = visits?.[visit];
-        return saved
-          ? { ...next, ...saved }
-          : keep
-            ? next
-            : { ...next, mainSelected: undefined };
+        const entered = thread
+          ? withThread(
+              next,
+              thread.channelId,
+              thread.messageId,
+              thread.rootId,
+              "select",
+              thread.pane ?? threadTabPane(),
+              false,
+              !!detail && thread.pane === "main",
+            )
+          : saved
+            ? { ...next, ...saved }
+            : keep || host
+              ? next
+              : { ...next, mainSelected: undefined };
+        return host
+          ? withThread(
+              entered,
+              host.channelId,
+              host.messageId,
+              host.rootId,
+              "select",
+              threadTabPane(),
+            )
+          : entered;
       }),
     [update],
   );
@@ -1002,6 +1015,18 @@ export function useChannelTabState(
     (paneOpen: boolean) => update((s) => ({ ...s, paneOpen })),
     [update],
   );
+  // Select an open thread's tab in the pane it is in, asking nothing of it.
+  const selectThread = useCallback(
+    (channelId: string, rootId: string) =>
+      update((s) => {
+        const tab = threadTab(s.tabs, channelId, rootId);
+        if (!tab) return s;
+        return tabPane(tab) === "main"
+          ? { ...s, mainSelected: tab.id }
+          : { ...s, selected: tab.id, paneOpen: true };
+      }),
+    [update],
+  );
   // Only visits whose address selected this thread are retired. A channel
   // visit that happened to keep its tab visible remains a real destination.
   const threadVisits = useCallback(
@@ -1082,6 +1107,7 @@ export function useChannelTabState(
       setThread,
       setSettings,
       setPaneOpen,
+      selectThread,
       setSidePanel,
       setSideDrawer,
       renameTab,
@@ -1107,6 +1133,7 @@ export function useChannelTabState(
       setThread,
       setSettings,
       setPaneOpen,
+      selectThread,
       setSidePanel,
       setSideDrawer,
       renameTab,

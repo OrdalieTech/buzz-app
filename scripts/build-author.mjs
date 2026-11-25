@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 const root = new URL("../", import.meta.url);
 // Tests can generate independent artifacts concurrently without racing dist-author.
 const out = process.argv[2]
@@ -23,12 +23,18 @@ const result = spawnSync(
 if (result.status !== 0) process.exit(result.status ?? 1);
 const pkg = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
 await mkdir(out, { recursive: true });
+await Promise.all(
+  ["LICENSE", "NOTICE.md"].map((file) =>
+    copyFile(new URL(file, root), new URL(file, out)),
+  ),
+);
 await writeFile(
   new URL("package.json", out),
   `${JSON.stringify(
     {
       name: "@buzz/author",
-      version: "0.0.0-preview.1",
+      version: "0.0.0-preview.2",
+      license: "Apache-2.0",
       private: true,
       type: "module",
       types: "types/plugins/author.d.ts",

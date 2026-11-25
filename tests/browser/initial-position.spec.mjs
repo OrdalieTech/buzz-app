@@ -7,6 +7,7 @@ import {
   settle,
   anchor,
   expectAnchor,
+  readAhead,
 } from "./timeline.mjs";
 
 test.use({
@@ -258,12 +259,14 @@ activityHead(
       );
     app.append("primary", "alpha", "Latest public message", false);
     const latest = history(page).getByText("Latest public message");
-    const filled = async (visit) => {
+    const filled = async (visit, ahead = true) => {
       await expect
         .poll(() =>
           history(page).evaluate((e) => e.scrollHeight - e.clientHeight),
         )
         .toBeGreaterThan(0);
+      // The settled reader reads on to the prefetch distance.
+      if (ahead) await readAhead(page, app);
       await bottom(page, app, `${visit} filled activity head`);
       await expect(latest).toBeInViewport();
       expect(
@@ -272,7 +275,7 @@ activityHead(
       ).toHaveLength(0);
     };
     for (const visit of ["cold", "reloaded"]) {
-      if (visit === "cold") await open(page, app);
+      if (visit === "cold") await open(page, app, { hold: true });
       else {
         await page.reload();
         await openPage(page, "Messages");
@@ -294,7 +297,7 @@ activityHead(
       // A return in the same session keeps the filled rows: no page is reread.
       await select(page, "Beta");
       await select(page, "Alpha");
-      await filled(`${visit} returned`);
+      await filled(`${visit} returned`, false);
     }
   },
 );

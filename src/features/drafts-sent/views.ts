@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { startTransition, useEffect, useRef, useState } from "react";
 import type { ReadFilter } from "../../features/relay/events";
 import type { RelaySession } from "../../features/relay/session";
 import {
@@ -171,14 +171,17 @@ export function useActivity(
           events.push(...(known.get(k)?.events ?? list));
         }
       });
-      setState({
-        events,
-        ready: new Map(
-          [...known]
-            .filter(([k]) => covered.has(k))
-            .map(([k, { floor }]) => [k, floor]),
-        ),
-      });
+      // Statuses follow the conversations; typing in the open preview comes first.
+      startTransition(() =>
+        setState({
+          events,
+          ready: new Map(
+            [...known]
+              .filter(([k]) => covered.has(k))
+              .map(([k, { floor }]) => [k, floor]),
+          ),
+        }),
+      );
     };
     const stops = views.map((view) => view?.subscribe(update));
     update();
@@ -210,6 +213,7 @@ const close = (read: Read) => {
 export function useDeletions(session: RelaySession, ids: readonly string[]) {
   const key = ids.slice(0, DELETION_IDS).join(",");
   const [deletions, setDeletions] = useState<readonly ReadEvent[]>([]);
+  const shown = useRef(deletions);
   const reads = useRef<{
     session?: RelaySession;
     views: Read[];
@@ -228,7 +232,14 @@ export function useDeletions(session: RelaySession, ids: readonly string[]) {
         for (const event of view?.snapshot().events ?? [])
           if (DELETION_KINDS.includes(event.kind))
             state.kept.set(event.id, event);
-      setDeletions([...state.kept.values()]);
+      // Views report every load and every new target; only a change re-renders.
+      if (
+        shown.current.length === state.kept.size &&
+        shown.current.every((event) => state.kept.get(event.id) === event)
+      )
+        return;
+      shown.current = [...state.kept.values()];
+      setDeletions(shown.current);
     };
     const open = (filters: ReadFilter[]): Read => {
       const read: Read = {

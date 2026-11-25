@@ -5,6 +5,7 @@ import { notesOf } from "./plugin-notes";
 import { retryRead } from "../relay/read-retry";
 import type { EventData, RelayEvent } from "../relay/events";
 import { type SettingsSchema, syncedSettings } from "./agent-config";
+import { routedSettings } from "./synced-route";
 import {
   ARTIFACT_KIND,
   artifactOp,
@@ -252,8 +253,14 @@ export type FieldChange = Readonly<{
 
 /** Settings fields that differ between two `buzz.agent.settings` revisions. */
 export function settingsDiff(before: string, after: string): FieldChange[] {
-  const fields = (content: string) =>
-    (parse(content)?.settings ?? {}) as Record<string, unknown>;
+  // A route shows as the model it is in a config.
+  const fields = (content: string) => {
+    const body = parse(content) ?? {};
+    return routedSettings(
+      body,
+      (body.settings ?? {}) as Record<string, string>,
+    ) as Record<string, unknown>;
+  };
   const a = fields(before);
   const b = fields(after);
   return [...new Set([...Object.keys(a), ...Object.keys(b)])]

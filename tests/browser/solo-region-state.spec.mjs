@@ -73,7 +73,9 @@ test.describe("disabled plugin chat fallback", () => {
     app,
   }) => {
     await page.clock.install();
-    await page.goto(`${app.origin}/?solo-region-fixture`);
+    await page.goto(
+      `${app.origin}/?solo-region-fixture&wrap-conversation-actions`,
+    );
     await newChat(page);
     await page.evaluate(async (id) => {
       await window.fixtureSoloRegion.createWorkspace();
@@ -87,6 +89,18 @@ test.describe("disabled plugin chat fallback", () => {
     );
     await expect(ordinary).toHaveCount(0);
     await expect(region).toHaveCount(1);
+    const regionActions = sidebar.getByRole("button", {
+      name: "Actions for Alpha",
+    });
+    await region.hover();
+    await expect(regionActions).toHaveCSS("opacity", "0");
+    await regionActions.hover();
+    await expect(regionActions).toHaveCSS("opacity", "1");
+    await regionActions.click();
+    await expect(
+      page.getByRole("menu", { name: "Actions for Alpha" }),
+    ).toBeVisible();
+    await page.keyboard.press("Escape");
     await sidebar.getByRole("button", { name: "Alpha", exact: true }).click();
 
     const history = page.getByRole("region", {

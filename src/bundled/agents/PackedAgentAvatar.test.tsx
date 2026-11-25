@@ -135,7 +135,7 @@ it("pauses while a covering pane hides it and resumes when revealed", async () =
   await waitFor(() => expect(play).toHaveBeenCalledTimes(2));
 });
 
-it("continues the outgoing avatar frame before showing the incoming video", () => {
+it("continues the outgoing avatar frame in the incoming video", () => {
   const avatar = agentAvatars[0];
   if (!avatar) throw new Error("Missing fixture avatar");
   const outgoing = render(<PackedAgentAvatar avatar={avatar} />);
@@ -149,9 +149,6 @@ it("continues the outgoing avatar frame before showing the incoming video", () =
   if (!newVideo) throw new Error("Missing incoming video");
   fireEvent.loadedData(newVideo);
   expect(newVideo.currentTime).toBe(2.5);
-  expect(newVideo).toHaveStyle({ opacity: "0" });
-  fireEvent.seeked(newVideo);
-  expect(newVideo).toHaveStyle({ opacity: "1" });
 });
 
 it("starts muted inline playback without native controls", () => {

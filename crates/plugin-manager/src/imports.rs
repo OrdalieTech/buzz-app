@@ -2066,6 +2066,23 @@ mod tests {
             commit: None,
         }));
         assert_eq!(next.update_source, git_source);
+        // Changing the tracked branch with identical code must persist without
+        // replacing the real rollback target or changing the enabled state.
+        git.git_source.as_mut().unwrap().reference = "release/two".into();
+        let same = git.install(&manager, &git.preview.token, "dist").unwrap();
+        let same = same
+            .plugins
+            .iter()
+            .find(|p| p.manifest.id == "example.remembered")
+            .unwrap();
+        assert_eq!(same.revision, next.revision);
+        assert_eq!(same.previous, next.previous);
+        assert_eq!(same.enabled, next.enabled);
+        let git_source = Some(InstallSource::Git(GitSource {
+            path: "dist".into(),
+            ..git.git_source.clone().unwrap()
+        }));
+        assert_eq!(same.update_source, git_source);
         let reopened = Manager::open(Some(home.path().into()), "test", false).unwrap();
         let catalog = reopened.catalog().unwrap();
         assert_eq!(

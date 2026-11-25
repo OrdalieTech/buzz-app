@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { createRelayReader } from "./reader";
+import { ACTIVE_READS, createRelayReader } from "./reader";
 import { flush, scriptedTransport } from "./testing";
 
 const owners: ReturnType<typeof createRelayReader>[] = [];
@@ -174,17 +174,18 @@ it("preserves ordered bridge extensions and distinguishes their request identity
 it("fresh reads retain scheduler bounds but never join older or simultaneous equal work", async () => {
   const h = setup();
   const old = h.read(filter("c"));
-  const one = h.read(filter("c"), { fresh: true });
-  const two = h.read(filter("c"), { fresh: true });
-  const three = h.read(filter("c"), { fresh: true });
-  expect(h.pending).toHaveLength(3);
+  const fresh = Array.from({ length: ACTIVE_READS }, () =>
+    h.read(filter("c"), { fresh: true }),
+  );
+  expect(h.pending).toHaveLength(ACTIVE_READS);
   h.next().respond([]);
   await flush();
-  expect(h.pending).toHaveLength(3);
-  h.next().respond([]);
-  h.next().respond([]);
-  h.next().respond([]);
-  await Promise.all([old, one, two, three]);
+  expect(h.pending).toHaveLength(ACTIVE_READS);
+  while (h.pending.length) {
+    h.next().respond([]);
+    await flush();
+  }
+  await Promise.all([old, ...fresh]);
 });
 
 /** Real owner wiring; tests dispatch lifecycle events, never toggle a private gate. */

@@ -366,6 +366,17 @@ it("lets multiple people form a group destination", async () => {
 it("forwards a snapshot and note through the chosen person's DM and retires the completed dialog", async () => {
   const user = userEvent.setup();
   const { navigation, directMessages, messages, outbox, operations } = setup();
+  // An inline avatar must not reach the outbox's 64 KiB recovery budget.
+  directMessages.people.mockResolvedValue({
+    people: [
+      {
+        pubkey: recipient,
+        name: "Avery Chen",
+        picture: `data:image/png;base64,${"A".repeat(70_000)}`,
+      },
+    ],
+    hasMore: false,
+  });
   await choose(user);
   expect(
     screen.getByRole("combobox", { name: "Message recipients" }),
@@ -521,11 +532,27 @@ it("keeps an uncertain send locked and retries its exact event without another D
   directMessages.delivered.mockRejectedValueOnce(
     new Error("Delivery could not be confirmed"),
   );
+  directMessages.people.mockResolvedValue({
+    people: [
+      {
+        pubkey: recipient,
+        name: "Avery Chen",
+        picture: "https://media.example/avery.png",
+      },
+    ],
+    hasMore: false,
+  });
   await choose(user);
   await user.click(
     screen.getByRole("button", { name: "Forward to Avery Chen" }),
   );
   const retry = await screen.findByRole("button", { name: "Retry forward" });
+  // The saved operation is trimmed; the open dialog keeps the picked avatar.
+  expect(
+    screen
+      .getByRole("dialog", { name: "Forward message" })
+      .querySelector('img[src="https://media.example/avery.png"]'),
+  ).not.toBeNull();
   expect(
     screen.getByRole("textbox", { name: "Note (optional)" }),
   ).toBeDisabled();
@@ -1028,6 +1055,10 @@ it("offers only writable channels and forwards there without opening a DM", asyn
     name: "design",
     channelType: "stream",
     private: true,
+    // A large roster must not reach the outbox's 64 KiB recovery budget.
+    members: Array.from({ length: 1200 }, (_, index) =>
+      index.toString(16).padStart(64, "0"),
+    ),
   } as ChannelSummary;
   channels.channels.push(
     channel,
@@ -1058,6 +1089,9 @@ it("offers only writable channels and forwards there without opening a DM", asyn
   await user.click(submit);
   await waitFor(() => expect(messages.forward).toHaveBeenCalledOnce());
   expect(messages.forward.mock.calls[0]?.[0]).toBe(destination);
+  expect(
+    JSON.parse(messages.forward.mock.calls[0]?.[4]?.value ?? "").channel,
+  ).toEqual({ id: destination, name: "design", private: true });
   expect(directMessages.open).not.toHaveBeenCalled();
   await screen.findByText("Message forwarded to #design");
 });

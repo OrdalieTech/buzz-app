@@ -62,7 +62,26 @@ export function apply(ctx) {
           checked: alerts,
           onCheckedChange: setAlerts,
         }),
-        h(ui.Button, { variant: "prominent", onClick: edit }, "Edit name"),
+        h(
+          "div",
+          { style: { display: "flex", gap: "var(--space-2)" } },
+          h(ui.Button, { variant: "prominent", onClick: edit }, "Edit name"),
+          // Newer hosts only; the Edit button still works without it.
+          ui.Menu &&
+            h(ui.Menu, {
+              "aria-label": "Name actions",
+              items: [
+                { label: "Edit name", onSelect: edit },
+                { label: "Use “Ada”", onSelect: () => setName("Ada") },
+                {
+                  label: "Clear name",
+                  tone: "destructive",
+                  disabled: !name,
+                  onSelect: () => setName(""),
+                },
+              ],
+            }),
+        ),
         h(
           ui.Dialog,
           {

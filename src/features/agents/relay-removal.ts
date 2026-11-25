@@ -108,8 +108,7 @@ export type AgentRecordEntry = Readonly<{
  * before it, and resolves with what it wrote once the relay accepts it.
  * Another desktop applies the record whole to an agent it has with that key,
  * and its parser requires `parallelism` and `respond_to`, so the record keeps
- * every setting of the one it replaces and defaults those two
- * (docs/relay-queries.md, "Managed-agent registration"). */
+ * every setting of the one it replaces and defaults those two. */
 export async function publishAgentRecord(
   session: Pick<RelaySession, "outbox">,
   { pubkey, name, picture, runtime, prior }: AgentRecordEntry,

@@ -35,6 +35,18 @@ export type JoinPresentation = Readonly<{
   visit: string;
   community?: string;
 }>;
+/** A dialog on top of a view; see `layer` on a conversation target. */
+export type ViewLayer = Readonly<
+  (
+    | { messageId: string; target?: undefined; threadId?: undefined }
+    | {
+        target: string;
+        threadId?: string;
+        messageId?: undefined;
+      }
+  ) & { rootId?: string; channelId?: string }
+>;
+
 export type OpenTarget = Readonly<{ join?: JoinPresentation }> &
   (
     | Readonly<{ version: 1; kind: "home" }>
@@ -89,6 +101,19 @@ export type OpenTarget = Readonly<{ join?: JoinPresentation }> &
         forward?: string;
         /** Read-only content selected beside this conversation; never an action. */
         detail?: Readonly<{ target: string; rootId?: string }>;
+        /** The thread read inline over this conversation's composer: its
+         * root. Presentation only; at most one per conversation. */
+        inline?: string;
+        /** With inline: the reply a link named, which the thread opens at. */
+        inlineMessage?: string;
+        /** The one dialog on top of a view: a details message
+         * (`messageId`) or a panel such as a profile or a pull request
+         * (`target`, opened from a message in `threadId`'s thread). It reads
+         * over the composer of the view it was opened in: the conversation
+         * without `rootId`, the inline thread when `rootId` is `inline`,
+         * otherwise the thread tab with that root, in `channelId` when that
+         * tab belongs to another channel. Read only; one per address. */
+        layer?: ViewLayer;
       }>
   );
 
@@ -98,6 +123,7 @@ const token = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const section = /^[a-z0-9][a-z0-9._-]{0,127}(?:\/[a-z0-9][a-z0-9._-]{0,127})?$/;
 const provider = /^[a-z0-9][a-z0-9._-]{0,127}\/[a-z0-9][a-z0-9._-]{0,127}$/;
 const hex = /^[a-f0-9]{64}$/i;
+const channelPattern = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$/;
 const paramKey = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const gitCommit = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
 const MAX_PARAMS = 16;
@@ -455,6 +481,9 @@ export function parseOpenTarget(input: unknown): OpenTarget {
           "panel",
           "forward",
           "detail",
+          "inline",
+          "inlineMessage",
+          "layer",
         ]);
         if (value.threadRootId !== undefined && value.messageId === undefined)
           throw invalid();
@@ -462,6 +491,8 @@ export function parseOpenTarget(input: unknown): OpenTarget {
           value.context !== undefined &&
           (value.context !== "channel" || value.threadRootId === undefined)
         )
+          throw invalid();
+        if (value.inlineMessage !== undefined && value.inline === undefined)
           throw invalid();
         if (
           value.panel !== undefined &&
@@ -481,14 +512,46 @@ export function parseOpenTarget(input: unknown): OpenTarget {
               : {}),
           });
         }
+        let layer: ViewLayer | undefined;
+        if (value.layer !== undefined) {
+          const input = record(value.layer);
+          fields(input, [
+            "messageId",
+            "target",
+            "threadId",
+            "rootId",
+            "channelId",
+          ]);
+          // Exactly one: a details message or a panel.
+          if ((input.messageId === undefined) === (input.target === undefined))
+            throw invalid();
+          if (input.messageId !== undefined && input.threadId !== undefined)
+            throw invalid();
+          const view = {
+            ...(input.rootId !== undefined
+              ? { rootId: text(input.rootId, hex).toLowerCase() }
+              : {}),
+            ...(input.channelId !== undefined
+              ? { channelId: text(input.channelId, channelPattern) }
+              : {}),
+          };
+          layer = Object.freeze(
+            input.messageId !== undefined
+              ? { messageId: text(input.messageId, hex).toLowerCase(), ...view }
+              : {
+                  target: text(input.target, /^[!-~]{1,4096}$/),
+                  ...(input.threadId !== undefined
+                    ? { threadId: text(input.threadId, hex).toLowerCase() }
+                    : {}),
+                  ...view,
+                },
+          );
+        }
         target = {
           version: 1,
           kind: "conversation",
           scope: boundScope(value.scope),
-          channelId: text(
-            value.channelId,
-            /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$/,
-          ),
+          channelId: text(value.channelId, channelPattern),
           ...(value.messageId !== undefined
             ? { messageId: text(value.messageId, hex).toLowerCase() }
             : {}),
@@ -501,6 +564,13 @@ export function parseOpenTarget(input: unknown): OpenTarget {
             ? { forward: text(value.forward, hex).toLowerCase() }
             : {}),
           ...(detail ? { detail } : {}),
+          ...(value.inline !== undefined
+            ? { inline: text(value.inline, hex).toLowerCase() }
+            : {}),
+          ...(value.inlineMessage !== undefined
+            ? { inlineMessage: text(value.inlineMessage, hex).toLowerCase() }
+            : {}),
+          ...(layer ? { layer } : {}),
         };
         break;
       }

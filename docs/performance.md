@@ -1,438 +1,151 @@
-# Local browser performance runs
+# Performance runs
 
-Run one checkout with a few parameters:
+`pnpm perf` measures how much browser work common actions cost: opening a
+channel, scrolling, opening a thread, and keeping up with background traffic.
+It drives the production app with the [browser test](browser-testing.md)
+fixture, so the backend is modeled and local. It reports numbers; no case
+fails on timing. CI runs every case once as a smoke check, without thresholds,
+and `pnpm test` doesn't run them.
+
+## Run
 
 ```sh
-source bin/activate-hermit
-bin/pnpm test:browser:install # once per pinned browser version
+bin/pnpm test:browser:install   # once per Playwright version
 bin/pnpm perf --scenario channel-open --repeat 5 --cpu 4 --out results.json
 ```
 
-`--scenario all` is the default. A case name runs only that case; a group
-(`channel-open`, `scroll-paging`, `thread`, `thread-scroll` or `background-traffic`) runs every case whose
-name it prefixes, so `scroll-paging-fast` excludes its variants. `--cpu` sets
-Chromium's CPU slowdown factor (1 means unthrottled); it does not throttle network
-or the fixture server. `--browser webkit` runs the `thread-scroll` cases in WebKit
-([Thread scrolling](#thread-scrolling)); every other case is Chromium only.
-`--repeat` defaults to 5. Every sample gets fresh browser storage, signed
-histories and server state; a production frontend build is shared by the worker.
-One worker runs serially with no retries. Required CI runs every case once in
-**Perf suite smoke check**, on its own isolated runner, without timing thresholds. Locally, use `pnpm perf`;
-`pnpm test` / `just scan` do not run these cases.
+- `--scenario`: a case name, or a group that runs every case starting with it
+  (`channel-open`, `scroll-paging`, `thread`, `thread-scroll`,
+  `background-traffic`). Default `all`.
+- `--repeat`: samples per case, default 5. Each sample starts from fresh
+  storage and server state.
+- `--cpu`: Chromium's CPU slowdown factor (1 is unthrottled). It doesn't
+  throttle the network.
+- `--browser webkit`: only for the `thread-scroll` cases. Everything else is
+  Chromium only.
 
-The existing browser fixture owns the production React/services/IndexedDB/Virtua
-app and modeled local HTTP broker. The runner owns settings and measurement
-windows; scenarios own setup, actions and proof that the intended work occurred.
-There is no comparison engine or second checkout. Thread scrolling has advisory
-[targets](channels.md#targets); no case fails on timing.
+Each run writes to a fresh `test-results/perf/run-*` directory, or to `--out`.
+The JSON has every sample and each metric's median, min and max. Only wholly
+passing samples count toward the summary, so check each run's status and
+errors before trusting a number.
 
-## Measurements
+## Cases
 
-The operation runs from immediately before the action until the timeline has
-visible rows and unchanged visible geometry for at least 200ms across at least
-three samples. Each sample reports Chromium `Performance.getMetrics` deltas and
-browser timings, in milliseconds:
+| Case | What it measures |
+| --- | --- |
+| `channel-open-cold` | Clicking a channel never opened or hovered |
+| `channel-open-hover` | The same, after a 150ms hover head start |
+| `channel-open-cold-markdown` | The cold case with Markdown-heavy messages |
+| `scroll-short` | 800px upward within the loaded head of a 120-message channel |
+| `scroll-long` | 12,000px upward through 360 fully loaded messages |
+| `scroll-paging-fast` | Scrolling to the oldest of 640 messages while older pages arrive after 100ms |
+| `scroll-paging-delayed` | The same with 500ms page delays |
+| `scroll-paging-delayed-short` | The delayed case with one- and two-line messages |
+| `scroll-paging-fast-keyboard`, `-markdown`, `-first-seen` | The fast case in keyboard modality, with Markdown messages, or with older pages the app hasn't verified yet |
+| `thread-open-rich`, `-close-rich`, `-reopen-rich` | A 120-reply thread with media, tables and code |
+| `thread-unread-open-60`, `-200` | Opening a thread whose 60 or 200 replies are all unread |
+| `thread-scroll-open`, `-fling`, `-reverse` | The [long-thread workload](#thread-scrolling) |
+| `background-traffic` | Reading one channel while 30 others get a message every 200ms for 30 seconds |
+| `background-traffic-large-sidebar` | The same, with 128 DMs and 1,001 participants |
+
+A case that can't finish its work (paging stalls, or the expected messages
+never arrive) fails instead of reporting a fast time.
+
+## Metrics
 
 | Metric | Meaning |
 | --- | --- |
-| `scriptMs` | `ScriptDuration`: JavaScript execution |
-| `layoutMs` | `LayoutDuration`: layout work |
-| `styleMs` | `RecalcStyleDuration`: style recalculation |
-| `taskMs` | `TaskDuration`: main-thread task time |
-| `durationMs` | Browser wall time through the settling barrier |
-| `loafBlockingMs` | Sum of browser-reported long-animation-frame blocking, from frames overlapping the operation, including settling |
-| `firstRowsMs` | Captured browser click event to visible target rows across two rendering updates |
+| `firstRowsMs` | Click to the target's rows on screen |
+| `durationMs` | Wall time until the timeline's layout stops changing for 200ms |
+| `scriptMs`, `layoutMs`, `styleMs`, `taskMs` | Chromium's JavaScript, layout, style and main-thread task time |
+| `loafBlockingMs` | Long-animation-frame blocking time, from every frame that overlaps the action |
+| `rafP95GapMs`, `rafMaxGapMs`, `rafGapsOver33`, `rafGapsOver50` | Animation-frame spacing during a scroll gesture |
+| `edgeWaitMs` | Paging time spent held at the top edge, waiting for older history |
+| `domGapFrames` | Thread scroll frames with no loaded reply in view |
+| `idleTaskMsPerSec`, `trafficTaskMsPerSec`, `taskMsPerMessage` (and script, style and layout per message) | Background traffic cost |
+| `heapGrowthKBPerMessage`, `nodesDelta`, `listenersDelta` | Background traffic growth, measured after a forced GC |
 
-The first-rows endpoint gives the browser a paint opportunity; it is not a
-compositor screenshot or proof that every pixel finished painting. The settle
-barrier observes row IDs/positions/heights and scroll geometry, not arbitrary
-future async work. A ten-second deadline (30 seconds for thread actions and
-60 seconds for paging through history)
-fails the sample instead of reporting an unfinished operation as a win.
-Counter windows also include measurement
-overhead and protocol dispatch around the action. Measured actions use browser
-input: JavaScript invoked directly through the automation protocol can be absent
-from `ScriptDuration`, even when included in `TaskDuration`. Categories overlap: do not
-sum them or interpret them as CPU percentages. No forced GC is performed.
+The task categories overlap, so don't add them up or read them as CPU
+percentages. Frame gaps show main-thread stalls, not compositor frame rate.
+The browser build verifies signatures in JavaScript, which the desktop app does
+natively, so per-message script time runs higher here.
 
-`loafBlockingMs` uses Chromium's [Long Animation Frames API](https://developer.chrome.com/docs/web-platform/long-animation-frames).
-Its `blockingDuration` accumulates blocking beyond the 50ms task budget, with
-rendering included in the longest task. It is not simply frame duration minus
-50ms, a frame count, or an FPS measure. The observer begins at measurement start;
-unsupported browsers fail explicitly rather than reporting zero. Raw
-`recording.longAnimationFrames` retains intersecting entries as `startMs`
-(relative to recording start), `durationMs` and `blockingDurationMs`.
+## Compare a change
 
-Every frame overlapping the operation contributes its entire blocking duration,
-including a frame that starts before measurement or finishes after the endpoint.
-This avoids reporting zero when a busy opening frame starts just before the
-recording marker. It is frame attribution, not exact clipping: boundary frames
-can include hover/setup work before the marker or work after the endpoint.
-Frames entirely outside the operation do not contribute.
-The API's aggregate cannot be split accurately. After counters stop, collection
-allows two further rendering opportunities and a queued task for late LoAF
-delivery. This bounded drain retains the final frame in our Chromium regression
-probe, but is not a presentation acknowledgement: unusually delayed presentation
-feedback can still omit a trailing entry. The drain is outside the existing
-duration and counter windows. Recorder overhead remains included; no subtraction
-is applied.
-
-`channel-open` measures two independent cases with fresh state:
-
-- `channel-open-cold` clicks a never-opened, never-hovered channel and requires a
-  head read during opening.
-- `channel-open-hover` gives the same unopened channel a 150ms hover head start,
-  then clicks whether preparation is finished or still running. CPU throttling
-  applies during hover too. There is no response-completion or idle wait.
-- `channel-open-cold-markdown` repeats the cold case with the
-  [Markdown corpus](#corpus-variants).
-
-Every case measures click-to-first-rows and browser work during opening plus
-settling. Work completed before the click earns the hover case a head start;
-remaining preparation can contribute to the measured work. Browser-counter
-windows exclude pre-measurement hover work; LoAF totals include whole overlapping
-boundary frames as described above. `work.hoverMs` records the requested lead and raw
-`recording.hoverLeadMs` records the actual browser hover-to-click interval, which
-can exceed 150ms due to browser scheduling and protocol dispatch. Head-read counts
-before and during opening are diagnostic evidence; hover does not require zero
-new reads. Each target has 120 mixed-height text messages; the existing app chooses
-how many it initially loads. The corpus content and timestamps are fixed; signing
-identities are ephemeral.
-
-The hover case replaces `channel-open-prepared`, which waited for a completed head
-response and an idle opportunity. Those older results are a different workload;
-collect a new baseline rather than comparing them as equivalent.
-
-## Scrolling
-
-```sh
-bin/pnpm perf --scenario scroll-short --repeat 5 --cpu 4
-bin/pnpm perf --scenario scroll-long --repeat 5 --cpu 4
-bin/pnpm perf --scenario scroll-paging --repeat 5 --cpu 4
-```
-
-All scroll scenarios use the same observer, counters, fresh contexts and result format:
-
-| Scenario | Workload |
-| --- | --- |
-| `scroll-short` | 800px upward at 1600px/s within the loaded head of a 120-message channel |
-| `scroll-long` | 12,000px upward at 4000px/s across a 360-message channel, fully loaded before measuring |
-| `scroll-paging-fast` | Repeated 2500px upward gestures at 25,000px/s through 640 mixed-height messages, with 100ms added older-response delay, until the oldest message is visible |
-| `scroll-paging-delayed` | The same complete traversal with 500ms added older-response delay |
-| `scroll-paging-fast-keyboard` | `scroll-paging-fast` in keyboard modality |
-| `scroll-paging-fast-markdown` | `scroll-paging-fast` through the [Markdown corpus](#corpus-variants) |
-| `scroll-paging-fast-first-seen` | `scroll-paging-fast` with [first-seen](#corpus-variants) older pages |
-
-The long case loads older pages without traversing them first, so the gesture
-encounters rows the virtualizer has not yet mounted/measured. Setup waits for
-page processing to finish, rejects the history-limit notice, then settles geometry.
-Neither short nor long windows permit older-page reads. They isolate rendering
-from pagination.
-
-Wheel input lands in the timeline gutter, away from message hover. Setup reaches
-Messages through palette arrow keys, which set `html[data-keyboard-navigation]`;
-in that state the app prepares each newly mounted row's full action bar. Every scroll
-case except `scroll-paging-fast-keyboard` therefore ends setup with a real
-pointer press at the gutter point. The press clears keyboard modality and
-focuses the message list, as clicking into a conversation does, so the reading
-observer runs during the gesture. `scroll-paging-fast-keyboard` only moves the
-pointer there, keeping keyboard modality and focus outside the list as after
-palette navigation. Each sample asserts its modality and focus before measuring
-and records `work.modality`. Scroll results recorded before the pointer press
-ran in keyboard modality, like `scroll-paging-fast-keyboard`; rerun baselines
-before comparing them.
-
-The short and long Chromium gestures must produce wheel events, scroll-offset movement
-of at least 80% of the request, multiple visible messages and changed visible IDs.
-Raw frames and work receipts record the requested distance/speed, history size,
-released pages, wheel count and observed rows. `scrollTopRangePx` is the observed
-offset range, including virtualizer corrections; it is not physical input distance.
-
-`--scenario scroll-paging` runs every paging case; so does the default `all`.
-Use a full case name to isolate one. Each case has its own samples and
-summary; the runner never pools their metrics. The same `--cpu` setting applies
-to all. There is no delay parameter or implicit CPU matrix.
-
-Paging cases start with only the head loaded. The modeled HTTP broker adds the named
-delay to each older-page response; there are no page-completion or idle waits
-between gestures. Arrivals compete with scrolling and pending virtualizer
-corrections, the workload behind [the held-range prepend fix](https://github.com/block/buzz-app/pull/1066).
-The existing installed-Virtua tests protect that correction's correctness; these
-scenarios measure its browser cost. They use normal-height text, unlike the
-taller short/long corpus. Fast retains pressure from closely spaced arrivals;
-delayed exercises more waiting while the user keeps scrolling. These are
-repeatable modeled conditions, not production latency percentiles or a guarantee
-that every run hits a particular scheduling race. The delay starts after the
-fixture computes its response; browser queueing, transport and verification add
-to it. `work.olderReleaseDelaysMs` records actual server-side release delays.
-
-Paging measures a complete traversal, not however many pages fit a fixed time:
-input continues until the oldest message is visibly in the viewport, with a
-200-gesture safety bound and a 60-second recording deadline. Those bounds allow
-for the intentional per-page waits in the delayed variant. Successful samples
-require real wheels, multiple older reads, all expected older fixture IDs in
-released responses, and the oldest message still visible after settling. Work receipts record gesture/page counts, unique older rows
-received and the endpoint ID. A stalled traversal fails; it cannot win by doing
-less work. There is no mount-count target or automatic performance verdict.
-
-These variants replace the experimental zero-delay `scroll-paging` workload;
-collect new baselines rather than treating those old results as equivalent.
-
-`rafMaxGapMs`, `rafP95GapMs`, `rafGapsOver33` (gaps longer than two 60 Hz frames
-plus 1ms) and `rafGapsOver50` describe animation-frame callback cadence during the
-gesture. Raw `gestureStartMs` and `gestureEndMs` timestamps
-are relative to the recording start: the first observed wheel event and the
-browser marker after Chromium reports the synthetic gesture complete. For paging,
-that marker follows the last gesture and its visible-oldest check; gaps between
-successive gestures remain inside the cadence window. The end includes the
-marker's protocol dispatch. Gaps are clipped to those boundaries,
-including partial gaps before the first and after the last callback inside the
-window. All callbacks count, including stalls when the scroll offset is unchanged.
-The settling tail after the end marker is excluded from cadence only:
-`scriptMs`, `layoutMs`, `styleMs`, `taskMs`, `durationMs` and `loafBlockingMs` cover scrolling
-plus settling, with the same measurement overhead.
-
-Recordings without these gesture timestamps used whole-operation cadence,
-including the settling tail. Their cadence values are not comparable with the
-new definition; rerun baselines before comparing. That cadence change added no
-summary metrics.
-Callback gaps expose main-thread stalls, not compositor FPS or a measured
-dropped-frame count. No generic blank-time, overlap or visual-shift verdict is
-inferred from them.
-
-## Corpus variants
-
-The default corpus is inert prose: an identifying line plus repeated sentences,
-authored by the viewer. Two opt-in fixture options change one property each, so a
-variant differs from its base case only there.
-
-`markdownMessages` (the `-markdown` cases) ends seven rows in eight with common
-chat content after the same height-varying text: colon prose, a second
-paragraph, a bare URL and a Markdown link, an `@mention` bound to a fixture
-profile, a nested bullet list with inline code and emphasis, a fenced code block,
-or a quote with emphasis and strikethrough. The eighth row stays inert prose.
-Lists are bullets only, because browser helpers find the timeline through its
-single ordered list.
-
-The app verifies each relay event's signature once per connection and reuses that
-proof. Its startup unread read takes the newest 500 events across joined channels,
-so default history reaches the app before measurement, including 480 of the
-620 older paging rows. `firstSeenHistory` (`scroll-paging-fast-first-seen`) adds a
-joined `busy` channel whose 500 newer messages fill that read, as busier channels
-do. Older pages then first reach the app, and are verified, during the measured
-traversal. The fixture records the event IDs of each modeled HTTP query response
-when it computes the response, which for a held older page is before release.
-Paging samples record `work.olderRowsServedBefore`, and the first-seen case
-requires zero. This proves which events arrive first-seen, not when background
-verification of the startup read finishes; setup does not wait for it. The option
-adds 500 fixture signatures to setup and one sidebar row. There is no first-seen
-channel-open case: verifying its one 20-event head page is within that case's
-sample-to-sample variation, and the busy channel also changes unread state
-before the click.
-
-## Rich thread lifecycle
-
-`--scenario thread` measures `thread-open-rich`, `thread-close-rich` and
-`thread-reopen-rich`, plus the [thread scrolling](#thread-scrolling) cases,
-independently with the existing metrics. Each sample starts
-fresh; close and reopen establish their prerequisite open state outside the
-measurement. Normal pointer-triggered panel animations remain enabled.
-
-The signed corpus has 120 replies from twelve participants, including eight
-agents, and eight additional channel threads.
-The auxiliary roots fit in the initial channel page before the measured thread
-and use reply summaries
-without inserting their replies into the top-level history. Initial setup requires
-all eight auxiliary roots and their rendered reply counts. Each phase records
-the actual mounted channel row IDs and checks
-that all eight roots remain mounted at the start of its measured action.
-Channel roots use distinct millisecond ordering from ordinary rows, so fresh
-signing identities cannot change their order or bubble grouping.
-Twenty nested replies remain collapsed as in an ordinary opening; the visible tree mounts 100 direct replies
-plus its root. The mix includes prose, mentions, links, Markdown tables, task
-lists, code, quotes, fifteen image previews and ten video previews. Media uses
-the repository's local image/video assets, not network downloads. Visible images
-must decode, videos must have loaded data and dimensions, and both transitions
-and thread geometry must settle. Offscreen lazy images retain normal loading.
-
-Each measured action also observes the channel through the existing 200ms
-geometry barrier. Close first waits for actual thread DOM removal and the
-channel's original width, then for Virtua's pointer hold to end, settled channel
-geometry and restoration of its reading anchor. Draft setup settles before
-measurement. Close also records channel geometry before/at/after the window and
-fails if another settling check reveals reflow after the endpoint. Every phase
-checks the channel draft, and reopen checks the saved thread draft. These are
-work-completion checks, not new timing counters. The workload covers populated
-thread mounting and panel reflow, not video playback, gallery interaction,
-expanding nested replies or live agent streaming.
-
-`thread-unread-open-60` and `thread-unread-open-200` open a strict-window thread
-of 60 or 200 replies that are all unread. The reader pages older to the first
-unread reply before it reveals the thread. The production broker answers each
-older page after a modeled 150ms round trip. They report `firstRowsMs` and
-`olderReads`.
+Keep one scenario and setting, save the baseline JSON, make one change and
+rerun. On an idle machine, alternate baseline and candidate runs before claiming
+a win, and run the correctness tests too. Results from different CPU settings,
+browsers or machines aren't comparable. If a case's definition changed between
+the two commits, collect a new baseline.
 
 ## Thread scrolling
 
-`--scenario thread-scroll` measures the long-thread workload behind the
-[thread scrolling targets](channels.md#targets). `tests/browser/perf/thread-corpus.mjs`
-fills the strict-window fixture thread with 460 weekly-update replies from 40
-authors: Markdown lists, bold text, inline code, mentions, links, quotes and plain
-prose, with 19 replies in collapsed branches. Their heights follow a real long
-thread's (median about 280px). Each sample opens the thread and loads all ten pages:
-wheel input at the top requests each older page, the fixture holds it until the
-sample sees the request, and the sample waits for its rows, so every page is
-loaded before measurement without fixed delays.
+`thread-scroll` scrolls a 460-reply weekly-update thread from 40 authors, with
+every page loaded first. Chromium scrolls threads off the main thread, so its
+frame spacing stays smooth even when compositing is slow; read its counters
+instead. `--browser webkit` shows those stalls in frame spacing, but has no
+counters, CPU throttling or real gesture timing. Neither shows trackpad momentum
+or painted pixels: `domGapFrames` can read zero while the macOS app shows blank
+regions. For that, use the native run below.
 
-| Case | Action |
-| --- | --- |
-| `thread-scroll-open` | Click Reply on the root: `firstRowsMs` to visible thread rows |
-| `thread-scroll-fling` | From the bottom of the loaded thread, one 6000px upward gesture at 6000px/s |
-| `thread-scroll-reverse` | Up 6000px, down 3000px, up 3500px at 8000px/s |
+### Thread scrolling targets
 
-Scroll cases report the scrolling cadence metrics above, `domGapFrames` (sampled
-frames inside the gesture with no loaded reply intersecting the viewport) and the
-traversed range,
-and require real wheel input, no older-page reads and at least 5000px of travel.
-The pointer rests mid-pane over replies, after a press in the empty gutter sets
-pointer modality.
+For the 460-reply thread in the macOS app, with every reply loaded, on a 60 Hz
+display. A run is two upward trackpad flings with a reversal, then Jump to
+latest. The targets are advisory.
 
-Chromium scrolls a composited thread off the main thread, so its frame intervals
-stay at 16.7ms whether or not each scroll update is expensive to composite. Its
-samples show main-thread cost (`taskMs` and the other counters). `--browser webkit`
-reproduces the stalls in frame intervals but has no gesture synthesis: wheel events
-arrive one rendering update apart, so use its frame intervals, not its duration or
-frame count. WebKit samples have no DevTools counters, CPU throttling or
-long-animation-frame data. Neither engine shows trackpad momentum or painted
-pixels; `domGapFrames` stays zero while the macOS app shows blank regions.
+| While scrolling the loaded thread | Target | Ceiling |
+| --- | --- | --- |
+| 95th-percentile frame interval | 16.7 ms (60 fps) | 33 ms |
+| Frames longer than two 60 Hz frames, per run | 0 | 5 |
+| Captured frames with a blank band (35% of the pane or more), per run | 0 | 5 |
+
+The target is the goal. The ceiling is the line a regression must not cross
+while the target is out of reach.
 
 ### Native thread scrolling
 
-`scripts/perf/thread-native/run.mjs` measures the same workload in the macOS app,
-which is where the targets apply. It runs locally, not in CI:
+This runs the same workload in the macOS desktop app and records the pane on
+video. It runs locally, not in CI.
 
 ```sh
-source bin/activate-hermit
 bin/node scripts/perf/thread-native/run.mjs --arms base=origin/main,head=worktree --runs 4
 ```
 
-Each arm names a revision (`worktree` builds the current files). The workload host
-(`host.spec.mjs`) runs the browser fixture with the thread corpus, builds one
-frontend per arm and serves the selected build through a loopback proxy that adds
-`agent.js`. A non-worktree arm builds in a temporary detached checkout of its
-revision, with that revision's dependencies and fixture build, so its styles,
-Tailwind classes and configuration all come from the revision; an interrupted run
-can leave that checkout behind, which `git worktree prune` and deleting its
-`buzz-thread-native-*` temporary directory clear. The fixture build
-always signs through the HTTP broker with an ephemeral fixture key. The desktop app opens the proxy with an empty
-`BUZZ_DEV_VIEWER`, which keeps a `.env.local` pin out of the Rust process, and its
-own app identifier, which separates its app and WebKit storage; the Keychain and
-plugin data stay shared with other development launches. The agent seeds the
-fixture account, opens the thread, loads all of its history and records each
-animation frame. Arms alternate run by run (ABBA) over one Rust build; a run whose
-gestures scrolled less than 10,000px (another window took the input) is repeated.
+Each arm is a revision; `worktree` means the current files. Runs alternate
+between arms (ABBA) over one Rust build.
 
-For every run the harness shows and places the window from inside the app,
-activates it with a click on empty title bar (WebKit throttles an occluded
-window), presses the thread gutter, rests the pointer mid-pane, records the pane with ffmpeg at a constant 60 fps
-without the cursor, and sends the same synthetic trackpad gestures with scroll
-and momentum phases (`drive.swift`): a 7000px/s upward fling, a reversal 500ms
-into its coast and a second upward fling, then Jump to latest. It reports:
+Before you start:
+- It needs a logged-in macOS session, Screen Recording and Accessibility
+  permission for the terminal, an idle machine and the main display at 60 Hz.
+- It places the window at the `1504×916` reference size when the main display's
+  usable area holds it, and otherwise fits it to the display (minimum
+  `1280×700` usable) for within-run ABBA comparisons.
+- It opens a real Buzz window, takes over the pointer with synthetic trackpad
+  gestures, and records the screen. Don't use the computer while it runs.
+- It signs with an ephemeral fixture key, but shares the Keychain and plugin
+  data with other development builds.
+- An interrupted run can leave a temporary checkout; `git worktree prune` and
+  deleting its `buzz-thread-native-*` temporary folder clean it up.
+
+`summary.md` in the results folder gives each metric's median and range per
+arm against the targets, with per-run JSON and videos beside it. Compare arms
+within one run, not across machines or sessions.
 
 | Metric | Meaning |
 | --- | --- |
-| `gapP95Ms`, `gapMaxMs` | Interval between animation frames |
-| `framesOver33` | Intervals longer than two 60 Hz frames plus 1ms |
+| `gapP95Ms`, `gapMaxMs` | Time between animation frames |
+| `framesOver33` | Frame intervals longer than two 60 Hz frames |
 | `droppedFrames` | Frames missed across those intervals |
-| `blankFrames` | Captured frames with one uniform band covering at least 35% of the pane |
-| `longestBlankMs` | Longest run of blank frames |
-
-Frame metrics cover every interval from the first wheel event to the frame after
-the last one that moved the thread, where Jump to latest lands, including stalls
-whose ending frame kept the same offset. A stall on the scrolling thread alone, while animation
-frames keep running, shows only in the video. `summary.md` in the results directory gives each metric's median and range per arm against the
-targets, with 1ms of timestamp tolerance; per-run JSON and videos sit beside it. It needs a
-logged-in session, Screen Recording and Accessibility permission for the terminal,
-an idle machine and the main display at 60 Hz. The app is a development build
-serving a production frontend. Synthetic momentum approximates a trackpad;
-compare arms within one run, not across machines or sessions.
+| `blankFrames`, `longestBlankMs` | Captured frames with a blank band over at least 35% of the pane, and the longest run of them |
 
 ### Current measurements
 
-Native medians on one MacBook Pro with a 60 Hz display, four ABBA runs per build in
-one session (2026-11-05). Each change that moves these numbers adds its row.
+Native medians on one Apple silicon macOS VM with a 60 Hz display (`1920×1200`,
+1×), four ABBA runs per build in one session (2026-11-24). Each change that
+moves these numbers adds its row.
 
 | Build | p95 frame interval | Frames over two 60 Hz frames | Dropped frames | Blank frames | Longest blank |
 | --- | --- | --- | --- | --- | --- |
-| Before thread scrolling fixes | 85 ms | 76 | 194 | 54 | 300 ms |
-| Closed action bars skip the glass | 50 ms | 44 | 94 | 9 | 133 ms |
-| Thread rows isolated in the scroller | 30 ms | 10 | 44 | 6 | 67 ms |
-
-## Background traffic
-
-```sh
-bin/pnpm perf --scenario background-traffic --repeat 3 --cpu 4
-```
-
-The viewer reads `alpha` while peers post into 30 other joined channels, one
-message every 200ms for 30 seconds, over the live stream. Nothing on screen
-needs to change, so the work per message is what staying current costs: live
-admission, store and unread updates, and whatever React renders because of them.
-
-| Case | Workload |
-| --- | --- |
-| `background-traffic` | 32 joined channels |
-| `background-traffic-large-sidebar` | The same traffic with the large-sidebar fixture: 128 DMs and 1,001 participants |
-
-Each sample settles for 5 seconds after setup, records 8 seconds with no
-traffic, then the traffic, then 2 seconds of drain. CPU throttling covers the
-idle and traffic windows. The JS heap, DOM node and listener gauges are read after
-a forced GC before the idle window and after the drain. The sample then opens the
-last channel posted to and requires its last message, so a run whose events never
-reached the client fails.
-
-| Metric | Meaning |
-| --- | --- |
-| `idleTaskMsPerSec` | `TaskDuration` per second with no traffic |
-| `trafficTaskMsPerSec` | `TaskDuration` per second across traffic and drain |
-| `taskMsPerMessage`, `scriptMsPerMessage`, `styleMsPerMessage`, `layoutMsPerMessage` | The traffic window's counter divided by messages sent, without subtracting idle work |
-| `heapGrowthKBPerMessage` | After-GC `JSHeapUsedSize` growth divided by messages sent |
-| `nodesDelta`, `listenersDelta` | After-GC change in DOM nodes and JS event listeners |
-
-The browser build verifies signatures in JavaScript, which the desktop app does
-natively, so per-message script time is higher here than in the app. The fixture
-sends chat messages only; agent activity, presence and typing traffic are not
-modeled. Heap growth over 30 seconds does not show whether the heap later levels
-off.
-
-## Results and iteration
-
-JSON contains raw per-frame geometry, work evidence, all samples and per-metric
-median/min/max/sample count. Only wholly passing samples enter summaries. Inspect
-the top-level status and each run's errors before using a number; a failed command
-is never a successful optimization. Runtime/source identity, dirty status, CPU
-setting, viewport, host load and setup timing accompany the samples. A dirty
-listing is not a content hash: tie claims to a clean commit.
-
-Every invocation creates a fresh ignored `test-results/perf/run-*` evidence
-directory. Existing fixture evidence and failure screenshots are retained there;
-the summary defaults to that directory or writes the exact `--out` path. Reusing
-an explicit output path replaces that summary. Traces/video are off to reduce
-measurement overhead; use the existing functional browser runner for diagnostics.
-
-Choose any relevant metric (including scripting) as the objective, keep the
-scenario and settings fixed, and inspect all other metrics plus actual work.
-Keep baseline JSON, make one change, rerun, and confirm promising changes with
-repeated samples and the existing correctness tests. Use an idle machine and
-alternate baseline/candidate runs when making a performance claim. Comparing
-different CPU settings, browsers, fixtures or concurrent host loads is not a
-controlled comparison. The runner does not decide which tradeoffs are acceptable.
-
-Apart from [thread scrolling](#thread-scrolling), this is Chromium-local evidence
-with modeled backend responses (immediate except for the named paging delays),
-HTTP interception (which disables HTTP cache) and preloaded fonts. Channel and
-scrolling workloads use text; the rich thread workload adds local media and
-multiple authors.
-It does not measure production network latency, native hosting or WebKit outside
-thread scrolling, memory growth over hours or application startup. Add those as explicit workloads
-when needed rather than changing the meaning of existing samples.
+| 2026-11-05 (`83c48be0aa`, before scrolling fixes) | 88 ms | 77 | 208 | 48 | 233 ms |
+| 2026-11-24 (`20c9e4c154`, `main`) | 31 ms | 12 | 27 | 0 | 0 ms |

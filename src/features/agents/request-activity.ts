@@ -18,7 +18,10 @@ type Parsed = Readonly<{
 // snapshots, and a record's projection depends on no other record, so parse each
 // record once per scope and assemble each array from those results.
 const parsedRecords = new WeakMap<object, Map<string, readonly Parsed[]>>();
-const parsedArrays = new WeakMap<object, Map<string, readonly Parsed[]>>();
+const parsedArrays = new WeakMap<
+  object,
+  Map<string, Map<string, readonly Parsed[]>>
+>();
 
 function parseRecord(
   record: Omit<ActivityRecord, "envelopeId">,
@@ -65,19 +68,81 @@ function parseRecords(
   agent: string,
   channelId: string,
 ): readonly Parsed[] {
-  let byScope = parsedArrays.get(records);
-  if (!byScope) {
-    byScope = new Map();
-    parsedArrays.set(records, byScope);
+  let byAgent = parsedArrays.get(records);
+  if (!byAgent) {
+    byAgent = new Map();
+    parsedArrays.set(records, byAgent);
   }
-  const scope = `${agent}\n${channelId}`;
-  const cached = byScope.get(scope);
+  let byChannel = byAgent.get(agent);
+  if (!byChannel) {
+    byChannel = new Map();
+    byAgent.set(agent, byChannel);
+  }
+  const cached = byChannel.get(channelId);
   if (cached) return cached;
-  const parsed = records.flatMap((record) =>
-    parseRecord(record, agent, channelId, scope),
-  );
-  byScope.set(scope, parsed);
+  const scope = `${agent}\n${channelId}`;
+  const parsed: Parsed[] = [];
+  for (const record of records)
+    if (record.agent === agent)
+      parsed.push(...parseRecord(record, agent, channelId, scope));
+  byChannel.set(channelId, parsed);
   return parsed;
+}
+
+// Most mounted rows have no agent work: index which triggers each snapshot can
+// associate so those rows answer without replaying every turn.
+const turnTriggers = new WeakMap<
+  object,
+  ReadonlyMap<string, ReadonlySet<string>>
+>();
+const anchorTriggers = new WeakMap<object, ReadonlySet<string>>();
+
+/** Agents whose turns name each trigger, keyed by channel and trigger ID. */
+export function triggeredAgents(
+  turns: readonly Pick<
+    ActivityTurn,
+    "agent" | "channelId" | "triggeringEventIds"
+  >[],
+): ReadonlyMap<string, ReadonlySet<string>> {
+  const cached = turnTriggers.get(turns);
+  if (cached) return cached;
+  const index = new Map<string, Set<string>>();
+  for (const turn of turns)
+    for (const id of turn.triggeringEventIds ?? []) {
+      const key = `${turn.channelId}\n${id}`;
+      const agents = index.get(key);
+      if (agents) agents.add(turn.agent);
+      else index.set(key, new Set([turn.agent]));
+    }
+  if (Object.isFrozen(turns)) turnTriggers.set(turns, index);
+  return index;
+}
+
+function anchoredTriggers(parsed: readonly Parsed[]) {
+  const cached = anchorTriggers.get(parsed);
+  if (cached) return cached;
+  const ids = new Set<string>();
+  for (const { value } of parsed)
+    if (value.kind === "turn_started" || value.kind === "turn_steered")
+      for (const id of turnTriggerIds(value.payload?.triggeringEventIds) ?? [])
+        ids.add(id);
+  anchorTriggers.set(parsed, ids);
+  return ids;
+}
+
+// requestWork asks every agent about the same request, and never mutates it.
+let lastRequest:
+  | { id: string | readonly string[]; wanted: ReadonlySet<string> }
+  | undefined;
+function wantedTriggers(requestId: string | readonly string[]) {
+  if (lastRequest?.id === requestId) return lastRequest.wanted;
+  const wanted = new Set(
+    (typeof requestId === "string" ? [requestId] : requestId).filter((id) =>
+      /^[0-9a-f]{64}$/.test(id),
+    ),
+  );
+  lastRequest = { id: requestId, wanted };
+  return wanted;
 }
 
 /** Live request association from explicit captured trigger IDs only. No time/name
@@ -89,7 +154,6 @@ export function requestActivity(
   requestId: string | readonly string[],
   turns: readonly ActivityTurn[] = [],
 ) {
-  const parsed = parseRecords(records, agent, channelId);
   const turnIds = new Set<string>();
   const selected: ActivityRecord[] = [];
   const terminal = new Map<
@@ -98,12 +162,18 @@ export function requestActivity(
   >();
   let uncertain = false;
   const result = () => ({ records: selected, turnIds, terminal, uncertain });
-  const triggersWanted = new Set(
-    (typeof requestId === "string" ? [requestId] : requestId).filter((id) =>
-      /^[0-9a-f]{64}$/.test(id),
-    ),
-  );
+  const triggersWanted = wantedTriggers(requestId);
   if (!triggersWanted.size) return result();
+  const parsed = parseRecords(records, agent, channelId);
+  const anchored = anchoredTriggers(parsed);
+  const triggered = triggeredAgents(turns);
+  let wanted = false;
+  for (const id of triggersWanted)
+    if (anchored.has(id) || triggered.get(`${channelId}\n${id}`)?.has(agent)) {
+      wanted = true;
+      break;
+    }
+  if (!wanted) return result();
   const ambiguous = new Set(
     turns
       .filter(

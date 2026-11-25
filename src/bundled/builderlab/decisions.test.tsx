@@ -25,6 +25,7 @@ const credential = (revision: string): Credential => ({
     email: "a@example.com",
     canUseRemoteAgents: true,
     canUseBuilderlabDecisions: true,
+    canUseHostedTranscription: false,
   },
 });
 const request = {
@@ -154,6 +155,7 @@ it("sends nothing to Builderlab unless the account may use decisions", async () 
       email: "a@example.com",
       canUseRemoteAgents: true,
       canUseBuilderlabDecisions: false,
+      canUseHostedTranscription: false,
     },
   }));
   await session.signIn();
@@ -180,6 +182,7 @@ it("offers Builderlab while signed in, ready only while the account may use deci
     account: {
       ...credential("first").account,
       canUseBuilderlabDecisions: allowed,
+      canUseHostedTranscription: false,
     },
   }));
   const decide = vi.fn<BuilderlabDecide>();

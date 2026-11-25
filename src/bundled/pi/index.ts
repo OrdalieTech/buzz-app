@@ -1,4 +1,5 @@
 import { piHookOutput } from "../hook-output";
+import { usageOn } from "../../features/agents/standalone-sessions";
 // Pi agents: an agent type whose agents run on Pi durable on this computer,
 // with any provider Pi supports. One Pi host runs them all, each with its own
 // storage; each conversation the agent is in is one continuing, durable Pi
@@ -20,7 +21,7 @@ export const TYPE_ID = "pi";
  * which includes the first install of Pi's packages. */
 const HANDOVER_MS = 2 * 60_000;
 
-export const inject = ["agents", "host", "agentProtection"];
+export const inject = ["agents", "host", "agentProtection", "settingsCards"];
 export const apply: PluginModule["apply"] = (ctx) => {
   // Only the desktop app can start the Pi host; no unusable type elsewhere.
   if (!isTauri()) return;
@@ -28,7 +29,9 @@ export const apply: PluginModule["apply"] = (ctx) => {
   const typeKey = `${ctx.pluginOwner?.id ?? "buzz.pi"}/${TYPE_ID}`;
   const runtime = new PiRuntime(
     host,
-    (key) => ownerReads(agents.relay(key), pubkeyOf(key)),
+    (key) =>
+      agents.conversationReads?.(key) ??
+      ownerReads(agents.relay(key), pubkeyOf(key)),
     (key, signal) => agents.core(key, signal),
     () => agents.tools(),
     repositoriesContext,
@@ -54,9 +57,18 @@ export const apply: PluginModule["apply"] = (ctx) => {
     // Without a Pi upstream in this build, every agent keeps its own
     // providers, as the runner sends every turn without the gateway.
     upstreamFor(HARNESS) ? GATEWAY_SEAM : undefined,
-    (agent, signal, channelId) =>
-      readyOwnerReads(agents.relay(agent.key), agent, signal, channelId),
+    (agent, signal, channelId, what) =>
+      readyOwnerReads(
+        agents.relay(agent.key),
+        agent,
+        signal,
+        channelId,
+        what,
+        () => agents.conversationReads?.(agent.key),
+      ),
+    (key) => agents.relay(key)?.snapshot().scope,
   );
+  runtime.usageOn = usageOn(ctx.settingsCards);
   ctx.agentProtection.registerModels({
     label: "Pi",
     models: async () => {
@@ -101,6 +113,9 @@ export const apply: PluginModule["apply"] = (ctx) => {
     hooks: { events: ["beforeTool", "afterTool"] },
     retire: (pubkey) => runtime.retire(pubkey),
     protection: true,
+    conversationFolders: true,
+    conversationSections: true,
+    notes: true,
     title: "Pi",
     icon: PiLogoIcon,
     description:
@@ -148,6 +163,7 @@ export const apply: PluginModule["apply"] = (ctx) => {
     }),
     sessions: {
       list: (key) => runtime.sessions(key),
+      ready: (key, conversation) => runtime.listed(key, conversation),
       subscribe: (listener) => runtime.subscribe(listener),
     },
     tabs: [

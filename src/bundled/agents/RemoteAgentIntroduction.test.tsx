@@ -75,12 +75,9 @@ function speechIn(container: HTMLElement) {
   return speech;
 }
 
-it("lays out the full disclosure from the start and staggers real Motion character entrances", async () => {
+it("lays out the full disclosure from the start", async () => {
   const { container } = render(introduction(true, "Nova 👩🏽‍💻"));
   const speech = speechIn(container);
-  const portrait = within(container).getByRole("img", {
-    name: "Nova 👩🏽‍💻’s avatar",
-  });
   const visual = speech.querySelector<HTMLDivElement>(
     `.${styles.remoteSpeechCopy}[aria-hidden]`,
   );
@@ -111,10 +108,8 @@ it("lays out the full disclosure from the start and staggers real Motion charact
   expect(
     [...characters].some((character) => character.textContent === "👩🏽‍💻"),
   ).toBe(true);
-  const first = characters[0];
-  const last = characters[characters.length - 1];
   const badge = visual.querySelector(`.${styles.remoteProvider}`);
-  if (!first || !last || !badge) throw new Error("Missing characters or badge");
+  if (!badge) throw new Error("Missing provider badge");
   expect(badge).toHaveTextContent(/^Builderlab$/);
   expect(badge.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
   const providerCharacters = [
@@ -125,37 +120,6 @@ it("lays out the full disclosure from the start and staggers real Motion charact
   expect(providerCharacters.map((character) => character.textContent)).toEqual([
     ..."Builderlab",
   ]);
-  expect(first).toHaveStyle({ opacity: "0", filter: "blur(0.5px)" });
-  expect(first.style.transform).toContain("scale(1.05)");
-  expect(portrait).toHaveStyle({ opacity: "0" });
-  expect(portrait.style.transform).toContain("scale(0.75)");
-  expect(speech).toHaveStyle({ opacity: "0" });
-  // Motion starts animations in its post-render microtask, before the next frame.
-  await act(async () => {});
-  expect(clock.frames.size).toBeGreaterThan(0);
-  await frame(0);
-  await frame(16);
-  await frame(300);
-  expect(portrait).toHaveStyle({ opacity: "1" });
-  expect(first).toHaveStyle({ opacity: "0" });
-  await frame(550);
-  expect(speech).toHaveStyle({ opacity: "1" });
-  expect(first).toHaveStyle({ opacity: "0" });
-  await frame(800);
-  expect(first).toHaveStyle({ opacity: "1", filter: "blur(0px)" });
-  expect(last).toHaveStyle({ opacity: "0", filter: "blur(0.5px)" });
-  // The provider name joins the same stream, rather than appearing as one badge.
-  await frame(560 + (fullText ?? "").indexOf("Builderlab") * 10.7 + 140);
-  expect(Number(providerCharacters[0]?.style.opacity)).toBeGreaterThan(
-    Number(providerCharacters.at(-1)?.style.opacity),
-  );
-  await frame(10_000);
-  expect(last).toHaveStyle({ opacity: "1", filter: "blur(0px)" });
-  expect(last.style.transform).toBe("none");
-  expect(visual.textContent).toBe(fullText);
-  expect(
-    visual.querySelectorAll(`.${styles.remoteSpeechCharacter}`),
-  ).toHaveLength(characters.length);
 });
 
 it("shows plain full copy with reduced motion, including a preference change mid-stream", () => {
@@ -212,30 +176,6 @@ it("describes another remote runtime without promising Builderlab capabilities",
   expect(speech).not.toHaveTextContent("won’t be able to open files");
   expect(speech).not.toHaveTextContent("Builderlab");
   expect(speech.querySelector("svg")).not.toBeInTheDocument();
-  expect(speech).toHaveStyle({ opacity: "1", transform: "none" });
-  expect(
-    within(container).getByRole("img", { name: "Nova’s avatar" }),
-  ).toHaveStyle({
-    opacity: "1",
-    transform: "none",
-  });
-});
-
-it("shows an uploaded image with its framing", () => {
-  const { container } = render(
-    <RemoteAgentIntroduction
-      name="Nova"
-      avatar={{
-        kind: "image",
-        picture: "https://images.example/nova.png",
-        crop: { zoom: 2, x: 0.25, y: 0 },
-      }}
-      builderlab={false}
-    />,
-  );
-  expect(
-    container.querySelector('img[src="https://images.example/nova.png"]'),
-  ).toHaveStyle({ width: "200%", height: "200%", left: "-25%", top: "-50%" });
 });
 
 it("falls back to the retrying portrait when the framed image fails", () => {

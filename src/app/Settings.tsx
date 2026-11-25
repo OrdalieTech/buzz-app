@@ -17,6 +17,11 @@ import type {
   RegisteredProvider,
 } from "../features/decisions/service";
 import { DecisionsSettings } from "./DecisionsSettings";
+import type {
+  RegisteredSpeechProvider,
+  SpeechService,
+} from "../features/speech/service";
+import { SpeechSettings } from "./SpeechSettings";
 import { Header, InlineHeader } from "../shared/design-system/ui/Header";
 import { ToastNotice } from "../shared/design-system/ui/Toast";
 import { Panel } from "../shared/design-system/ui/Panel";
@@ -91,6 +96,7 @@ import type { ShortcutBindings } from "../features/shortcuts/preferences";
 import { ShortcutSettings } from "./ShortcutSettings";
 import { DeveloperSettings } from "./DeveloperSettings";
 import { AgentSettings } from "./AgentSettings";
+import { pluginSection as replaceableSection } from "../features/agent-harness/sections";
 import type { SettingsCards } from "../features/settings/service";
 import { OwnedContribution } from "../plugins/OwnedContribution";
 import type { Updates } from "../features/updates/updates";
@@ -152,6 +158,25 @@ function isEssentialPlugin(plugin: PluginInfo) {
       false)
   );
 }
+
+/** The names of the plugins that are on and can replace `section` of the
+ * agents' base instructions in the chats they manage. Safe mode pauses the
+ * external ones. */
+export const sectionPlugins = (
+  plugins: readonly PluginInfo[],
+  section: string,
+  externalPaused = false,
+) =>
+  plugins
+    .filter(
+      (plugin) =>
+        plugin.enabled &&
+        !(externalPaused && plugin.source === "external") &&
+        plugin.manifest.host?.agentPromptSections?.some(
+          (id) => replaceableSection(id)?.id === section,
+        ),
+    )
+    .map((plugin) => plugin.manifest.name);
 
 function comparePlugins(a: PluginInfo, b: PluginInfo) {
   return (
@@ -257,6 +282,8 @@ const noAccessSubscription = () => () => {};
 const noInstallRequest = () => undefined;
 const noProviders: readonly RegisteredProvider[] = [];
 const noDecisionProviders = () => noProviders;
+const noSpeechChoices: readonly RegisteredSpeechProvider[] = [];
+const noSpeechProviders = () => noSpeechChoices;
 /** The plugin whose details a Manage plugins visit shows, for Back/Forward. */
 const PLUGIN_DETAILS = "settings.pluginDetails";
 
@@ -669,6 +696,7 @@ function PluginDetails({
 export function Settings({
   agents,
   decisions,
+  speech,
   cards,
   plugins,
   adminAccess,
@@ -693,6 +721,7 @@ export function Settings({
 }: {
   agents?: Agents | undefined;
   decisions?: DecisionsService | undefined;
+  speech?: SpeechService | undefined;
   cards: SettingsCards;
   plugins: PluginManager;
   adminAccess?: AdminAccessReader;
@@ -757,6 +786,10 @@ export function Settings({
   const decisionProviders = useSyncExternalStore(
     decisions?.subscribe ?? noAccessSubscription,
     decisions?.providers ?? noDecisionProviders,
+  );
+  const speechProviders = useSyncExternalStore(
+    speech?.subscribe ?? noAccessSubscription,
+    speech?.providers ?? noSpeechProviders,
   );
   const identityCards = contributed.filter((card) => card.identityRow);
   const client = useSyncExternalStore(
@@ -1161,11 +1194,15 @@ export function Settings({
           ? decisionProviders.some(
               (provider) => provider.pluginId === selectedPlugin.manifest.id,
             )
-          : contributed.some(
-              (card) =>
-                card.key === section.id &&
-                card.pluginId === selectedPlugin.manifest.id,
-            ),
+          : section.id === "speech"
+            ? speechProviders.some(
+                (provider) => provider.pluginId === selectedPlugin.manifest.id,
+              )
+            : contributed.some(
+                (card) =>
+                  card.key === section.id &&
+                  card.pluginId === selectedPlugin.manifest.id,
+              ),
       )
     : [];
   const renderPluginGroup = (
@@ -1499,6 +1536,13 @@ export function Settings({
           <AgentSettings
             agents={agents}
             active={selected === "agents"}
+            sectionPlugins={(section) =>
+              sectionPlugins(
+                catalog?.plugins ?? [],
+                section,
+                externalPluginsPaused,
+              )
+            }
             navigation={navigation}
             onProvider={onProvider}
           />
@@ -1508,6 +1552,16 @@ export function Settings({
             <DecisionsSettings
               decisions={decisions}
               active={() => selected === "decisions"}
+              onSection={openSection}
+            />
+          </div>
+        )}
+        {speech && (
+          <div hidden={selected !== "speech"}>
+            <SpeechSettings
+              speech={speech}
+              community={relay.status === "ready" ? relay.origin : undefined}
+              active={() => selected === "speech"}
               onSection={openSection}
             />
           </div>
@@ -1620,7 +1674,7 @@ export function Settings({
         )}
         {developerMode && (
           <div hidden={selected !== "developer"}>
-            <DeveloperSettings relay={communities.relay} />
+            <DeveloperSettings />
           </div>
         )}
         <div hidden={selected !== "plugins"}>

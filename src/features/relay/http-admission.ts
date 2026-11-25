@@ -247,11 +247,13 @@ type Ticket = {
   reject(error: Error): void;
   abort(): void;
 };
-/** One host/principal API lane, bounded like the broker's six-request ceiling.
+/** Requests one API lane runs at once, like the browser broker's ceiling. */
+export const API_ACTIVE_LIMIT = 10;
+/** One host/principal API lane, bounded like the broker's ten-request ceiling.
  * Available capacity dispatches immediately; only server cooldowns pause starts.
  * Cooldowns reject queued work rather than spending a read's 10s deadline. */
 export function createApiAdmission() {
-  const activeLimit = 6;
+  const activeLimit = API_ACTIVE_LIMIT;
   const artifactActiveLimit = 4;
   const queuedLimit = 128;
   const artifactQueuedLimit = 120;
@@ -405,13 +407,20 @@ export async function admittedApiRequest(
     body: unknown,
     status: number,
   ) => string | Pick<ApiFailure, "error" | "code"> | undefined,
+  migrationWrite = false,
 ): Promise<Response> {
   return lane.run(
     async () => {
       const response = await request();
       if (response.ok) return response;
       const failure = await readApiFailure(response, reason);
-      if (failure.quota === "api" && failure.retryAfterMs !== undefined)
+      // The relay adds Retry-After to the migration budget's refusals. The
+      // shared API quota response has no such header, even for a tagged write.
+      if (
+        failure.quota === "api" &&
+        failure.retryAfterMs !== undefined &&
+        !(migrationWrite && response.headers.has("retry-after"))
+      )
         lane.pause(failure.retryAfterMs);
       const headers = new Headers(response.headers);
       headers.delete("content-length");

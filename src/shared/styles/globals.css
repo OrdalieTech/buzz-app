@@ -674,3 +674,21 @@ body:has(.shell-header[data-integrated-window-controls]) .buzz-toast-viewport {
     var(--space-2)
   );
 }
+
+/* A file drag resting on a navigation target gives it the sidebar's selected
+   fill and ink, as Finder selects a spring-loaded folder. spring-loaded-drag.ts
+   sets "on", and "off" in the gaps of the blink before the target opens; both
+   apply at once, with no fade. Unlayered so it beats the layered row and
+   button fills. A row whose fill is painted by an element around its button
+   paints that element instead and clears this fill, as the channel sidebar row
+   does. */
+[data-spring-loaded] {
+  transition: none;
+}
+[data-spring-loaded="on"] {
+  --navigation-item-text: var(--text-sidebar-selected);
+  --text-subtle: var(--text-sidebar-selected);
+  --text-metadata: var(--text-sidebar-selected);
+  background-color: var(--surface-sidebar-selected);
+  color: var(--text-sidebar-selected);
+}

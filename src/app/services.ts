@@ -37,6 +37,7 @@ import {
 import { AccountActionsService } from "../features/account-actions/service";
 import { ShortcutsService } from "../features/shortcuts/service";
 import { DecisionsService } from "../features/decisions/service";
+import { SpeechService } from "../features/speech/service";
 import { AgentsService } from "../features/agents/service";
 import { deviceSettings } from "./device-settings";
 import { createShortcutBindings } from "../features/shortcuts/preferences";
@@ -64,6 +65,7 @@ import {
 import { createUpdates } from "../features/updates/updates";
 import { PanelsService } from "../features/panels/service";
 import { BackdropsService } from "../features/backdrops/service";
+import { NoticesService } from "../features/notices/service";
 import { SubjectLiftService } from "../features/messages/subject-lift";
 import { pluginUi } from "../features/plugin-ui/service";
 import { Context } from "@deepseek-ai/cordis";
@@ -115,6 +117,7 @@ export function createServices() {
   const browser = new BrowserService(ctx);
   const shortcuts = new ShortcutsService(ctx, undefined, shortcutBindings);
   const decisions = new DecisionsService(ctx);
+  const speech = new SpeechService(ctx);
   const pages = new PagesService(ctx);
   const sidebarSections = new SidebarSectionsService(ctx);
   const pluginInstallRequests = createPluginInstallRequests();
@@ -129,6 +132,7 @@ export function createServices() {
   const sidebarRows = new SidebarRowsService(ctx);
   const panels = new PanelsService(ctx);
   const backdrops = new BackdropsService(ctx);
+  const notices = new NoticesService(ctx);
   new SubjectLiftService(ctx);
   ctx.provide("ui", pluginUi);
   const accountActions = new AccountActionsService(ctx);
@@ -452,6 +456,7 @@ export function createServices() {
     navigationHost,
     shortcuts,
     decisions,
+    speech,
     agents,
     accountActions,
     shortcutBindings,
@@ -467,6 +472,7 @@ export function createServices() {
     sidebarRows,
     panels,
     backdrops,
+    notices,
     plugins,
     federatedIdentity,
     firstRunFederatedIdentity,

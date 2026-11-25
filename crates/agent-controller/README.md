@@ -23,6 +23,5 @@ The crate name is retained to keep native consumers stable.
 
 Tests use temporary directories and isolated credentials; they do not touch a
 real Keychain or run agents. Profile tests verify signatures, merge preservation
-and malformed-profile refusal. See [agents](../../docs/agents.md) for the app's
-current agent behavior. Native import still requires an attended check of OS
+and malformed-profile refusal. Native import still requires an attended check of OS
 credential consent and relay behavior; unit tests do not establish that result.

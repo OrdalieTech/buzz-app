@@ -7,6 +7,6 @@ Exploring a user flow doesn’t require running the whole Buzz app. A simple bro
 
 Interactions can use local state, and any services a component needs can be stubbed out. The underlying feature doesn’t need to exist yet.
 
-For new UI, follow the [design system](../../../src/shared/design-system/README.md) and its [host integration guidance](../../../docs/design-system.md#incremental-system-integration). Existing [message](../../../tests/fixtures/messages.tsx) and [conversation](../../../tests/fixtures/conversation.tsx) fixtures show offline service patterns.
+For new UI, follow the [design system](../../../src/shared/design-system/DESIGN.md). Existing [message](../../../tests/fixtures/messages.tsx) and [conversation](../../../tests/fixtures/conversation.tsx) fixtures show offline service patterns.
 
 Optional: [demo source and setup notes](https://github.com/block/buzz-app/tree/jtennant/lightweight-task-mockups/examples/task-workspace-mockup). This is a design reference on a separate branch, not a maintained starter or the styling source for new UI.

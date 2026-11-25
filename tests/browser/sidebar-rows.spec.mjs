@@ -1,6 +1,7 @@
 import { test as appTest } from "./fixture.mjs";
 import { expect } from "./playwright-test.mjs";
 import {
+  clickSidebarHeadingAction,
   openPage,
   openSettings,
   closeSettings,
@@ -45,7 +46,9 @@ appTest(
     await expect(
       section.locator('[data-plugin-row="decorated"] [data-channel-id="beta"]'),
     ).toBeVisible();
-    await page.getByRole("button", { name: "More actions for Team" }).click();
+    await clickSidebarHeadingAction(
+      section.getByRole("button", { name: "More actions for Team" }),
+    );
     await page.getByRole("menuitem", { name: "Sort", exact: true }).click();
     await expect(
       page.getByRole("menuitemradio", { name: "Reverse name" }),

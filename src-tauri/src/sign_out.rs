@@ -94,6 +94,8 @@ pub(crate) struct Paths {
     backups: PathBuf,
     /// Other app-owned folders: local data and WebView storage, caches.
     others: Vec<PathBuf>,
+    /// Saved relay images, inside the caches.
+    media: PathBuf,
     /// Storage the legacy identifier left, each with where it goes.
     moves: Vec<(PathBuf, PathBuf)>,
     /// Where a first development launch copies the installed app's folders, app data last.
@@ -121,10 +123,9 @@ impl Paths {
     pub(crate) fn resolve(identifier: &str) -> Option<Self> {
         let data = dirs::data_dir()?;
         let app_data = data.join(identifier);
-        let mut others = vec![
-            dirs::data_local_dir()?.join(identifier),
-            dirs::cache_dir()?.join(identifier),
-        ];
+        let cache = dirs::cache_dir()?.join(identifier);
+        let media = cache.join(crate::relay::MEDIA_CACHE_DIR);
+        let mut others = vec![dirs::data_local_dir()?.join(identifier), cache];
         #[cfg(target_os = "macos")]
         others.push(dirs::home_dir()?.join("Library/WebKit").join(identifier));
         others.retain(|path| *path != app_data);
@@ -138,6 +139,7 @@ impl Paths {
             app_data,
             backups: crate::nsec_backup_choice::root()?,
             others,
+            media,
             moves: legacy_identifier::moves(identifier)?,
             seeds: legacy_identifier::seeds(identifier)?,
         })
@@ -306,6 +308,31 @@ fn wait_for<E>(mut attempt: impl FnMut() -> Result<(), E>) -> bool {
     }
 }
 
+/// A pending erase's agent cleanup: the old agents' keys, then each registry's
+/// own environment variables and keys, while the registry still names them.
+/// A failure leaves the marker, so the next launch retries.
+pub(crate) fn remove_local_agents(
+    app_data: &Path,
+    credentials: &dyn buzz_agent_controller::Credentials,
+    env: &dyn Fn(&str) -> Box<dyn crate::claude_key::KeyStore>,
+) -> Result<(), String> {
+    let old = app_data.join(OLD_AGENTS);
+    if old
+        .try_exists()
+        .map_err(|error| format!("check agent registry: {error}"))?
+    {
+        buzz_agent_controller::delete_local_agent_keys(old, credentials)?;
+    }
+    // The pending erase runs before the temporary startup migration.
+    for folder in [AGENTS, migrate_agents::LEGACY] {
+        let agents =
+            buzz_agent_controller::AppAgents::open(app_data.join(folder).join("identities.json"));
+        crate::agent_env::forget_registry(&agents, env)?;
+        agents.delete_keys(credentials)?;
+    }
+    Ok(())
+}
+
 /// Run at launch, before anything else. Returns this instance's lock, or the
 /// message to show before exiting.
 #[allow(clippy::incompatible_msrv)] // `File` locking; see `Instance`.
@@ -423,10 +450,18 @@ pub(crate) fn boot(
 /// and never deletes a key saved since.
 pub(crate) fn forget_signed_out_key(
     instance: &Instance,
+    paths: &Paths,
     remove_current_key: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    let forget = || {
+        // Another copy signed out of the key this one shares, so the next
+        // identity here must not see the saved images (see `finish`).
+        missing(fs::remove_dir_all(&paths.media))
+            .map_err(|error| format!("delete saved images: {error}"))?;
+        remove_current_key()
+    };
     // std can't sync a folder on Windows.
-    reconcile_sign_outs(instance, remove_current_key, |folder| {
+    reconcile_sign_outs(instance, forget, |folder| {
         if cfg!(unix) {
             File::open(folder)?.sync_all()
         } else {
@@ -703,6 +738,10 @@ fn finish(
             .and_then(|()| clear(path, kept))
             .map_err(|error| format!("delete wiped {}: {error}", path.display()))?;
     }
+    // Saved images are keyed by URL alone and served without the relay, so the
+    // next identity on this device would see this one's private images.
+    missing(fs::remove_dir_all(&paths.media))
+        .map_err(|error| format!("delete saved images: {error}"))?;
     // Record it before the marker goes; a resumed attempt records it again.
     OpenOptions::new()
         .create(true)

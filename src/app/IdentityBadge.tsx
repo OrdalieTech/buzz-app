@@ -141,7 +141,7 @@ export function IdentityBadge({
                     <Tooltip
                       content={
                         photoContext
-                          ? `Photo from ${photoContext}`
+                          ? `Your avatar in ${photoContext}`
                           : "Your ID is shared across communities."
                       }
                     >
@@ -150,8 +150,8 @@ export function IdentityBadge({
                         className={styles.photoHint}
                         aria-label={
                           photoContext
-                            ? `Photo from ${photoContext}`
-                            : "Buzz identity photo"
+                            ? `Your avatar in ${photoContext}`
+                            : "Your avatar"
                         }
                       >
                         <Avatar
@@ -215,7 +215,7 @@ export function IdentityBadge({
                   <span
                     className={`${styles.keyLabel} text-caption text-subtle`}
                   >
-                    PUBLIC KEY
+                    Buzz ID
                   </span>
                   {/* Code 128-B: fixed public word BUZZBUZZ, checksum 51; no key data. */}
                   <div className={`dark ${styles.barcodeSticker}`}>
@@ -241,10 +241,7 @@ export function IdentityBadge({
                       {abbreviatedPublicKey(viewer)}
                     </code>
                     <span className={styles.copyAction}>
-                      <Tooltip
-                        content="Copy your full public Buzz ID"
-                        hint="familiar"
-                      >
+                      <Tooltip content="Copy full Buzz ID" hint="familiar">
                         <IconButton
                           aria-label="Copy Buzz ID"
                           size="xs"

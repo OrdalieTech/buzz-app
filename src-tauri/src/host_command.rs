@@ -209,6 +209,7 @@ pub(crate) async fn plugin_host_run_command(
     input: Option<String>,
 ) -> Result<Option<String>, String> {
     let operation = async {
+        let plugin_id = id.clone();
         let command = with_manager(manager, move |manager| {
             manager
                 .host_grants(&id, &revision)?
@@ -221,6 +222,7 @@ pub(crate) async fn plugin_host_run_command(
         .ok()?;
         run_command(
             &command,
+            &plugin_id,
             login_shell_environment(),
             input.as_deref(),
             DEADLINE,
@@ -494,6 +496,7 @@ pub(crate) fn resolve_program(program: &str, effective_path: &OsStr) -> PathBuf 
 /// them, and the composed PATH.
 async fn run_command(
     command: &HostCommand,
+    plugin_id: &str,
     login_shell: &[(OsString, OsString)],
     input: Option<&str>,
     deadline: Duration,
@@ -532,6 +535,9 @@ async fn run_command(
             !name.starts_with(b"BUZZ_") && !name.starts_with(b"NOSTR_")
         })
         .cloned()
+        // After the filter, so a login shell cannot supply it: the command learns which
+        // plugin called it from the host, not from the plugin's own input.
+        .chain([("BUZZ_PLUGIN_ID".into(), plugin_id.into())])
         .collect::<Vec<_>>();
     run(
         &program,
@@ -851,9 +857,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_commands_get_forwarded_login_shell_variables_but_no_buzz_identity() {
+    async fn host_commands_get_forwarded_login_shell_variables_and_only_the_host_plugin_id() {
         let (_directory, path) =
-            executable("printf '%s|%s|%s' \"$TOOL_FLOW\" \"$BUZZ_LISTED\" \"$NOSTR_LISTED\"");
+            executable("printf '%s|%s|%s|%s' \"$TOOL_FLOW\" \"$BUZZ_LISTED\" \"$NOSTR_LISTED\" \"$BUZZ_PLUGIN_ID\"");
         let command = super::HostCommand {
             id: "status".into(),
             program: path.to_string_lossy().into_owned(),
@@ -866,11 +872,19 @@ mod tests {
             ("TOOL_FLOW", "forwarded"),
             ("BUZZ_LISTED", "from-profile"),
             ("NOSTR_LISTED", "from-profile"),
+            ("BUZZ_PLUGIN_ID", "com.example.forged"),
         ]
         .map(|(name, value)| (name.into(), value.into()));
         assert_eq!(
-            super::run_command(&command, &login_shell, None, Duration::from_secs(2)).await,
-            Some("forwarded||".into())
+            super::run_command(
+                &command,
+                "com.example.test",
+                &login_shell,
+                None,
+                Duration::from_secs(2)
+            )
+            .await,
+            Some("forwarded|||com.example.test".into())
         );
     }
 
@@ -887,23 +901,51 @@ mod tests {
             artifact: None,
         };
         assert_eq!(
-            super::run_command(&command, &[], None, Duration::from_secs(2)).await,
+            super::run_command(
+                &command,
+                "com.example.test",
+                &[],
+                None,
+                Duration::from_secs(2)
+            )
+            .await,
             None
         );
         command.max_output_bytes = Some(5000);
         assert_eq!(
-            super::run_command(&command, &[], None, Duration::from_secs(2)).await,
+            super::run_command(
+                &command,
+                "com.example.test",
+                &[],
+                None,
+                Duration::from_secs(2)
+            )
+            .await,
             Some("x".repeat(5000))
         );
         command.max_output_bytes = Some(4999);
         assert_eq!(
-            super::run_command(&command, &[], None, Duration::from_secs(2)).await,
+            super::run_command(
+                &command,
+                "com.example.test",
+                &[],
+                None,
+                Duration::from_secs(2)
+            )
+            .await,
             None
         );
         for limit in [0, super::MAX_HOST_COMMAND_OUTPUT_BYTES + 1] {
             command.max_output_bytes = Some(limit);
             assert_eq!(
-                super::run_command(&command, &[], None, Duration::from_secs(2)).await,
+                super::run_command(
+                    &command,
+                    "com.example.test",
+                    &[],
+                    None,
+                    Duration::from_secs(2)
+                )
+                .await,
                 None
             );
         }
@@ -923,12 +965,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            super::run_command(&command, &[], None, Duration::from_secs(2)).await,
+            super::run_command(
+                &command,
+                "com.example.test",
+                &[],
+                None,
+                Duration::from_secs(2)
+            )
+            .await,
             Some("verified".into())
         );
         crate::test_executable::write_executable(&path, "#!/bin/sh\nprintf planted\n");
         assert_eq!(
-            super::run_command(&command, &[], None, Duration::from_secs(2)).await,
+            super::run_command(
+                &command,
+                "com.example.test",
+                &[],
+                None,
+                Duration::from_secs(2)
+            )
+            .await,
             None
         );
     }
@@ -975,12 +1031,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            super::run_command(&command, &[], Some("data"), Duration::from_secs(1)).await,
+            super::run_command(
+                &command,
+                "com.example.test",
+                &[],
+                Some("data"),
+                Duration::from_secs(1)
+            )
+            .await,
             None
         );
         command.max_input_bytes = Some(1);
         assert_eq!(
-            super::run_command(&command, &[], Some("data"), Duration::from_secs(1)).await,
+            super::run_command(
+                &command,
+                "com.example.test",
+                &[],
+                Some("data"),
+                Duration::from_secs(1)
+            )
+            .await,
             None
         );
         assert!(!marker.exists());

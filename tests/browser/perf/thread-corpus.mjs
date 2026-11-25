@@ -1,6 +1,6 @@
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools";
 
-// The long-thread workload in docs/channels.md#targets: a weekly-update thread
+// The long-thread workload in docs/performance.md#thread-scrolling-targets: a weekly-update thread
 // filling the strict window's full history (10 initial replies plus nine pages
 // of 50). Text, timestamps and structure are fixed; keys are ephemeral. Bodies
 // mix plain prose, Markdown lists, mentions and links, and their lengths follow

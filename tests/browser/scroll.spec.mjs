@@ -234,7 +234,13 @@ readingTest(
       scenario: "live-appends",
       ...(await workSample(page)),
     });
-    expect(app.pending).toHaveLength(0);
+    // Visits left read-ahead reads cancelled; only the reader now at the
+    // latest message may still be reading ahead.
+    expect(
+      app.pending.filter(
+        (read) => !(read.community === "primary" && read.channel === "alpha"),
+      ),
+    ).toEqual([]);
   },
 );
 
@@ -335,10 +341,12 @@ readingTest(
 test("cursor paging preserves visible anchors and keeps a large history virtualized", {
   tag: "@local-webkit",
 }, async ({ page, app, browserName }) => {
-  await open(page, app);
+  const ahead = await open(page, app);
   await observeWork(page);
-  let loaded = 20;
-  const cursors = new Set();
+  let loaded = 20 + ahead.reduce((rows, read) => rows + read.events.length, 0);
+  const cursors = new Set(
+    ahead.map(({ filter }) => `${filter.until}:${filter.before_id}`),
+  );
   while (loaded < historySize) {
     // A small prepend can leave us inside the prefetch zone and automatically
     // request the next page. A new gesture must not duplicate that pending read.
@@ -362,13 +370,17 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
     expect(pending.channel).toBe("alpha");
     expect(pending.filter.until).toBeDefined();
     expect(pending.filter.before_id).toMatch(/^[a-f0-9]{64}$/);
-    expect(pending.filter.limit).toBe(20);
+    // Pages are sized to the reader's pace, within the relay's read limit.
+    expect(pending.filter.limit).toBeGreaterThanOrEqual(20);
+    expect(pending.filter.limit).toBeLessThanOrEqual(200);
     const cursor = `${pending.filter.until}:${pending.filter.before_id}`;
     expect(cursors.has(cursor), "each older cursor is requested once").toBe(
       false,
     );
     cursors.add(cursor);
-    expect(pending.events).toHaveLength(20);
+    expect(pending.events).toHaveLength(
+      Math.min(pending.filter.limit, historySize - loaded),
+    );
     pending.release();
     loaded += pending.events.length;
     await expect
@@ -387,10 +399,15 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
     await settle(page);
     expect(app.pending.length).toBeLessThanOrEqual(1);
   }
-  expect(cursors.size).toBe(31);
+  expect(loaded).toBe(historySize);
+  // Each page's aux closure is read apart from its rows.
   expect(
-    app.report.queries.filter(({ filter }) => filter.until !== undefined),
-  ).toHaveLength(31);
+    app.report.queries.filter(
+      ({ filter }) =>
+        filter.until !== undefined &&
+        !(filter.include_aux && !filter.include_summaries),
+    ),
+  ).toHaveLength(cursors.size);
   expect(app.pending).toHaveLength(0);
 
   await edge(page, -1);
@@ -476,6 +493,7 @@ test("cursor paging preserves visible anchors and keeps a large history virtuali
       true,
     );
   expect(primaryQueries(app)).toBe(queriesBeforeTraversal);
+  // Each Beta visit's read-ahead was cancelled when the reader left.
   expect(app.pending).toHaveLength(0);
   const sample = await workSample(page);
   expect(sample.frameSamples).toBeGreaterThan(0);

@@ -1,3 +1,4 @@
+import { bindingKey } from "../../shared/keyboard-key";
 import type { KeyBinding } from "./bindings";
 
 /** The dispatcher's platform test: `mod` is Command here and Control elsewhere. */
@@ -52,13 +53,14 @@ export function formatBinding(
   binding: KeyBinding,
   apple: boolean,
 ): FormattedBinding {
-  const normalized = binding.key.toLowerCase();
+  const name = bindingKey(binding.key);
+  const normalized = name.toLowerCase();
   const special = Object.hasOwn(SPECIAL_KEYS, normalized)
     ? SPECIAL_KEYS[normalized]
     : undefined;
   const key: Words = special ?? [
-    binding.key.length === 1 ? binding.key.toUpperCase() : binding.key,
-    binding.key.length === 1 ? binding.key.toUpperCase() : binding.key,
+    name.length === 1 ? name.toUpperCase() : name,
+    name.length === 1 ? name.toUpperCase() : name,
   ];
   const modifiers = (apple ? APPLE_MODIFIERS : OTHER_MODIFIERS)
     .filter(([flag]) => binding[flag])

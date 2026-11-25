@@ -18,7 +18,7 @@
   letter-spacing: var(--text-body-sm--letter-spacing);
 }
 
-.search-field:has([data-search-clear]) {
+.search-field:has(.search-field-actions, [data-search-clear]) {
   padding-right: var(--space-1);
 }
 

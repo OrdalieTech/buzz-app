@@ -16,6 +16,9 @@ type Standard = EmojiMatch & {
 };
 const normalize = (value: string) => value.toLowerCase().replace(/[-_\s]/g, "");
 let standard: Promise<readonly Standard[]> | undefined;
+/** Times a match ID was chosen, from the shared emoji usage store. */
+type Uses = (id: string) => number;
+const unused: Uses = () => 0;
 
 type ShortcodeScore = Readonly<{ tier: number; score: number }>;
 
@@ -128,18 +131,20 @@ function semanticScore(query: string, terms: readonly string[]) {
 export async function searchEmoji(
   query: string,
   custom: readonly CustomEmoji[],
+  uses: Uses = unused,
   limit = Number.POSITIVE_INFINITY,
   tone = defaultSkinTone(),
 ): Promise<readonly EmojiMatch[]> {
   const native = await loadStandard();
-  return rankEmoji(query, native, custom, limit, tone);
+  return rankEmoji(query, native, custom, limit, tone, uses);
 }
 export function searchCustomEmoji(
   query: string,
   custom: readonly CustomEmoji[],
+  uses: Uses = unused,
   limit = Number.POSITIVE_INFINITY,
 ): readonly EmojiMatch[] {
-  return rankEmoji(query, [], custom, limit, 1);
+  return rankEmoji(query, [], custom, limit, 1, uses);
 }
 /** The one match whose shortcode is the typed name; separator-insensitive ranking
  * ties (`:1:` for `-1`) and community/Unicode namesakes are not exact. */
@@ -154,6 +159,7 @@ function rankEmoji(
   custom: readonly CustomEmoji[],
   limit: number,
   tone: number,
+  uses: Uses,
 ): readonly EmojiMatch[] {
   if (!normalize(query)) return [];
   const customCandidates: Standard[] = custom.map(({ shortcode, url }) => ({
@@ -181,14 +187,26 @@ function rankEmoji(
       .map(({ item }) => item)
       .filter((item) => !semanticIds.has(item.id)),
   ];
+  const literal = query.toLowerCase();
   const strong = rank(combined)
     .filter(({ tier }) => tier <= 1)
-    .map(({ item }) => item);
-  const promoted = new Set(strong.map((item) => item.id));
+    // The typed shortcode itself leads its separator-insensitive namesakes.
+    .map((match) =>
+      match.item.shortcode.toLowerCase() === literal
+        ? { ...match, tier: -1 }
+        : match,
+    );
+  const promoted = new Set(strong.map(({ item }) => item.id));
   const ranked = [
     ...strong,
-    ...combined.filter((item) => !promoted.has(item.id)),
-  ];
+    ...combined
+      .filter((item) => !promoted.has(item.id))
+      .map((item) => ({ item, tier: semanticIds.has(item.id) ? 2 : 3 })),
+  ]
+    // Within literal, exact, prefix, name or keyword, and fuzzy matches, the more often
+    // chosen emoji comes first; ties and unused emoji keep their query order.
+    .sort((a, b) => a.tier - b.tier || uses(b.item.id) - uses(a.item.id))
+    .map(({ item }) => item);
   const bounded = Number.isFinite(limit)
     ? ranked.slice(0, Math.max(0, limit))
     : ranked;

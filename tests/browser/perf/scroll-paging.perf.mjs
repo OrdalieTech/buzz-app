@@ -2,10 +2,11 @@ import { test, expect, repeats, timeline } from "./runner.mjs";
 import { scrollCadence } from "./cadence.mjs";
 
 const count = 640;
-// Each variant changes one condition of scroll-paging-fast.
+// Each variant changes one condition of scroll-paging-fast or -delayed.
 for (const [name, olderPageDelayMs, modality, options] of [
   ["scroll-paging-fast", 100, "pointer", {}],
   ["scroll-paging-delayed", 500, "pointer", {}],
+  ["scroll-paging-delayed-short", 500, "pointer", { shortMessages: true }],
   ["scroll-paging-fast-keyboard", 100, "keyboard", {}],
   ["scroll-paging-fast-markdown", 100, "pointer", { markdownMessages: true }],
   ["scroll-paging-fast-first-seen", 100, "pointer", { firstSeenHistory: true }],
@@ -23,7 +24,9 @@ for (const [name, olderPageDelayMs, modality, options] of [
         const oldestId = app.histories.get("primary/alpha")[0].id;
         const point = await perf.gutter("alpha", modality);
         await perf.settle("alpha");
-        expect(app.pending, "history is not preloaded").toHaveLength(0);
+        // Input starts as soon as the opening settles, with any read-ahead
+        // still in flight: a reader scrolling back at once.
+        const olderReadsBefore = app.pending.length;
         const head = app.report.queries.find(
           ({ filter }) =>
             filter.top_level &&
@@ -35,8 +38,12 @@ for (const [name, olderPageDelayMs, modality, options] of [
           .slice(0, -head.limit)
           .map(({ id }) => id);
         // Served events are in the app's proof memo; first-seen ones verify.
-        const olderRowsServedBefore = expectedOlderIds.filter((id) =>
-          app.served.has(id),
+        // The visit's own older pages, read ahead, verify as they arrive.
+        const paged = new Set(
+          app.pending.flatMap(({ events }) => events.map(({ id }) => id)),
+        );
+        const olderRowsServedBefore = expectedOlderIds.filter(
+          (id) => app.served.has(id) && !paged.has(id),
         ).length;
         if (options.firstSeenHistory)
           expect(olderRowsServedBefore, "older history is first-seen").toBe(0);
@@ -77,6 +84,19 @@ for (const [name, olderPageDelayMs, modality, options] of [
           },
         });
         Object.assign(sample.metrics, scrollCadence(sample.recording));
+        // Time the reader spent held at the top edge, waiting for history.
+        const { frames, gestureStartMs, gestureEndMs } = sample.recording;
+        sample.metrics.edgeWaitMs = frames
+          .slice(1)
+          .reduce(
+            (sum, { t }, i) =>
+              frames[i].top <= 1 &&
+              frames[i].t >= gestureStartMs &&
+              t <= gestureEndMs
+                ? sum + t - frames[i].t
+                : sum,
+            0,
+          );
         const received = new Set(
           app.pending
             .filter(({ releaseDelayMs }) => releaseDelayMs !== undefined)
@@ -85,7 +105,8 @@ for (const [name, olderPageDelayMs, modality, options] of [
         Object.assign(sample.work, {
           gestures,
           wheels: sample.recording.wheels,
-          olderReadsDuring: app.pending.length,
+          olderReadsBefore,
+          olderReadsDuring: app.pending.length - olderReadsBefore,
           olderReleaseDelaysMs: app.pending.map(
             ({ releaseDelayMs }) => releaseDelayMs,
           ),
@@ -99,10 +120,9 @@ for (const [name, olderPageDelayMs, modality, options] of [
           expect.arrayContaining(expectedOlderIds),
         );
         expect(sample.work.wheels, "real wheel input").toBeGreaterThan(0);
-        expect(
-          sample.work.olderReadsDuring,
-          "multiple pages arrive during input",
-        ).toBeGreaterThan(1);
+        expect(app.pending.length, "history arrives in pages").toBeGreaterThan(
+          1,
+        );
         expect(
           sample.recording.frames.at(-1).rows.map(([id]) => id),
           "oldest message remains visible after settling",

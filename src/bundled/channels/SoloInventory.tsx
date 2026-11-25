@@ -1,4 +1,6 @@
 import { useSoloRowActivation } from "../../features/channel-navigation/useSoloRowActivation";
+import { SpringLoadedNavigationItem } from "../../features/channel-navigation/SpringLoadedNavigationItem";
+import { useSpringLoaded } from "../../features/messages/spring-loaded-drag";
 import { useIsPresent } from "motion/react";
 import { SoloChatTitle } from "../../features/solo/SoloChatTitle";
 import type { ComposeWorkspaces } from "../../features/channel-navigation/WorkspaceComposition";
@@ -65,7 +67,6 @@ import creationStyles from "./SoloInventory.module.css";
 import {
   DotsThreeIcon,
   ChatCircleIcon,
-  PencilSimpleIcon,
   PlusIcon,
 } from "../../shared/design-system/icons";
 import { NavigationItem } from "../../shared/design-system/ui/NavigationItem";
@@ -439,16 +440,17 @@ export function SoloInventory({
               id: route?.linked ?? route?.project ?? "solo",
               projectId: route?.project,
               content: (
-                <NavigationItem
+                <SpringLoadedNavigationItem
                   label="New chat"
                   aria-description="Unsent draft"
                   selected={selected}
+                  onSpring={() => void navigator.open(destination)}
                   icon={
                     <span
                       className={styles.conversationIcon}
                       aria-hidden="true"
                     >
-                      <PencilSimpleIcon size={16} />
+                      <PlusIcon size={16} />
                     </span>
                   }
                   onClick={() => {
@@ -607,6 +609,7 @@ function SoloConversationRow({
     onSelect,
     onRename,
   );
+  const springLoaded = useSpringLoaded(onSelect, selected);
   const { agents, agentProfiles, waiting } = useWorkingAgents(
     session,
     id,
@@ -636,6 +639,7 @@ function SoloConversationRow({
           aria-current={selected ? "page" : undefined}
           aria-describedby={shared ? soloSharedMarkId(id) : undefined}
           {...activation}
+          {...springLoaded}
           icon={
             Icon ? (
               <Icon session={session} channelId={id} fallback={chatIcon} />

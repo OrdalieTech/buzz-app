@@ -47,3 +47,43 @@ it("preserves missing-roster versus self-DM fallback and uses public labels for 
   expect(dmLabel(undefined, names, resolve)).toBe("Notes to self");
   expect(dmLabel([key], names, resolve)).toBe(publicKeyLabels([key]).get(key));
 });
+it("names the people in a DM and leaves its agents out", () => {
+  const [ana, ben, cy, dee, bot, helper, unloaded] = [
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "9",
+  ].map((c) => c.repeat(64)) as [
+    string,
+    string,
+    string,
+    string,
+    string,
+    string,
+    string,
+  ];
+  const profiles = new Map<string, { name: string; isAgent?: true }>([
+    [ana, { name: "Ana" }],
+    [ben, { name: "Ben" }],
+    [cy, { name: "Cy" }],
+    [dee, { name: "Dee" }],
+    [bot, { name: "Bot", isAgent: true }],
+    [helper, { name: "Helper", isAgent: true }],
+  ]);
+  const resolve = (_key: string, fallback: string) => fallback;
+  // People and agents: only the people.
+  expect(dmLabel([bot, ana], profiles, resolve)).toBe("Ana");
+  // Only agents: no other person, so the agents.
+  expect(dmLabel([helper, bot], profiles, resolve)).toBe("Bot, Helper");
+  // More than three people and agents: "+N" counts people only.
+  expect(dmLabel([bot, dee, cy, helper, ben, ana], profiles, resolve)).toBe(
+    "Ana, Ben, Cy +1",
+  );
+  // A profile not loaded yet is named until it says it is an agent.
+  expect(dmLabel([bot, unloaded], profiles, resolve)).toBe(
+    publicKeyLabels([unloaded]).get(unloaded),
+  );
+});

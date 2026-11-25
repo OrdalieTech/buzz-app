@@ -466,8 +466,8 @@ function reconnectHarness(
     wire.pending.filter(
       (entry) => !entry.signal?.aborted && entry.filters[0]?.top_level === true,
     );
-  /** The one outstanding window read, after answering profile reads empty.
-   * A head's notice read, sent beside it, stays pending. */
+  /** The one outstanding window read, after answering byline profile reads
+   * empty. A notice read of its own stays pending. */
   const read = (channelId = "c") => {
     for (const entry of wire.pending.splice(0)) {
       if (entry.signal?.aborted) continue;
@@ -475,8 +475,9 @@ function reconnectHarness(
       else wire.pending.push(entry);
     }
     const reads = wire.pending.filter((entry) => !isNoticeRead(entry.filters));
-    expect(reads.map((entry) => entry.filters)).toMatchObject([
-      [{ "#h": [channelId], top_level: true }],
+    // A head read carries its notice filter second.
+    expect(reads.map((entry) => entry.filters[0])).toMatchObject([
+      { "#h": [channelId], top_level: true },
     ]);
     const [entry] = reads;
     assert(entry);
@@ -574,6 +575,7 @@ function reconnectHarness(
   };
   return {
     owner,
+    relay,
     alice,
     wire,
     queries,
@@ -1183,6 +1185,33 @@ it("a fill whose last page lands in the tick the stream drops reports the window
   }
 });
 
+it("a stream drop that cancels an older page's aux read reads it again after the catch-up", async () => {
+  const h = reconnectHarness();
+  try {
+    const seen = message(h.alice, "c", "seen", 10),
+      old = message(h.alice, "c", "old", 5);
+    await h.reconnect(seen);
+    h.read().respond(h.page("head", [seen], seen));
+    await flush();
+    h.owner.session.channels.loadOlder("c");
+    h.read().respond(h.page(h.cursor(seen), [old], null));
+    await flush();
+    const aux = h.read();
+    expect(aux.filters[0]).toMatchObject({ until: 10, include_aux: true });
+    // The history has no older page left to read it with.
+    await h.dropAndReplay([]);
+    expect(aux.signal?.aborted).toBe(true);
+    h.read().respond(h.page("head", [seen], seen));
+    await flush();
+    expect(h.read().filters[0]).toMatchObject({
+      until: 10,
+      include_aux: true,
+    });
+  } finally {
+    h.owner.dispose();
+  }
+});
+
 it("an older page read while the stream is down waits below a settled fill until paging reaches it", async () => {
   // Those rows are not in the drop-time snapshot, so a fill that gives up on
   // the snapshot does not drop them; the settle's cursor hides them below the
@@ -1207,6 +1236,14 @@ it("an older page read while the stream is down waits below a settled fill until
     older.respond(h.page(h.cursor(seen), [old], old));
     await flush();
     expect(h.rows()).toEqual([old.id, seen.id]);
+    // The page's aux closure follows its rows.
+    const aux = h.read();
+    expect(aux.filters[0]).toMatchObject({
+      until: seen.created_at,
+      include_aux: true,
+    });
+    aux.respond(h.page(h.cursor(seen), [old], old));
+    await flush();
     await h.dropAndReplay([]);
     let previous: (typeof missed)[number] | undefined;
     for (const row of missed) {
@@ -1457,7 +1494,9 @@ it("skips the reads a continuous global replay covers, and keeps them after a cu
   const relay = keypair(),
     viewer = keypair(),
     alice = keypair();
-  const wire = scriptedTransport(viewer.pubkey, relay.pubkey);
+  const wire = scriptedTransport(viewer.pubkey, relay.pubkey, {
+    statuses: true,
+  });
   let live!: LiveCallbacks;
   let journal: ReadJournal | undefined;
   const decodeMarkers = vi.fn(async (events: readonly RelayEvent[]) =>
@@ -2096,7 +2135,9 @@ describe("a reconnect whose replay was continuous", () => {
       expect(h.window().freshness).toBe("verified");
       // The head read also asks for the newest membership notices.
       expect(
-        channelReads(h).filter((filters) => filters[0]?.kinds?.[0] === 40099),
+        channelReads(h).filter((filters) =>
+          filters.some((filter) => filter.kinds?.[0] === 40099),
+        ),
       ).toHaveLength(1);
     } finally {
       h.owner.dispose();
@@ -2267,10 +2308,24 @@ describe("a reconnect whose replay was continuous", () => {
       h.live.state({ status: "connected", routes: [] });
       h.live.established("c");
       await flush();
-      h.read().respond(h.page("head", [seen], seen));
+      // A long drop: a full page of joins lands with the catch-up's head,
+      // so their descent continues below it.
+      const joins = Array.from({ length: 500 }, (_, index) =>
+        signed(h.relay, {
+          kind: 40099,
+          content: JSON.stringify({
+            type: "member_joined",
+            actor: h.alice.pubkey,
+            target: keypair().pubkey,
+          }),
+          created_at: 11 + index,
+          tags: [["h", "c"]],
+        }),
+      );
+      h.read().respond([...h.page("head", [seen], seen), ...joins]);
       await flush();
       expect(h.window().freshness).toBe("verified");
-      // The catch-up's notice read fails: its notices are still owed.
+      // The descent's read fails: the notices below are still owed.
       const owed = notices();
       expect(owed).toHaveLength(1);
       owed[0]?.fail(new Error("Membership notices did not advance"));

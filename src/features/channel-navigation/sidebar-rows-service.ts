@@ -1,5 +1,5 @@
 import { Service, type Context } from "@deepseek-ai/cordis";
-import type { ReactElement } from "react";
+import { isValidElement, type ReactElement } from "react";
 import type { ChannelSummary } from "../relay/contracts";
 import type { UnreadSnapshot } from "../relay/unread";
 import {
@@ -7,6 +7,7 @@ import {
   type Contribution,
 } from "../../plugins/contributions";
 import { isSidebarSortMode, type SidebarSortMode } from "../relay/sidebar-sort";
+import type { SidebarSectionAction } from "./sidebar-sections-service";
 
 export type SidebarRow = Readonly<{
   id: string;
@@ -30,6 +31,9 @@ export type SidebarRowContribution = Readonly<{
     Default: ReactElement | null,
   ) => ReactElement | null;
   sortModes?: readonly SidebarRowSortMode[];
+  /** Items for a row's menu, after Mute, in the sidebar and the channel
+   * header. Asked each time the menu renders. */
+  menuItems?: (row: SidebarRow) => readonly SidebarSectionAction[];
 }>;
 export type RegisteredSidebarRows = Contribution<SidebarRowContribution>;
 export type SidebarRows = Readonly<{
@@ -92,6 +96,8 @@ export class SidebarRowsService extends Service implements SidebarRows {
       typeof value.id !== "string" ||
       !idPattern.test(value.id) ||
       (value.render !== undefined && typeof value.render !== "function") ||
+      (value.menuItems !== undefined &&
+        typeof value.menuItems !== "function") ||
       (value.sortModes !== undefined &&
         (!Array.isArray(value.sortModes) ||
           new Set(value.sortModes.map((mode) => mode?.id)).size !==
@@ -137,6 +143,46 @@ export function sidebarRow(
     channel,
     unread,
   };
+}
+
+export function pluginRowSectionKey(
+  channel: ChannelSummary,
+  sectionKey: string,
+) {
+  if (channel.channelType !== "solo") return sectionKey;
+  return sectionKey.startsWith("group:") ? sectionKey.slice(6) : "";
+}
+
+/** Each contribution's valid menu items for a row; a throwing or invalid
+ * contribution adds none. */
+export function sidebarRowMenuItems(
+  entries: readonly RegisteredSidebarRows[],
+  row: SidebarRow,
+) {
+  return entries.flatMap((entry) => {
+    try {
+      const items = entry.menuItems?.(row) ?? [];
+      return Array.isArray(items)
+        ? items
+            .filter(
+              (item) =>
+                typeof item?.id === "string" &&
+                idPattern.test(item.id) &&
+                typeof item.label === "string" &&
+                !!item.label.trim() &&
+                isValidElement(item.icon) &&
+                typeof item.onSelect === "function",
+            )
+            .filter(
+              (item, index, valid) =>
+                valid.findIndex((other) => other.id === item.id) === index,
+            )
+            .map((item) => ({ ...item, key: `${entry.key}/${item.id}` }))
+        : [];
+    } catch {
+      return [];
+    }
+  });
 }
 
 export function sidebarRowSortModes(entries: readonly RegisteredSidebarRows[]) {

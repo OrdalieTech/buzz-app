@@ -24,6 +24,8 @@ export type FakeProcess = {
   requests: Request[];
   ended: boolean;
   killed: boolean;
+  /** Whether it has exited. */
+  gone: boolean;
   /** The launcher's line: the host source and the packages it installs. */
   launched?: { host: string; package: string; lock: string };
   /** Sends the plugin one message, as stdout. */
@@ -63,6 +65,7 @@ export function fakeHost(
       requests: [],
       ended: false,
       killed: false,
+      gone: false,
       send: (message) => {
         if (!gone) spawnOptions.onStdout?.(`${JSON.stringify(message)}\n`);
       },
@@ -76,6 +79,7 @@ export function fakeHost(
         if (gone) return;
         if (stderr) spawnOptions.onStderr?.(stderr);
         gone = true;
+        process.gone = true;
         exit(code);
       },
     };

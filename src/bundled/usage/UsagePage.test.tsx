@@ -107,6 +107,7 @@ function host(
     snapshot: () => snapshot,
     types: () => types,
     subscribe: () => () => {},
+    conversationReads: () => ({ ownerReadable: () => true }),
   } as unknown as Agents;
 }
 
@@ -262,6 +263,31 @@ it("counts a session with no conversation, listing it without a link to open", a
   expect(
     screen.queryByRole("button", { name: /Open conversation/ }),
   ).toBeNull();
+});
+
+it("groups cost by the timer or watch that started each session, the rest under Other", async () => {
+  render(
+    <UsagePage
+      agents={host([agent("Pixel"), agent("Relay")], async (target) => [
+        target.name === "Pixel"
+          ? { ...session("a", 750_000), wake: "timer/daily" }
+          : session("b", 250_000),
+      ])}
+      open={vi.fn()}
+    />,
+  );
+  const routines = await screen.findByRole("region", { name: "By routine" });
+  const rows = within(routines).getAllByRole("listitem");
+  expect(rows.map((row) => row.textContent)).toEqual([
+    "timer/dailyPixel · 1 session$3.00",
+    "Other1 session$1.00",
+  ]);
+});
+
+it("shows no By routine when no session says which timer or watch started it", async () => {
+  render(<UsagePage agents={team()} open={vi.fn()} />);
+  await screen.findByRole("region", { name: "Estimated cost" });
+  expect(screen.queryByRole("region", { name: "By routine" })).toBeNull();
 });
 
 it("opens an agent from By agent in Agents", async () => {

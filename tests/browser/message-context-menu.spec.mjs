@@ -223,7 +223,11 @@ test("right-clicking a message timestamp offers its ⋯ actions and copies its l
   );
   const box = await menu.boundingBox();
   expect(Math.abs(box.x - point.x)).toBeLessThan(16);
-  expect(Math.abs(box.y - point.y)).toBeLessThan(16);
+  // At the pointer, or raised just enough to stay in the viewport.
+  const { height } = page.viewportSize();
+  expect(Math.abs(box.y - Math.min(point.y, height - box.height))).toBeLessThan(
+    16,
+  );
   await menu.getByRole("menuitem", { name: "Copy link", exact: true }).click();
   await expect(menu).toHaveCount(0);
   await expect

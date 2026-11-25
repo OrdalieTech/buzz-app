@@ -98,7 +98,12 @@ async function queryModels(spawn: Spawn, signal: AbortSignal) {
     process = await ClaudeProcess.start(
       async (id, options) => {
         request.signal.throwIfAborted();
-        child = await spawn(id, options);
+        // As an ordinary agent's, with the device's variables, so a key kept
+        // only there lists its models. A review never comes this way.
+        child = await spawn(id, {
+          ...options,
+          secrets: [...(options?.secrets ?? []), "agent-env"],
+        });
         if (request.signal.aborted) await child.kill();
         request.signal.throwIfAborted();
         return child;
@@ -252,6 +257,9 @@ export type SetupState = Readonly<{
   output: string;
   /** Why the latest release is not the one in use, after it failed its test. */
   notice: string | undefined;
+  /** Whether a protected agent could run, from the same sample as `status`
+   * (`ClaudeAuth.protectedEligible`); undefined until known. */
+  protectedReady: boolean | undefined;
 }>;
 const OUTPUT_LIMIT = 20_000;
 
@@ -266,6 +274,7 @@ export class ClaudeSetup {
     running: undefined,
     output: "",
     notice: undefined,
+    protectedReady: undefined,
   };
   private readonly listeners = new Set<() => void>();
   private health: AgentProviderSnapshot = { readiness: "checking" };
@@ -291,6 +300,8 @@ export class ClaudeSetup {
     readonly auth = new ClaudeAuth(spawn),
   ) {
     this.spawn = spawn && auth.authorize(spawn);
+    // A saved or cleared key, or a changed own setup, changes it at once.
+    auth.subscribe(() => this.set({ protectedReady: auth.protectedEligible }));
   }
 
   snapshot = () => this.state;
@@ -359,6 +370,7 @@ export class ClaudeSetup {
     }
     this.set({
       status,
+      protectedReady: this.auth.protectedEligible,
       ...(invalidate
         ? { models: [], modelsChecking: false, modelsError: "" }
         : {}),
@@ -468,7 +480,7 @@ export class ClaudeSetup {
     return this.hold(
       (async () => {
         const status = await checkClaude(spawn, this.auth);
-        this.set({ status });
+        this.set({ status, protectedReady: this.auth.protectedEligible });
         if (!needed && status.state === "missing") return;
         await this.run("install", false);
       })(),

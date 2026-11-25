@@ -170,10 +170,10 @@
   }
   /* Borderless titles have no perimeter to stroke; their message carries
      validation. Keyboard focus still draws its cue. */
-  .buzz-input:is([data-appearance="title"], [data-appearance="heading"]):is(
-    [data-invalid],
-    [aria-invalid="true"]
-  ) {
+  :is(.buzz-input, .buzz-textarea):is(
+    [data-appearance="title"],
+    [data-appearance="heading"]
+  ):is([data-invalid], [aria-invalid="true"]) {
     --border: transparent;
   }
   .buzz-input:disabled,
@@ -599,7 +599,7 @@
     border-radius: 0;
     background: transparent;
   }
-  .buzz-input[data-appearance="heading"] {
+  :is(.buzz-input, .buzz-textarea)[data-appearance="heading"] {
     display: block;
     @apply text-heading;
     min-height: 0;
@@ -615,14 +615,17 @@
   .buzz-input:where(
     :not([data-appearance="title"], [data-appearance="heading"])
   ):where(:focus, [data-popup-open]),
-  .buzz-textarea:where(:focus),
+  .buzz-textarea:where(:not([data-appearance="heading"])):where(:focus),
   .buzz-input-group:where(:focus-within) {
     --border: var(--interaction-border);
   }
   /* Title edits stay visually inline on pointer/autofocus entry. Keep a
      perimeter cue when navigating these borderless inputs with the keyboard. */
   html[data-keyboard-navigation]
-  .buzz-input:is([data-appearance="title"], [data-appearance="heading"]):focus {
+  :is(.buzz-input, .buzz-textarea):is(
+    [data-appearance="title"],
+    [data-appearance="heading"]
+  ):focus {
     --border: var(--interaction-border);
   }
   html[data-keyboard-navigation]

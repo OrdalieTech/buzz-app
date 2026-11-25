@@ -28,6 +28,12 @@ import { eventDto, type RelayEvent } from "../../features/relay/events";
 import type { RelayWriter } from "../../features/relay/transport";
 import { createRelayProfiler } from "../../features/relay/profiling";
 import { soloChatLinkMessage } from "../../features/solo/share";
+import {
+  EXPIRED_PIN_RECOVERY,
+  PIN_KIND,
+  pinLists,
+  type PinSource,
+} from "../../features/relay/pins";
 import { OutboxStatus } from "./OutboxStatus";
 
 afterEach(cleanup);
@@ -62,6 +68,57 @@ function show(item: OutgoingEvent) {
   fireEvent.click(screen.getByText("Outbox · 1 items"));
   return { retry, add, acknowledge };
 }
+
+it("offers no retry for a pin command refused as too old and reads its list again", async () => {
+  const read = vi.fn(async () => []);
+  const pins = {
+    relayAuthor: "a".repeat(64),
+    workflowAuthority: "a".repeat(64),
+    read,
+    readPage: async () => ({ events: [], relayCount: 0 }),
+    subscribeLive: () => () => {},
+    live: { snapshot: () => ({ heads: [] }), subscribe: () => () => {} },
+  } satisfies PinSource;
+  // A view keeps this channel's list.
+  pinLists(pins).subscribe("room", () => {});
+  await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+  const retry = vi.fn();
+  const items = [
+    {
+      event: {
+        id: "pin",
+        kind: PIN_KIND,
+        content: "",
+        tags: [
+          ["h", "room"],
+          ["e", "1".repeat(64)],
+        ],
+      },
+      delivery: "unknown",
+      error: "Retry blocked: invalid: event timestamp too far from server time",
+    } as OutgoingEvent,
+  ];
+  render(
+    <OutboxStatus
+      outbox={
+        {
+          snapshot: () => items,
+          subscribe: () => () => {},
+          retry,
+          dismiss: vi.fn(),
+        } as unknown as Outbox
+      }
+      profiling={createRelayProfiler()}
+      memberAdditions={{ add: vi.fn(async () => {}) }}
+      pins={pins}
+    />,
+  );
+  fireEvent.click(screen.getByText("Outbox · 1 items"));
+  expect(screen.getByText(EXPIRED_PIN_RECOVERY)).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+  expect(retry).not.toHaveBeenCalled();
+});
 
 it("labels a setup with unconfirmed creation and withholds abandonment and removal", () => {
   const viewer = keypair();
@@ -218,7 +275,7 @@ it("retries a guest addition as a guest", async () => {
   );
 });
 
-it("retries a guest batch per person as guests, each as a new addition", async () => {
+it("passes the saved receipt, role, and source when retrying a migration batch", async () => {
   const { add } = show({
     ...invitation,
     event: {
@@ -228,6 +285,7 @@ it("retries a guest batch per person as guests, each as a new addition", async (
         ["p", "one"],
         ["p", "two"],
         ["role", "guest"],
+        ["migration", "slack"],
       ],
     },
     recovery: { key: "member-add:batch:operation", value: "1" },
@@ -235,8 +293,24 @@ it("retries a guest batch per person as guests, each as a new addition", async (
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
   await waitFor(() =>
     expect(add.mock.calls).toEqual([
-      ["channel", "one", { role: "guest" }],
-      ["channel", "two", { role: "guest" }],
+      [
+        "channel",
+        "one",
+        {
+          role: "guest",
+          migration: "slack",
+          batchReceipt: invitation.event.id,
+        },
+      ],
+      [
+        "channel",
+        "two",
+        {
+          role: "guest",
+          migration: "slack",
+          batchReceipt: invitation.event.id,
+        },
+      ],
     ]),
   );
 });

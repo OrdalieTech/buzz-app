@@ -270,16 +270,18 @@ function setup({
   imports = {} as object | null,
   open = vi.fn(async () => ({ status: "opened" })),
   plugins = [info("example.market", "Market")],
+  hostOwned = [],
 }: {
   imports?: object | null;
   open?: () => Promise<{ status: string }>;
   plugins?: PluginInfo[];
+  hostOwned?: PluginInfo["manifest"][];
 } = {}) {
   let configuration: ConfigurationState = ready(plugins);
   const managerListeners = new Set<() => void>();
   const manager = {
     imports: imports ?? undefined,
-    snapshot: () => ({ configuration, activation: {} }),
+    snapshot: () => ({ configuration, hostOwned, activation: {} }),
     subscribe(listener: () => void) {
       managerListeners.add(listener);
       return () => managerListeners.delete(listener);
@@ -1333,6 +1335,36 @@ it("falls back to the plugin id for a blank name and rejects an unattributed cal
   await expect(service.requestInstall(base)).rejects.toThrow(
     /installed plugin/,
   );
+});
+
+it("names the request after a host-owned feature's manifest, and an unlisted caller by its id", async () => {
+  const emoji = info("buzz.emoji", "Emoji").manifest;
+  const { requests, as } = setup({ hostOwned: [emoji] });
+  const hostOwned = (await as("buzz.emoji")).requestInstall(base);
+  expect(requests.snapshot()?.origin).toEqual({
+    id: "buzz.emoji",
+    name: "Emoji",
+  });
+  settleRequest(requests, "cancelled");
+  await expect(hostOwned).resolves.toBe("cancelled");
+
+  const unlisted = (await as("example.unlisted")).requestInstall(base);
+  expect(requests.snapshot()?.origin).toEqual({
+    id: "example.unlisted",
+    name: "example.unlisted",
+  });
+  settleRequest(requests, "cancelled");
+  await expect(unlisted).resolves.toBe("cancelled");
+
+  // The manager never activates a catalog entry under a host-owned id.
+  const shadowed = setup({
+    hostOwned: [emoji],
+    plugins: [info("buzz.emoji", "Shadowed emoji")],
+  });
+  const outcome = (await shadowed.as("buzz.emoji")).requestInstall(base);
+  expect(shadowed.requests.snapshot()?.origin.name).toBe("Emoji");
+  settleRequest(shadowed.requests, "cancelled");
+  await expect(outcome).resolves.toBe("cancelled");
 });
 
 it("is unavailable from a plugin that has already been disposed, without opening a review", async () => {

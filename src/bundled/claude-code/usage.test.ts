@@ -760,3 +760,19 @@ it("counts a community lifetime first opened by an unaddressed wake", () => {
   expect(session?.observations).toHaveLength(1);
   expect(session?.channelId).toBeUndefined();
 });
+
+it("leaves out a community session's generated title, which may describe any channel it served", () => {
+  const file = [
+    context([
+      "Scope: channel",
+      "Session scope: community",
+      "Channel: general (#chan)",
+      `Agent: ${agent}`,
+    ]),
+    reply(1000, "m1", usage(2, 10)),
+    JSON.stringify({ type: "ai-title", aiTitle: "Private DM plans" }),
+  ].join("\n");
+  const session = sessionUsage("s", file, new Map(), agent, false);
+  expect(session?.channelId).toBe("chan");
+  expect(session?.title).toBeUndefined();
+});

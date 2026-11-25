@@ -86,7 +86,6 @@ it("shows the host while finding, then only published facts, gating Join on ever
   expect(screen.queryByRole("button", { name: /join/i })).toBeNull();
   await act(async () => info.resolve(Response.json(buzz)));
   expect(joinCommunity()).toBeVisible();
-  expect(screen.getByText(host)).toHaveClass("text-body");
   expect(document.querySelector("img")).toHaveAttribute(
     "src",
     "https://cdn.example.com/icon.png",

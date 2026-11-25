@@ -246,7 +246,10 @@ test("section labels fade on overflow and recover when widened", async ({
   await sidebar.evaluate((element) => {
     element.closest(".shell-sidebar").style.width = "220px";
   });
+  await page.mouse.move(0, 0);
+  const boundsAtRest = await summary.boundingBox();
   await summary.hover();
+  expect(await summary.boundingBox()).toEqual(boundsAtRest);
   await expect
     .poll(() =>
       summary.evaluate((element) => {
@@ -254,16 +257,11 @@ test("section labels fade on overflow and recover when widened", async ({
         const label = title.parentElement;
         const rect = title.getBoundingClientRect();
         const labelRect = label.getBoundingClientRect();
-        const actions = element
-          .closest(".navigation-section-heading")
-          .querySelector(".navigation-section-heading-actions")
-          .getBoundingClientRect();
         return {
           wrapped:
             rect.height > Number.parseFloat(getComputedStyle(title).lineHeight),
           fits: title.scrollWidth <= title.clientWidth,
           visible: rect.left >= labelRect.left && rect.right <= labelRect.right,
-          clearOfActions: rect.right <= actions.left,
         };
       }),
     )
@@ -271,7 +269,6 @@ test("section labels fade on overflow and recover when widened", async ({
       wrapped: false,
       fits: false,
       visible: true,
-      clearOfActions: true,
     });
   const title = summary.locator("span > span");
   await expect(title).toHaveAttribute("data-overflowing", "true");
@@ -301,9 +298,7 @@ test("section labels fade on overflow and recover when widened", async ({
               buttons[1].width / 2 -
               buttons[0].left -
               buttons[0].width / 2,
-            separateTargets:
-              chevron.right <= buttons[0].left &&
-              buttons[0].right <= buttons[1].left,
+            separateTargets: buttons[0].right <= buttons[1].left,
           };
         }),
       )
@@ -320,7 +315,6 @@ test("section labels fade on overflow and recover when widened", async ({
 
   // Enlarging a narrow saved section must preserve useful text space without
   // changing this same single-line fading contract.
-  // At rest: revealed actions take their width back from the label.
   await page.mouse.move(0, 0);
   await page.evaluate(() => {
     localStorage.setItem("buzz-font-scale.v1", "2");

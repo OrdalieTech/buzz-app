@@ -222,7 +222,7 @@ it("old broad marks never crowd out the newest read", () => {
       expect(kept.frontiers[key]).toBe(state.frontiers[key]);
   }
 });
-it("drops covered marks, unless overrides need ancestry", () => {
+it("drops covered marks, unless a message or thread override needs ancestry", () => {
   const state = {
     frontiers: { room: 20, "msg:covered": 10, "msg:other": 30 },
     overrides: {},
@@ -239,7 +239,7 @@ it("drops covered marks, unless overrides need ancestry", () => {
   ).toEqual({ room: 20, "msg:other": 30 });
   const withOverride = {
     ...state,
-    overrides: { other: { set: 0, clear: 9, baseline: 0 } },
+    overrides: { "msg:other": { set: 0, clear: 9, baseline: 0 } },
   };
   expect(
     retainReadState([withOverride], {}, "fixture", undefined, covered)
@@ -385,7 +385,7 @@ it("never advances the floor when protected ancestry fills the reserve ahead of 
         frontiers: Object.fromEntries(
           Array.from({ length: 8000 }, (_, n) => [`msg:${n}`, 2_000_000 + n]),
         ),
-        overrides: { child: { set: 1, clear: 0, baseline: 0 } },
+        overrides: { "msg:child": { set: 1, clear: 0, baseline: 0 } },
       },
     ],
     {},
@@ -409,7 +409,7 @@ it("reports protected ancestry overflow rather than dropping inherited floors", 
       [
         {
           frontiers: {},
-          overrides: { child: { set: 1, clear: 0, baseline: 0 } },
+          overrides: { "msg:child": { set: 1, clear: 0, baseline: 0 } },
         },
       ],
       {},
@@ -556,7 +556,7 @@ it("retains every protected inherited floor at the exact serialized reserve cap"
     [
       {
         frontiers: {},
-        overrides: { child: { set: 1, clear: 0, baseline: 0 } },
+        overrides: { "msg:child": { set: 1, clear: 0, baseline: 0 } },
       },
     ],
     {},
@@ -742,12 +742,12 @@ it("covered marks leave the reserve as well as the journal", () => {
     "msg:room.30": 30,
     "msg:loose.1": 1,
   });
-  // With an override, ancestry is load-bearing, so nothing is pruned.
+  // With a message override, ancestry is load-bearing, so nothing is pruned.
   const withOverride = retainLocalRead(
     [
       {
         frontiers: { room: 20 },
-        overrides: { other: { set: 0, clear: 9, baseline: 0 } },
+        overrides: { "msg:other": { set: 0, clear: 9, baseline: 0 } },
       },
     ],
     {},
@@ -784,4 +784,55 @@ it("dropping row hints never raises the local read floor or displaces read recei
       ...kept.reserve,
     }).filter((key) => key.startsWith("msg:")).length;
   expect(reads(after)).toBe(reads(before));
+});
+it("a channel override, active or cleared, protects only its own floor", () => {
+  const thread = (n: number) => `thread:${n.toString(16).padStart(64, "0")}`;
+  const frontiers = Object.fromEntries(
+    Array.from({ length: 2000 }, (_, n) => [thread(n), 100 + n]),
+  );
+  for (const [room, active] of [
+    [{ set: 1, clear: 0, baseline: 50 }, true],
+    [{ set: 1, clear: 2, baseline: 0 }, false],
+  ] as const) {
+    const overrides = { room };
+    const state = { frontiers: { ...frontiers, room: 50 }, overrides };
+    expect(overrideActive(room, state.frontiers.room)).toBe(active);
+    const journal = retainReadState([state], {}, "fixture");
+    expect(journal.overrides).toEqual(overrides);
+    expect(journal.frontiers.room).toBe(50);
+    expect(overrideActive(journal.overrides.room, journal.frontiers.room)).toBe(
+      active,
+    );
+    expect(Object.keys(journal.frontiers).length).toBeLessThan(2001);
+    const local = retainLocalRead(
+      [state],
+      {},
+      "fixture",
+      Object.fromEntries(
+        Array.from({ length: READ_RESERVE_KEYS + 10 }, (_, n) => [
+          thread(5000 + n),
+          200 + n,
+        ]),
+      ),
+      undefined,
+      60,
+    );
+    expect(local.state.frontiers.room).toBe(50);
+    expect(
+      overrideActive(local.state.overrides.room, local.state.frontiers.room),
+    ).toBe(active);
+    expect(local.floor).toBeGreaterThan(60);
+  }
+  expect(() =>
+    retainReadState(
+      [
+        {
+          frontiers,
+          overrides: { "thread:root": { set: 1, clear: 0, baseline: 0 } },
+        },
+      ],
+      {},
+      "fixture",
+    ),
+  ).toThrow("Read override ancestry capacity reached; saved floors retained");
 });

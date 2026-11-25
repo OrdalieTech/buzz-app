@@ -60,6 +60,22 @@ export const incompletePreview = (
       : "Preview updating…"
     : undefined;
 
+/** Where a DM row's message is: plain "DM" when `sender`, whom the row
+ * already names, is the DM's only other member; otherwise "DM", `join` and
+ * the DM's names. Compares keys, since two people can share a name. */
+function dmContext(
+  channel: ChannelSummary,
+  sender: string | undefined,
+  join: string,
+  profiles: ReadonlyMap<string, Profile>,
+  name: ResolveName,
+) {
+  return channel.participants?.length === 1 &&
+    channel.participants[0] === sender
+    ? "DM"
+    : `DM${join}${dmLabel(channel.participants, profiles, name, channel.name ?? "Direct message")}`;
+}
+
 /** Who sent a row and where, as the Inbox page and its sidebar preview name it. */
 export function rowIdentity(
   item: InboxItem,
@@ -77,7 +93,14 @@ export function rowIdentity(
   const sender = item.workflowOwnerId ? workflowLabel(resolved) : resolved;
   const context =
     channel?.channelType === "dm"
-      ? `DM · ${dmLabel(channel.participants, profiles, name, channel.name ?? "Direct message")}`
+      ? dmContext(
+          channel,
+          // A workflow's row names its owner, not the key that signed it.
+          item.workflowOwnerId ? undefined : item.authorId,
+          " · ",
+          profiles,
+          name,
+        )
       : channel
         ? channelText(channel)
         : "Conversation";
@@ -205,7 +228,13 @@ export function ReactionRowButton({
   const profile = profiles.get(authors[0] ?? "");
   const context =
     channel?.channelType === "dm"
-      ? `DM with ${dmLabel(channel.participants, profiles, name, channel.name ?? "Direct message")}`
+      ? dmContext(
+          channel,
+          authors.length === 1 ? authors[0] : undefined,
+          " with ",
+          profiles,
+          name,
+        )
       : channel
         ? channelText(channel)
         : "Conversation";

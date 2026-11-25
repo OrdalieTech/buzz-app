@@ -6,7 +6,12 @@ import type { BuzzClient, Memories } from "./client";
 import { nativeToolClient } from "../features/agents/tool-operation";
 import { prepareAttachment } from "../features/messages/prepare-attachment";
 import { imageType } from "../features/relay/attachment-limits";
-import type { AgentHandle, AgentHandoff } from "../features/agents/service";
+import type {
+  AgentHandle,
+  AgentHandoff,
+  WorkspaceAudience,
+  WorkspaceChat,
+} from "../features/agents/service";
 import type {
   HostProcess,
   HostProcessOptions,
@@ -18,6 +23,14 @@ type Spawn = (id: string, options?: HostProcessOptions) => Promise<HostProcess>;
 export const READ_LIMIT = 50 * 1024 * 1024;
 const READ_TIMEOUT_MS = 60_000;
 
+/** A connected host's relay key: `null` when the relay advertises none,
+ * undefined when there is no connection to ask. */
+export function relayKeyOf(
+  source: { workflowAuthority(): string | undefined } | undefined,
+) {
+  return source && (source.workflowAuthority() ?? null);
+}
+
 export function appClient(
   agent: AgentHandle,
   options: Readonly<{
@@ -25,7 +38,8 @@ export function appClient(
      * directory. */
     read(path: string): Promise<Uint8Array>;
     relayAuthor?: string | undefined;
-    signingAuthority?: string | undefined;
+    /** As `BuzzClient.signingAuthority`; undefined when unknown. */
+    signingAuthority?: string | null | undefined;
     memories(slug?: string): Promise<Memories>;
     /** Forget a read that may have started before a successful memory write. */
     remembered?(): void;
@@ -67,8 +81,9 @@ export function appClient(
   };
   const handoff = agent.handoff;
   const threadsApart = agent.threadsApart;
+  const isTaskThread = agent.isTaskThread;
   const plugins = agent.plugins;
-  const { settings, soloWorkspaces } = agent;
+  const { settings, workspaces } = agent;
   const signal = options.callSignal ?? options.signal;
   const client: BuzzClient = {
     ...(signal ? { signal } : {}),
@@ -125,23 +140,33 @@ export function appClient(
           ...(options.nativeToolGate ? { nativeToolGate: true as const } : {}),
         }
       : {}),
-    ...(soloWorkspaces && {
-      soloWorkspaces: {
+    ...(workspaces && {
+      workspaces: {
         list: async () => {
           check();
-          const result = await soloWorkspaces.list(options.signal);
+          const result = await workspaces.list(options.signal);
+          check();
+          return result;
+        },
+        defaults: async (workspace: string, chat: WorkspaceChat) => {
+          check();
+          const result = await workspaces.defaults(
+            workspace,
+            chat,
+            options.signal,
+          );
           check();
           return result;
         },
         prepare: async (
           workspace: string,
-          members: readonly string[],
+          audience: WorkspaceAudience,
           channelId: string,
         ) => {
           check();
-          const file = await soloWorkspaces.prepare(
+          const file = await workspaces.prepare(
             workspace,
-            members,
+            audience,
             channelId,
             options.signal,
           );
@@ -153,13 +178,22 @@ export function appClient(
             return result;
           };
         },
+        move: async (id: string, workspace?: string) => {
+          check();
+          const result = await workspaces.move(id, workspace, options.signal);
+          check();
+          return result;
+        },
       },
     }),
     pubkey: agent.pubkey,
     key: agent.key,
     owner: agent.owner,
     relayAuthor: options.relayAuthor,
-    signingAuthority: options.signingAuthority,
+    // Absent when the host can't learn the relay's key.
+    ...(options.signingAuthority !== undefined
+      ? { signingAuthority: options.signingAuthority }
+      : {}),
     attention: agent.attention && {
       enabled: () => {
         check();
@@ -350,6 +384,14 @@ export function appClient(
           threadsApart: (channel: string) => {
             check();
             return threadsApart(channel);
+          },
+        }
+      : {}),
+    ...(isTaskThread
+      ? {
+          isTaskThread: (channel: string, root: string) => {
+            check();
+            return isTaskThread(channel, root);
           },
         }
       : {}),

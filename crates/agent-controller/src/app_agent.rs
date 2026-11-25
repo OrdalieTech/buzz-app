@@ -15,13 +15,13 @@ use std::path::{Path, PathBuf};
 /// (9), a channel member change (9000, 9001), edit (9002), creation (9007),
 /// deletion (9008), join (9021) or leave (9022), typing (20002), an edit of its
 /// own message (40003), a shared note (30023), a channel canvas (40100), a
-/// request to open a DM (41010), a repository announcement (30617) or an
-/// artifact revision (45010). The relay decides which channel changes and
-/// artifact edits it may make. Its profile (0) is the app's, and
-/// its memory (30174) is written by `memory`.
-const KINDS: [u16; 17] = [
-    5, 7, 9, 9000, 9001, 9002, 9007, 9008, 9021, 9022, 20002, 30023, 30617, 40003, 40100, 41010,
-    45010,
+/// pin or unpin (40010, 40011), a request to open a DM (41010), a repository
+/// announcement (30617) or an artifact revision (45010). The relay decides
+/// which channel changes, pins and artifact edits it may make. Its profile (0)
+/// is the app's, and its memory (30174) is written by `memory`.
+const KINDS: [u16; 19] = [
+    5, 7, 9, 9000, 9001, 9002, 9007, 9008, 9021, 9022, 20002, 30023, 30617, 40003, 40010, 40011,
+    40100, 41010, 45010,
 ];
 
 /// Content of a live channel Canvas (40100), in UTF-8 bytes. Mirrors
@@ -1273,9 +1273,7 @@ impl AppAgents {
             return Ok(());
         };
         // Under the keys lock, a joining row is no Join under way.
-        let last = !rows
-            .iter()
-            .any(|other| other.relay != relay && other.live(pubkey, &other.relay));
+        let last = last_membership(&rows, pubkey, relay);
         let unfinished: Vec<&AppAgent> = rows
             .iter()
             .filter(|other| {
@@ -1304,6 +1302,12 @@ impl AppAgents {
             Ok(())
         })
     }
+    /// Whether removing it from the community at `relay` leaves it in none:
+    /// as `remove` decides, so unfinished joins elsewhere don't count.
+    pub fn is_last_membership(&self, pubkey: &str, relay: &str) -> Result<bool> {
+        let relay = canonical_relay(relay)?;
+        Ok(last_membership(&self.list()?, pubkey, &relay))
+    }
     /// Deletes every key it still has, as an erase that removes agents does
     /// before the rows go with app data. Absence is success, so it repeats safely.
     pub fn delete_keys(&self, credentials: &dyn Credentials) -> Result<()> {
@@ -1322,6 +1326,12 @@ impl AppAgents {
             Ok(())
         })
     }
+}
+
+fn last_membership(rows: &[AppAgent], pubkey: &str, relay: &str) -> bool {
+    !rows
+        .iter()
+        .any(|other| other.relay != relay && other.live(pubkey, &other.relay))
 }
 
 /// One copy of the app taking an agent out of a community: see

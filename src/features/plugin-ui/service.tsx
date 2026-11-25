@@ -1,17 +1,26 @@
 // Hands plugins the host's own controls. Each wrapper forwards only the props in
 // `contract.ts`, so plugins (usually plain JS) cannot come to depend on internal
 // variants or on Base UI's event details.
-import { type RefObject, useRef } from "react";
+import { isValidElement, type RefObject, useRef } from "react";
+import { DotsThreeIcon } from "../../shared/design-system/icons";
 import { Button } from "../../shared/design-system/ui/Button";
 import { Dialog } from "../../shared/design-system/ui/Dialog";
 import { Field } from "../../shared/design-system/ui/Field";
+import { IconButton } from "../../shared/design-system/ui/IconButton";
 import { Input } from "../../shared/design-system/ui/Input";
+import {
+  MenuItem,
+  MenuPopup,
+  MenuRoot,
+  MenuTrigger,
+} from "../../shared/design-system/ui/Menu";
 import { Switch } from "../../shared/design-system/ui/Switch";
 import type {
   PluginButtonProps,
   PluginDialogProps,
   PluginFieldProps,
   PluginInputProps,
+  PluginMenuProps,
   PluginSwitchProps,
   PluginUi,
 } from "./contract";
@@ -175,6 +184,65 @@ export const pluginUi: PluginUi = Object.freeze({
       >
         {props.children}
       </Dialog>
+    );
+  },
+  Menu: (props: PluginMenuProps) => {
+    const label = str(props.label);
+    const name = str(props["aria-label"]);
+    const disabled = props.disabled === true;
+    const icon = isValidElement(props.icon) ? props.icon : undefined;
+    const items = Array.isArray(props.items) ? props.items : [];
+    return (
+      <MenuRoot>
+        <MenuTrigger
+          render={
+            label === undefined ? (
+              <IconButton
+                aria-label={name ?? ""}
+                title={name}
+                icon={icon ?? <DotsThreeIcon size={16} aria-hidden="true" />}
+                disabled={disabled}
+              />
+            ) : (
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={name}
+                disabled={disabled}
+              >
+                {icon}
+                {label}
+              </Button>
+            )
+          }
+        />
+        <MenuPopup
+          size="compact"
+          align={oneOf(props.align, ["start", "end"]) ?? "start"}
+          aria-label={name ?? label}
+        >
+          {items.map((item: unknown) => {
+            if (typeof item !== "object" || item === null) return null;
+            const { label, onSelect, tone, disabled } = item as Record<
+              string,
+              unknown
+            >;
+            const text = str(label);
+            const select = fn(onSelect);
+            if (text === undefined) return null;
+            return (
+              <MenuItem
+                key={text}
+                tone={tone === "destructive" ? "danger" : "default"}
+                disabled={disabled === true}
+                onClick={select && (() => select())}
+              >
+                {text}
+              </MenuItem>
+            );
+          })}
+        </MenuPopup>
+      </MenuRoot>
     );
   },
 });

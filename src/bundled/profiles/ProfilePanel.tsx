@@ -633,9 +633,11 @@ function ProfileDetails({
       aria-label="Profile details"
       tabIndex={-1}
       className={styles.root}
+      // Over a conversation, it draws to its sheet's edges, under the header.
+      data-full-bleed=""
     >
       <div className={styles.profileContents}>
-        <div className={`${hero.hero} ${hero.panelHero}`}>
+        <div className={`${hero.hero} ${hero.panelHero} ${styles.hero}`}>
           <ProfileBackdrop src={picture} />
           <div className={styles.portrait}>
             <AgentAvatar

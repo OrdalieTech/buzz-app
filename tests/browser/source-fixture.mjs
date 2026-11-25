@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import { readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { createServer, warmUp } from "./vite-server.mjs";
+import { seedThreadPlacement } from "./thread-placement.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 
@@ -41,5 +42,13 @@ export const test = base.extend({
     { scope: "worker", timeout: 60_000 },
   ],
   baseURL: async ({ sourceOrigin }, use) => use(sourceOrigin),
+  // Open threads and panels in: "side", "main" or "inline" (the app default).
+  // Pages open tabs unless they opt into inline.
+  threadPlacement: ["side", { option: true }],
+  context: async ({ context, threadPlacement }, use) => {
+    if (threadPlacement !== "inline")
+      await seedThreadPlacement(context, threadPlacement);
+    await use(context);
+  },
 });
 export { expect };

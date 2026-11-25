@@ -7,6 +7,7 @@ import { PluginRuntime } from "../../plugins/runtime";
 import { provideNavigation } from "../navigation/service";
 import { createNotifications } from "./platform";
 import { NotificationsService } from "./service";
+import { createNotificationPreferences } from "./preferences";
 import { messageNotificationText } from "./content";
 
 const sdk = vi.hoisted(() => ({
@@ -45,14 +46,24 @@ afterEach(async () => {
   vi.unstubAllGlobals();
   native.value = true;
 });
-function setup() {
+function setup(storage?: Window, present?: () => boolean) {
   const ctx = new Context();
   contexts.push(ctx);
   const runtime = new PluginRuntime(ctx, async () => ({ apply() {} }));
   ctx.effect(() => () => runtime.dispose());
   const navigation = provideNavigation(ctx).navigation;
-  // Exercise the production default, not an injected adapter.
-  const service = new NotificationsService(ctx, navigation);
+  // Exercise the production default, not an injected adapter. This Node host
+  // has no storage or document of its own; a test that needs one supplies
+  // only that.
+  const service = new NotificationsService(
+    ctx,
+    navigation,
+    undefined,
+    storage && createNotificationPreferences(storage),
+    undefined,
+    undefined,
+    present,
+  );
   service.selectViewer("a".repeat(64));
   const submit = (sourceKey: string) =>
     service.admit(
@@ -63,6 +74,18 @@ function setup() {
       () => true,
     );
   return { service, submit, navigation, ctx };
+}
+/** A host whose storage works, so the once-per-device record can be claimed. */
+function storage() {
+  const values = new Map<string, string>();
+  return {
+    localStorage: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => void values.set(key, value),
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  } as unknown as Window;
 }
 async function flush() {
   for (let i = 0; i < 40; i++) await Promise.resolve();
@@ -102,7 +125,12 @@ it("macOS banner permission reads the native authorization independently of Dock
   expect(sdk.bannerPermission).toHaveBeenCalled();
   expect(sdk.bannerRequest).toHaveBeenCalledOnce();
   expect(sdk.show).not.toHaveBeenCalled();
-  expect(sdk.permission).toHaveBeenCalledExactlyOnceWith({ request: false });
+  // The Dock setting is only read, at startup and again once the banner
+  // request settles. A banner request never requests it.
+  expect(sdk.permission.mock.calls).toEqual([
+    [{ request: false }],
+    [{ request: false }],
+  ]);
   expect(service.indicator.snapshot().permission).toBe("enabled");
   expect(sdk.indicator).toHaveBeenCalledExactlyOnceWith({ unread: false });
   await submit("first");
@@ -127,6 +155,101 @@ it("macOS first-run Delivery exposes an explicit authorization action", async ()
   await service.requestPermission();
   expect(sdk.bannerRequest).toHaveBeenCalledOnce();
   expect(service.snapshot().permission).toBe("granted");
+});
+
+it("entering the app on a macOS first run asks the system once; an arriving alert alone never does", async () => {
+  sdk.bannerPermission.mockResolvedValue("default");
+  sdk.bannerRequest.mockImplementationOnce(async () => {
+    sdk.bannerPermission.mockResolvedValue("granted");
+    return "granted";
+  });
+  const { service, submit } = setup(storage(), () => true);
+  await submit("first");
+  await flush();
+  expect(sdk.bannerRequest).not.toHaveBeenCalled();
+  expect(sdk.show).not.toHaveBeenCalled();
+  service.setEntered(true);
+  await flush();
+  expect(sdk.bannerRequest).toHaveBeenCalledOnce();
+  // Allowed: the alert held meanwhile is shown, and nothing asks again.
+  expect(sdk.show).toHaveBeenCalledOnce();
+  service.setEntered(true);
+  await submit("second");
+  await flush();
+  expect(sdk.bannerRequest).toHaveBeenCalledOnce();
+  expect(service.snapshot()).toMatchObject({
+    permission: "granted",
+    requesting: false,
+    error: null,
+  });
+});
+
+it("an automatic request nobody answers leaves Delivery showing denied, with no in-app request and no error", async () => {
+  sdk.bannerPermission.mockResolvedValue("default");
+  // As macOS does: the native wait gives up and the status then reads denied.
+  sdk.bannerRequest.mockImplementationOnce(async () => {
+    sdk.bannerPermission.mockResolvedValue("denied");
+    throw new Error("Dock authorization request timed out");
+  });
+  const { service } = setup(storage(), () => true);
+  service.setEntered(true);
+  await flush();
+  expect(sdk.bannerRequest).toHaveBeenCalledOnce();
+  expect(service.snapshot()).toMatchObject({
+    permission: "denied",
+    requesting: false,
+    error: null,
+  });
+  expect(
+    renderToStaticMarkup(
+      createElement(NotificationSettings, { notifications: service }),
+    ),
+  ).not.toContain("Allow notifications");
+});
+
+it("Allow lights the Dock dot even when a Dock read sent during the prompt answers denied afterwards", async () => {
+  sdk.bannerPermission.mockResolvedValue("default");
+  sdk.permission.mockResolvedValue("default");
+  let answer!: (permission: string) => void;
+  sdk.bannerRequest.mockImplementationOnce(
+    () => new Promise<string>((resolve) => (answer = resolve)),
+  );
+  let earlier!: (permission: string) => void;
+  const { service } = setup(storage(), () => true);
+  service.indicator.setUnread(true);
+  service.setEntered(true);
+  try {
+    await flush();
+    expect(sdk.bannerRequest).toHaveBeenCalledOnce();
+    expect(sdk.permission).toHaveBeenCalledOnce();
+    // What a window focus does while the prompt is up: a Dock read that macOS
+    // will answer denied, still on its way when the person allows.
+    sdk.permission.mockImplementationOnce(
+      () => new Promise<string>((resolve) => (earlier = resolve)),
+    );
+    void service.indicator.refresh();
+    await flush();
+    expect(sdk.permission).toHaveBeenCalledTimes(2);
+    sdk.bannerPermission.mockResolvedValue("granted");
+    sdk.permission.mockResolvedValue("enabled");
+  } finally {
+    answer?.("granted");
+    await flush();
+    earlier?.("denied");
+    await flush();
+  }
+  expect(service.snapshot()).toMatchObject({
+    permission: "granted",
+    requesting: false,
+  });
+  // The read behind the late one is a read, never a request.
+  expect(sdk.permission.mock.calls).toEqual([
+    [{ request: false }],
+    [{ request: false }],
+    [{ request: false }],
+  ]);
+  expect(service.indicator.snapshot().permission).toBe("enabled");
+  expect(sdk.indicator).toHaveBeenLastCalledWith({ unread: true });
 });
 
 it("observable SDK failures surface once without retry or a browser fallback", async () => {
@@ -358,7 +481,9 @@ it.each(["Win32", "Linux x86_64"])(
   "%s has no Dock IPC or Settings and keeps existing banners",
   async (platform) => {
     vi.stubGlobal("navigator", { platform });
-    const { service, submit, ctx } = setup();
+    // What the macOS bridge would answer on a first run, were it consulted.
+    sdk.bannerPermission.mockResolvedValue("default");
+    const { service, submit, ctx } = setup(storage(), () => true);
     await service.indicator.refresh();
     expect(service.indicator.available).toBe(false);
     expect(
@@ -370,9 +495,15 @@ it.each(["Win32", "Linux x86_64"])(
     await flush();
     await service.indicator.request();
     expect(sdk.permission).not.toHaveBeenCalled();
+    // Entry with a usable device record and a focused window sends nothing.
+    service.setEntered(true);
+    await flush();
+    expect(sdk.bannerRequest).not.toHaveBeenCalled();
     await submit("banner");
     await flush();
     expect(sdk.show).toHaveBeenCalledOnce();
+    expect(sdk.bannerPermission).not.toHaveBeenCalled();
+    expect(sdk.bannerRequest).not.toHaveBeenCalled();
     await ctx.fiber.dispose();
     expect(sdk.indicator).not.toHaveBeenCalled();
     expect(sdk.permission).not.toHaveBeenCalled();

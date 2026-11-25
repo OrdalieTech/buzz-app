@@ -1,3 +1,4 @@
+import { viewerMember } from "../relay/membership";
 import {
   REPLY_CORRELATION_MS,
   type LocalAgentSource,
@@ -81,7 +82,7 @@ export function notificationAuthorized(
           channel.id === target.channelId &&
           !channel.huddle &&
           !channel.metadataPending &&
-          channel.members?.includes(scope.viewer),
+          viewerMember(channel, scope.viewer),
       )
   );
 }

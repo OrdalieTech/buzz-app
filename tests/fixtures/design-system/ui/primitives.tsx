@@ -122,7 +122,7 @@ export function Stub({ what, decide }: { what: string; decide: string[] }) {
  * A list of uniform rows — the tabular case, where every row looks alike and the
  * eye needs a line to track along. Dividers, no container: the section heading
  * already says these belong together, so a fill behind them adds a box without
- * adding meaning. See DESIGN.md § Density and rhythm.
+ * adding meaning.
  *
  * If the rows carry their own visual difference — a swatch, a type specimen — use
  * `Specimens` instead. Content that separates itself needs no divider.

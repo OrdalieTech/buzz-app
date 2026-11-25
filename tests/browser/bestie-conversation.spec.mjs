@@ -422,3 +422,83 @@ test("Bestie main and thread messages open the shared forwarding dialog", async 
     await page.evaluate(() => window.bestieFixture.target()),
   ).toMatchObject({ kind: "conversation", forward: replyId });
 });
+
+test.describe("Inline", () => {
+  test.use({ threadPlacement: "inline" });
+
+  test("Bestie opens threads and details over its composer, which stays in reach", async ({
+    page,
+  }) => {
+    await page.goto("/tests/fixtures/bestie-conversation.html?details");
+    const composer = page.getByRole("textbox", { name: "Message Bestie" });
+    const threadHeading = page.getByRole("heading", {
+      name: "Thread",
+      exact: true,
+    });
+    const sheets = page.locator("[data-details-sheet-surface]");
+    const thread = sheets.filter({ has: threadHeading });
+    const viewThread = page
+      .getByRole("button", { name: "View thread: 1 reply" })
+      .first();
+    const threadTabs = page.locator('[role="tab"][data-tab-value^="thread:"]');
+    await viewThread.click();
+    await expect(thread).toBeVisible();
+    await expect(
+      thread.getByRole("textbox", { name: "Reply to thread" }),
+    ).toBeVisible();
+    await expect(threadTabs).toHaveCount(0);
+    // The thread is a visit: Back closes it, Forward reopens it, and ✕
+    // retires it.
+    await page.evaluate(() => window.bestieFixture.back());
+    await expect(thread).toHaveCount(0);
+    await page.evaluate(() => window.bestieFixture.forward());
+    await expect(thread).toBeVisible();
+    await thread
+      .getByRole("button", { name: "Close", exact: true })
+      .first()
+      .click();
+    await expect(thread).toHaveCount(0);
+    await page.evaluate(() => window.bestieFixture.back());
+    await page.evaluate(() => window.bestieFixture.forward());
+    await expect(thread).toHaveCount(0);
+    await viewThread.click();
+    await thread
+      .getByRole("button", { name: "Move to side panel", exact: true })
+      .click();
+    await expect(thread).toHaveCount(0);
+    await expect(threadTabs).toHaveCount(1);
+    await expect(
+      page.getByRole("textbox", { name: "Reply to thread" }),
+    ).toBeVisible();
+    await page.getByRole("button", { name: /^Close .* tab$/ }).click();
+    await expect(threadTabs).toHaveCount(0);
+    // A tab an agent opens for the inline thread takes it over, shown, in
+    // place of its inline visit.
+    await viewThread.click();
+    await expect(thread).toBeVisible();
+    await page.evaluate(() => {
+      const f = window.bestieFixture;
+      f.tabs.open(f.channelId, f.rootIds[0]);
+    });
+    await expect(thread).toHaveCount(0);
+    await expect(threadTabs).toHaveAttribute("aria-selected", "true");
+    await expect(
+      page.getByRole("textbox", { name: "Reply to thread" }),
+    ).toBeVisible();
+    await page.evaluate(() => window.bestieFixture.back());
+    await expect(thread).toHaveCount(0);
+
+    await page
+      .locator("[data-message-id]")
+      .filter({ hasText: "Findings brief" })
+      .getByRole("button", { name: "Show more", exact: true })
+      .click();
+    const details = sheets.filter({ hasNot: threadHeading });
+    await expect(details).toBeVisible();
+    await expect(details).toContainText("More of the findings follow.");
+    await composer.click();
+    await composer.pressSequentially("Answering while reading");
+    await expect(composer).toHaveText("Answering while reading");
+    await expect(details).toBeVisible();
+  });
+});

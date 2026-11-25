@@ -81,6 +81,20 @@ it("lets a joined Guest read the canvas and reacts to promotion and demotion", a
     const panel = panels.snapshot()[0];
     assert.exists(panel);
     expect(panel?.channelMenu?.eligible(channel, session)).toBe(true);
+    const { members: _peers, ...withoutPeers } = channel;
+    expect(
+      panel?.channelMenu?.eligible(
+        { ...withoutPeers, viewerMembership: { pubkey: viewer, joined: true } },
+        session,
+      ),
+    ).toBe(true);
+    expect(
+      panel?.channelMenu?.eligible(
+        { ...channel, viewerMembership: { pubkey: viewer, joined: false } },
+        session,
+      ),
+    ).toBe(false);
+
     expect(
       panel?.channelMenu?.eligible({ ...channel, cached: true }, session),
     ).toBe(false);

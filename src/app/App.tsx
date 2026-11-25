@@ -36,6 +36,7 @@ import { UpdateReview } from "../bundled/agents/UpdateReview";
 import { TeamUpdateReview } from "../bundled/agents/TeamUpdateReview";
 import { AppOverlays } from "../features/pages/AppOverlays";
 import { InterruptedNotice } from "../features/agents/InterruptedNotice";
+import { ShellNotices } from "../features/notices/ShellNotices";
 import {
   useCallback,
   useEffect,
@@ -74,6 +75,10 @@ import {
   type JoinForm,
 } from "../features/communities/invite-intent";
 import { CommunityLanding } from "../features/communities/CommunityLanding";
+import {
+  activeModal,
+  behindActiveOverlay,
+} from "../shared/design-system/overlayLayer";
 import { LegacyCommunityImport } from "../features/communities/LegacyCommunityImport";
 import {
   LaunchSignIn,
@@ -121,6 +126,17 @@ export function App({ services }: { services: AppServices }) {
       </ModalWindowDragProvider>
     </AgentAvatarArtworkProvider>
   );
+}
+
+/** Settings sections open in the selected community's scope, as the sidebar does. */
+function selectedSettingsScope(services: AppServices) {
+  const client = services.communities.snapshot();
+  return client.viewer && client.selected
+    ? {
+        viewer: client.viewer,
+        communityOrigin: communityDestination(client.selected).url,
+      }
+    : null;
 }
 
 function ConnectedApp({ services }: { services: AppServices }) {
@@ -366,6 +382,15 @@ function ConnectedAppContent({ services }: { services: AppServices }) {
     () => setLaunchReady(launchReady, terminal),
     [launchReady, terminal],
   );
+  // In the app with a community, the launch screen gone: the one moment the
+  // notifications service may send its automatic permission request.
+  const entered =
+    !launching && !!client.viewer && client.memberships.length > 0;
+  useEffect(() => {
+    if (!entered) return;
+    services.notifications.setEntered(true);
+    return () => services.notifications.setEntered(false);
+  }, [entered, services]);
   const select = route.select;
   useEffect(
     () =>
@@ -377,9 +402,38 @@ function ConnectedAppContent({ services }: { services: AppServices }) {
         },
         true,
         () => services.communities.reload(),
+        services.shortcutBindings,
       ),
     [services],
   );
+  // macOS Buzz → Check for Updates… checks and shows the result in Settings.
+  // Behind a modal it does nothing, unless that modal is a navigation visit
+  // such as Settings itself.
+  useEffect(() => {
+    const check = () => {
+      const modal = activeModal(document);
+      if (
+        modal &&
+        (!modal.matches("[data-navigation-visit]") ||
+          behindActiveOverlay(modal))
+      )
+        return;
+      // A departure guard can keep the current page; then nothing is checked.
+      void services.navigation
+        .open({
+          version: 1,
+          kind: "settings",
+          section: "updates",
+          scope: selectedSettingsScope(services),
+        })
+        .then((result) => {
+          if (result.status === "opened")
+            void services.updates.checkForUpdate();
+        });
+    };
+    window.addEventListener("buzz:check-for-updates", check);
+    return () => window.removeEventListener("buzz:check-for-updates", check);
+  }, [services]);
   useEffect(
     () => registerNavigationShortcuts(services.shortcuts, services.navigation),
     [services],
@@ -552,20 +606,12 @@ function ConnectedAppContent({ services }: { services: AppServices }) {
       />
     );
   const openSettingsSection = (section: string, pluginId?: string) => {
-    const client = services.communities.snapshot();
     void services.navigation.open({
       version: 1,
       kind: "settings",
       section,
       ...(pluginId ? { pluginId } : {}),
-      ...(client.viewer && client.selected
-        ? {
-            scope: {
-              viewer: client.viewer,
-              communityOrigin: communityDestination(client.selected).url,
-            },
-          }
-        : { scope: null }),
+      scope: selectedSettingsScope(services),
     });
   };
   // As for pages, a timed-out reopen of the shown section keeps its editor.
@@ -831,6 +877,7 @@ function ConnectedAppContent({ services }: { services: AppServices }) {
             relay={services.relay}
           />
           <InterruptedNotice agents={services.agents} />
+          <ShellNotices notices={services.notices} plugins={plugins} />
           <MediaMenuDownloadNotice />
           <CreationReview agents={services.agents} />
           <UpdateReview agents={services.agents} />
@@ -938,6 +985,7 @@ function ConnectedAppContent({ services }: { services: AppServices }) {
                     <Settings
                       agents={services.agents}
                       decisions={services.decisions}
+                      speech={services.speech}
                       plugins={plugins}
                       cards={services.settingsCards}
                       adminAccess={services.adminAccess}

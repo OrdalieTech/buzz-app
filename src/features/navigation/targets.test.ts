@@ -140,6 +140,54 @@ describe("open target boundary", () => {
     ])
       expect(() => parseOpenTarget({ ...conversation, detail })).toThrow();
   });
+  it("addresses an inline thread and the layer over a view as their own visits", () => {
+    const inline = parseOpenTarget({ ...conversation, inline: "A".repeat(64) });
+    expect(inline.kind === "conversation" && inline.inline).toBe(
+      "a".repeat(64),
+    );
+    expect(targetKey(inline)).not.toBe(targetKey(conversation));
+    const layer = {
+      messageId: "B".repeat(64),
+      rootId: "A".repeat(64),
+      channelId: "beta",
+    };
+    const nested = parseOpenTarget({ ...inline, layer });
+    layer.messageId = "changed";
+    expect(nested.kind === "conversation" && nested.layer).toEqual({
+      messageId: "b".repeat(64),
+      rootId: "a".repeat(64),
+      channelId: "beta",
+    });
+    expect(
+      Object.isFrozen(nested.kind === "conversation" && nested.layer),
+    ).toBe(true);
+    expect(targetKey(nested)).not.toBe(targetKey(inline));
+    const panel = parseOpenTarget({
+      ...inline,
+      layer: {
+        target: "https://github.com/sample/project/pull/42",
+        threadId: "A".repeat(64),
+        rootId: "A".repeat(64),
+      },
+    });
+    expect(panel.kind === "conversation" && panel.layer).toEqual({
+      target: "https://github.com/sample/project/pull/42",
+      threadId: "a".repeat(64),
+      rootId: "a".repeat(64),
+    });
+    expect(targetKey(panel)).not.toBe(targetKey(nested));
+    for (const bad of [
+      { inline: "thread" },
+      { layer: {} },
+      { layer: { messageId: "b".repeat(64), target: "buzz:x" } },
+      { layer: { messageId: "b".repeat(64), threadId: "a".repeat(64) } },
+      { layer: { target: "with space" } },
+      { layer: { messageId: "b".repeat(64), rootId: "invalid" } },
+      { layer: { messageId: "b".repeat(64), channelId: "with space" } },
+      { layer: { messageId: "b".repeat(64), action: "reply" } },
+    ])
+      expect(() => parseOpenTarget({ ...conversation, ...bad })).toThrow();
+  });
   it("supports local targets without account or relay and gives routes stable identity", () => {
     for (const target of [
       { version: 1, kind: "home" },

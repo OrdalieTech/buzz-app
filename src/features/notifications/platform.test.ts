@@ -85,6 +85,8 @@ it("bounded presentation closes the old banner instead of stranding its target",
 });
 it("denial and a native WebView never silently use browser notification delivery", async () => {
   const t = setup();
+  // A browser needs a user gesture to ask: it never asks on its own.
+  expect(t.platform.requestsAutomatically).toBeUndefined();
   t.FakeNotification.permission = "denied";
   expect(await t.platform.permission()).toBe("denied");
   await expect(

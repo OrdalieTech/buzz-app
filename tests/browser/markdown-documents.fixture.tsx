@@ -11,17 +11,15 @@ import { CanvasEditor } from "../../src/bundled/channels/CanvasEditor";
 import { CanvasMarkdown } from "../../src/bundled/channels/CanvasView";
 import type { ChannelCanvas } from "../../src/features/channel-templates/capability";
 import { GitHubBody } from "../../src/bundled/github/GitHubBody";
-import { NoteBody } from "../../src/bundled/relay-notes/NotesPage";
-import notesStyles from "../../src/bundled/relay-notes/NotesPage.module.css";
 import { Body as RepoBody } from "../../src/bundled/repos/RepoPage";
 import { InstructionsMarkdown } from "../../src/bundled/watching/InstructionsMarkdown";
 import "../../src/bundled/watching/AttentionPage.css";
 import { ActivityTranscript } from "../../src/features/agents/ActivityTranscript";
+import { TranscriptPanel } from "../../src/features/agents/TranscriptPanel";
 import { activityTranscript } from "../../src/features/agents/activity-transcript";
 import { createAgentMemories } from "../../src/features/agents/memory";
 import { MemoryPanel } from "../../src/features/agents/MemoryPanel";
 import type { Agent } from "../../src/features/agents/service";
-import type { RelaySession } from "../../src/features/relay/session";
 import { ToastProvider } from "../../src/shared/design-system/ui/Toast";
 import "../../src/shared/styles/globals.css";
 
@@ -104,6 +102,7 @@ const reply = (seq: number, text: string, messageId: string) =>
       },
     },
   });
+const working = params.has("working");
 const transcript = activityTranscript(
   [
     {
@@ -125,7 +124,9 @@ const transcript = activityTranscript(
               },
             }),
             reply(3, LONG_CODE, "m2"),
-            frame(4, "turn_completed", { outcome: "completed" }),
+            ...(working
+              ? []
+              : [frame(4, "turn_completed", { outcome: "completed" })]),
           ],
         },
       }),
@@ -145,23 +146,13 @@ const memories = createAgentMemories(
   () => true,
 );
 const memoryAgent = {
+  key: agent,
   pubkey: agent,
   name: "Ada",
   relay: "wss://current.example",
   place: "here",
 } as Agent;
 
-const note = {
-  id: "d".repeat(64),
-  pubkey: agent,
-  created_at: Math.floor(at / 1000),
-  kind: 30_023,
-  content: SAMPLE,
-  tags: [
-    ["d", "runbook"],
-    ["title", "Runbook"],
-  ],
-};
 const scope = { viewer: agent, communityOrigin: "https://current.example" };
 
 const root = document.getElementById("root");
@@ -216,14 +207,6 @@ createRoot(root).render(
       <section data-screen="canvas-source">
         <CanvasMarkdown content={TOO_DEEP} openLink={() => false} />
       </section>
-      <section data-screen="notes" className={notesStyles.page}>
-        <NoteBody
-          note={note}
-          session={undefined as unknown as RelaySession}
-          openLink={() => false}
-          author="Ada"
-        />
-      </section>
       <section data-screen="repo" className="repos-page text-body">
         <RepoBody text={SAMPLE} open={async () => {}} scope={scope} />
       </section>
@@ -235,12 +218,25 @@ createRoot(root).render(
         />
       </section>
       <section data-screen="transcript">
-        <ActivityTranscript
-          transcript={transcript}
-          agentName="Ada"
-          state={() => "ended"}
-          follow={false}
-        />
+        {working ? (
+          <TranscriptPanel
+            agent={memoryAgent}
+            read={async () => transcript}
+            readKey="S"
+            working
+            refreshWhileWorking={false}
+            reading="Reading transcript…"
+            failed="Could not read transcript"
+            missing={null}
+          />
+        ) : (
+          <ActivityTranscript
+            transcript={transcript}
+            agentName="Ada"
+            state={() => "ended"}
+            follow={false}
+          />
+        )}
       </section>
       <section data-screen="plugin-readme">
         <PluginReadme text={SAMPLE} />

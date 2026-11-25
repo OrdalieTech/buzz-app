@@ -222,7 +222,7 @@ it("retargets an already-open community and ignores the prior session after swit
   expect(h.project).toHaveBeenCalledTimes(calls);
 });
 
-it.each(["huddle", "metadataPending"] as const)(
+it.each(["huddle", "metadataPending", "archived", "hidden"] as const)(
   "excludes %s channels from the Dock indicator",
   (flag) => {
     const h = setup();

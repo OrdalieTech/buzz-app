@@ -535,7 +535,7 @@ fn list_or_map(
 /// The community as Builderlab names it: the relay's host, lowercase, with
 /// its port only when not the scheme's default. `None` when it is not a relay
 /// URL.
-fn community_host(community: &str) -> Option<String> {
+pub(crate) fn community_host(community: &str) -> Option<String> {
     let url = reqwest::Url::parse(community.trim()).ok()?;
     if !matches!(url.scheme(), "wss" | "ws" | "https" | "http") {
         return None;

@@ -4,6 +4,7 @@ import {
   useNamesRevision,
 } from "../../features/identity-names/react";
 import { npubEncode } from "nostr-tools/nip19";
+import { publicKeyLabels } from "../../shared/identity/public-key";
 import {
   type ReactNode,
   useEffect,
@@ -89,6 +90,7 @@ import {
 } from "./SearchFilterGuide";
 import { MatchRank, matchName, matchRank } from "../../features/search/match";
 import { useUnreadFirstPreference } from "../../features/search/unread-first-preference";
+import { messageSortPreference } from "../../features/search/message-sort-preference";
 import {
   noSearchUsage,
   readSearchUsage,
@@ -102,6 +104,8 @@ import {
   channelIconLabel,
 } from "../../features/channels/channel-icon";
 import { type SearchSort, useSearchMessages } from "./useSearchMessages";
+import type { Decisions } from "../../features/decisions/service";
+import { RERANK_PAGES, useCanRerank, useMessageRerank } from "./message-rerank";
 import {
   MESSAGE_SEARCH_MIN_CHARS,
   SEARCH_MIN_CHARS,
@@ -141,7 +145,10 @@ import {
   useNamePreference,
   verifiedLabel,
 } from "../../features/profiles/name-preference";
-import { sortParticipantNames } from "../../features/identity-names/participant-order";
+import {
+  dmNamedParticipants,
+  sortParticipantNames,
+} from "../../features/identity-names/participant-order";
 import {
   directMessageWith,
   messagePerson,
@@ -156,7 +163,7 @@ function conversationName(
     return channel.name;
   return (
     sortParticipantNames(
-      channel.participants.map((id) =>
+      dmNamedParticipants(channel.participants, profiles).map((id) =>
         resolveName(
           id,
           profiles.get(id)?.name ?? id.slice(0, 10),
@@ -181,6 +188,11 @@ const noMembers: readonly string[] = [];
  * neither is a result. */
 const isSearchAction = (key: string) =>
   key === "more-messages" || key === "ask";
+
+/** The viewer is in this conversation now: a saved row or a guest's read-only
+ * one counts; a public channel read after leaving does not. */
+const joined = (channel: ChannelSummary) =>
+  !channel.readOnly || !!channel.cached || channel.viewerRole === "guest";
 
 function useDelayedSearch(pending: boolean) {
   const [slow, setSlow] = useState(false);
@@ -245,8 +257,14 @@ export function SearchResults({
   views,
   offline,
   openAsk,
+  decisions,
+  community,
 }: {
   session: RelaySession;
+  /** Reranks message hits by how well each answers the query. */
+  decisions?: Decisions | undefined;
+  /** The community (its relay URL) a decision call bills. */
+  community?: string | undefined;
   /** Open a new chat with `agent` that starts with `question`. */
   openAsk?:
     | ((question: string, agent: { pubkey: string; name: string }) => void)
@@ -720,9 +738,21 @@ export function SearchResults({
   const [askAgent, setAskAgent] = useState<MentionRecipient>();
   // Search unmounts as it closes, so each opening reads previews afresh.
   const [previews] = useState<PreviewCache>(() => new Map());
-  const [sort, setSort] = useState<SearchSort>("relevance");
+  // Each opening starts from the saved order; the Sort menu overrides it
+  // for this search only.
+  const [sort, setSort] = useState<SearchSort>(messageSortPreference);
   // The chip or a single resolved `in:` limits results to one conversation.
   const effectiveChannelId = scopedChannelId ?? operatorChannelId;
+  const canRerank = useCanRerank(decisions);
+  // One search: its text within its conversation. Changing either reads a
+  // new set of hits.
+  const searchKey = JSON.stringify([effectiveChannelId ?? null, query]);
+  // A provider that stops being able to answer, as a key found missing does,
+  // leaves this search's hits and order as they are: only a new search drops
+  // them.
+  const [rerankFor, setRerankFor] = useState<string>();
+  if (canRerank && rerankFor !== searchKey) setRerankFor(searchKey);
+  const rerankable = canRerank || rerankFor === searchKey;
   const search = useSearchMessages(
     session,
     offline || asking ? "" : query,
@@ -739,6 +769,7 @@ export function SearchResults({
     // Only one conversation's results offer the choice; across
     // conversations, search keeps relevance.
     effectiveChannelId ? sort : "relevance",
+    rerankable ? RERANK_PAGES : 1,
   );
   // Offline or asking, nothing is searched, so there is no order to choose.
   const sortable =
@@ -991,22 +1022,39 @@ export function SearchResults({
               Number(members.includes(right)) - Number(members.includes(left)),
           )
           .slice(0, 12)
-          .map(({ pubkey, profile, label, verified }) => {
+          .map(({ pubkey, profile, label, verified }) => ({
+            pubkey,
+            profile,
+            label,
+            // The name the label is not: a verified person's other verified
+            // name, else a handle that differs from the label.
+            name: verified
+              ? otherVerifiedName(verifiedLabel(verified, preference), verified)
+              : profile.username && profile.username !== label
+                ? `@${profile.username}`
+                : undefined,
+          }))
+          .map(({ pubkey, profile, label, name }, _, rows) => {
             const agent = selectableAgents.get(pubkey);
             const isAgent = !!agent || !!profile.isAgent;
+            // Rows that read alike name different people: a key label tells
+            // them apart, as in the recipient picker.
+            const alike = rows.filter(
+              (row) => row.label === label && row.name === name,
+            );
+            const detail = [
+              name,
+              alike.length > 1 &&
+                publicKeyLabels(alike.map((row) => row.pubkey)).get(
+                  pubkey.toLowerCase(),
+                ),
+            ]
+              .filter(Boolean)
+              .join(" · ");
             return {
               key: `author:${pubkey}`,
               label,
-              detail: [
-                verified &&
-                  otherVerifiedName(
-                    verifiedLabel(verified, preference),
-                    verified,
-                  ),
-                pubkey.slice(0, 12),
-              ]
-                .filter(Boolean)
-                .join(" · "),
+              ...(detail ? { detail } : {}),
               icon: ChatCircleIcon,
               avatar: {
                 src: avatarMedia(
@@ -1619,11 +1667,7 @@ export function SearchResults({
   const suggestions = channels
     .filter(
       (channel) =>
-        (!channel.readOnly ||
-          channel.cached ||
-          channel.viewerRole === "guest") &&
-        !channel.archived &&
-        !sidebarHidden(channel),
+        joined(channel) && !channel.archived && !sidebarHidden(channel),
     )
     .sort(
       (a, b) =>
@@ -1817,7 +1861,44 @@ export function SearchResults({
       : name;
   };
   const terms = useMemo(() => searchTerms(parsed.text), [parsed.text]);
-  const messages: SearchDestination[] = search.messages.map((message) => {
+  // The search whose results the person has started moving through: a
+  // rerank that lands after that is dropped. Moving through one
+  // conversation's hits doesn't hold the next search's.
+  const [movedFor, setMovedFor] = useState<string>();
+  if (movedFor !== undefined && movedFor !== searchKey) setMovedFor(undefined);
+  const rerank = useMessageRerank({
+    decisions,
+    community,
+    query: parsed.text,
+    messages: search.messages,
+    enabled:
+      rerankable && !!parsed.text && !search.newestFirst && !search.loading,
+    facts: (message) => {
+      const channel = session.channels.get?.(message.channelId);
+      return {
+        where:
+          channel?.channelType === "dm"
+            ? `Direct message: ${whereOf(message.channelId)}`
+            : whereOf(message.channelId),
+        // As the row shows it: a workflow's output isn't its owner's own.
+        author: message.workflowOwnerId
+          ? workflowLabel(nameOf(message.workflowOwnerId, message.channelId))
+          : nameOf(message.authorId, message.channelId),
+        mine: message.authorId === session.viewer,
+        // As message rows decide: whoever owns the agent, its profile or
+        // envelope says so; the viewer's own agents are known here too.
+        // Workflow output is automation too, not its owner's own message.
+        agent:
+          !!message.agentEnvelope ||
+          !!message.workflowOwnerId ||
+          !!profiles.get(message.authorId)?.isAgent ||
+          knownAgents.has(message.authorId),
+        member: !!channel && joined(channel),
+      };
+    },
+    held: movedFor === searchKey,
+  });
+  const messages: SearchDestination[] = rerank.messages.map((message) => {
     // Every listed hit's channel is readable here, with settled metadata.
     const channel = session.channels.get?.(message.channelId);
     const displayId = message.workflowOwnerId ?? message.authorId;
@@ -1865,7 +1946,9 @@ export function SearchResults({
       run: () => {
         cancelPersonOpen();
         remember();
-        openConversation(message.channelId, message.id);
+        if (message.threadRootId)
+          openConversation(message.channelId, message.id, message.threadRootId);
+        else openConversation(message.channelId, message.id);
       },
     };
   });
@@ -2194,6 +2277,7 @@ export function SearchResults({
         ? "Reads like a topic"
         : `${messageCount ?? hits} mention it`
       : undefined,
+    reranked: rerank.reranked,
     count: messageCount,
     destinations: messageRows,
     // Until the relay answers, Messages has no heading or empty state: after
@@ -2293,6 +2377,7 @@ export function SearchResults({
                     : hasOperator
                       ? "Filters apply to messages"
                       : undefined,
+                  reranked: rerank.reranked,
                   destinations: messageRows,
                   headingStatus: slowMessages ? "Searching…" : undefined,
                   empty: messageEmpty,
@@ -2554,6 +2639,7 @@ export function SearchResults({
             !guideOpen &&
             !!query.trim() &&
             (messagesPending || directoryPending),
+          onMove: () => setMovedFor(searchKey),
           unsearched:
             !guideOpen && (search.tooShort || search.onlyExclusions)
               ? { Messages: messageEmpty }

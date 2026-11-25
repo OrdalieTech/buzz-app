@@ -1,10 +1,11 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
-import type { UploadedAttachment } from "../relay/attachments";
+import { UploadError, type UploadedAttachment } from "../relay/attachments";
 import type { ComposerSession } from "./composer-session";
 import {
   attachmentDraft,
   clearAttachmentDraft,
   transferAttachmentDraft,
+  unsupportedTypes,
   type AttachmentDraft,
   type DraftAttachment,
 } from "./attachment-draft";
@@ -123,7 +124,14 @@ function update(queue: Queue) {
   for (const listener of queue.listeners) listener();
 }
 
-function reason(error: unknown) {
+function reason(error: unknown, files: readonly DraftAttachment[]) {
+  // The notice is the only one for a type the relay refused after Send.
+  const refused =
+    error instanceof UploadError && error.code === "type"
+      ? files.filter((file) => file.unsupported)
+      : [];
+  if (refused.length)
+    return unsupportedTypes(refused.map((item) => item.file.name));
   return error instanceof Error && error.message
     ? error.message
     : "Unknown error";
@@ -171,7 +179,7 @@ export function sendInBackground(
           title: uploaded
             ? `Message to ${destination.name} failed to send`
             : `Upload to ${destination.name} failed`,
-          description: reason(error),
+          description: reason(error, store.snapshot()),
         };
       }
     } finally {

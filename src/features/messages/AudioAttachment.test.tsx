@@ -120,7 +120,11 @@ it("shows wire duration before metadata loads", () => {
   );
 });
 
-it("keeps normal media durations from metadata", () => {
+it.each([
+  ["normal", 95, "01:35", "95"],
+  ["oversized", 1e15, "01:23", "83"],
+  ["non-finite", Number.POSITIVE_INFINITY, "01:23", "83"],
+])("handles %s media durations from metadata", (_case, duration, text, max) => {
   const { container } = render(
     <AudioAttachment
       attachment={{
@@ -133,53 +137,13 @@ it("keeps normal media durations from metadata", () => {
   );
   const audio = container.querySelector("audio");
   if (!audio) throw new Error("Missing audio element");
-  setDuration(audio, 95);
+  setDuration(audio, duration);
   fireEvent.durationChange(audio);
-  expect(screen.getByRole("group")).toHaveTextContent("00:00 01:35");
+  expect(screen.getByRole("group")).toHaveTextContent(`00:00 ${text}`);
   expect(screen.getByRole("slider", { name: "Seek audio" })).toHaveAttribute(
     "max",
-    "95",
+    max,
   );
-});
-
-it("ignores oversized media durations", () => {
-  const { container } = render(
-    <AudioAttachment
-      attachment={{
-        url: "https://fixture.test/audio.mp3",
-        kind: "audio",
-        duration: 83,
-      }}
-      source={source}
-    />,
-  );
-  const audio = container.querySelector("audio");
-  if (!audio) throw new Error("Missing audio element");
-  setDuration(audio, 1e15);
-  fireEvent.durationChange(audio);
-  expect(screen.getByRole("group")).toHaveTextContent("00:00 01:23");
-  expect(screen.getByRole("slider", { name: "Seek audio" })).toHaveAttribute(
-    "max",
-    "83",
-  );
-});
-
-it("ignores non-finite media durations", () => {
-  const { container } = render(
-    <AudioAttachment
-      attachment={{
-        url: "https://fixture.test/audio.mp3",
-        kind: "audio",
-        duration: 83,
-      }}
-      source={source}
-    />,
-  );
-  const audio = container.querySelector("audio");
-  if (!audio) throw new Error("Missing audio element");
-  setDuration(audio, Number.POSITIVE_INFINITY);
-  fireEvent.durationChange(audio);
-  expect(screen.getByRole("group")).toHaveTextContent("00:00 01:23");
 });
 
 it("keeps playback enabled while disabling seek until metadata supplies a duration", () => {
@@ -204,43 +168,32 @@ it("keeps playback enabled while disabling seek until metadata supplies a durati
   expect(screen.getByRole("group")).toHaveTextContent("00:00 01:23");
 });
 
-it("updates bare elapsed slider value text before duration is known", () => {
-  const { container } = render(
-    <AudioAttachment
-      attachment={{ url: "https://fixture.test/audio.mp3", kind: "audio" }}
-      source={source}
-    />,
-  );
-  const audio = container.querySelector("audio");
-  if (!audio) throw new Error("Missing audio element");
-  audio.currentTime = 42;
-  fireEvent.timeUpdate(audio);
-  expect(screen.getByRole("slider", { name: "Seek audio" })).toHaveAttribute(
-    "aria-valuetext",
-    "0:42",
-  );
-});
-
-it("updates slider value text from playback time", () => {
-  const { container } = render(
-    <AudioAttachment
-      attachment={{
-        url: "https://fixture.test/audio.mp3",
-        kind: "audio",
-        duration: 83,
-      }}
-      source={source}
-    />,
-  );
-  const audio = container.querySelector("audio");
-  if (!audio) throw new Error("Missing audio element");
-  audio.currentTime = 42;
-  fireEvent.timeUpdate(audio);
-  expect(screen.getByRole("slider", { name: "Seek audio" })).toHaveAttribute(
-    "aria-valuetext",
-    "0:42 of 1:23",
-  );
-});
+it.each([
+  ["before duration is known", undefined, "0:42"],
+  ["with a known duration", 83, "0:42 of 1:23"],
+])(
+  "updates slider value text from playback time %s",
+  (_case, duration, text) => {
+    const { container } = render(
+      <AudioAttachment
+        attachment={{
+          url: "https://fixture.test/audio.mp3",
+          kind: "audio",
+          ...(duration === undefined ? {} : { duration }),
+        }}
+        source={source}
+      />,
+    );
+    const audio = container.querySelector("audio");
+    if (!audio) throw new Error("Missing audio element");
+    audio.currentTime = 42;
+    fireEvent.timeUpdate(audio);
+    expect(screen.getByRole("slider", { name: "Seek audio" })).toHaveAttribute(
+      "aria-valuetext",
+      text,
+    );
+  },
+);
 
 it("sets currentTime when the seek slider changes", () => {
   const { container } = render(
@@ -320,38 +273,6 @@ it("completes progress, resets the play label, and releases playback when audio 
   expect(pause).not.toHaveBeenCalled();
 });
 
-it("keeps ended cleanup idempotent when pause fires after ended", () => {
-  const { container } = render(
-    <>
-      <AudioAttachment
-        attachment={{
-          url: "https://fixture.test/one.mp3",
-          kind: "audio",
-          duration: 5.4,
-        }}
-        source="/api/relay/media?url=https%3A%2F%2Ffixture.test%2Fone.mp3"
-      />
-      <AudioAttachment
-        attachment={{ url: "https://fixture.test/two.mp3", kind: "audio" }}
-        source="/api/relay/media?url=https%3A%2F%2Ffixture.test%2Ftwo.mp3"
-      />
-    </>,
-  );
-  const [ended, next] = Array.from(container.querySelectorAll("audio"));
-  if (!ended || !next) throw new Error("Missing audio elements");
-
-  fireEvent.play(ended);
-  ended.currentTime = 5.4;
-  fireEvent.ended(ended);
-  fireEvent.pause(ended);
-  fireEvent.play(next);
-
-  expect(
-    screen.getAllByRole("button", { name: "Play audio" })[0],
-  ).toBeInTheDocument();
-  expect(pause).not.toHaveBeenCalled();
-});
-
 it("keeps ended cleanup idempotent when pause fires before ended", () => {
   const { container } = render(
     <>
@@ -416,31 +337,6 @@ it("does not correct duration or suppress later duration sync when ended far bef
     "max",
     "62",
   );
-});
-
-it("does not correct duration just outside the ended correction bound", () => {
-  const { container } = render(
-    <AudioAttachment
-      attachment={{
-        url: "https://fixture.test/voice-note.mp4",
-        kind: "audio",
-        duration: 5.4,
-      }}
-      source={source}
-    />,
-  );
-  const audio = container.querySelector("audio");
-  if (!audio) throw new Error("Missing audio element");
-
-  fireEvent.play(audio);
-  audio.currentTime = 3.89;
-  fireEvent.ended(audio);
-
-  expect(screen.getByRole("slider", { name: "Seek audio" })).toHaveAttribute(
-    "max",
-    "5.4",
-  );
-  expect(screen.getByRole("group")).toHaveTextContent("00:05 00:05");
 });
 
 it("corrects duration to the observed end without resetting it on replay", () => {

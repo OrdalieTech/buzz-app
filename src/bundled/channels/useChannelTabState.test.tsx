@@ -65,6 +65,36 @@ test("a detail visit retains the exact source thread in the main pane", () => {
   ]);
 });
 
+test("a layer's visit that names another thread selects the tab the layer is read over", () => {
+  const session = { scope: crypto.randomUUID() } as RelaySession;
+  const h = renderHook(() => useChannelTabState(session, "alpha"));
+  const thread = (rootId: string) => ({
+    channelId: "alpha",
+    messageId: rootId,
+    rootId,
+  });
+  // A reload: neither tab exists. The visit names `routed`; its layer is
+  // read over `host`.
+  act(() =>
+    h.result.current.enterVisit(
+      "layer:thread",
+      thread("routed"),
+      false,
+      undefined,
+      thread("host"),
+    ),
+  );
+  expect(h.result.current.tabs.map((tab) => tab.id)).toEqual([
+    "thread:alpha:routed",
+    "thread:alpha:host",
+  ]);
+  expect(h.result.current.selected).toBe("thread:alpha:host");
+  // Only the thread the visit names owns it: closing the host's tab must
+  // not retire this visit.
+  expect(h.result.current.threadVisits("alpha", "routed")).toEqual(["layer"]);
+  expect(h.result.current.threadVisits("alpha", "host")).toEqual([]);
+});
+
 test("selection readers stay stable during local updates and change with the channel", () => {
   const session = {} as RelaySession;
   const observations: unknown[] = [];

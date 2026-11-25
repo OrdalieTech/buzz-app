@@ -5,6 +5,8 @@ import {
   bestieThreadTarget,
   bestieDetailRoute,
   bestieDetailTarget,
+  bestieInlineRoute,
+  bestieInlineTarget,
 } from "./routes";
 
 const page = {
@@ -60,5 +62,23 @@ it("round-trips a panel address without accepting malformed detail routes", () =
     { ...detail, extra: true },
   ]) {
     expect(bestieDetailRoute(invalid)).toBeUndefined();
+  }
+});
+
+it("round-trips an inline thread address that no other route reads", () => {
+  const inline = { channelId: route.channelId, inline: route.threadRootId };
+  const target = bestieInlineTarget(page, inline);
+  expect(bestieInlineRoute(target.route?.params)).toEqual(inline);
+  expect(bestieBaseTarget(target)).toEqual(page);
+  expect(bestieRoute(target.route?.params)).toBeUndefined();
+  expect(bestieDetailRoute(target.route?.params)).toBeUndefined();
+  for (const invalid of [
+    undefined,
+    { channelId: route.channelId },
+    { ...inline, channelId: "../other" },
+    { ...inline, inline: "invalid" },
+    { ...inline, extra: true },
+  ]) {
+    expect(bestieInlineRoute(invalid)).toBeUndefined();
   }
 });

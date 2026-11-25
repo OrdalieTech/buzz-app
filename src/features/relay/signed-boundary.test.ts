@@ -2,7 +2,7 @@
 
 import { assert, afterEach, expect, it, vi } from "vitest";
 import { connectSignedTransport } from "./transport";
-import { ApiCapacity, ApiPaused } from "./http-admission";
+import { API_ACTIVE_LIMIT, ApiCapacity, ApiPaused } from "./http-admission";
 import { PublishRejected } from "./outbox";
 import { hostSigner, signed } from "./testing";
 const tick = async () => {
@@ -72,7 +72,7 @@ it("work queued for dispatch cannot bypass a newly learned shared cooldown; refu
   );
   assert.exists(t.writer);
   const paused = t.query([{ kinds: [0], limit: 1 }]).catch((error) => error);
-  const active = Array.from({ length: 5 }, () =>
+  const active = Array.from({ length: API_ACTIVE_LIMIT - 1 }, () =>
     t.query([{ kinds: [0], limit: 1 }]),
   );
   const queuedRead = t.query([{ kinds: [0], limit: 2 }]);
@@ -89,11 +89,11 @@ it("work queued for dispatch cannot bypass a newly learned shared cooldown; refu
   await publishRejected;
   host.release();
   await Promise.all(active);
-  expect(host.request).toHaveBeenCalledTimes(6);
+  expect(host.request).toHaveBeenCalledTimes(API_ACTIVE_LIMIT);
   await vi.advanceTimersByTimeAsync(60000);
-  expect(host.request).toHaveBeenCalledTimes(6); // No automatic resend.
+  expect(host.request).toHaveBeenCalledTimes(API_ACTIVE_LIMIT); // No automatic resend.
   await t.writer.publish(event, new AbortController().signal);
-  expect(host.request).toHaveBeenCalledTimes(7);
+  expect(host.request).toHaveBeenCalledTimes(API_ACTIVE_LIMIT + 1);
   expect(host.bodies.at(-1)).toBe(JSON.stringify(event));
 });
 
@@ -105,11 +105,11 @@ it("cancelled while queued for dispatch never reaches the host or blocks the nex
     "https://cancel-sign.test",
     "relay",
   );
-  const active = Array.from({ length: 6 }, () =>
+  const active = Array.from({ length: API_ACTIVE_LIMIT }, () =>
     t.query([{ kinds: [0], limit: 1 }]),
   );
   await tick();
-  expect(host.request).toHaveBeenCalledTimes(6);
+  expect(host.request).toHaveBeenCalledTimes(API_ACTIVE_LIMIT);
   const controller = new AbortController();
   const cancelled = t.query([{ kinds: [0], limit: 2 }], controller.signal);
   const rejected = expect(cancelled).rejects.toMatchObject({
@@ -120,9 +120,9 @@ it("cancelled while queued for dispatch never reaches the host or blocks the nex
   await rejected;
   host.release();
   await Promise.all(active);
-  expect(host.request).toHaveBeenCalledTimes(6);
+  expect(host.request).toHaveBeenCalledTimes(API_ACTIVE_LIMIT);
   await t.query([{ kinds: [0], limit: 3 }]);
-  expect(host.request).toHaveBeenCalledTimes(7);
+  expect(host.request).toHaveBeenCalledTimes(API_ACTIVE_LIMIT + 1);
   expect(host.bodies.at(-1)).toBe(JSON.stringify([{ kinds: [0], limit: 3 }]));
   expect(vi.getTimerCount()).toBe(0);
 });
@@ -142,7 +142,7 @@ it("host request ownership is bounded across signed constructor recreation", asy
       .catch((error) => error),
   );
   await tick();
-  expect(host.request).toHaveBeenCalledTimes(6);
+  expect(host.request).toHaveBeenCalledTimes(API_ACTIVE_LIMIT);
   const replacement = await connectSignedTransport(
     { ...host.signer },
     "https://bounded-sign.test/",
@@ -157,11 +157,11 @@ it("host request ownership is bounded across signed constructor recreation", asy
   // slots until they settle.
   const next = replacement.query([{ kinds: [0], limit: 1 }]);
   await tick();
-  expect(host.request).toHaveBeenCalledTimes(6);
+  expect(host.request).toHaveBeenCalledTimes(API_ACTIVE_LIMIT);
   host.release();
   await next;
-  expect(host.request).toHaveBeenCalledTimes(7);
-  // Queued reads never reached the host; the six in flight settled through it.
-  const queued = (await Promise.all(reads)).slice(6);
+  expect(host.request).toHaveBeenCalledTimes(API_ACTIVE_LIMIT + 1);
+  // Queued reads never reached the host; the in-flight ones settled through it.
+  const queued = (await Promise.all(reads)).slice(API_ACTIVE_LIMIT);
   expect(queued.every((error) => error.name === "AbortError")).toBe(true);
 });

@@ -1,4 +1,5 @@
 import { assert, describe, expect, it, vi } from "vitest";
+import { verifyEvent } from "nostr-tools";
 import { SOLO_LABEL } from "../solo/labels";
 import { createChannelWrites } from "./channel-writes";
 import type { Outbox, OutgoingEvent } from "./outbox";
@@ -14,6 +15,7 @@ import {
 } from "./testing";
 import { createRelaySession } from "./session";
 import { PublishRejected } from "./outbox";
+import { acceptPublish } from "./transport";
 import { canAddMembers } from "../channel-members/members";
 import type { ReadFilter, RelayEvent } from "./events";
 const event = message(keypair(), "chat", "Work", 1);
@@ -101,22 +103,33 @@ it("retries an identical create with its signed event, replaces a changed one an
     writer: { kinds: [9007], sign, publish },
   };
   const input = { name: "Release notes", visibility: "open" as const };
+  const migration = { ...input, migration: "slack" };
   const owner = createRelaySession(transport, { outboxStorage: storage });
   try {
-    await expect(owner.session.channelCreation.create(input)).rejects.toThrow(
-      /connection lost/,
-    );
-    await expect(owner.session.channelCreation.create(input)).rejects.toThrow(
-      /connection lost/,
-    );
+    await expect(
+      owner.session.channelCreation.create(migration),
+    ).rejects.toThrow(/connection lost/);
+    await expect(
+      owner.session.channelCreation.create(migration),
+    ).rejects.toThrow(/connection lost/);
     expect(sign).toHaveBeenCalledOnce();
     const [first, again] = publish.mock.calls.map(([event]) => event);
     expect(again).toEqual(first);
+    assert.exists(first);
+    expect(verifyEvent(structuredClone(first))).toBe(true);
+    expect(first.tags).toContainEqual(["migration", "slack"]);
+
+    await expect(owner.session.channelCreation.create(input)).rejects.toThrow(
+      /connection lost/,
+    );
+    const [ordinary] = publish.mock.lastCall ?? [];
+    expect(ordinary?.tags[0]).not.toEqual(first.tags[0]);
+    expect(ordinary?.tags.some(([tag]) => tag === "migration")).toBe(false);
 
     await expect(
       owner.session.channelCreation.create({ ...input, name: "Changelog" }),
     ).rejects.toThrow(/connection lost/);
-    expect(sign).toHaveBeenCalledTimes(2);
+    expect(sign).toHaveBeenCalledTimes(3);
     await vi.waitFor(() =>
       expect(records.map(({ event }) => event.tags[1])).toEqual([
         ["name", "Changelog"],
@@ -133,11 +146,52 @@ it("retries an identical create with its signed event, replaces a changed one an
     await expect(
       restored.session.channelCreation.create({ ...input, name: "Changelog" }),
     ).rejects.toThrow(/connection lost/);
-    expect(sign).toHaveBeenCalledTimes(3);
+    expect(sign).toHaveBeenCalledTimes(4);
     const [saved, fresh] = publish.mock.calls.slice(-2).map(([event]) => event);
     expect(fresh?.tags[0]).not.toEqual(saved?.tags[0]);
   } finally {
     restored.dispose();
+  }
+});
+
+it("surfaces an HTTP migration quota refusal without retrying channel creation", async () => {
+  const viewer = keypair();
+  const reason = "rate-limited: quota exceeded; retry in 5s";
+  const publish = vi.fn(async (event: RelayEvent) => {
+    await acceptPublish(
+      Response.json({ error: reason }, { status: 429 }),
+      event.id,
+    );
+  });
+  const owner = createRelaySession(
+    {
+      viewer: viewer.pubkey,
+      relayAuthor: keypair().pubkey,
+      media: () => undefined,
+      query: async () => [],
+      writer: {
+        kinds: [9007],
+        sign: async (event) => signed(viewer, event),
+        publish,
+      },
+    },
+    { outboxStorage: { load: () => [], save: () => {} } },
+  );
+  try {
+    await expect(
+      owner.session.channelCreation.create({
+        name: "Imported channel",
+        visibility: "open",
+        migration: "slack",
+      }),
+    ).rejects.toThrow(/^rate-limited:/);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(publish.mock.lastCall?.[0].tags).toContainEqual([
+      "migration",
+      "slack",
+    ]);
+  } finally {
+    owner.dispose();
   }
 });
 

@@ -45,7 +45,7 @@ const BASE = {
      insertion line reads more precisely than a highlighted half-tab. */
   dndTabIndicator: "line",
   /* Tab reorder animation. Dockview's `smooth` transitions tab positions
-     during the drag, which DESIGN.md § Motion rules out: direct manipulation
+     during the drag, which we rule out: direct manipulation
      follows the pointer with no easing. */
   tabAnimation: "default",
 } as const satisfies Partial<DockviewTheme>;

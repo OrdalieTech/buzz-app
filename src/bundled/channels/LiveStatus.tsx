@@ -9,6 +9,7 @@ import type { RelaySession } from "../../features/relay/session";
 import { useRecovery } from "../../features/relay/RecoveryNotice";
 import { liveRecoveryStatus } from "../../features/relay/live-recovery";
 import { Button } from "../../shared/design-system/ui/Button";
+import { diagnosticsAvailable } from "../../features/developer/mode";
 import styles from "./LiveStatus.module.css";
 
 export function LiveStatus({
@@ -147,7 +148,7 @@ export function LiveStatus({
       );
     },
   };
-  if (diagnostics) {
+  if (diagnosticsAvailable && diagnostics) {
     const connecting =
       snapshot.status === "connecting" ||
       (channelId && route?.status !== "live") ||

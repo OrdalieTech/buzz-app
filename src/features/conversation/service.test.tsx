@@ -2,6 +2,7 @@ import { Context } from "@deepseek-ai/cordis";
 import { afterEach, expect, it, vi } from "vitest";
 import { PluginRuntime } from "../../plugins/runtime";
 import { ConversationService } from "./service";
+import { SettingsCardsService } from "../settings/service";
 import { ChannelMembersDialog } from "../../bundled/channels/ChannelMembersDialog";
 import { ChannelGeneralAccess } from "../../bundled/channels/ChannelGeneralAccess";
 import { DocumentEditor } from "../messages/DocumentEditor";
@@ -102,6 +103,36 @@ it("provides ui.Tabs only while a plugin supplies the tab workspace", async () =
   expect(h.service.ui.Tabs).toBe(h.service.ui.Tabs);
   h.runtime.reconcile([]);
   await vi.waitFor(() => expect(h.service.ui.Tabs).toBeUndefined());
+});
+it("reports the slots the active ui.Workspace provider declares", async () => {
+  const Workspace = () => null;
+  const h = harness({
+    inject: ["conversation"],
+    apply(ctx) {
+      ctx.conversation.registerWorkspace(Workspace, {
+        slots: { headerActions: true },
+      });
+    },
+  });
+  expect(h.service.workspaceSlots).toBeUndefined();
+  h.runtime.reconcile([h.plugin]);
+  await vi.waitFor(() =>
+    expect(h.service.workspaceSlots).toEqual({ headerActions: true }),
+  );
+  h.runtime.reconcile([]);
+  await vi.waitFor(() => expect(h.service.workspaceSlots).toBeUndefined());
+});
+it("reports no slots for a ui.Workspace provider that declares none", async () => {
+  const Workspace = () => null;
+  const h = harness({
+    inject: ["conversation"],
+    apply(ctx) {
+      ctx.conversation.registerWorkspace(Workspace);
+    },
+  });
+  h.runtime.reconcile([h.plugin]);
+  await vi.waitFor(() => expect(h.service.ui.Workspace).toBeDefined());
+  expect(h.service.workspaceSlots).toBeUndefined();
 });
 it("bundled Emoji really registers a picker and a renderer, including reaction metadata", async () => {
   const h = harness(emoji);
@@ -269,16 +300,45 @@ it("registers link previews and withdraws them with their plugin", async () => {
           component: Component,
         } as never),
       ).toThrow("matcher");
+      const status = () => "ready" as const;
+      const subscribe = () => () => {};
+      for (const partial of [
+        { status },
+        { subscribe },
+        { status, subscribe },
+        { status, subscribe, settings: "" },
+        { status, subscribe, settings: "tracker/setup" },
+        { status, subscribe, settings: "Setup" },
+        { status, subscribe, settings: "x".repeat(129) },
+        { settings: 7 },
+        { settings: "-setup" },
+      ])
+        expect(() =>
+          ctx.conversation.registerLinkPreview({
+            ...base,
+            id: "partial",
+            ...partial,
+            component: Component,
+          } as never),
+        ).toThrow(/status|settings/);
       ctx.conversation.registerLinkPreview({
         ...base,
         order: 100,
+        component: Component,
+      });
+      ctx.conversation.registerLinkPreview({
+        ...base,
+        id: "needs-setup",
+        status: () => "needs-setup",
+        subscribe,
+        settings: "setup",
         component: Component,
       });
     },
   });
   h.runtime.reconcile([h.plugin]);
   await vi.waitFor(() =>
-    expect(h.service.linkPreviews.snapshot()).toHaveLength(1),
+    expect(h.service.linkPreviews.snapshot()).toHaveLength(2),
   );
   h.runtime.reconcile([]);
   await vi.waitFor(() =>
@@ -318,6 +378,58 @@ it("registers identity marks and withdraws them with their plugin", async () => 
   h.runtime.reconcile([]);
   await vi.waitFor(() =>
     expect(h.service.identityMarks.snapshot()).toHaveLength(0),
+  );
+});
+
+it("registers a send gate with only an id and hold, and withdraws it with its plugin", async () => {
+  const h = harness({
+    inject: ["conversation"],
+    apply(ctx) {
+      expect(() =>
+        ctx.conversation.registerSendGate({ id: "gate" } as never),
+      ).toThrow("id and hold function");
+      ctx.conversation.registerSendGate({ id: "gate", hold: () => false });
+    },
+  });
+  h.runtime.reconcile([h.plugin]);
+  await vi.waitFor(() =>
+    expect(h.service.sendGates.snapshot()).toHaveLength(1),
+  );
+  h.runtime.reconcile([]);
+  await vi.waitFor(() =>
+    expect(h.service.sendGates.snapshot()).toHaveLength(0),
+  );
+});
+
+it("publishes a kept message for a plugin", async () => {
+  const send = vi.fn(() => "event-id");
+  const session = { messages: { send } } as never;
+  const message = {
+    channelId: "channel",
+    text: "Later",
+    recipients: [],
+    references: [],
+    attachments: [],
+    picks: {},
+  };
+  let publish: ConversationService["publish"] | undefined;
+  const h = harness({
+    inject: ["conversation"],
+    apply(ctx) {
+      publish = ctx.conversation.publish.bind(ctx.conversation);
+    },
+  });
+  h.runtime.reconcile([h.plugin]);
+  await vi.waitFor(() => expect(publish).toBeDefined());
+  await expect(publish?.(session, message)).resolves.toBe("event-id");
+  expect(send).toHaveBeenCalledExactlyOnceWith(
+    "channel",
+    "Later",
+    [],
+    [],
+    undefined,
+    [],
+    {},
   );
 });
 
@@ -415,6 +527,41 @@ it("owns completion registration through disable, replacement and failed activat
   );
   expect(broken.service.completions.snapshot()).toHaveLength(0);
 });
+it("makes a supplement only through registerCompletionSupplement", async () => {
+  const provider = {
+    title: "Rows",
+    match: () => null,
+    component: Component,
+  };
+  const h = harness({
+    inject: ["conversation"],
+    apply(ctx) {
+      ctx.conversation.registerCompletion({ ...provider, id: "owner" });
+      ctx.conversation.registerCompletionSupplement({
+        ...provider,
+        id: "rows",
+      });
+      expect(() =>
+        ctx.conversation.registerCompletion({
+          ...provider,
+          id: "refused",
+          supplement: true,
+        }),
+      ).toThrow("registerCompletionSupplement");
+    },
+  });
+  h.runtime.reconcile([h.plugin]);
+  await vi.waitFor(() =>
+    expect(
+      h.service.completions
+        .snapshot()
+        .map(({ id, supplement }) => [id, supplement === true]),
+    ).toEqual([
+      ["owner", false],
+      ["rows", true],
+    ]),
+  );
+});
 it.each([
   [emoji, ["typeahead"]],
   [mentions, ["typeahead", "folders", "skills"]],
@@ -494,4 +641,64 @@ it("retires plugin chat menu contributions when their plugin is disabled", async
   await vi.waitFor(() =>
     expect(h.service.chatMenus.snapshot()).toHaveLength(0),
   );
+});
+
+it("reports which plugin Settings cards a link preview setup card can open", async () => {
+  const root = new Context();
+  root.provide("pluginStatus", {
+    isActive: () => true,
+    subscribe: () => () => {},
+  });
+  new SettingsCardsService(root);
+  const service = new ConversationService(root);
+  const listener = vi.fn();
+  const stop = service.settings.subscribe(listener);
+  expect(service.settings.has("tracker/setup")).toBe(false);
+  let visible: boolean | "pending" = false;
+  const visibilityListeners = new Set<() => void>();
+  const setVisible = (next: typeof visible) => {
+    visible = next;
+    for (const each of [...visibilityListeners]) each();
+  };
+  const fiber = root
+    .extend({ pluginOwner: { id: "tracker", revision: "one" } })
+    .plugin((ctx) => {
+      ctx.settingsCards.register({
+        id: "setup",
+        title: "Tracker",
+        component: () => null,
+      });
+      ctx.settingsCards.register({
+        id: "gated",
+        title: "Tracker admin",
+        visibility: {
+          snapshot: () => visible,
+          subscribe: (each) => {
+            visibilityListeners.add(each);
+            return () => visibilityListeners.delete(each);
+          },
+          ensure: () => () => {},
+        },
+        component: () => null,
+      });
+    });
+  await fiber.await();
+  expect(service.settings.has("tracker/setup")).toBe(true);
+  expect(service.settings.has("other/setup")).toBe(false);
+  expect(listener).toHaveBeenCalled();
+  expect(service.settings.has("tracker/gated")).toBe(false);
+  listener.mockClear();
+  setVisible(true);
+  expect(listener).toHaveBeenCalled();
+  expect(service.settings.has("tracker/gated")).toBe(true);
+  setVisible("pending");
+  expect(service.settings.has("tracker/gated")).toBe(false);
+  setVisible(false);
+  expect(service.settings.has("tracker/gated")).toBe(false);
+  setVisible(true);
+  await fiber.dispose();
+  expect(service.settings.has("tracker/setup")).toBe(false);
+  expect(service.settings.has("tracker/gated")).toBe(false);
+  stop();
+  await root.fiber.dispose();
 });

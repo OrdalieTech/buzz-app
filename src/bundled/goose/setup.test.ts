@@ -713,6 +713,23 @@ describe("GooseSetup", () => {
     });
   });
 
+  it("offers an agent on a model route its provider's own models", async () => {
+    const { setup: configured } = setup({
+      saved: new Map([["anthropic", new Set(["ANTHROPIC_API_KEY"])]]),
+    });
+    await expect(
+      configured.picks({ provider: "anthropic", model: "route:auto-balanced" }),
+    ).resolves.toEqual({
+      current: "route:auto-balanced",
+      // No row for the route itself, and none for the provider's default
+      // model the provider doesn't list.
+      models: [
+        { id: "claude-opus-5-5", label: "claude-opus-5-5", efforts: [] },
+        { id: "claude-haiku-5-5", label: "claude-haiku-5-5", efforts: [] },
+      ],
+    });
+  });
+
   it("saves a provider's fields into goose and reads the list again", async () => {
     const saved = new Map<string, Set<string>>();
     const { fake, setup: goose } = setup({ saved });
@@ -902,12 +919,58 @@ describe("GooseSetup", () => {
     expect((await goose.efforts(inherited)).levels).toEqual(["off"]);
   });
 
+  it("reads a named model's levels on goose's default provider when its config names no default model", async () => {
+    const { fake, setup: goose } = setup({
+      defaults: { providerId: "databricks" },
+      thinking: {
+        "goose-claude": { current: "high", levels: ["low", "high"] },
+      },
+    });
+    expect(
+      await goose.efforts({ provider: "", model: "goose-claude" }),
+    ).toEqual({ current: "high", levels: ["low", "high"] });
+    const [read] = fake.geese;
+    expect(read?.opened[0]?._meta).toMatchObject({ provider: "databricks" });
+    expect(read?.configured).toEqual(["session-1 model=goose-claude"]);
+    expect(read?.deleted).toEqual(["session-1"]);
+    // goose's own model is not one it has: that read alone fails.
+    await expect(goose.efforts({ provider: "", model: "" })).rejects.toThrow(
+      "goose's config names no default model",
+    );
+  });
+
+  it("leaves goose's error when its config names no default provider", async () => {
+    const { fake, setup: goose } = setup({
+      defaults: {},
+      thinking: { "goose-claude": { current: "high", levels: ["high"] } },
+    });
+    await expect(
+      goose.efforts({ provider: "", model: "goose-claude" }),
+    ).rejects.toThrow("Configuration value not found: GOOSE_PROVIDER");
+    expect(fake.geese[0]?.opened[0]?._meta).not.toHaveProperty("provider");
+  });
+
   it("reads no thinking levels from a goose that lists none", async () => {
     const { setup: goose } = setup();
     expect(await goose.efforts({ provider: "", model: "" })).toEqual({
       current: "",
       levels: [],
     });
+  });
+
+  it("checks providers with the device's environment variables", async () => {
+    const fake = fakeSpawn();
+    const asked: Parameters<Spawn>[1][] = [];
+    const spawn: Spawn = async (id, options) => {
+      if (id === "goose") asked.push(options);
+      return fake.spawn(id, options);
+    };
+    await new GooseSetup({ ...fake, spawn }).providers();
+    expect(asked.length).toBeGreaterThan(0);
+    for (const options of asked) {
+      expect(options?.secrets).toEqual(["agent-env"]);
+      expect(options?.envAgent).toBeUndefined();
+    }
   });
 
   it("says when the bundled goose-acp is missing", async () => {
@@ -1057,6 +1120,53 @@ it("blocks dismissal throughout credential persistence and clears blocking on fa
   }
   await result;
   expect(goose.snapshot().blocking).toBe(false);
+});
+
+it("reads the current default provider for forwarding even when the catalog is cached", async () => {
+  const { fake, setup: goose } = setup({
+    providers: [
+      ...PROVIDERS,
+      { providerId: "databricks_v2", providerName: "Databricks AI Gateway" },
+    ],
+  });
+  expect((await goose.providers()).defaults.provider).toBe("ollama");
+  await new GooseSetup(fake).saveDefaults({
+    provider: "databricks_v2",
+    model: "catalog.schema.model",
+  });
+  expect((await goose.providers()).defaults.provider).toBe("ollama");
+  await expect(goose.defaultProvider()).resolves.toBe("databricks_v2");
+});
+
+it("reads the default provider again after a finished read, so a later external change is not overridden", async () => {
+  const { fake, setup: goose } = setup({
+    providers: [
+      ...PROVIDERS,
+      { providerId: "databricks_v2", providerName: "Databricks AI Gateway" },
+    ],
+  });
+  await new GooseSetup(fake).saveDefaults({
+    provider: "databricks_v2",
+    model: "catalog.schema.model",
+  });
+  await expect(goose.defaultProvider()).resolves.toBe("databricks_v2");
+  // Changed outside this setup, as `goose configure` would.
+  await new GooseSetup(fake).saveDefaults({
+    provider: "ollama",
+    model: "qwen3",
+  });
+  await expect(goose.defaultProvider()).resolves.toBe("ollama");
+});
+
+it("shares one default provider read between concurrent forwarded turns", async () => {
+  const { fake, setup: goose } = setup();
+  const before = fake.geese.length;
+  await expect(
+    Promise.all([goose.defaultProvider(), goose.defaultProvider()]),
+  ).resolves.toEqual(["ollama", "ollama"]);
+  expect(fake.geese.length - before).toBe(1);
+  await goose.defaultProvider();
+  expect(fake.geese.length - before).toBe(2);
 });
 
 it("invalidates inherited sessions when a fresh check finds external defaults changes", async () => {

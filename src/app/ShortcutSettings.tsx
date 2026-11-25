@@ -37,6 +37,7 @@ import {
   useSendWithModEnterPreference,
 } from "../features/messages/send-key-preference";
 import type { PluginManager } from "../plugins/manager";
+import { ownerName } from "../plugins/owner";
 import { editKeyPreference } from "../features/messages/edit-key-preference";
 
 type Row = Readonly<{
@@ -128,13 +129,16 @@ const CLIPBOARD_CHORDS: readonly KeyBinding[] = [
   { key: "x", mod: true },
   { key: "a", mod: true },
 ];
-/** Switch tab, close tab and quit: the desktop shell owns these, so they stay fixed. */
+/** Switch tab, close tab, quit and, on Mac, Settings: the desktop shell owns these, so they stay fixed. */
 const DESKTOP_CHORDS: readonly KeyBinding[] = [
   { key: "q", mod: true },
   { key: "w", mod: true },
   { key: "Tab", mod: true },
   { key: "Tab", mod: true, shift: true },
 ];
+/** The Mac menu's Settings… accelerator fires whenever the page doesn't take ⌘,. */
+const MAC_MENU_CHORDS: readonly KeyBinding[] = [{ key: ",", mod: true }];
+const MAC_DESKTOP_CHORDS = [...DESKTOP_CHORDS, ...MAC_MENU_CHORDS];
 // Common shifted pairs. Aliases for one physical key (⌘= and ⌘+) exist so
 // the chord works on every layout; the row shows that key once.
 const SHIFTED: Readonly<Record<string, string>> = {
@@ -184,11 +188,13 @@ function useShortcutGroups({
   bindings,
   plugins,
   desktop = isTauri(),
+  apple = isApplePlatform(navigator.platform),
 }: {
   shortcuts: ShortcutsService;
   bindings: ShortcutBindings;
   plugins: Pick<PluginManager, "subscribe" | "snapshot">;
   desktop?: boolean;
+  apple?: boolean;
 }) {
   const host = useSyncExternalStore(
     shortcuts.hostSubscribe,
@@ -202,24 +208,17 @@ function useShortcutGroups({
     bindings.subscribe,
     bindings.snapshot,
   );
-  const { configuration } = useSyncExternalStore(
-    plugins.subscribe,
-    plugins.snapshot,
-  );
+  const owners = useSyncExternalStore(plugins.subscribe, plugins.snapshot);
   const sendWithModEnter = useSendWithModEnterPreference();
 
-  const pluginName = (id: string) =>
-    (configuration.status === "ready"
-      ? configuration.catalog.plugins.find(
-          (plugin) => plugin.manifest.id === id,
-        )?.manifest.name
-      : undefined) ?? id;
   const row = (
     key: string,
     shortcut: NormalizedShortcut,
     owner: string,
     readOnly = false,
     local = false,
+    /** Native chords that keep working beside an override. */
+    fixed: readonly KeyBinding[] = [],
   ): Row => {
     const override = overrides[key];
     return {
@@ -231,7 +230,7 @@ function useShortcutGroups({
       local,
       defaults: shortcut.binding,
       override,
-      effective: override ? [override] : shortcut.binding,
+      effective: override ? [...fixed, override] : shortcut.binding,
     };
   };
   // Group ids are namespaced so a plugin whose manifest id is "buzz" or "host"
@@ -248,15 +247,20 @@ function useShortcutGroups({
           "Buzz",
           desktop &&
             shortcut.binding.some((binding) =>
-              includes(DESKTOP_CHORDS, binding),
+              includes(apple ? MAC_DESKTOP_CHORDS : DESKTOP_CHORDS, binding),
             ),
           shortcut.local,
+          desktop && apple
+            ? shortcut.binding.filter((binding) =>
+                includes(MAC_MENU_CHORDS, binding),
+              )
+            : [],
         ),
       ),
     },
     ...[...new Set(contributed.map((shortcut) => shortcut.pluginId))]
       .map((pluginId) => {
-        const label = pluginName(pluginId);
+        const label = ownerName(owners, pluginId);
         return {
           id: `plugin:${pluginId}`,
           label,
@@ -326,7 +330,7 @@ export function ShortcutSettings({
 }: {
   shortcuts: ShortcutsService;
   bindings: ShortcutBindings;
-  /** Display names for plugin groups come from the catalog. */
+  /** Names plugin groups: a host-owned feature's manifest first, then the catalog. */
   plugins: Pick<PluginManager, "subscribe" | "snapshot">;
   apple?: boolean;
   /** Packaged desktop build, where close/quit chords belong to the shell. */
@@ -337,6 +341,7 @@ export function ShortcutSettings({
     bindings,
     plugins,
     desktop,
+    apple,
   });
   const [editing, setEditing] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -412,10 +417,11 @@ export function ShortcutSettings({
       return refuse(
         `${chord} is reserved for copy, cut, paste and select all. Try another.`,
       );
-    if (desktop && includes(DESKTOP_CHORDS, binding))
-      return refuse(
-        `${chord} is reserved for switching or closing tabs and quitting Buzz. Try another.`,
-      );
+    if (
+      desktop &&
+      includes(apple ? MAC_DESKTOP_CHORDS : DESKTOP_CHORDS, binding)
+    )
+      return refuse(`${chord} is reserved by Buzz. Try another.`);
     const conflict = rows.find(
       (row) =>
         competes(target, row) &&
@@ -616,12 +622,11 @@ function ShortcutRow({
           </h4>
         }
         subtitle={
-          row.readOnly ? (
-            explained ? undefined : (
-              "Reserved by Buzz"
-            )
-          ) : row.override || sharedWith.length > 0 ? (
+          row.readOnly && explained ? undefined : row.readOnly ||
+            row.override ||
+            sharedWith.length > 0 ? (
             <>
+              {row.readOnly && <span className="block">Reserved by Buzz</span>}
               {row.override && <span className="block">Modified</span>}
               {sharedWith.length > 0 && (
                 <span className="block text-subtle">

@@ -1,3 +1,4 @@
+import { viewerMember } from "./membership.ts";
 import type { EventTemplate } from "nostr-tools";
 import type { ChannelSummary } from "./contracts.ts";
 import { newer, type RelayEvent } from "./events.ts";
@@ -210,7 +211,7 @@ export function lifecycleOffer(
     (channel.readOnly && channel.viewerRole !== "guest") ||
     !UUID.test(channel.id) ||
     !channel.owners ||
-    !channel.members?.includes(viewer)
+    !viewerMember(channel, viewer)
   )
     return;
   const archived = !!channel.archived;

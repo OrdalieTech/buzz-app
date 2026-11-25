@@ -90,6 +90,8 @@ export class AgentProcess {
               ...(agent && {
                 agent: { pubkey: agent.pubkey, relay: agent.relay },
               }),
+              // Only a local agent's unprotected launch gets its variables.
+              ...(agent && !bridge && { secrets: ["agent-env"] }),
               ...(bridge && {
                 protected: true,
                 env: {

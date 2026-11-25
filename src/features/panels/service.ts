@@ -103,6 +103,12 @@ export type Panel = Readonly<{
   keepOpen?: boolean;
   /** Opt into conversation detail addresses and Back/Forward/Close behavior. */
   addressable?: true;
+  /**
+   * False keeps it a tab when the viewer opens things inline. A dialog
+   * unmounts on Back and Close, so a panel with a live lifetime (a call, an
+   * editor, a running app) stays a tab until that lifetime survives it.
+   */
+  inline?: false;
   /** Mount tab content on first selection, then retain it for the workspace visit.
    * Component-provided titles and local detail tabs are also deferred. */
   deferUntilShown?: boolean;

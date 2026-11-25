@@ -1,5 +1,9 @@
 import { test, expect } from "./fixture.mjs";
-import { openPage, settleShellToggle } from "./navigation.mjs";
+import {
+  clickSidebarHeadingAction,
+  openPage,
+  settleShellToggle,
+} from "./navigation.mjs";
 
 // The roster can paint before the saved stars and workspaces arrive. Alpha then
 // starts in its default section and leaves it, inert, while its saved copy
@@ -38,7 +42,7 @@ test("Team offers empty-workspace creation with keyboard focus, emoji and confir
   await page.keyboard.press("Escape");
   await expect(trigger).toBeFocused();
   expect(app.report.sidebarPublications ?? []).toHaveLength(0);
-  await trigger.click();
+  await clickSidebarHeadingAction(trigger);
   await page
     .getByRole("menuitem", { name: "Create workspace", exact: true })
     .click();
@@ -218,7 +222,7 @@ test("Team offers empty-workspace creation with keyboard focus, emoji and confir
   lostResponse = false;
   failWriterRead = true;
   await page.route("**/sidebar-assignment", loseCreationResponse);
-  await trigger.click();
+  await clickSidebarHeadingAction(trigger);
   await page
     .getByRole("menuitem", { name: "Create workspace", exact: true })
     .click();
@@ -252,7 +256,7 @@ test("Team offers empty-workspace creation with keyboard focus, emoji and confir
     .click();
   await expect(trigger).toBeFocused();
   await expect(accepted).toBeVisible();
-  await trigger.click();
+  await clickSidebarHeadingAction(trigger);
   await page
     .getByRole("menuitem", { name: "Create workspace", exact: true })
     .click();

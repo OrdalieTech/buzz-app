@@ -13,6 +13,20 @@
   max-width: 48rem;
   margin-inline: auto;
 }
+/* Borrow panel inset so the turn can clip paint beyond the disclosure outlines. */
+[data-transcript] .timeline:has(> .turn) {
+  margin-inline: calc(-1 * var(--space-3));
+}
+[data-transcript] .timeline:has(> .turn) > :not(.turn) {
+  padding-inline: var(--space-3);
+}
+[data-transcript] .turn {
+  contain: paint;
+  box-sizing: border-box;
+  max-width: calc(48rem + 2 * var(--space-3));
+  padding: var(--space-1) var(--space-3);
+  margin-block: calc(-1 * var(--space-1));
+}
 .session {
   display: flex;
   align-items: center;

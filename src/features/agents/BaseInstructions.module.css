@@ -1,0 +1,68 @@
+.rowTitle {
+  opacity: 1;
+}
+
+button[aria-expanded="true"] .rowTitle {
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html:not([data-keyboard-input]) .rowTitle {
+    transition: opacity var(--duration-state) var(--easing-enter);
+  }
+}
+
+.markdown > p:has(+ p) {
+  margin-block-end: var(--space-2);
+}
+
+.markdown > p + p {
+  margin-block-start: var(--space-2);
+}
+
+.sectionPreview > [data-layout="rows"] {
+  border-block-end-color: transparent;
+  border-end-start-radius: 0;
+  border-end-end-radius: 0;
+}
+
+.sectionPreview:not(:has(:focus-visible, [aria-expanded="true"])) {
+  mask-image: linear-gradient(
+    to bottom,
+    black calc(100% - var(--space-16)),
+    calc(100% - var(--space-6)),
+    transparent
+  );
+
+  @media (prefers-reduced-transparency: reduce), (forced-colors: active) {
+    mask-image: none;
+  }
+}
+
+.editor,
+.readingArea {
+  --instruction-text-max-height: min(16rem, 32dvh);
+}
+
+.editor {
+  --document-field-max-height: var(--instruction-text-max-height);
+}
+
+.editor :is([contenteditable], textarea) {
+  padding-block-end: var(--space-3);
+}
+
+.editor [data-overflow-end] {
+  mask-image: var(--scroll-fade-end);
+}
+
+.readingArea {
+  max-block-size: var(--instruction-text-max-height);
+  overflow-y: auto;
+}
+
+html[data-keyboard-navigation] .readingArea:focus-visible {
+  mask-image: none;
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}

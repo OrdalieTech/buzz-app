@@ -799,3 +799,37 @@ it("keeps a titled active Interest's watches unreadable to older builds, which w
   for (const slug of Object.keys(watches))
     expect(olderApplies(slug, plain.attention[slug].value)).toBe(true);
 });
+
+it("saves a model route beside the config, so older readers run their default", async () => {
+  const storage = memoryStorage();
+  const routed = {
+    ...record,
+    config: { word: "hi", model: "route:auto-fast" },
+  };
+  await writeRecord(storage, routed);
+  const stored = JSON.parse(storage.getItem(recordKey(pubkey)) as string);
+  expect(stored.config).toEqual({ word: "hi", model: "" });
+  expect(stored.modelRoute).toBe("auto-fast");
+  expect(readRecords(storage)[pubkey]?.config).toEqual(routed.config);
+  // A model an older version saved takes the agent off its route, and a
+  // version that dropped `modelRoute` leaves it on its default.
+  storage.setItem(
+    recordKey(pubkey),
+    JSON.stringify({ ...stored, config: { word: "hi", model: "gpt-x" } }),
+  );
+  expect(readRecords(storage)[pubkey]?.config).toEqual({
+    word: "hi",
+    model: "gpt-x",
+  });
+  const { modelRoute: _, ...dropped } = stored;
+  storage.setItem(recordKey(pubkey), JSON.stringify(dropped));
+  expect(readRecords(storage)[pubkey]?.config).toEqual({
+    word: "hi",
+    model: "",
+  });
+  // Without a route, nothing moves.
+  await writeRecord(storage, record);
+  expect(
+    JSON.parse(storage.getItem(recordKey(pubkey)) as string),
+  ).not.toHaveProperty("modelRoute");
+});

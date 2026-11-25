@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { Context } from "@deepseek-ai/cordis";
 import "@testing-library/jest-dom/vitest";
 import {
   act,
@@ -9,8 +10,11 @@ import {
 } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { PluginRuntime } from "../../plugins/runtime";
 import { AgentsContext } from "./react";
-import type { Agents } from "./service";
+import { AgentsService, type Agents } from "./service";
+import { fakeCommunities, fakeNative, fakeRelay } from "./service-testing";
+import { memoryStorage } from "./test-fakes";
 import {
   LIVE_READ_MS,
   STEP_READ_MS,
@@ -19,7 +23,11 @@ import {
   useLiveTranscript,
   withLatest,
 } from "./TranscriptPanel";
-import type { Transcript, TranscriptTurn } from "./activity-transcript";
+import type {
+  Transcript,
+  TranscriptItem,
+  TranscriptTurn,
+} from "./activity-transcript";
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => {
@@ -29,15 +37,15 @@ afterEach(() => {
 });
 
 /** A read whose calls each settle when the test says. */
-function reads() {
+function reads<T = string>() {
   const calls: {
     key: string;
     signal: AbortSignal;
-    resolve(value: string | undefined): void;
+    resolve(value: T | undefined): void;
     reject(error: Error): void;
   }[] = [];
   const read = (key: string) => (signal: AbortSignal) =>
-    new Promise<string | undefined>((resolve, reject) =>
+    new Promise<T | undefined>((resolve, reject) =>
       calls.push({ key, signal, resolve, reject }),
     );
   return { calls, read };
@@ -45,7 +53,7 @@ function reads() {
 
 type Props = { key: string; again?: string; working: boolean };
 
-function setup() {
+function setup(onRefreshRequested?: () => void) {
   const steps = new Set<() => void>();
   const agents = {
     subscribeSteps: (_agent: string, listener: () => void) => {
@@ -76,6 +84,7 @@ function setup() {
         again,
         working,
         agentKey: "agent",
+        onRefreshRequested,
       }),
     { wrapper, initialProps: { key: "a", working: false } as Props },
   );
@@ -90,7 +99,7 @@ function nth<T>(items: readonly T[], index: number) {
   if (!item) throw new Error(`No read ${index}`);
   return item;
 }
-const settle = (call: { resolve(value: string): void }, value: string) =>
+const settle = <T,>(call: { resolve(value: T): void }, value: T) =>
   act(async () => call.resolve(value));
 
 it("reads on open and keeps its result while the next read runs", async () => {
@@ -149,14 +158,17 @@ it("polls only while working, and stops when idle", async () => {
 });
 
 it("never overlaps reads, and reads once more after one asked during it", async () => {
-  const { calls, view, step } = setup();
+  const onRefreshRequested = vi.fn();
+  const { calls, view, step } = setup(onRefreshRequested);
   await settle(nth(calls, 0), "first");
   view.rerender({ key: "a", working: true });
   act(() => vi.advanceTimersByTime(LIVE_READ_MS * 4));
   // Automatic reads don't show as loading; Refresh does.
   expect(view.result.current.loading).toBe(false);
   step();
+  expect(onRefreshRequested).not.toHaveBeenCalled();
   act(() => view.result.current.refresh());
+  expect(onRefreshRequested).toHaveBeenCalledOnce();
   expect(view.result.current.loading).toBe(true);
   expect(calls).toHaveLength(2);
   await settle(nth(calls, 1), "second");
@@ -308,7 +320,11 @@ it("keeps the transcript while new read inputs are read, and ignores the read th
   });
   view.rerender({ key: "a", again: "s3", working: false });
   await settle(nth(calls, 3), "second");
-  expect(view.result.current.shown).toEqual({ key: "a", transcript: "second" });
+  expect(view.result.current.shown).toEqual({
+    key: "a",
+    transcript: "second",
+    working: false,
+  });
 });
 
 it("shows a missing transcript as null", async () => {
@@ -316,6 +332,83 @@ it("shows a missing transcript as null", async () => {
   await act(async () => nth(calls, 0).resolve(undefined));
   expect(view.result.current.shown.transcript).toBeNull();
 });
+
+const agent = { key: "agent", name: "Agent" } as Parameters<
+  typeof TranscriptPanel
+>[0]["agent"];
+
+it.each([
+  { result: "succeeds", late: false },
+  { result: "fails", late: false },
+  { result: "succeeds", late: true },
+  { result: "fails", late: true },
+])(
+  "shows the stop outcome when the read $result (past the hold: $late)",
+  async ({ result, late }) => {
+    const { read, calls } = reads<Transcript>();
+    const panel = (working: boolean) => (
+      <TranscriptPanel
+        agent={agent}
+        read={read("session")}
+        readKey="session"
+        working={working}
+        reading="Reading…"
+        missing="Missing"
+        failed="Could not read"
+      />
+    );
+    const live: TranscriptTurn = {
+      turnId: "latest",
+      startedAt: 1000,
+      channelId: null,
+      threadRootId: null,
+      triggeringEventIds: [],
+      config: [],
+      newSession: false,
+      partial: false,
+      items: [],
+    };
+    const view = render(panel(true));
+    await act(async () => nth(calls, 0).resolve({ turns: [live] }));
+    expect(screen.getByText("Working")).toBeVisible();
+
+    view.rerender(panel(false));
+    const stop = nth(calls, 1);
+    expect(screen.getByText("Working")).toBeVisible();
+    expect(screen.queryByText("Status unknown")).toBeNull();
+    if (late) {
+      act(() => vi.advanceTimersByTime(9_999));
+      expect(screen.getByText("Working")).toBeVisible();
+      act(() => vi.advanceTimersByTime(1));
+      expect(screen.getByText("Status unknown")).toBeVisible();
+      expect(screen.queryByText("Working")).toBeNull();
+    }
+    if (result === "succeeds") {
+      await act(async () =>
+        stop.resolve({ turns: [{ ...live, endedAt: 2000 }] }),
+      );
+      expect(screen.getByText("Completed")).toBeVisible();
+    } else {
+      await act(async () => stop.reject(new Error("unavailable")));
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Could not read: unavailable",
+      );
+      expect(screen.getByText("Status unknown")).toBeVisible();
+    }
+    expect(screen.queryByText("Working")).toBeNull();
+    act(() => vi.advanceTimersByTime(LIVE_READ_MS * 3));
+    expect(calls).toHaveLength(2);
+    if (late && result === "succeeds") {
+      view.rerender(panel(true));
+      await act(async () => nth(calls, 2).resolve({ turns: [live] }));
+      view.rerender(panel(false));
+      act(() => vi.advanceTimersByTime(9_999));
+      expect(screen.getByText("Working")).toBeVisible();
+      act(() => vi.advanceTimersByTime(1));
+      expect(screen.getByText("Status unknown")).toBeVisible();
+    }
+  },
+);
 
 it("keeps the shown transcript mounted while its sessions change", async () => {
   const pending: {
@@ -326,9 +419,6 @@ it("keeps the shown transcript mounted while its sessions change", async () => {
     new Promise<Transcript | undefined>((resolve, reject) =>
       pending.push({ resolve, reject }),
     );
-  const agent = { key: "agent", name: "Agent" } as Parameters<
-    typeof TranscriptPanel
-  >[0]["agent"];
   const panel = (readAgain: string) => (
     <div style={{ overflowY: "auto" }}>
       <TranscriptPanel
@@ -364,6 +454,203 @@ const turn = (turnId: string, text = turnId) =>
     startedAt: 1,
     items: [{ id: text }],
   }) as unknown as TranscriptTurn;
+
+function reuseTurn(turnId: string, items: TranscriptItem[] = []) {
+  return {
+    turnId,
+    channelId: "channel",
+    threadRootId: null,
+    triggeringEventIds: ["request"],
+    sessionId: "session",
+    newSession: false,
+    config: ["model", "effort"],
+    startedAt: 1,
+    partial: false,
+    items,
+  } satisfies TranscriptTurn;
+}
+
+function toolTurn(turnId: string, answer: string) {
+  return reuseTurn(turnId, [
+    {
+      id: "run",
+      at: 1,
+      type: "tool",
+      toolCallId: "run",
+      title: "Run script",
+      kind: "execute",
+      status: "completed",
+      input: "script",
+      output: "done",
+      diffs: [],
+      paths: ["script.sh"],
+      truncated: false,
+      children: [{ id: "child", at: 2, type: "message", text: answer }],
+    },
+  ]);
+}
+
+type TurnSnapshot = Transcript & {
+  more: boolean;
+  details?: { author: string };
+};
+
+function readTurnSnapshots(working = false) {
+  const full = reads<TurnSnapshot>();
+  const latest = reads<readonly TranscriptTurn[]>();
+  const view = renderHook(() =>
+    useLiveTranscript({
+      read: full.read("conversation"),
+      readLatest: latest.read("conversation"),
+      key: "conversation",
+      again: "",
+      working,
+      agentKey: "agent",
+    }),
+  );
+  function snapshot() {
+    const shown = view.result.current.shown.transcript;
+    if (!shown) throw new Error("Transcript did not settle");
+    return shown;
+  }
+  return {
+    full: full.calls,
+    latest: latest.calls,
+    refresh: () => act(() => view.result.current.refresh()),
+    snapshot,
+    loading: () => view.result.current.loading,
+  };
+}
+
+it("reuses accepted transcript turns across a live send at the turn limit", async () => {
+  const reader = readTurnSnapshots(true);
+  const turns = Array.from({ length: TURN_LIMIT }, (_, index) =>
+    toolTurn(`turn ${index}`, "before the send"),
+  );
+  const details = { author: "provider" };
+  await settle(nth(reader.full, 0), { turns, more: false, details });
+  const previousLast = nth(turns, TURN_LIMIT - 1);
+  const sent = reuseTurn("sent", [
+    {
+      id: "sent-message",
+      at: 3,
+      type: "message",
+      text: "A posted message",
+      posted: true,
+      messageId: "message",
+    },
+  ]);
+  act(() => vi.advanceTimersByTime(LIVE_READ_MS));
+  await settle(nth(reader.latest, 0), [
+    toolTurn(previousLast.turnId, "before the send"),
+    sent,
+  ]);
+
+  const accepted = reader.snapshot();
+  expect(accepted.turns.map(({ turnId }) => turnId)).toEqual([
+    ...turns.slice(1).map(({ turnId }) => turnId),
+    "sent",
+  ]);
+  expect(accepted.more).toBe(true);
+  expect(accepted.turns[0]).toBe(turns[1]);
+  expect(accepted.turns.at(-2)).toBe(previousLast);
+  expect(accepted.turns.at(-1)).toBe(sent);
+  expect(accepted.details).toBe(details);
+});
+
+it("reuses accepted transcript turns by unique ID on Refresh while preserving the incoming window", async () => {
+  const reader = readTurnSnapshots();
+  const first = reuseTurn("first");
+  const moved = reuseTurn("moved");
+  const repeatedBefore = reuseTurn("repeated before");
+  const repeatedAfter = reuseTurn("repeated after");
+  await settle(nth(reader.full, 0), {
+    more: false,
+    turns: [
+      first,
+      moved,
+      reuseTurn("removed"),
+      repeatedBefore,
+      reuseTurn(repeatedBefore.turnId),
+      repeatedAfter,
+      toolTurn("corrected child", "old text"),
+    ],
+    details: { author: "previous" },
+  });
+  const corrected = toolTurn("corrected child", "updated text");
+  const incoming = Object.freeze([
+    reuseTurn(moved.turnId),
+    reuseTurn("added"),
+    reuseTurn(repeatedAfter.turnId),
+    reuseTurn(repeatedBefore.turnId),
+    reuseTurn(first.turnId),
+    reuseTurn(repeatedAfter.turnId),
+    corrected,
+  ]);
+  const details = { author: "refreshed" };
+  reader.refresh();
+  await settle(nth(reader.full, 1), { more: true, turns: incoming, details });
+
+  const accepted = reader.snapshot();
+  expect(accepted.turns.map(({ turnId }) => turnId)).toEqual([
+    "moved",
+    "added",
+    "repeated after",
+    "repeated before",
+    "first",
+    "repeated after",
+    "corrected child",
+  ]);
+  expect(accepted.turns[0]).toBe(moved);
+  expect(accepted.turns[1]).toBe(incoming[1]);
+  expect(accepted.turns[2]).toBe(incoming[2]);
+  expect(accepted.turns[3]).toBe(incoming[3]);
+  expect(accepted.turns[4]).toBe(first);
+  expect(accepted.turns[5]).toBe(incoming[5]);
+  expect(accepted.turns.at(-1)).toBe(corrected);
+  expect(accepted.details).toBe(details);
+});
+
+it("keeps a frozen transcript through an equal Refresh", async () => {
+  const reader = readTurnSnapshots();
+  const held = Object.freeze({
+    turns: [toolTurn("first", "same reply")],
+    more: false,
+    details: { author: "original" },
+  });
+  await settle(nth(reader.full, 0), held);
+  reader.refresh();
+  await settle(nth(reader.full, 1), {
+    ...held,
+    turns: [toolTurn("first", "same reply")],
+    details: { author: "original" },
+  });
+  expect(reader.snapshot()).toBe(held);
+});
+
+it("settles a Refresh containing cyclic extension data and keeps the other equal turn", async () => {
+  function extensionTurn() {
+    const extension: Record<string, unknown> = {};
+    extension.self = extension;
+    return { ...reuseTurn("extension"), extension };
+  }
+
+  const reader = readTurnSnapshots();
+  const stable = reuseTurn("stable");
+  await settle(nth(reader.full, 0), {
+    more: false,
+    turns: [extensionTurn(), stable],
+  });
+  const incoming = extensionTurn();
+  reader.refresh();
+  await settle(nth(reader.full, 1), {
+    more: false,
+    turns: [incoming, reuseTurn("stable")],
+  });
+  expect(reader.loading()).toBe(false);
+  expect(reader.snapshot().turns[0]).toBe(incoming);
+  expect(reader.snapshot().turns[1]).toBe(stable);
+});
 
 it("swaps the latest turns over the end of the held transcript", () => {
   const held = { turns: [turn("1"), turn("2", "open")], more: true };
@@ -489,4 +776,62 @@ it("reads only when work starts and ends without refreshWhileWorking", async () 
   expect(view.result.current.shown.transcript).toBe("b");
   view.rerender({ working: true });
   expect(calls).toHaveLength(3);
+});
+
+it("exposes TranscriptPanel stably on Agents.ui across renders", async () => {
+  const host = new Context();
+  const runtime = new PluginRuntime(host, async () => ({ apply() {} }));
+  const service = new AgentsService(
+    host,
+    fakeCommunities(fakeRelay()).communities,
+    fakeNative(),
+    memoryStorage(),
+  );
+  const plugin = host.extend({
+    pluginOwner: { id: "example.harness", revision: "1" },
+  });
+  try {
+    expect(plugin.agents.ui?.Transcript).toBe(TranscriptPanel);
+    let reads = 0;
+    const read = async () => {
+      reads++;
+      return { turns: [] };
+    };
+    const agent = {
+      key: "agent-1",
+      name: "Agent",
+      relay: "wss://relay.example",
+    } as Parameters<typeof TranscriptPanel>[0]["agent"];
+    const Tab = ({ title }: { title: string }) => {
+      const Transcript = plugin.agents.ui?.Transcript;
+      return Transcript ? (
+        <div title={title}>
+          <Transcript
+            agent={agent}
+            read={read}
+            readKey="chan-1"
+            working={false}
+            reading="Reading…"
+            missing={null}
+            failed="Failed"
+          />
+        </div>
+      ) : null;
+    };
+    const tree = (title: string) => (
+      <AgentsContext.Provider value={service}>
+        <Tab title={title} />
+      </AgentsContext.Provider>
+    );
+    const view = render(tree("one"));
+    await act(async () => {});
+    expect(reads).toBe(1);
+    view.rerender(tree("two"));
+    await act(async () => {});
+    expect(reads).toBe(1);
+    view.unmount();
+  } finally {
+    await runtime.dispose();
+    await host.fiber.dispose();
+  }
 });

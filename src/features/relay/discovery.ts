@@ -115,6 +115,8 @@ export class DiscoveryState {
   private denied = new CountedSet<string>(this.changed);
   /** Denied only because a complete read omitted them; a later one can list them again. */
   private absent = new CountedSet<string>(this.changed);
+  /** Denied by the relay's answer for the channel itself (see `revoked`). */
+  private revokedIds = new Set<string>();
   /** Fresh public resolution can restore reading while membership remains denied. */
   private confirmedPreviews = new CountedSet<string>(this.changed);
   private suspended = new CountedSet<string>(this.changed);
@@ -230,13 +232,14 @@ export class DiscoveryState {
         previous &&
         hasTag(previous, "p", this.viewer) &&
         !hasTag(event, "p", this.viewer)
-      )
+      ) {
         this.denied.add(id);
-      else if (hasTag(event, "p", this.viewer)) this.denied.delete(id);
+        this.revokedIds.add(id);
+      } else if (hasTag(event, "p", this.viewer)) this.regrant(id);
       // A signed roster without the viewer ends the start it stood in for.
       if (!hasTag(event, "p", this.viewer)) this.starting.delete(id);
     } else if (previous && !this.rosters.has(id) && this.open(id))
-      this.denied.delete(id);
+      this.regrant(id);
     if (this.authorized(id) || (event.kind === 39000 && this.open(id)))
       this.suspended.delete(id);
     if (this.metadata.has(id) && this.authorized(id)) this.starting.delete(id);
@@ -270,6 +273,23 @@ export class DiscoveryState {
     this.suspended.delete(id);
     this.confirmedPreviews.delete(id);
     this.denied.add(id);
+  }
+  private regrant(id: string) {
+    this.denied.delete(id);
+    this.revokedIds.delete(id);
+  }
+  /** `deny`, on the relay's answer for this channel itself: a denied read of
+   * it, or a removal. */
+  revoke(id: string) {
+    this.deny(id);
+    if (this.denied.has(id)) this.revokedIds.add(id);
+  }
+  /** The relay ended the viewer's access to this channel itself: it denied a
+   * read of the channel, or its roster dropped the viewer. That settles the
+   * channel without a complete roster read. Not a channel a roster read only
+   * omitted, nor one denied with every other when the roster was refused. */
+  revoked(id: string): boolean {
+    return this.revokedIds.has(id) && this.denied.has(id);
   }
   /** A CLOSED preview is unreadable pending fresh evidence, not permanently denied. */
   suspend(id: string): boolean {
@@ -498,6 +518,7 @@ export class DiscoveryState {
       ...(!this.authorized(id) || this.cached.has(id) || viewerRole === "guest"
         ? { readOnly: true as const }
         : {}),
+      viewerMembership: { pubkey: this.viewer, joined: this.authorized(id) },
       ...(viewerRole ? { viewerRole } : {}),
       ...(this.cached.has(id) ? { cached: true as const } : {}),
       name: this.name(id),
@@ -565,7 +586,13 @@ export class DiscoveryState {
     });
   }
   /** Every roster channel get() serves, system channels included. Membership,
-   * not listing, decides what the device may keep. */
+   * not listing, decides what the device may keep.
+   *
+   * Invariant: every entry is a channel whose roster names the viewer, or one
+   * the viewer is starting. An open channel the viewer has not joined is
+   * served by get() alone and never enters this list or channels(). Thread
+   * tabs read any confirmed (not `cached`) listed channel on that basis, a
+   * Solo chat included, without checking its members again. */
   readable(): readonly ChannelSummary[] {
     if (this.lastReadable?.changes === this.changes)
       return this.lastReadable.channels;

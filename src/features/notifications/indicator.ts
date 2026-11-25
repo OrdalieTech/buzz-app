@@ -110,6 +110,9 @@ export function createUnreadIndicator(
       };
     },
     refresh: () => check(false),
+    /** A read after a known change. One already in flight may have sampled
+     * the earlier state, so this one starts behind it. */
+    reread: () => (checking ? checking.then(() => check(false)) : check(false)),
     request: () => check(true),
     setUnread(value: boolean) {
       if (!closed) {

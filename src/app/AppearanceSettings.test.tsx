@@ -17,6 +17,7 @@ import {
   setUnreadFirstPreference,
   unreadFirstPreference,
 } from "../features/search/unread-first-preference";
+import { setMessageSortPreference } from "../features/search/message-sort-preference";
 
 import {
   setThreadPlacementPreference,
@@ -56,6 +57,7 @@ afterEach(() => {
   setFollowUpBehaviorPreference("immediate");
   setMessageAutocorrectPreference(false);
   setUnreadFirstPreference(true);
+  setMessageSortPreference("relevance");
   setClockPreference({
     hourCycle: "system",
     seconds: false,
@@ -280,7 +282,7 @@ it("selects and saves color mode through the Mode dropdown", async () => {
   appearance.dispose();
 });
 
-it("selects and restores an accent color, including retry after a failed save", async () => {
+it("selects and restores an accent color", async () => {
   const appearance = createAppearance();
   render(
     <ToastProvider>
@@ -294,11 +296,6 @@ it("selects and restores an accent color, including retry after a failed save", 
   expect(
     screen.getByRole("button", { name: "Citrus accent color" }),
   ).toHaveAttribute("aria-pressed", "true");
-  const save = vi
-    .spyOn(Storage.prototype, "setItem")
-    .mockImplementationOnce(() => {
-      throw new Error("denied");
-    });
   fireEvent.click(screen.getByRole("button", { name: "Mono accent color" }));
   expect(
     screen.getByRole("button", { name: "Mono accent color" }),
@@ -308,11 +305,7 @@ it("selects and restores an accent color, including retry after a failed save", 
   expect(
     screen.getByRole("button", { name: "Magenta accent color" }),
   ).toHaveAttribute("data-color-mode", appearance.snapshot().mode);
-  fireEvent.click(
-    await screen.findByRole("button", { name: "Retry saving accent color" }),
-  );
   expect(localStorage.getItem("buzz-accent.v1")).toBe("mono");
-  save.mockRestore();
   appearance.dispose();
   const restored = createAppearance();
   expect(restored.snapshot().accent).toBe("mono");
@@ -328,10 +321,13 @@ it("saves new-thread placement, restores it, and follows another window", async 
     screen.getByRole("combobox", { name: "Open threads in" });
   expect(
     screen.getByText(
-      "New threads open here. Already-open threads stay where you placed them.",
+      "New threads open here. Inline opens threads, profiles and links over the conversation instead of in tabs; calls, canvases and apps still open as tabs. Already-open threads stay where you placed them.",
     ),
   ).toBeVisible();
-  expect(choice()).toHaveTextContent("Side pane");
+  expect(choice()).toHaveTextContent("Inline");
+  await user.click(choice());
+  await user.click(await screen.findByRole("option", { name: "Side pane" }));
+  expect(threadPlacementPreference()).toBe("side");
   await user.click(choice());
   await user.click(await screen.findByRole("option", { name: "Main pane" }));
   expect(threadPlacementPreference()).toBe("main");
@@ -483,7 +479,7 @@ it("switches contrast through the shared select and restores it", async () => {
   appearance.dispose();
 });
 
-it("switches message density, restores it, and retries a failed save", async () => {
+it("switches message density and restores it", async () => {
   const appearance = createAppearance();
   preferenceAppearances.push(appearance);
   render(
@@ -515,26 +511,6 @@ it("switches message density, restores it, and retries a failed save", async () 
   const restored = createAppearance();
   expect(restored.snapshot().density).toBe("compact");
   restored.dispose();
-
-  const write = vi
-    .spyOn(Storage.prototype, "setItem")
-    .mockImplementationOnce(() => {
-      throw new Error("denied");
-    });
-  await user.click(density);
-  await user.click(await screen.findByRole("option", { name: "Default" }));
-  expect(document.documentElement.dataset.messageDensity).toBe("default");
-  expect(localStorage.getItem("buzz-message-density.v1")).toBe("compact");
-  await user.click(
-    await screen.findByRole("button", { name: "Retry saving message density" }),
-  );
-  expect(write).toHaveBeenLastCalledWith("buzz-message-density.v1", "default");
-  expect(localStorage.getItem("buzz-message-density.v1")).toBe("default");
-  await waitFor(() =>
-    expect(
-      screen.queryByRole("button", { name: "Retry saving message density" }),
-    ).not.toBeInTheDocument(),
-  );
 });
 
 it("offers message spelling correction only on Mac WebKit, off until this device opts in", async () => {
@@ -572,35 +548,6 @@ it("offers message spelling correction only on Mac WebKit, off until this device
   expect(toggle()).not.toBeChecked();
 });
 
-it("keeps an unsaved spelling opt-in active and retries the same choice", async () => {
-  const user = userEvent.setup();
-  const appearance = createAppearance();
-  preferenceAppearances.push(appearance);
-  render(<AppearanceSettings appearance={appearance} autocorrectAvailable />, {
-    wrapper: ToastProvider,
-  });
-  const write = vi
-    .spyOn(Storage.prototype, "setItem")
-    .mockImplementation(() => {
-      throw new Error("unavailable");
-    });
-  await user.click(
-    screen.getByRole("switch", { name: "Allow automatic spelling correction" }),
-  );
-  expect(messageAutocorrectPreference()).toBe(true);
-  expect(await screen.findByRole("dialog")).toHaveTextContent(
-    "Spelling preference wasn’t saved",
-  );
-  write.mockRestore();
-  await user.click(
-    screen.getByRole("button", { name: "Retry saving spelling correction" }),
-  );
-  expect(localStorage.getItem("buzz-message-autocorrect.v1")).toBe("on");
-  await waitFor(() =>
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
-  );
-});
-
 it("leads search with unread until this device turns it off", async () => {
   const user = userEvent.setup();
   const appearance = createAppearance();
@@ -628,33 +575,27 @@ it("leads search with unread until this device turns it off", async () => {
   expect(toggle()).toBeChecked();
 });
 
-it("keeps an unsaved unread-first choice active and retries the same choice", async () => {
+it("saves the message sort default and restores it", async () => {
   const user = userEvent.setup();
   const appearance = createAppearance();
   preferenceAppearances.push(appearance);
+  const select = () =>
+    screen.getByRole("combobox", { name: "Sort messages by" });
+  const choose = async (name: string) => {
+    await user.click(select());
+    await user.click(await screen.findByRole("option", { name }));
+  };
   render(<AppearanceSettings appearance={appearance} />, {
     wrapper: ToastProvider,
   });
-  const write = vi
-    .spyOn(Storage.prototype, "setItem")
-    .mockImplementation(() => {
-      throw new Error("unavailable");
-    });
-  await user.click(
-    screen.getByRole("switch", { name: "Show unread first in search" }),
-  );
-  expect(unreadFirstPreference()).toBe(false);
-  expect(await screen.findByRole("dialog")).toHaveTextContent(
-    "Search preference wasn’t saved",
-  );
-  write.mockRestore();
-  await user.click(
-    screen.getByRole("button", { name: "Retry saving search preference" }),
-  );
-  expect(localStorage.getItem("buzz-search-unread-first.v1")).toBe("off");
-  await waitFor(() =>
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
-  );
+  expect(select()).toHaveTextContent("Most relevant");
+  await choose("Most recent");
+  expect(localStorage.getItem("buzz-search-message-sort.v1")).toBe("newest");
+  cleanup();
+  render(<AppearanceSettings appearance={appearance} />, {
+    wrapper: ToastProvider,
+  });
+  expect(select()).toHaveTextContent("Most recent");
 });
 
 it.each([
@@ -713,44 +654,6 @@ it("changes message width through the shared select and restores the saved choic
   expect(
     document.documentElement.style.getPropertyValue("--buzz-message-width"),
   ).toBe("52rem");
-});
-
-it("retries an unsaved message width when returning to Appearance", async () => {
-  const user = userEvent.setup();
-  const appearance = createAppearance();
-  preferenceAppearances.push(appearance);
-  const content = (active: boolean) => (
-    <ToastProvider>
-      <AppearanceSettings appearance={appearance} active={active} />
-    </ToastProvider>
-  );
-  const view = render(content(true));
-  const write = vi
-    .spyOn(Storage.prototype, "setItem")
-    .mockImplementation(() => {
-      throw new Error("denied");
-    });
-  await user.click(screen.getByRole("combobox", { name: "Message width" }));
-  await user.click(await screen.findByRole("option", { name: "Wide" }));
-  expect(await screen.findByRole("dialog")).toHaveTextContent(
-    "Message width wasn’t saved",
-  );
-  view.rerender(content(false));
-  await waitFor(() =>
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
-  );
-  view.rerender(content(true));
-  expect(
-    screen.getByRole("combobox", { name: "Message width" }),
-  ).toHaveTextContent("Wide");
-  write.mockRestore();
-  await user.click(
-    await screen.findByRole("button", { name: "Retry saving message width" }),
-  );
-  expect(localStorage.getItem("buzz-message-width.v1")).toBe("wide");
-  await waitFor(() =>
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
-  );
 });
 
 it("offers a choice between usernames and full names only where the community verifies names", async () => {

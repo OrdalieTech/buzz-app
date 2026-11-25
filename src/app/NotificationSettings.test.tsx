@@ -438,6 +438,61 @@ it("keeps an explicit permission check focused and busy until the native read fi
     screen.queryByRole("button", { name: "Allow notifications" }),
   ).not.toBeInTheDocument();
 });
+it("the permission check never sends the automatic request; the next window focus still does", async () => {
+  const ctx = new Context();
+  contexts.push(ctx);
+  const runtime = new PluginRuntime(ctx, async () => ({ apply() {} }));
+  ctx.effect(() => () => runtime.dispose());
+  const permission = vi.fn(
+    async (): Promise<NotificationPermission> => "default",
+  );
+  const requestPermission = vi.fn(
+    async (): Promise<NotificationPermission> => "default",
+  );
+  const service = new NotificationsService(
+    ctx,
+    provideNavigation(ctx).navigation,
+    {
+      label: "Test",
+      requestsAutomatically: true,
+      permission,
+      requestPermission,
+      show: async () => {},
+      dispose() {},
+    },
+    undefined,
+    undefined,
+    undefined,
+    () => true,
+  );
+  service.selectViewer("a".repeat(64));
+  const asked = () =>
+    Object.keys(localStorage).filter((key) => key.includes("asked"));
+  // Entering with Desktop alerts off reads the status and asks nothing.
+  service.updatePreferences({ enabled: false });
+  service.setEntered(true);
+  vi.useFakeTimers();
+  render(<NotificationSettings notifications={service} />, {
+    wrapper: ToastProvider,
+  });
+  await act(() => vi.advanceTimersByTimeAsync(0));
+  expect(service.snapshot().permission).toBe("default");
+  // Turned on in Settings, which keeps the window focused: no focus read.
+  fireEvent.click(screen.getByRole("switch", { name: "Desktop alerts" }));
+  const reads = permission.mock.calls.length;
+  fireEvent.click(screen.getByRole("button", { name: "Check permission" }));
+  await act(() => vi.advanceTimersByTimeAsync(1000));
+  expect(permission).toHaveBeenCalledTimes(reads + 1);
+  expect(requestPermission).not.toHaveBeenCalled();
+  expect(asked()).toEqual([]);
+  // The automatic request is unspent, and still waits for a window focus.
+  await act(async () => {
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  expect(requestPermission).toHaveBeenCalledTimes(1);
+  expect(asked()).toHaveLength(1);
+});
 it("repeated identical permission failures retain feedback without leaving Settings", async () => {
   const ctx = new Context();
   contexts.push(ctx);

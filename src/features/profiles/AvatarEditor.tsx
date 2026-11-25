@@ -894,15 +894,16 @@ export function AvatarEmojiPicker({
 }) {
   const host = useRef<HTMLDivElement>(null);
   const pointer = useRef(false);
-  const callback = useRef<(value: string) => void>(() => {});
+  const callback = useRef<(value: string) => boolean>(() => false);
   callback.current = (value) => {
-    if (disabled) return;
+    if (disabled) return false;
     const fromPointer = pointer.current;
     pointer.current = false;
     const animate =
       fromPointer &&
       !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     onSelect(value, animate);
+    return true;
   };
   const [error, setError] = useState(false);
   const [{ scale, perLine }, setLayout] = useState({

@@ -29,7 +29,8 @@ const viewer = keypair(),
   authority = keypair();
 const id = "11111111-1111-4111-8111-111111111111";
 const scope = `https://test.example:${viewer.pubkey}`;
-const long = new URLSearchParams(location.search).has("long");
+const search = new URLSearchParams(location.search);
+const long = search.has("long");
 const roots = [
   "Planning the day",
   "A second conversation",
@@ -51,6 +52,18 @@ const replies = roots.map((root, index) =>
     ["e", root.id, "", "reply"],
   ]),
 );
+// The agent's details message, whose brief holds back the rest.
+const findings = search.has("details")
+  ? [
+      message(
+        agent,
+        id,
+        `Findings brief\n\n${"More of the findings follow. ".repeat(30)}`,
+        1700000020,
+        [["audience", "details"]],
+      ),
+    ]
+  : [];
 const owner = createRelaySession(
   {
     viewer: viewer.pubkey,
@@ -114,6 +127,7 @@ const owner = createRelaySession(
             if (filter.top_level)
               return [
                 ...roots,
+                ...findings,
                 ...roots.map((root) =>
                   summary(authority, id, root.id, {
                     reply_count: 1,

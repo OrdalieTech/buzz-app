@@ -824,6 +824,23 @@ mod tests {
     }
 
     #[test]
+    fn a_signed_managed_policy_cannot_auto_install_an_unsigned_plugin_with_trust_enabled() {
+        let fixture = Fixture::new();
+        let one = fixture.artifact("example.one", "export function apply() {}", "");
+        fixture.policy(&[("example.one", &one, AUTO)]);
+        fs::write(
+            fixture.home.path().join(crate::trust::FILE_NAME),
+            r#"{"version":1,"allowSelfDeveloped":true}"#,
+        )
+        .unwrap();
+
+        let manager = fixture.manager();
+        assert!(fixture.apply(&manager).is_empty());
+        assert_eq!(*fixture.fetched.borrow(), [one.0]);
+        assert!(info(&manager, "example.one").is_none());
+    }
+
+    #[test]
     fn an_automatic_install_is_enabled_and_recorded_with_its_install() {
         let fixture = Fixture::new();
         let one = fixture.artifact("example.one", "export function apply() {}", "");

@@ -13,6 +13,8 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { CONFIG_STORAGE_KEY } from "./agent-config";
 import { CATCH_UP_KEY, CATCH_UP_PREFIX } from "./catch-up";
 import { INTERRUPTED_PREFIX } from "./interrupted";
+import { CONVERSATION_SECTIONS_PREFIX } from "./conversation-sections";
+import { PROMPT_SECTIONS_KEY } from "./prompt-sections";
 import { PROMPTS_PREFIX } from "./session-prompts";
 import { SYNCED_TEAMS_KEY } from "./team-config";
 import { TEAM_MOVES_KEY } from "./team-migration";
@@ -43,6 +45,10 @@ export function isAgentKey(key: string) {
     key.startsWith("buzz.agents.session-admission.v1:") ||
     // The standing instructions plugins gave agents' conversations.
     key.startsWith("buzz.agents.conversation-instructions.v1:") ||
+    // The owner's choices for the base prompt's sections.
+    key === PROMPT_SECTIONS_KEY ||
+    // The sections plugins replaced in the conversations they manage.
+    key.startsWith(CONVERSATION_SECTIONS_PREFIX) ||
     // The sessions the bundled agent types save.
     key.startsWith("buzz.claude-code.sessions.") ||
     key.startsWith("buzz.codex.sessions.") ||

@@ -145,6 +145,22 @@ it("surfaces a manual check requested while a background check is in flight", as
   await vi.waitFor(() => expect(state()).toBe("up-to-date"));
 });
 
+it("keeps a downloading or ready update when a manual check is requested", async () => {
+  const updates = start();
+  const { update, download } = handle();
+  (await check(0)).resolve(update);
+  await vi.waitFor(() => expect(state()).toBe("downloading"));
+  await updates.checkForUpdate();
+  expect(state()).toBe("downloading");
+  download.resolve();
+  await vi.waitFor(() => expect(state()).toBe("ready"));
+  await updates.checkForUpdate();
+  expect(state()).toBe("ready");
+  expect(platform.check).toHaveBeenCalledOnce();
+  expect(update.download).toHaveBeenCalledOnce();
+  expect(update.close).not.toHaveBeenCalled();
+});
+
 it("reports builds without the native updater as unavailable", async () => {
   const updates = start();
   (await check(0)).reject("plugin updater not found");

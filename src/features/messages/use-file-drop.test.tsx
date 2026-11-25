@@ -11,6 +11,11 @@ import { StrictMode, useRef, type ReactNode } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { RelaySession } from "../relay/session";
 import { ThreadPanel } from "./ThreadPanel";
+import {
+  SPRING_LOAD_ATTRIBUTE,
+  SPRING_LOAD_GRACE_MS,
+  useSpringLoaded,
+} from "./spring-loaded-drag";
 import { useFileDrop, useRejectUnclaimedDrops } from "./use-file-drop";
 
 afterEach(cleanup);
@@ -39,7 +44,7 @@ function Composer({
 }
 function drag(
   target: HTMLElement,
-  kind: "dragEnter" | "dragOver" | "drop",
+  kind: "dragEnter" | "dragOver" | "dragLeave" | "drop",
   type = "Files",
 ) {
   const transfer = {
@@ -166,6 +171,70 @@ it("an available composer claims the drop once and preserves the copy cursor", (
   expect(screen.queryByText("Drop files")).not.toBeInTheDocument();
 });
 
+it("a drop reports which of its files are folders, which an empty file is not", () => {
+  const attach = vi.fn();
+  render(<Composer enabled attach={attach} />);
+  const folder = new File([], "top-recipes");
+  const empty = new File([], "empty.txt");
+  const dragged = new File(["pixels"], "photo.png");
+  const item = (entry: { isDirectory: boolean } | null) => ({
+    kind: "file",
+    webkitGetAsEntry: () => entry,
+  });
+  fireEvent.drop(screen.getByRole("textbox"), {
+    dataTransfer: {
+      types: ["text/uri-list", "Files"],
+      files: [folder, empty, dragged],
+      // Text dragged along has no file. Bytes dragged from a page have no entry.
+      items: [
+        { kind: "string" },
+        item({ isDirectory: true }),
+        item({ isDirectory: false }),
+        item(null),
+      ],
+    },
+  });
+  expect(attach).toHaveBeenCalledTimes(1);
+  const [files, folders] = attach.mock.calls[0] ?? [];
+  expect(files.map((file: File) => file.name)).toEqual([
+    "top-recipes",
+    "empty.txt",
+    "photo.png",
+  ]);
+  expect(folders.size).toBe(1);
+  expect(folders.has(folder)).toBe(true);
+});
+
+it.each([
+  ["fewer", 1],
+  ["more", 3],
+])(
+  "a drop with %s entries than files reports no folders, rather than call a real file one",
+  (_, count) => {
+    const attach = vi.fn();
+    render(<Composer enabled attach={attach} />);
+    fireEvent.drop(screen.getByRole("textbox"), {
+      dataTransfer: {
+        types: ["Files"],
+        files: [new File(["pixels"], "photo.png"), new File([], "top-recipes")],
+        // Paired by position, the first entry would make photo.png the folder.
+        items: Array.from({ length: count }, () => ({
+          kind: "file",
+          webkitGetAsEntry: () => ({ isDirectory: true }),
+        })),
+      },
+    });
+    expect(attach).toHaveBeenCalledTimes(1);
+    const [files, folders] = attach.mock.calls[0] ?? [];
+    // Both still reach the draft, which takes the folder for an empty file.
+    expect(files.map((file: File) => file.name)).toEqual([
+      "photo.png",
+      "top-recipes",
+    ]);
+    expect(folders.size).toBe(0);
+  },
+);
+
 it("availability changes clear the drag hint and disabling rejects attachment", () => {
   const attach = vi.fn();
   const view = render(<Composer enabled attach={attach} />);
@@ -180,4 +249,70 @@ it("availability changes clear the drag hint and disabling rejects attachment", 
   );
   expect(attach).not.toHaveBeenCalled();
   view.unmount();
+});
+
+it("a pane that mounts under a drag in progress claims it from the first dragover", () => {
+  const attach = vi.fn();
+  render(<Composer enabled attach={attach} />);
+  const form = screen.getByRole("form", { name: "Main composer" });
+  const input = screen.getByRole("textbox");
+  // The drag was already inside when the pane mounted, so it never entered.
+  drag(form, "dragOver");
+  expect(screen.getByText("Drop files")).toBeInTheDocument();
+  // Crossing into a child reports the child entered, then its parent left.
+  drag(input, "dragEnter");
+  drag(form, "dragLeave");
+  expect(screen.getByText("Drop files")).toBeInTheDocument();
+  drag(input, "dragLeave");
+  expect(screen.queryByText("Drop files")).not.toBeInTheDocument();
+  drag(input, "dragOver");
+  drag(input, "drop");
+  expect(attach).toHaveBeenCalledTimes(1);
+});
+
+it("a drag crossing into a nested pane leaves the outer pane's hint", () => {
+  render(
+    <Composer enabled attach={vi.fn()}>
+      <aside data-attachment-drop-zone="" aria-label="Thread" />
+    </Composer>,
+  );
+  const input = screen.getByRole("textbox");
+  drag(input, "dragEnter");
+  expect(screen.getByText("Drop files")).toBeInTheDocument();
+  drag(screen.getByRole("complementary"), "dragEnter");
+  drag(input, "dragLeave");
+  expect(screen.queryByText("Drop files")).not.toBeInTheDocument();
+});
+
+function ThreadSummary({ open }: { open(): void }) {
+  return (
+    <button type="button" {...useSpringLoaded(open)}>
+      3 replies
+    </button>
+  );
+}
+it("a drop on a spring-loaded target inside a pane still attaches to that pane", () => {
+  const attach = vi.fn();
+  const open = vi.fn();
+  render(
+    <Composer enabled attach={attach}>
+      <ThreadSummary open={open} />
+    </Composer>,
+  );
+  const summary = screen.getByRole("button", { name: "3 replies" });
+  vi.useFakeTimers();
+  try {
+    drag(summary, "dragEnter");
+    vi.advanceTimersByTime(SPRING_LOAD_GRACE_MS);
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(drag(summary, "dragOver").transfer.dropEffect).toBe("copy");
+  expect(summary).toHaveAttribute(SPRING_LOAD_ATTRIBUTE, "on");
+  expect(screen.getByText("Drop files")).toBeVisible();
+  expect(drag(summary, "drop").event.defaultPrevented).toBe(true);
+  expect(attach).toHaveBeenCalledOnce();
+  expect(summary).not.toHaveAttribute(SPRING_LOAD_ATTRIBUTE);
+  expect(screen.queryByText("Drop files")).toBeNull();
+  expect(open).not.toHaveBeenCalled();
 });

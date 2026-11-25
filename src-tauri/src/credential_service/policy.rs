@@ -14,9 +14,10 @@ pub(super) enum Verdict {
 }
 
 /// Everyday work: messages and their edits, pins, bookmarks, schedules and
-/// reminders (9, 40002–40008), reactions (7), shared notes (30023), forum posts,
-/// votes and comments (45001–45003), presence and typing (20001–20003), read
-/// state (30078) and user status (30315), the identity's own lists (10000,
+/// reminders (9, 40002–40008), channel pin commands (40010, 40011), reactions
+/// (7), shared notes (30023), forum posts, votes and comments (45001–45003),
+/// presence and typing (20001–20003), read state (30078) and user status
+/// (30315), the identity's own lists (10000,
 /// 10001, 10003, 10030, 30000, 30003, 30030), canvases (40100), artifacts
 /// (45010), git patches, pull requests, issues and statuses (1617–1633), DM
 /// open and hide (41010, 41012), archive requests (9035, 9036), workflow
@@ -25,8 +26,8 @@ pub(super) enum Verdict {
 const ORDINARY: &[u16] = &[
     7, 9, 1617, 1618, 1619, 1621, 1630, 1631, 1632, 1633, 9035, 9036, 10000, 10001, 10003, 10030,
     20001, 20002, 20003, 24200, 30000, 30003, 30023, 30030, 30078, 30174, 30315, 40002, 40003,
-    40004, 40005, 40006, 40007, 40008, 40100, 41010, 41012, 43001, 43002, 43003, 43004, 43005,
-    43006, 45001, 45002, 45003, 45010, 46020,
+    40004, 40005, 40006, 40007, 40008, 40010, 40011, 40100, 41010, 41012, 43001, 43002, 43003,
+    43004, 43005, 43006, 45001, 45002, 45003, 45010, 46020,
 ];
 
 /// Changes to who the identity is, what it controls or what others see about

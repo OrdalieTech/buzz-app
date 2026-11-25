@@ -540,6 +540,7 @@ export function ProfileButton({
           </MenuSubmenu>
           <PluginUpdatesMenu
             recommendations={pluginRecommendations}
+            returnFocus={() => profileTrigger.current}
             onManage={() => {
               handoff.current = true;
               onSettings("plugins");

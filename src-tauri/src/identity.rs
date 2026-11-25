@@ -1462,15 +1462,31 @@ impl IdentityHost {
         created_at: u64,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        let system_clock: fn() -> Result<u64> = || {
+            Ok(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| "System clock is unavailable")?
+                .as_secs())
+        };
+        self.sign_thread_follows_at(slot, created_at, payload, system_clock)
+            .await
+    }
+
+    /// `sign_thread_follows` against `clock`, so a test can hold the instant
+    /// the 60-second window is measured from.
+    pub(crate) async fn sign_thread_follows_at(
+        &self,
+        slot: String,
+        created_at: u64,
+        payload: serde_json::Value,
+        clock: fn() -> Result<u64>,
+    ) -> Result<serde_json::Value> {
         with_identity(self.clone(), move |identity| {
             identity.restore()?;
             let State::Ready(key) = &identity.state else {
                 return Err("Set up your identity first".into());
             };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| "System clock is unavailable")?
-                .as_secs();
+            let now = clock()?;
             if !valid_follow_coordinate(&format!("thread-follows:{slot}"))
                 || created_at > u32::MAX as u64
                 || now.abs_diff(created_at) > 60

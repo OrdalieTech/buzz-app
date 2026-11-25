@@ -2,7 +2,7 @@
 //! debug builds. Keychain approvals belong to the program that asks, and a debug
 //! build is a different program after every rebuild; this helper is installed
 //! once outside the repository, so an approval given to it lasts.
-//! See docs/identity.md, "Local credential helper on macOS".
+//! See CONTRIBUTING.md, "Run it".
 mod policy;
 
 #[cfg(target_os = "macos")]

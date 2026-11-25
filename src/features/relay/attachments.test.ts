@@ -436,10 +436,27 @@ it.each([
     "unsupported media codec: only H.264 video and AAC audio are accepted",
     "codec",
   ],
-  [415, "unsupported container: only MP4 is accepted", "rejected"],
+  [415, "unsupported container: only MP4 is accepted", "type"],
+  [
+    415,
+    "disallowed content type: application/vnd.microsoft.portable-executable",
+    "type",
+  ],
+  [415, "unknown content type", "type"],
+  // Relays older than block/buzz#2006 answer this one with 400.
+  [400, "unknown content type", "type"],
+  // A refusal the relay does not name as a type is not called one.
+  [415, "unsupported", "rejected"],
   [422, "moov atom not at front of file (not fast-start)", "rejected"],
-])("names the relay's %i video rule: %s", async (status, error, code) => {
+  [422, "invalid image data", "rejected"],
+])("names the relay's %i content rule: %s", async (status, error, code) => {
   await expect(
     readUploadResponse(Response.json({ error }, { status })),
   ).rejects.toMatchObject({ code });
+});
+
+it("takes the broker's name for a refused type", async () => {
+  await expect(
+    readUploadResponse(Response.json({ code: "type" }, { status: 400 })),
+  ).rejects.toMatchObject({ code: "type" });
 });

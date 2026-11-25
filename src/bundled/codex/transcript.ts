@@ -12,8 +12,12 @@ import {
 import type { AgentKey } from "../../features/agents/membership";
 import { sessionTag, sessionTitle } from "./prompt";
 import { AppServer, Oversized, type Spawn } from "./rpc";
-import { READ_LIMIT, readFile } from "../../buzz-mcp/app-client";
-import { recordedLines, restoreRecordedTools } from "./recorded-tools";
+import { READ_LIMIT } from "../../buzz-mcp/app-client";
+import {
+  recordedLines,
+  recordedTurnStart,
+  restoreRecordedTools,
+} from "./recorded-tools";
 
 /** The latest turns shown; earlier ones stay in Codex's own history. */
 export const TURN_LIMIT = 20;
@@ -440,56 +444,278 @@ export async function withServer<T>(
   }
 }
 
-/** Rollouts read before, by path, with the lines restoring tools reads,
- * so a read parses only what was appended since; Codex only appends. */
-const rollouts = new Map<
-  string,
-  { bytes: number; lines: Json[]; oversized?: boolean }
->();
-/** Rollouts remembered at most. */
-const ROLLOUT_LIMIT = 2;
+/** Only complete records are cached. A live final line is read again on append. */
+type RecordedWindow = { from: number; bytes: number; lines: Json[] };
+type Rollout = {
+  oldest: string;
+  file: Awaited<ReturnType<typeof rolloutStat>>;
+  content: "over-limit" | RecordedWindow;
+};
+const rollouts = new Map<string, Rollout>();
+const TAIL_BYTES = 32 << 20;
+const CACHE_RECORDS = 8192;
+const encoder = new TextEncoder();
 
-/** A rollout's lines restoring tools reads: read whole the first time or
- * when the file shrank, and then from where the last read ended. */
+async function fileExit(
+  child: Awaited<ReturnType<Spawn>>,
+  signal: AbortSignal,
+) {
+  const stop = () => void child.kill();
+  signal.addEventListener("abort", stop, { once: true });
+  if (signal.aborted) stop();
+  const timer = setTimeout(stop, 60_000);
+  try {
+    const code = await child.exited;
+    signal.throwIfAborted();
+    return code;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", stop);
+  }
+}
+
+async function rolloutStat(
+  spawn: Spawn,
+  cwd: string,
+  path: string,
+  signal: AbortSignal,
+) {
+  let output = "";
+  const child = await spawn("rollout-stat", {
+    cwd,
+    args: [path],
+    onStdout: (s) => {
+      output += s;
+    },
+  });
+  const code = await fileExit(child, signal);
+  const match = /^(\d+) (\d+:\d+) (.+)$/.exec(output.trim());
+  const size = Number(match?.[1]);
+  if (code !== 0 || !match || !Number.isSafeInteger(size))
+    throw new Error(`Could not read ${path}`);
+  return { size, id: match[2], modified: match[3] };
+}
+
+/** The host delivers complete UTF-8 characters. Keep split records until
+ * the next newline, including a partial last record that may grow on append. */
+async function readWindow(
+  spawn: Spawn,
+  cwd: string,
+  path: string,
+  signal: AbortSignal,
+  from: number,
+  size: number,
+  align: boolean,
+  throughLine = false,
+) {
+  const lines: Json[] = [];
+  const fragments: string[] = [];
+  let bytes = from;
+  let stderr = "";
+  const child = await spawn("read-window", {
+    cwd,
+    args: [
+      path,
+      String(from + 1),
+      String(size - from),
+      ...(align ? ["align"] : []),
+      ...(throughLine ? ["through-line"] : []),
+    ],
+    onStdout: (chunk) => {
+      const end = chunk.lastIndexOf("\n");
+      if (end < 0) {
+        fragments.push(chunk);
+        return;
+      }
+      fragments.push(chunk.slice(0, end + 1));
+      const complete = fragments.join("");
+      if (!throughLine) bytes += encoder.encode(complete).length;
+      for (const record of recordedLines(complete)) lines.push(record);
+      fragments.length = 0;
+      fragments.push(chunk.slice(end + 1));
+    },
+    onStderr: (data) => {
+      stderr += data;
+    },
+  });
+  const code = await fileExit(child, signal);
+  if (code !== 0) throw new Error(stderr.trim() || `Could not read ${path}`);
+  const skipped = align && /^\d+$/.test(stderr.trim()) ? Number(stderr) : 0;
+  const tail = fragments.join("");
+  return {
+    lines,
+    bytes:
+      !throughLine && (!align || skipped > 0) && from + skipped < size
+        ? bytes + skipped
+        : undefined,
+    trailing: recordedLines(tail),
+  };
+}
+
+/** A start in an earlier turn proves the window reaches past the shown
+ * history. A completion from an earlier turn can outlive it. */
+function firstTurn(lines: Json[], shown: Set<string>) {
+  for (const record of lines) {
+    const id = str((record.payload as Json)?.turn_id);
+    if (shown.has(id)) return "shown";
+    if (recordedTurnStart(record)) return "earlier";
+  }
+}
+
+/** A context or even a repeated start of the oldest shown turn can occur in
+ * mid-turn. Walk back to the preceding turn or EOF before accepting that cut.
+ * Include the record straddling each cut in the preceding page. */
+async function hasShownPrefix(
+  spawn: Spawn,
+  directory: string,
+  path: string,
+  signal: AbortSignal,
+  end: number,
+  shown: Set<string>,
+) {
+  while (end > 0) {
+    const from = Math.max(0, end - (4 << 20));
+    const read = await readWindow(
+      spawn,
+      directory,
+      path,
+      signal,
+      Math.max(0, from - 1),
+      end,
+      from > 0,
+      true,
+    );
+    const owner = firstTurn(read.lines.concat(read.trailing).reverse(), shown);
+    if (owner) return owner === "shown";
+    end = from;
+  }
+  return false;
+}
+
+function windowRange(from: number, end: number, append = false) {
+  const align = !append && from > 0;
+  return { from, start: align ? from - 1 : from, end, align };
+}
+
+export function planRollout(
+  known: Rollout | undefined,
+  oldest: string,
+  file: Rollout["file"],
+) {
+  const { size } = file;
+  let held: RecordedWindow | undefined;
+  if (
+    known?.oldest === oldest &&
+    known.file.id === file.id &&
+    (size > known.file.size ||
+      (size === known.file.size && file.modified === known.file.modified))
+  ) {
+    if (known.content === "over-limit")
+      return { kind: "held", content: known.content } as const;
+    if (size - known.content.from <= READ_LIMIT) held = known.content;
+  }
+  if (held && size === held.bytes)
+    return { kind: "held", content: held } as const;
+  if (size === 0) return { kind: "empty" } as const;
+  const from = held?.bytes ?? (size <= READ_LIMIT ? 0 : size - TAIL_BYTES);
+  const range = windowRange(from, size, Boolean(held));
+  return { kind: "read", range, held } as const;
+}
+
+type Prefix = {
+  limit?: boolean;
+  cut?: boolean;
+  first?: "earlier" | "shown" | null;
+};
+
+/** Probe the maximum cut before the initial cut. Keep the first record classification across probes. */
+export function afterWindow(
+  range: ReturnType<typeof windowRange>,
+  held: RecordedWindow | undefined,
+  read: Awaited<ReturnType<typeof readWindow>>,
+  shown: Set<string>,
+  prefix: Prefix = {},
+) {
+  const { from, end: size } = range;
+  const limitStart = size - READ_LIMIT;
+  if (!held && from > 0 && from !== limitStart) {
+    const first =
+      prefix.first !== undefined
+        ? prefix.first
+        : (firstTurn(read.lines, shown) ??
+          firstTurn(read.trailing, shown) ??
+          null);
+    if (first !== "earlier") {
+      const probe = (at: "limit" | "cut", end: number) =>
+        ({ kind: "probe", at, end, first }) as const;
+      if (prefix.limit === undefined) return probe("limit", limitStart);
+      if (prefix.limit) return { kind: "limit", cache: "over-limit" } as const;
+      if (first && prefix.cut === undefined) return probe("cut", from);
+      if (!first || prefix.cut)
+        return { kind: "widen", range: windowRange(limitStart, size) } as const;
+    }
+  }
+  const lines = held ? held.lines.concat(read.lines) : read.lines;
+  const cache =
+    read.bytes !== undefined && lines.length <= CACHE_RECORDS
+      ? { from: held?.from ?? from, bytes: read.bytes, lines }
+      : undefined;
+  return { kind: "accept", lines: lines.concat(read.trailing), cache } as const;
+}
+
 async function rollout(
   spawn: Spawn,
   directory: string,
   path: string,
   signal: AbortSignal,
+  turns: readonly TranscriptTurn[],
 ) {
-  let known = rollouts.get(path);
-  rollouts.delete(path);
-  let added: Uint8Array;
-  try {
-    added = known
-      ? await readFile(spawn, directory, path, signal, undefined, "read-from", [
-          String(known.bytes + 1),
-        ])
-      : await readFile(spawn, directory, path, signal);
-  } catch (error) {
-    signal.throwIfAborted();
-    if (!known || !/shrank/.test(String(error))) throw error;
-    known = undefined;
-    added = await readFile(spawn, directory, path, signal);
+  const oldest = turns[0]?.turnId;
+  if (!oldest) return [];
+  const source = [spawn, directory, path, signal] as const;
+  const file = await rolloutStat(...source);
+  const known = rollouts.get(path);
+  const tooLarge = () =>
+    new Error(`The turns shown take more than 50 MB of ${path}`);
+  const plan = planRollout(known, oldest, file);
+  if (plan.kind === "held") {
+    rollouts.set(path, { oldest, file, content: plan.content });
+    if (plan.content === "over-limit") throw tooLarge();
+    return plan.content.lines;
   }
-  // Remembered lines are held to a full read's limit; past it only the
-  // size is kept, so later reads reject without reading it all again.
-  const total = (known?.bytes ?? 0) + added.length;
-  const oversized = known?.oversized || total > READ_LIMIT;
-  // Only whole lines are kept, so no record or character is split.
-  const end = oversized ? added.length : added.lastIndexOf(10) + 1;
-  const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
-  const lines = oversized
-    ? []
-    : [
-        ...(known?.lines ?? []),
-        ...recordedLines(decode(added.subarray(0, end))),
-      ];
-  rollouts.set(path, { bytes: (known?.bytes ?? 0) + end, lines, oversized });
-  for (const old of rollouts.keys())
-    if (rollouts.size > ROLLOUT_LIMIT) rollouts.delete(old);
-  if (oversized) throw new Error(`${path} is larger than 50 MB`);
-  return [...lines, ...recordedLines(decode(added.subarray(end)))];
+  rollouts.delete(path);
+  if (plan.kind === "empty") return [];
+
+  const remember = (content: Rollout["content"]) => {
+    rollouts.set(path, { oldest, file, content });
+    for (const old of rollouts.keys())
+      if (rollouts.size > 2) rollouts.delete(old);
+  };
+  let range = plan.range;
+  const readAt = ({ start, end, align }: typeof range) =>
+    readWindow(...source, start, end, align);
+  let read = await readAt(range);
+  const shown = new Set(range.align ? turns.map((turn) => turn.turnId) : []);
+  const prefix: Prefix = {};
+  for (;;) {
+    const step = afterWindow(range, plan.held, read, shown, prefix);
+    switch (step.kind) {
+      case "probe":
+        prefix.first = step.first;
+        prefix[step.at] = await hasShownPrefix(...source, step.end, shown);
+        break;
+      case "widen":
+        range = step.range;
+        read = await readAt(range);
+        break;
+      case "limit":
+        remember(step.cache);
+        throw tooLarge();
+      case "accept":
+        if (step.cache) remember(step.cache);
+        return step.lines;
+    }
+  }
 }
 
 /** The latest turns of all the conversation's threads, oldest first, from a
@@ -500,6 +726,7 @@ export async function readTranscript(
   lookup: Lookup,
   signal: AbortSignal,
   name?: Names,
+  agentWorking = false,
 ): Promise<CodexTranscript | undefined> {
   return withServer(spawn, signal, async (rpc) => {
     // The saved thread is the conversation's; a found one by its name.
@@ -512,8 +739,8 @@ export async function readTranscript(
     let found = false;
     let more = false;
     let working = false;
-    // Any thread in progress keeps the rollouts' cache.
-    let active = false;
+    // A short-lived reader can report an unfinished turn as interrupted.
+    let active = agentWorking;
     const paths: string[] = [];
     for (const [threadId, legacy] of threads) {
       const read = await page(rpc, threadId, TURN_LIMIT, signal);
@@ -539,7 +766,7 @@ export async function readTranscript(
         const directory = thread.path.slice(0, thread.path.lastIndexOf("/"));
         restoreRecordedTools(
           mapped,
-          await rollout(spawn, directory, thread.path, signal),
+          await rollout(spawn, directory, thread.path, signal, mapped),
         );
       } catch (error) {
         signal.throwIfAborted();
@@ -553,7 +780,7 @@ export async function readTranscript(
       }
       all.push(...mapped);
     }
-    // Once the turn ends, the next read reads its rollouts whole.
+    // Once the turn ends, the next read starts at the tail.
     if (!active) for (const path of paths) rollouts.delete(path);
     if (!found) return undefined;
     all.sort((a, b) => a.startedAt - b.startedAt);

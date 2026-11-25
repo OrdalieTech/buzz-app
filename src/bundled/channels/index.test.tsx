@@ -3,12 +3,15 @@ import { afterEach, expect, it, vi } from "vitest";
 import { apply } from "./index";
 
 vi.mock("./canvas-panel", () => ({ registerCanvas: () => {} }));
+vi.mock("./pins-panel", () => ({ registerPins: () => {} }));
 
 afterEach(() => {
   document.body.innerHTML = "";
   vi.restoreAllMocks();
 });
-function registered() {
+function registered(
+  registerWorkspace: (...args: unknown[]) => void = () => {},
+) {
   const shortcuts = { register: vi.fn() };
   apply({
     reflect: { get: () => undefined },
@@ -16,7 +19,7 @@ function registered() {
     conversation: {
       registerCompletion() {},
       registerTabs() {},
-      registerWorkspace() {},
+      registerWorkspace,
       registerMessageAction() {},
     },
     settingsCards: { register() {} },
@@ -53,6 +56,14 @@ it.each([
     allowInEditable: true,
   });
   expect(shortcut.allowInModal).toBeUndefined();
+});
+
+it("declares the workspace slots that Channels renders", () => {
+  const registerWorkspace = vi.fn();
+  registered(registerWorkspace);
+  expect(registerWorkspace).toHaveBeenCalledWith(expect.any(Function), {
+    slots: { headerActions: true, trailing: true, aside: true },
+  });
 });
 
 it("steps only while the sidebar renders rows, and not from a terminal", () => {

@@ -28,6 +28,9 @@ describe("channel window bounds", () => {
     expect(bare).toMatchObject({ top_level: true, limit: 200 });
     expect(bare).not.toHaveProperty("include_aux");
     expect(bare).not.toHaveProperty("include_summaries");
+    const rows = windowFilter(channel, null, 50, false, true);
+    expect(rows).toMatchObject({ include_summaries: true, limit: 50 });
+    expect(rows).not.toHaveProperty("include_aux");
   });
   it("reads the relay's membership notices apart, by the same composite cursor", () => {
     expect(noticeFilter(channel, relay.pubkey, null)).toEqual({

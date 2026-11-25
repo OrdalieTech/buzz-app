@@ -1,18 +1,21 @@
 import { Button } from "../../shared/design-system/ui/Button";
-import { AlertDialog } from "../../shared/design-system/ui/AlertDialog";
 import { isWorkflowOperation } from "../../features/workflows/protocol";
 import { useRef, useState, useSyncExternalStore } from "react";
 import type { RelayProfiler } from "../../features/relay/profiling";
 import { RelayTimings } from "./RelayTimings";
 import { PRODUCT_FEEDBACK_KIND } from "../../features/relay/product-feedback";
-import {
-  HELD_RETRY_REFUSED,
-  type Outbox,
-  type OutboxRecovery,
-} from "../../features/relay/outbox";
+import { HELD_RETRY_REFUSED, type Outbox } from "../../features/relay/outbox";
 import type { RelaySession } from "../../features/relay/session";
 import { isBatchAddition } from "../../features/channel-members/members";
 import { soloAdminSetup } from "../../features/relay/solo-admins";
+import {
+  AbandonAdminSetupDialog,
+  abandonableSetup,
+  type AbandonableSetup,
+} from "../../features/solo/AdminSetupRecovery";
+import { migrationSource } from "../../features/relay/migration";
+import { refusedPinCommand, type PinSource } from "../../features/relay/pins";
+import { RefusedPin } from "../../features/messages/RefusedPin";
 
 /** A batch names everyone its Retry re-adds. */
 function additionLabel(tags: readonly (readonly string[])[]) {
@@ -27,10 +30,13 @@ export function OutboxStatus({
   outbox,
   profiling,
   memberAdditions,
+  pins,
 }: {
   outbox: Outbox;
   profiling: RelayProfiler;
   memberAdditions: Pick<RelaySession["memberAdditions"], "add">;
+  /** Reads a pin list again after its command is refused as too old. */
+  pins?: PinSource | undefined;
 }) {
   const operations = useSyncExternalStore(
     outbox.subscribe,
@@ -38,27 +44,15 @@ export function OutboxStatus({
     outbox.snapshot,
   )
     .filter((item) => item.event.kind !== PRODUCT_FEEDBACK_KIND)
-    .map((item) => {
-      const setup = soloAdminSetup(item);
-      const abandonSetup =
-        item.delivery === "accepted" || item.delivery === "seen"
-          ? setup?.recovery
-          : undefined;
-      return { ...item, setup, abandonSetup };
-    });
+    .map((item) => ({
+      ...item,
+      setup: soloAdminSetup(item),
+      abandonSetup: abandonableSetup(item),
+    }));
   const [error, setError] = useState<string>();
-  const [abandon, setAbandon] = useState<{
-    id: string;
-    recovery: OutboxRecovery;
-  }>();
-  const [abandoning, setAbandoning] = useState(false);
+  const [abandon, setAbandon] = useState<AbandonableSetup>();
   const summary = useRef<HTMLElement>(null);
   const abandonButton = useRef<HTMLButtonElement>(null);
-  const cancel = useRef<HTMLButtonElement>(null);
-  const closeAbandon = () => {
-    setError(undefined);
-    setAbandon(undefined);
-  };
 
   return (
     <details>
@@ -93,6 +87,7 @@ export function OutboxStatus({
             {!isWorkflowOperation(item.event) &&
               !item.guarded &&
               !item.held &&
+              !refusedPinCommand(item) &&
               (item.delivery === "failed" ||
                 item.delivery === "unknown" ||
                 // A kept batch still names someone unsettled.
@@ -121,17 +116,22 @@ export function OutboxStatus({
                         // admission, so each person is checked again. A guest
                         // addition is retried as one, so it never sends a
                         // writing role. A single addition finishes only its own
-                        // receipt. A batch is never resumed, so each person it
-                        // names is added again; it clears once all are settled.
+                        // receipt. Retry a batch through Add for each person
+                        // so the session rechecks the roster before writing.
                         const guest = item.event.tags.some(
                           ([tag, value]) => tag === "role" && value === "guest",
                         );
                         const batch = isBatchAddition(item);
+                        const migration = migrationSource(item.event.tags);
                         const results = await Promise.allSettled(
                           pubkeys.map((pubkey) =>
                             memberAdditions.add(channelId, pubkey, {
                               ...(guest ? { role: "guest" as const } : {}),
                               ...(batch ? {} : { retry: true as const }),
+                              ...(migration === undefined ? {} : { migration }),
+                              ...(batch && migration !== undefined
+                                ? { batchReceipt: item.event.id }
+                                : {}),
                             }),
                           ),
                         );
@@ -160,6 +160,9 @@ export function OutboxStatus({
               (item.delivery === "failed" || item.delivery === "unknown") && (
                 <span>{HELD_RETRY_REFUSED}</span>
               )}{" "}
+            {refusedPinCommand(item) && (
+              <RefusedPin source={pins} item={item} />
+            )}{" "}
             {(!item.setup || item.abandonSetup || item.delivery === "failed") &&
               item.delivery !== "sending" && (
                 <Button
@@ -200,45 +203,16 @@ export function OutboxStatus({
         ))}
       </ul>
       {abandon && (
-        <AlertDialog
-          title="Abandon admin setup?"
-          description="The chat keeps its current roles. Retry your opening message to continue, or send a new message if it expired."
-          initialFocus={cancel}
+        <AbandonAdminSetupDialog
+          outbox={outbox}
+          setup={abandon}
           finalFocus={() =>
             abandonButton.current?.isConnected
               ? abandonButton.current
               : summary.current
           }
-          pending={abandoning}
-          onClose={closeAbandon}
-          actions={
-            <>
-              <Button ref={cancel} disabled={abandoning} onClick={closeAbandon}>
-                Cancel
-              </Button>
-              <Button
-                variant="prominent"
-                disabled={abandoning}
-                onClick={async () => {
-                  setAbandoning(true);
-                  setError(undefined);
-                  try {
-                    await outbox.dismiss(abandon.id, abandon.recovery);
-                    closeAbandon();
-                  } catch (reason) {
-                    setError(String(reason));
-                  } finally {
-                    setAbandoning(false);
-                  }
-                }}
-              >
-                Abandon admin setup
-              </Button>
-            </>
-          }
-        >
-          {error && <p role="alert">{error}</p>}
-        </AlertDialog>
+          onClose={() => setAbandon(undefined)}
+        />
       )}
       {!abandon && error && <p role="alert">{error}</p>}
       <RelayTimings profiling={profiling} />

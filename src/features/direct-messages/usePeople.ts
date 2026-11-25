@@ -11,6 +11,16 @@ import {
 } from "../../shared/search-debounce";
 
 export type Recipient = Profile & { pubkey: string };
+// Persist identity and a bounded label, never the directory's full metadata.
+export const recipientView = ({
+  pubkey,
+  name,
+  isAgent,
+}: Recipient): Recipient => ({
+  pubkey,
+  name: name.slice(0, 500),
+  ...(isAgent === true ? { isAgent: true } : {}),
+});
 
 type PeopleState = {
   session: RelaySession;

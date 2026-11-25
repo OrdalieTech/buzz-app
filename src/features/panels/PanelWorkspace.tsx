@@ -45,7 +45,11 @@ export type PanelWorkspaceItem = {
   /** Header icon actions for this tab's content, shown while it is selected. */
   toolbar?: ReactNode;
 };
-type Identity = { label: string; icon?: ReactNode };
+type Identity = {
+  label: string;
+  icon?: ReactNode;
+  actions?: readonly TabAction[] | undefined;
+};
 /** `keepOwner`: the owner stays open; only its detail tabs are cleared. */
 type Close = (options?: { keepOwner?: boolean }) => void;
 type Local = { id: string; label: string; owner: string; close: Close };
@@ -60,15 +64,19 @@ export function usePanelTabHost() {
   return useContext(TabHost);
 }
 
-export function usePanelTabTitle(label: string, icon?: ReactNode) {
+export function usePanelTabTitle(
+  label: string,
+  icon?: ReactNode,
+  actions?: readonly TabAction[],
+) {
   const host = usePanelTabHost();
   const title = host?.title;
   const owner = host?.owner;
   useLayoutEffect(() => {
     if (!title || !owner) return;
-    title(owner, { label, icon });
+    title(owner, { label, icon, actions });
     return () => title(owner, undefined);
-  }, [title, owner, label, icon]);
+  }, [title, owner, label, icon, actions]);
 }
 
 // Keyboard opens and reduced motion skip the push. Deciding here, rather than
@@ -214,16 +222,22 @@ export function PanelWorkspace({
     (tab) => tab.id === localSelection && tab.owner === value,
   );
   const selected = selectedLocal?.id ?? value;
-  const tabs = items.flatMap((item) => [
-    {
-      ...item,
-      ...titles[item.id],
-      icon: titles[item.id]?.icon ?? item.icon ?? <BrowserIcon size="1rem" />,
-    },
-    ...owned
-      .filter((tab) => tab.owner === item.id)
-      .map((tab) => ({ ...tab, icon: <TerminalWindowIcon size="1rem" /> })),
-  ]);
+  const tabs = items.flatMap((item) => {
+    const title = titles[item.id];
+    return [
+      {
+        ...item,
+        ...title,
+        icon: title?.icon ?? item.icon ?? <BrowserIcon size="1rem" />,
+        actions: title?.actions
+          ? [...title.actions, ...(item.actions ?? [])]
+          : item.actions,
+      },
+      ...owned
+        .filter((tab) => tab.owner === item.id)
+        .map((tab) => ({ ...tab, icon: <TerminalWindowIcon size="1rem" /> })),
+    ];
+  });
   const active = tabs.find((tab) => tab.id === selected);
   const choose = (id: string) => {
     const local = owned.find((tab) => tab.id === id);

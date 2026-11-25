@@ -94,3 +94,41 @@ it("restore keeps alerts on for an unknown sound name and leaves storage untouch
   });
   service.dispose();
 });
+
+it("the automatic permission request is claimed once per device, and never without working storage", () => {
+  const store = new Map<string, string>();
+  const storage = {
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => void store.set(k, v),
+  };
+  const host = (localStorage: Partial<Storage>) =>
+    ({
+      localStorage,
+      addEventListener() {},
+      removeEventListener() {},
+    }) as unknown as Window;
+  const first = createNotificationPreferences(host(storage));
+  first.selectViewer("a".repeat(64));
+  expect(first.claimAutomaticRequest()).toBe(true);
+  expect(first.claimAutomaticRequest()).toBe(false);
+  first.selectViewer("b".repeat(64));
+  expect(first.claimAutomaticRequest()).toBe(false);
+  // One device-wide key, apart from each account's saved choices.
+  expect([...store.keys()]).toEqual(["buzz-notification-permission-asked.v1"]);
+  expect(
+    createNotificationPreferences(host(storage)).claimAutomaticRequest(),
+  ).toBe(false);
+  const throws = () => {
+    throw new Error("disk");
+  };
+  for (const broken of [
+    { getItem: throws, setItem: storage.setItem },
+    { getItem: () => null, setItem: throws },
+  ])
+    expect(
+      createNotificationPreferences(host(broken)).claimAutomaticRequest(),
+    ).toBe(false);
+  expect(createNotificationPreferences(undefined).claimAutomaticRequest()).toBe(
+    false,
+  );
+});

@@ -21,6 +21,7 @@ import {
   nativeWriteKinds,
   verifyNativeStored,
 } from "./native";
+import { API_ACTIVE_LIMIT } from "./http-admission";
 import { keypair, message, nativeSignatureChecks, signed } from "./testing";
 import { createOutbox, type OutgoingEvent, PublishRejected } from "./outbox";
 import { createMessages } from "./messages";
@@ -655,7 +656,7 @@ it("cancellation fences a late native response and prevents undispatched work", 
   await expect(request).rejects.toMatchObject({ name: "AbortError" });
 });
 
-it("cancelled native reads retain the six-request admission bound until IPC settles", async () => {
+it("cancelled native reads retain the request admission bound until IPC settles", async () => {
   vi.useFakeTimers();
   const transport = await connectNativeTransport(
     "https://cancelled-native.test",
@@ -672,7 +673,10 @@ it("cancelled native reads retain the six-request admission bound until IPC sett
       active--;
     }
   };
-  const controllers = Array.from({ length: 12 }, () => new AbortController());
+  const controllers = Array.from(
+    { length: API_ACTIVE_LIMIT * 2 },
+    () => new AbortController(),
+  );
   const reads = controllers.map((controller) =>
     transport
       .query([{ kinds: [0], limit: 5 }], controller.signal)
@@ -680,19 +684,25 @@ it("cancelled native reads retain the six-request admission bound until IPC sett
   );
   try {
     await vi.waitFor(() =>
-      expect(requests.filter((r) => r.path === "/query")).toHaveLength(6),
+      expect(requests.filter((r) => r.path === "/query")).toHaveLength(
+        API_ACTIVE_LIMIT,
+      ),
     );
     for (const controller of controllers) controller.abort();
     // A further request has entered the same lane, but cannot dispatch past cancelled native work.
     const last = transport.query([{ kinds: [0], limit: 5 }]);
     await vi.advanceTimersByTimeAsync(0);
-    expect(requests.filter((r) => r.path === "/query")).toHaveLength(6);
+    expect(requests.filter((r) => r.path === "/query")).toHaveLength(
+      API_ACTIVE_LIMIT,
+    );
     gate.resolve({ body: [] });
     await last;
-    expect(requests.filter((r) => r.path === "/query")).toHaveLength(7);
+    expect(requests.filter((r) => r.path === "/query")).toHaveLength(
+      API_ACTIVE_LIMIT + 1,
+    );
     for (const error of await Promise.all(reads))
       expect(error).toMatchObject({ name: "AbortError" });
-    expect(maximum).toBe(6);
+    expect(maximum).toBe(API_ACTIVE_LIMIT);
   } finally {
     gate.resolve({ body: [] });
     await Promise.all(reads);
@@ -1042,7 +1052,7 @@ it("holds the shared admission lease until a cancelled native history request se
   const workflows = transport.workflows;
   assert.exists(workflows);
   const id = "11111111-1111-4111-8111-111111111111";
-  const pending = Array.from({ length: 6 }, () =>
+  const pending = Array.from({ length: API_ACTIVE_LIMIT }, () =>
     deferred<{
       status: number;
       headers: Record<string, string>;
@@ -1068,12 +1078,12 @@ it("holds the shared admission lease until a cancelled native history request se
   const reads = controllers.map((controller) =>
     workflows.runs(id, undefined, controller.signal),
   );
-  await vi.waitFor(() => expect(historyCalls).toHaveLength(6));
+  await vi.waitFor(() => expect(historyCalls).toHaveLength(API_ACTIVE_LIMIT));
   const outcomes = reads.map((read) => expect(read).rejects.toThrow());
   for (const controller of controllers) controller.abort();
   const query = transport.query([{ kinds: [9], limit: 1 }]);
   await Promise.resolve();
-  expect(requests).toHaveLength(1); // Discovery only; all six IPC requests still hold slots.
+  expect(requests).toHaveLength(1); // Discovery only; all IPC requests at the ceiling still hold slots.
   for (const request of pending) {
     request.resolve({
       status: 200,
@@ -1103,6 +1113,12 @@ it("advertises purpose-bound channel capabilities and gates creation on NIP-29",
   });
   expect((await connectNativeTransport(community)).writer?.kinds).toContain(
     9007,
+  );
+});
+
+it("offers pin commands without an advertisement", async () => {
+  expect((await connectNativeTransport(community)).writer?.kinds).toEqual(
+    expect.arrayContaining([40010, 40011]),
   );
 });
 
@@ -1646,7 +1662,10 @@ it("uploads exact bytes natively and validates the relay descriptor", async () =
 
 it.each([
   [422, { error: "metadata forbidden" }, "metadata"],
-  [415, { error: "unsupported container" }, "rejected"],
+  [415, { error: "unsupported container" }, "type"],
+  [415, { error: "disallowed content type: application/x-msdownload" }, "type"],
+  // A refusal the relay does not name as a type is not called one.
+  [415, { error: "unsupported" }, "rejected"],
   [500, "internal error", "failed"],
 ])(
   "maps relay upload status %i to a user-facing failure",
@@ -1928,7 +1947,7 @@ it("holds native publication admission until cancelled IPC settles", async () =>
     ],
     content: "ciphertext",
   });
-  const gates = Array.from({ length: 6 }, () =>
+  const gates = Array.from({ length: API_ACTIVE_LIMIT }, () =>
     deferred<{
       status: number;
       headers: Record<string, string>;
@@ -1955,7 +1974,7 @@ it("holds native publication admission until cancelled IPC settles", async () =>
           .mock.calls.filter(
             ([command]) => command === "relay_publish_read_state",
           ),
-      ).toHaveLength(6),
+      ).toHaveLength(API_ACTIVE_LIMIT),
     );
     controllers[0]?.abort();
     const queued = readState.publish?.(event, new AbortController().signal);
@@ -1965,7 +1984,7 @@ it("holds native publication admission until cancelled IPC settles", async () =>
         .mock.calls.filter(
           ([command]) => command === "relay_publish_read_state",
         ),
-    ).toHaveLength(6);
+    ).toHaveLength(API_ACTIVE_LIMIT);
     gates[0]?.resolve({
       status: 200,
       headers: {},
@@ -1978,7 +1997,7 @@ it("holds native publication admission until cancelled IPC settles", async () =>
           .mock.calls.filter(
             ([command]) => command === "relay_publish_read_state",
           ),
-      ).toHaveLength(7),
+      ).toHaveLength(API_ACTIVE_LIMIT + 1),
     );
     await expect(queued).resolves.toBeUndefined();
   } finally {

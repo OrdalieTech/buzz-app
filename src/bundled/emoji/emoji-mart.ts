@@ -5,9 +5,10 @@ import { pickerIcons } from "../../shared/design-system/icons/svg";
 // Emoji Mart config adapted from block/buzz's shared picker; see NOTICE.md.
 import data from "@emoji-mart/data";
 import english from "@emoji-mart/data/i18n/en.json";
-import { Data, Picker, SearchIndex } from "emoji-mart";
+import { Data, FrequentlyUsed, Picker, SearchIndex } from "emoji-mart";
 import type { CustomEmoji } from "../../features/relay/emoji";
 import { rankShortcodes } from "./emoji-search";
+import { addEmojiUsage, customEmojiId, frequentEmoji } from "./emoji-usage";
 import { PREVIEW_ACTION_SLOT } from "./add-emoji";
 import {
   SKIN_TONE_SLOT,
@@ -19,10 +20,37 @@ import {
 import { rootFontSize, spaciousGrid } from "./picker-layout";
 
 const martSearch = SearchIndex.search;
+/** Mart 5.6's private Picker component; `dispose` cancels its prop timer. */
+const martComponent = (picker: HTMLElement) =>
+  (picker as { component?: { nextStateTimer?: ReturnType<typeof setTimeout> } })
+    .component;
+/** An emoji-mart upgrade that renames the timer would silently reopen the
+ * closed-picker crash; say so wherever a theme write should have armed it. */
+function checkMartPropTimer(picker: HTMLElement) {
+  const component = martComponent(picker);
+  if (component && !("nextStateTimer" in component))
+    console.error(
+      "emoji-mart no longer exposes component.nextStateTimer; dispose() cannot cancel its deferred re-render",
+    );
+}
+// Buzz owns usage history. Mart caches its copy per window, overwriting other
+// windows' choices, and counts a pick before the tone prompt confirms it.
+Object.assign(FrequentlyUsed, {
+  add() {},
+  get(props: { maxFrequentRows: number; perLine: number }) {
+    // Mart fills this row last, after dropping from the other categories what
+    // this client cannot render or this picker does not offer.
+    const shown = new Set<string>();
+    for (const category of Data?.categories ?? [])
+      if (category.id !== "frequent")
+        for (const emoji of category.emojis)
+          shown.add(typeof emoji === "string" ? emoji : emoji.id);
+    return frequentEmoji(props, FrequentlyUsed.DEFAULTS, (id) => shown.has(id));
+  },
+});
 const resolvedTheme = (value: unknown): "light" | "dark" =>
   value === "dark" ? "dark" : "light";
 
-const prefix = "buzz-custom/";
 // Idle and with no matches, the footer shows only its actions; the empty grid
 // under the query already says nothing matched.
 const previewStrings = {
@@ -53,6 +81,8 @@ const categoryIcons = {
   custom: { svg: pickerIcons.asterisk },
   "buzz-custom": { svg: pickerIcons.asterisk },
 };
+// At most one picker is live: each mount disposes `active` first, so dispose()
+// may delete its scope's entries from Mart's shared Data.emojis without a peer.
 let active: (() => void) | undefined;
 export type EmojiSearchSelection = {
   emoji: string | undefined;
@@ -98,7 +128,8 @@ export function mountEmojiMart({
   searchChange(value: string): void;
   entries: readonly CustomEmoji[];
   media(url: string): string | undefined;
-  select(value: string, customEmoji?: string): void;
+  /** Return false when the host rejects the insertion; it then does not count. */
+  select(value: string, customEmoji?: string): unknown;
   close(): void;
   /** With `preview`, the footer's skin-tone action renders the saved tone (1–6). */
   skinToneChange?(tone: number, open: boolean): void;
@@ -109,7 +140,7 @@ export function mountEmojiMart({
   const emojis = entries.flatMap(({ shortcode, url }) => {
     const src = media(url);
     if (!src) return [];
-    const id = `${prefix}${encodeURIComponent(scope)}/${shortcode}`;
+    const id = customEmojiId(scope, shortcode);
     const literal = `:${shortcode}:`;
     values.set(id, { literal, shortcode });
     // Match Mart's first-hyphen query normalization as well as individual words.
@@ -130,15 +161,6 @@ export function mountEmojiMart({
       },
     ];
   });
-  // Restore Mart's default Frequent row if storage contains a poisoned empty map.
-  try {
-    if (localStorage.getItem("emoji-mart.frequently") === "{}") {
-      localStorage.removeItem("emoji-mart.frequently");
-      localStorage.removeItem("emoji-mart.last");
-    }
-  } catch {
-    /* Like Mart, selection works without localStorage. */
-  }
   const picker = new Picker({
     data,
     custom: emojis.length
@@ -175,12 +197,16 @@ export function mountEmojiMart({
     ),
     onEmojiSelect: (emoji: { native?: string; id?: string }) => {
       if (disposed) return;
+      if (!emoji.id) return;
       if (emoji.native) {
-        if (!promptSkinTone(emoji.id)) select(emoji.native);
+        if (promptSkinTone(emoji.id)) return;
+        if (select(emoji.native) !== false) addEmojiUsage(emoji.id);
         return;
       }
-      const custom = values.get(emoji.id ?? "");
-      if (custom) select(custom.literal, custom.shortcode);
+      const custom = values.get(emoji.id);
+      if (!custom) return;
+      if (select(custom.literal, custom.shortcode) !== false)
+        addEmojiUsage(emoji.id);
     },
   }) as unknown as HTMLElement;
   // The documented web-component attribute updates in place: do not recreate the
@@ -188,8 +214,12 @@ export function mountEmojiMart({
   const documentRoot = host.ownerDocument.documentElement;
   const syncAppearance = () => {
     const theme = resolvedTheme(colorMode ?? documentRoot.dataset.colorMode);
-    if (picker.getAttribute("theme") !== theme)
+    // Same-value sets still reach Mart's attributeChangedCallback, which arms a
+    // deferred re-render. Keyboard-navigation marks must not arm one per key.
+    if (picker.getAttribute("theme") !== theme) {
       picker.setAttribute("theme", theme);
+      if (import.meta.env.DEV) checkMartPropTimer(picker);
+    }
     picker.toggleAttribute(
       "data-keyboard-navigation",
       documentRoot.hasAttribute("data-keyboard-navigation"),
@@ -657,7 +687,7 @@ ${[1, 2, 3, 4, 5, 6].map((tone) => `    .menu .skin-tone-${tone}::before { conte
     const tone = chosenTone;
     const native = tone && Data?.emojis[id]?.skins[tone - 1]?.native;
     if (!native || disposed) return false;
-    select(native);
+    if (select(native) !== false) addEmojiUsage(id);
     return true;
   };
   // Mart clears the preview whenever the pointer leaves an emoji, so crossing
@@ -870,6 +900,11 @@ ${[1, 2, 3, 4, 5, 6].map((tone) => `    .menu .skin-tone-${tone}::before { conte
     // Base UI's removal recovery can reclaim it after the new picker mounts.
     if (root?.activeElement) host.focus({ preventScroll: true });
     picker.remove(); // unregisters Mart's document listeners and observers
+    // Mart applies attribute changes, such as a color-mode `theme` change, on
+    // a timer. If that timer fired now, the detached picker would re-render a
+    // Frequent row that names custom emoji deleted below, and the render would
+    // throw. The timer is private: emoji-mart.test.ts fails if it is renamed.
+    clearTimeout(martComponent(picker)?.nextStateTimer);
     for (const id of values.keys()) delete Data?.emojis[id];
     if (Data) {
       Data.categories = Data.categories.filter(

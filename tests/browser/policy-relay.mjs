@@ -6,6 +6,8 @@ import { createHash } from "node:crypto";
 /** Model the relay boundaries that matter to this journey, not a replacement
  * session: AUTH, explicit channel fan-out, EOSE, CLOSED and HTTP quota reasons.
  * The production broker owns all pacing, signing, SSE and retry controls. */
+const REQUEST_PART = Symbol("request part");
+
 export function policyRelay({
   viewer,
   relayAuthor,
@@ -123,7 +125,7 @@ export function policyRelay({
     if (socket.readyState === 1)
       socket.onmessage?.({ data: JSON.stringify(frame) });
   }
-  return {
+  const api = {
     startupQuota(limit, setupLatencyMs = 40) {
       wsLimit = limit;
       eoseMs = setupLatencyMs;
@@ -205,8 +207,26 @@ export function policyRelay({
       refusal = status ? { status, body, only } : undefined;
     },
     async fetch(url, init) {
+      const holdProfile = (result) =>
+        new Promise((resolve, reject) => {
+          const held = { pending: true, aborted: false };
+          profileHolds.push(held);
+          const abort = () => {
+            held.pending = false;
+            held.aborted = true;
+            reject(init.signal.reason);
+          };
+          init.signal.addEventListener("abort", abort, { once: true });
+          pendingProfiles.push(() => {
+            held.pending = false;
+            init.signal.removeEventListener("abort", abort);
+            resolve(Response.json(result));
+          });
+        });
+      // One filter of a request already checked and delayed as a whole.
+      const part = init?.[REQUEST_PART] === true;
       try {
-        if (latencyMs)
+        if (latencyMs && !part)
           await new Promise((resolve) => setTimeout(resolve, latencyMs));
         // NIP-11 is a public GET with no signed query body. The rail now reads
         // it for saved communities, including inactive ones.
@@ -227,23 +247,58 @@ export function policyRelay({
           "/profiles/search",
           ...(acceptPublication ? ["/events"] : []),
         ]).toContain(new URL(url).pathname);
-        const auth = JSON.parse(
-          Buffer.from(init.headers.Authorization.slice(6), "base64").toString(),
-        );
-        expect(verifyEvent(auth)).toBe(true);
-        expect(auth.pubkey).toBe(viewer);
-        expect(auth.kind).toBe(27235);
-        expect(auth.tags).toContainEqual(["u", String(url)]);
-        expect(auth.tags).toContainEqual([
-          "payload",
-          createHash("sha256").update(init.body).digest("hex"),
-        ]);
+        if (!part) {
+          const auth = JSON.parse(
+            Buffer.from(
+              init.headers.Authorization.slice(6),
+              "base64",
+            ).toString(),
+          );
+          expect(verifyEvent(auth)).toBe(true);
+          expect(auth.pubkey).toBe(viewer);
+          expect(auth.kind).toBe(27235);
+          expect(auth.tags).toContainEqual(["u", String(url)]);
+          expect(auth.tags).toContainEqual([
+            "payload",
+            createHash("sha256").update(init.body).digest("hex"),
+          ]);
+        }
         const filters = JSON.parse(init.body);
         if (new URL(url).pathname === "/profiles/search")
           return Response.json(searchProfiles(communityOf(url), filters));
         if (new URL(url).pathname === "/events") {
           acceptPublication(communityOf(url), filters);
           return Response.json({ accepted: true, event_id: filters.id });
+        }
+        // A channel head read carries the channel's newest membership notices
+        // second; each filter is answered as its own read would be.
+        if (
+          filters.length === 2 &&
+          filters[0].top_level === true &&
+          filters[0].until === undefined &&
+          filters[1].kinds?.length === 1 &&
+          filters[1].kinds[0] === 40099
+        ) {
+          expect(filters[1]["#h"]).toEqual(filters[0]["#h"]);
+          // Returned, not awaited: a part held and then cancelled by the app
+          // is consumer cancellation, not a fault (see the presence hold).
+          return Promise.all(
+            filters.map((filter) =>
+              api.fetch(url, {
+                ...init,
+                body: JSON.stringify([filter]),
+                [REQUEST_PART]: true,
+              }),
+            ),
+          ).then(async (parts) => {
+            const failed = parts.find((response) => !response.ok);
+            if (failed) return failed;
+            return Response.json(
+              (
+                await Promise.all(parts.map((response) => response.json()))
+              ).flat(),
+            );
+          });
         }
         if (filters.length === 2 && filters[1].depth_limit) {
           const [root, replies] = filters;
@@ -564,34 +619,31 @@ export function policyRelay({
           filter.kinds?.includes(0) &&
           filter.authors?.some((id) => heldAuthors.has(id))
         )
-          return new Promise((resolve, reject) => {
-            const held = { pending: true, aborted: false };
-            profileHolds.push(held);
-            const abort = () => {
-              held.pending = false;
-              held.aborted = true;
-              reject(init.signal.reason);
-            };
-            init.signal.addEventListener("abort", abort, { once: true });
-            pendingProfiles.push(() => {
-              held.pending = false;
-              init.signal.removeEventListener("abort", abort);
-              resolve(Response.json(result));
-            });
-          });
+          return holdProfile(result);
+        // An older page's aux closure, read apart from its rows, is not held.
         if (
           filter.search === undefined &&
           filter.until !== undefined &&
+          !(filter.include_aux && !filter.include_summaries) &&
           holdOlder
         )
           return new Promise((resolve, reject) => {
-            const abort = () => reject(init.signal.reason);
+            const abort = () => {
+              // A read the app cancels is no longer pending.
+              const index = pending.indexOf(receipt);
+              if (index >= 0) pending.splice(index, 1);
+              reject(init.signal.reason);
+            };
             init.signal.addEventListener("abort", abort, { once: true });
             const receipt = {
               community,
               channel,
               filter,
               events: result.filter((event) => event.kind === 9),
+              // The app abandoned the read, such as a cancelled read-ahead.
+              get closed() {
+                return init.signal.aborted;
+              },
               release() {
                 init.signal.removeEventListener("abort", abort);
                 resolve(Response.json(result));
@@ -889,4 +941,5 @@ export function policyRelay({
           socket.close();
     },
   };
+  return api;
 }

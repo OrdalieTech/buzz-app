@@ -157,7 +157,7 @@ it("keeps the shared Canvas signing corpus nonempty", () => {
 });
 
 // Shape only: the broker additionally checks freshness; Rust also deserializes
-// EventTemplate and bounds the signed serialization. See contributing.md.
+// EventTemplate and bounds the signed serialization.
 it.each(canvasCases)("Canvas signing shape: $name", ({ accepted, tags }) => {
   expect(validCanvas({ kind: 40100, content: "# Plan", tags })).toBe(accepted);
 });

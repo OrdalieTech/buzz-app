@@ -21,6 +21,7 @@ import type { AgentViewProps } from "./service";
 export const LIVE_READ_MS = 2500;
 /** How long after a read a step the agent reports reads again. */
 export const STEP_READ_MS = 1000;
+const STOP_STATUS_HOLD_MS = 10_000;
 /** Turns a merged transcript holds at most. */
 export const TURN_LIMIT = 50;
 
@@ -51,6 +52,7 @@ type Shown<T> = Readonly<{
   key: string;
   /** null: the agent type has no transcript for it. */
   transcript?: T | null;
+  working?: boolean;
   error?: string;
 }>;
 /** A full read, or one of only the latest turns. */
@@ -73,12 +75,53 @@ export function withLatest<T extends Transcript>(
   const at = ids.get(turns[from]?.turnId ?? "") ?? 0;
   const kept = turns.slice(from);
   const sessions = new Set(kept.map((turn) => turn.sessionId));
-  return held.turns.slice(at).every((turn) => sessions.has(turn.sessionId))
-    ? {
-        ...held,
-        turns: [...held.turns.slice(0, at), ...kept].slice(-TURN_LIMIT),
-      }
-    : undefined;
+  if (!held.turns.slice(at).every((turn) => sessions.has(turn.sessionId)))
+    return undefined;
+  const merged = [...held.turns.slice(0, at), ...kept];
+  return {
+    ...held,
+    ...("more" in held && held.more === false && merged.length > TURN_LIMIT
+      ? { more: true }
+      : {}),
+    turns: merged.slice(-TURN_LIMIT),
+  };
+}
+
+const dataPrototypes = new Set([Object.prototype, Array.prototype, null]);
+const { get, getPrototypeOf, ownKeys } = Reflect;
+const sameFields: (a: unknown, b: unknown) => boolean = (a, b) => {
+  if (Object.is(a, b)) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+  try {
+    const proto = getPrototypeOf(a);
+    if (proto !== getPrototypeOf(b) || !dataPrototypes.has(proto)) return false;
+    const keys = ownKeys(a);
+    if (keys.length !== ownKeys(b).length) return false;
+    if (!keys.every((key) => Object.hasOwn(b, key))) return false;
+    return keys.every((key) => sameFields(get(a, key), get(b, key)));
+  } catch {
+    return false;
+  }
+};
+const enumerableFields = (value: Transcript) =>
+  Object.keys(value).length === ownKeys(value).length;
+function reuseTurns<T extends Transcript>(prior: T, next: T) {
+  try {
+    if (prior === next || !enumerableFields(next)) return next;
+    const plain = getPrototypeOf(next) === Object.prototype;
+    const held = new Map(prior.turns.map((turn) => [turn.turnId, turn]));
+    const counts = new Map<string, number>();
+    for (const { turnId } of [...prior.turns, ...next.turns])
+      counts.set(turnId, (counts.get(turnId) ?? 0) + 1);
+    const turns = next.turns.map((turn) => {
+      const old = counts.get(turn.turnId) === 2 && held.get(turn.turnId);
+      return old && sameFields(old, turn) ? old : turn;
+    });
+    const shown = plain ? { ...next, turns } : next;
+    return enumerableFields(prior) && sameFields(prior, shown) ? prior : shown;
+  } catch {
+    return next;
+  }
 }
 
 /** `read` for `key`: in full on open, on `refresh`, and when `again` or
@@ -101,6 +144,7 @@ export function useLiveTranscript<T extends Transcript>({
   working,
   refreshWhileWorking = true,
   agentKey,
+  onRefreshRequested,
 }: {
   read: (signal: AbortSignal) => Promise<T | undefined>;
   readLatest?:
@@ -114,6 +158,7 @@ export function useLiveTranscript<T extends Transcript>({
   working: boolean;
   refreshWhileWorking?: boolean | undefined;
   agentKey: string;
+  onRefreshRequested?: (() => void) | undefined;
 }) {
   const agents = useContext(AgentsContext);
   const [shown, setShown] = useState<Shown<T>>({ key });
@@ -214,8 +259,8 @@ export function useLiveTranscript<T extends Transcript>({
         const before = held.current;
         held.current =
           next.error !== undefined && before.key === key
-            ? { ...before, error: next.error }
-            : { key, ...next };
+            ? { ...before, working, error: next.error }
+            : { key, ...next, working };
         setShown(held.current);
         if (queued.current && request(true, queued.current)) return;
         setLoading(false);
@@ -229,6 +274,7 @@ export function useLiveTranscript<T extends Transcript>({
       reading.then(
         (transcript) => {
           if (abort.signal.aborted) return;
+          if (prior && transcript) transcript = reuseTurns(prior, transcript);
           if (transcript !== undefined) return settle({ transcript });
           // The latest turns don't continue what it holds.
           running.current = undefined;
@@ -287,7 +333,10 @@ export function useLiveTranscript<T extends Transcript>({
   return {
     shown: shown.key === key ? shown : ({ key } as Shown<T>),
     loading,
-    refresh: () => void request(false),
+    refresh: () => {
+      onRefreshRequested?.();
+      request(false);
+    },
   };
 }
 
@@ -299,6 +348,7 @@ export function TranscriptPanel<T extends Transcript>({
   readLatest,
   readKey,
   readAgain = "",
+  onRefreshRequested,
   working,
   refreshWhileWorking,
   reading,
@@ -319,6 +369,8 @@ export function TranscriptPanel<T extends Transcript>({
   readKey: string;
   /** Inputs that only make `read` read again, keeping what it shows. */
   readAgain?: string;
+  /** Called immediately on manual Refresh, including when its read must queue. */
+  onRefreshRequested?: () => void;
   working: boolean;
   /** Whether a working agent's transcript reads again on a timer and on its
    * steps; otherwise only when it starts or stops working. On by default. */
@@ -340,7 +392,17 @@ export function TranscriptPanel<T extends Transcript>({
     working,
     refreshWhileWorking,
     agentKey: agent.key,
+    onRefreshRequested,
   });
+  const holding = !working && Boolean(shown.working);
+  const [holdExpired, setHoldExpired] = useState(false);
+  useEffect(() => {
+    setHoldExpired(false);
+    if (!holding) return;
+    const timer = setTimeout(() => setHoldExpired(true), STOP_STATUS_HOLD_MS);
+    return () => clearTimeout(timer);
+  }, [holding]);
+  const isWorking = shown.working && (working || !holdExpired);
   const { transcript, error } = shown;
   return (
     <div className={activityStyles.transcript} data-transcript>
@@ -379,7 +441,7 @@ export function TranscriptPanel<T extends Transcript>({
             agentKey={agent.key}
             agentPicture={agent.picture}
             community={agent.relay}
-            state={() => (working ? "working" : undefined)}
+            state={() => (isWorking ? "working" : undefined)}
             before={notes?.(transcript)}
           />
         ) : (

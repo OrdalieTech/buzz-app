@@ -45,7 +45,7 @@ const Context = createContext<{
   updates: readonly PluginUpdate[];
   recommended: readonly string[];
   busy: boolean;
-  open(update: PluginUpdate): void;
+  open(update: PluginUpdate, returnFocus?: () => HTMLElement | null): void;
   /** Plugins the owner asked to check again, while that check runs. */
   checking: readonly string[];
   checkAgain(id: string): Promise<void>;
@@ -54,6 +54,12 @@ const noSubscribe = () => () => {};
 const empty: readonly PluginUpdate[] = [];
 const noUpdates = () => empty;
 const noQueueRevision = () => 0;
+type PendingNotificationAction = {
+  store: Updates;
+  update: PluginUpdate;
+  queueId?: string;
+  returnFocus?: (() => HTMLElement | null) | undefined;
+};
 
 export function PluginUpdates({
   plugins,
@@ -71,8 +77,12 @@ export function PluginUpdates({
   const [store, setStore] = useState<Updates>();
   const [action, setAction] = useState<PluginUpdate>();
   const [actionQueueId, setActionQueueId] = useState<string>();
+  const pendingAction = useRef<PendingNotificationAction | undefined>(
+    undefined,
+  );
+  const [pendingUpdate, setPendingUpdate] = useState<PluginUpdate>();
   const reviewLeaseRevision = useRef<number | undefined>(undefined);
-  const returnFocus = useRef<HTMLElement | null>(null);
+  const returnFocus = useRef<(() => HTMLElement | null) | undefined>(undefined);
   const state = useSyncExternalStore(plugins.subscribe, plugins.snapshot);
   const updates = useSyncExternalStore(
     store?.subscribe ?? noSubscribe,
@@ -88,6 +98,16 @@ export function PluginUpdates({
   );
   const authorizeGit = async (repository: string) =>
     (await relay.snapshot().session.authorizeGit?.(repository)) ?? null;
+  const openPluginSettings = useCallback(
+    (pluginId: string) =>
+      void navigation.open({
+        version: 1,
+        kind: "settings",
+        section: "plugins",
+        pluginId,
+      }),
+    [navigation],
+  );
   useEffect(() => {
     const updates = createPluginUpdates(
       plugins,
@@ -147,14 +167,91 @@ export function PluginUpdates({
       updates.dispose();
     };
   }, [plugins, relay, installRequests]);
+  useEffect(
+    () => () => {
+      pendingAction.current = undefined;
+    },
+    [],
+  );
   const configuration = state.configuration;
   const catalog =
     configuration.status === "ready" ? configuration.catalog : undefined;
-  const open = (update: PluginUpdate) => {
-    if (state.busy || action || !update.token) return;
-    returnFocus.current = document.activeElement as HTMLElement;
-    if (!store?.capability.queueUpdates([update.token]))
-      void store?.check(true);
+  const clearPendingAction = useCallback(
+    (intent: NonNullable<typeof pendingAction.current>) => {
+      if (pendingAction.current !== intent) return false;
+      pendingAction.current = undefined;
+      setPendingUpdate(undefined);
+      return true;
+    },
+    [],
+  );
+  const continueNotificationAction = async (
+    intent: NonNullable<typeof pendingAction.current>,
+  ) => {
+    const store = intent.store;
+    try {
+      const checking = store.capability.getSnapshot().status === "checking";
+      await store.check(!checking);
+      if (pendingAction.current !== intent) return;
+      const current = store
+        .snapshot()
+        .find((item) => item.id === intent.update.id);
+      if (
+        !current?.candidate ||
+        !current.token ||
+        current.installedEnabled !== intent.update.installedEnabled ||
+        current.updateChoice !== intent.update.updateChoice ||
+        updateSourceKey(current.source) !==
+          updateSourceKey(intent.update.source)
+      ) {
+        clearPendingAction(intent);
+        openPluginSettings(intent.update.id);
+        return;
+      }
+      const queued = store.capability.queueUpdates([current.token]);
+      if (queued) {
+        intent.queueId = queued.id;
+        return;
+      }
+    } catch {
+      // The notification remains a route to the plugin's actionable settings state.
+    }
+    if (clearPendingAction(intent)) openPluginSettings(intent.update.id);
+  };
+  const open = (
+    update: PluginUpdate,
+    focusTarget?: () => HTMLElement | null,
+  ) => {
+    if (state.busy || action || pendingAction.current) return;
+    if (!store || !update.token) {
+      openPluginSettings(update.id);
+      return;
+    }
+    const intent: PendingNotificationAction = {
+      store,
+      update,
+      returnFocus: focusTarget,
+    };
+    pendingAction.current = intent;
+    setPendingUpdate(update);
+    const queued = store.capability.queueUpdates([update.token]);
+    if (queued) {
+      intent.queueId = queued.id;
+      return;
+    }
+    if (store.isCurrentToken(update.token)) {
+      if (clearPendingAction(intent)) openPluginSettings(update.id);
+      return;
+    }
+    void continueNotificationAction(intent);
+  };
+  const dismiss = (update: PluginUpdate) => {
+    const intent = pendingAction.current;
+    if (intent?.update.id === update.id) {
+      clearPendingAction(intent);
+      if (intent.queueId) intent.store.capability.cancelQueue(intent.queueId);
+    }
+    store?.later(update);
   };
   useEffect(() => {
     if (
@@ -167,8 +264,17 @@ export function PluginUpdates({
       return;
     const review = store.startNextReview(installRequests.tryHoldReview);
     if (!review) return;
+    const intent = pendingAction.current;
+    const notificationReview = intent?.queueId === review.queueId;
+    if (intent && notificationReview) clearPendingAction(intent);
     reviewLeaseRevision.current = installRequests.reviewRevision();
-    returnFocus.current = document.activeElement as HTMLElement;
+    // A notification can wait for another review while the person moves focus.
+    if (notificationReview && intent.returnFocus) {
+      returnFocus.current = intent.returnFocus;
+    } else {
+      const focused = document.activeElement as HTMLElement;
+      returnFocus.current = () => focused;
+    }
     setAction(review.update);
     setActionQueueId(review.queueId);
   }, [
@@ -178,7 +284,29 @@ export function PluginUpdates({
     queueRevision,
     reviewRevision,
     installRequests,
+    clearPendingAction,
   ]);
+  const pendingQueueId = pendingAction.current?.queueId;
+  const pendingQueue = pendingQueueId
+    ? store?.capability.getQueue(pendingQueueId)
+    : undefined;
+  useEffect(() => {
+    const intent = pendingAction.current;
+    if (!intent) return;
+    if (intent.store !== store || (intent.queueId && !pendingQueue)) {
+      if (clearPendingAction(intent)) openPluginSettings(intent.update.id);
+      return;
+    }
+    if (!pendingQueue || action) return;
+    if (
+      !["failed", "cancelled", "completed", "partial"].includes(
+        pendingQueue.status,
+      )
+    )
+      return;
+    if (clearPendingAction(intent) && pendingQueue.status === "failed")
+      openPluginSettings(intent.update.id);
+  }, [store, action, pendingQueue, openPluginSettings, clearPendingAction]);
   const activeReview = store?.getActiveReview();
   const endReview = useCallback(
     (review: NonNullable<typeof activeReview>, error?: string) =>
@@ -300,6 +428,19 @@ export function PluginUpdates({
       setChecking((ids) => ids.filter((item) => item !== id));
     }
   };
+  const visibleUpdates = updates.filter(
+    (update) =>
+      // A failed check stays on its Settings row.
+      update.candidate &&
+      (!store?.hidden(update) || pendingUpdate?.id === update.id) &&
+      update.id !== action?.id,
+  );
+  const notices =
+    pendingUpdate &&
+    pendingUpdate.id !== action?.id &&
+    !visibleUpdates.some((update) => update.id === pendingUpdate.id)
+      ? [...visibleUpdates, pendingUpdate]
+      : visibleUpdates;
   return (
     <Context
       value={{
@@ -307,7 +448,7 @@ export function PluginUpdates({
         open,
         checking,
         checkAgain,
-        busy: state.busy || !!action,
+        busy: state.busy || !!action || !!pendingUpdate,
         recommended: pendingManaged(managed).map((entry) => entry.id),
       }}
     >
@@ -342,53 +483,44 @@ export function PluginUpdates({
           }}
         />
       )}
-      {updates
-        .filter(
-          (update) =>
-            // A failed check stays on its Settings row.
-            update.candidate &&
-            !store?.hidden(update) &&
-            update.id !== action?.id,
-        )
-        .map((update) => {
-          const plugin = catalog?.plugins.find(
-            (p) => p.manifest.id === update.id,
-          );
-          const name = plugin?.manifest.name ?? update.id;
-          const manage = {
-            label: `Manage ${name} update checks`,
-            open: () =>
-              void navigation.open({
-                version: 1,
-                kind: "settings",
-                section: "plugins",
-                pluginId: update.id,
-              }),
-          };
-          const review = needsReview(update);
-          return (
-            <ToastNotice
-              key={update.id}
-              title={`Update ${name}`}
-              description="Save unfinished forms and stop active plugin workers first. Updating an enabled plugin reloads it immediately."
-              tone="info"
-              onDismiss={() => store?.later(update)}
-              closeLabel="Dismiss plugin update notice"
-              navigation={manage}
+      {notices.map((update) => {
+        const plugin = catalog?.plugins.find(
+          (p) => p.manifest.id === update.id,
+        );
+        const name = plugin?.manifest.name ?? update.id;
+        const manage = {
+          label: `Manage ${name} update checks`,
+          open: () => openPluginSettings(update.id),
+        };
+        const review = needsReview(update);
+        return (
+          <ToastNotice
+            key={update.id}
+            title={`Update ${name}`}
+            description="Save unfinished forms and stop active plugin workers first. Updating an enabled plugin reloads it immediately."
+            tone="info"
+            onDismiss={() => dismiss(update)}
+            closeLabel="Dismiss plugin update notice"
+            navigation={manage}
+          >
+            <Button
+              size="sm"
+              disabled={state.busy || !!action || !!pendingUpdate}
+              focusableWhenDisabled={pendingUpdate?.id === update.id}
+              onClick={() => open(update)}
             >
-              <Button
-                size="sm"
-                disabled={state.busy || !!action}
-                onClick={() => open(update)}
-              >
-                {review ? "Review permissions" : "Update and reload"}
-              </Button>
-              <Button size="sm" onClick={() => store?.later(update)}>
-                Later
-              </Button>
-            </ToastNotice>
-          );
-        })}
+              {pendingUpdate?.id === update.id
+                ? "Preparing update…"
+                : review
+                  ? "Review permissions"
+                  : "Update and reload"}
+            </Button>
+            <Button size="sm" onClick={() => dismiss(update)}>
+              Later
+            </Button>
+          </ToastNotice>
+        );
+      })}
       {validAction && catalog && (
         <PluginImport
           key={`${action.id}:${updateSourceKey(action.source)}:${action.token}`}
@@ -407,7 +539,10 @@ export function PluginUpdates({
           }}
           reviewRequested
           authorizeGit={authorizeGit}
-          returnFocus={() => returnFocus.current}
+          returnFocus={() => {
+            const target = returnFocus.current?.();
+            return target?.isConnected ? target : null;
+          }}
           queuedUpdate={queuedUpdate}
           onClosed={() => {
             setRecovering((ids) =>
@@ -471,9 +606,11 @@ function automaticTitle(source: string, changes: readonly ManagedChange[]) {
 export function PluginUpdatesMenu({
   onManage,
   recommendations,
+  returnFocus,
 }: {
   onManage(): void;
   recommendations: number;
+  returnFocus?: () => HTMLElement | null;
 }) {
   const context = useContext(Context);
   // A failed check is reported on its plugin's row in Manage plugins.
@@ -506,7 +643,7 @@ export function PluginUpdatesMenu({
           <MenuItem
             key={update.id}
             disabled={context?.busy}
-            onClick={() => context?.open(update)}
+            onClick={() => context?.open(update, returnFocus)}
           >
             Update {update.candidate?.manifest.name ?? update.id}
           </MenuItem>

@@ -99,7 +99,7 @@ function gitSizeRecoveryHint(message: string) {
   }
 }
 
-function importLocation(
+export function importLocation(
   preview: Pick<ImportPreview, "source" | "commit">,
   path: string | undefined,
 ) {
@@ -539,6 +539,7 @@ export function PluginImport({
   const upToDate =
     !conflict &&
     !pinError &&
+    !changesReference &&
     // An identical package can still establish a missing source. Native keeps
     // its enabled state and existing rollback target for the same revision.
     !(updateId && !savedSource) &&

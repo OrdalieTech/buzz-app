@@ -1,8 +1,9 @@
 use buzzodz_plugins::{
     automatic::Action,
     managed::{Install, Managed, ManagedSource, ManagedState, Update},
-    pack_release, release_manifest, sign_policy, sign_release_saved, valid_id, Catalog, Manager,
-    Manifest, Result,
+    pack_release, release_manifest, sign_policy, sign_release_saved,
+    trust::{self, Publisher, Trust},
+    valid_id, Catalog, Manager, Manifest, Result,
 };
 use serde_json::json;
 use std::{
@@ -25,6 +26,11 @@ Commands:
   managed [--apply]        Show the managed plugin sources policy and its status;
                            --apply first installs and updates its automatic entries
   access [URL]             Show repository access rules and how Git would read URL
+  trust                    Show trusted publishers and whether self-developed plugins run
+  trust add PUBLISHER [NAME]  Trust a publisher key (npub or hex); the first one turns on
+                           the trusted-publisher restriction
+  trust remove PUBLISHER   Stop trusting a publisher key
+  trust self-developed on|off  Allow plugins signed with your saved Buzz human identity
   enable ID | disable ID | remove ID | rollback ID
   recover                  Back up settings and reset to bundled defaults
 
@@ -36,6 +42,7 @@ Options:
 The desktop and CLI also read BUZZODZ_HOME and BUZZODZ_PROFILE.
 BUZZ_MANAGED_PLUGINS overrides the managed plugin policy file location.
 BUZZ_REPOSITORY_ACCESS overrides the repository access rules file location.
+BUZZ_PLUGIN_TRUST overrides the plugin trust file location.
 Set BUZZ_REQUIRE_PLUGIN_SIGNATURES=1 when launching the desktop or CLI to require
 signed plugins. Enforcement is off by default; supplied signatures are always verified.
 Launch the desktop with BUZZODZ_SAFE_MODE=1 to skip external pages.";
@@ -174,6 +181,61 @@ fn run() -> Result<()> {
             );
         }
         ("access", _) => return Err("Usage: buzzodz plugin access [URL]".into()),
+        ("trust", []) => print_trust(&manager.trust()),
+        ("trust", [command, rest @ ..]) => {
+            match (command.as_str(), rest) {
+                ("add", [publisher] | [publisher, _]) => {
+                    let publisher = trust::parse_publisher(publisher)?;
+                    let name = rest.get(1).map(|name| trust::valid_name(name)).transpose()?;
+                    manager.trust().update(|policy| {
+                        match policy.publishers.iter_mut().find(|p| p.publisher == publisher) {
+                            Some(existing) => {
+                                if name.is_some() {
+                                    existing.name = name;
+                                }
+                            }
+                            None => policy.publishers.push(Publisher { publisher, name }),
+                        }
+                        Ok(())
+                    })?
+                }
+                ("remove", [publisher]) => {
+                    let publisher = trust::parse_publisher(publisher)?;
+                    manager.trust().update(|policy| {
+                        let before = policy.publishers.len();
+                        policy.publishers.retain(|p| p.publisher != publisher);
+                        if policy.publishers.len() == before {
+                            return Err(format!("{publisher} is not a trusted publisher"));
+                        }
+                        Ok(())
+                    })?
+                }
+                ("self-developed", [value]) if value == "on" || value == "off" => manager
+                    .trust()
+                    .update(|policy| {
+                        policy.allow_self_developed = value == "on";
+                        Ok(())
+                    })?,
+                _ => return Err("Usage: buzzodz plugin trust [add PUBLISHER [NAME] | remove PUBLISHER | self-developed on|off]".into()),
+            };
+            print_trust(&manager.trust());
+            let blocked: Vec<_> = manager
+                .catalog()?
+                .plugins
+                .into_iter()
+                .filter(|p| p.source == "external" && p.error.is_some())
+                .collect();
+            if !blocked.is_empty() {
+                println!("\nInstalled plugins that cannot run:");
+                for plugin in blocked {
+                    println!(
+                        "{:<24} {}",
+                        plugin.manifest.id,
+                        plugin.error.unwrap_or_default()
+                    );
+                }
+            }
+        }
         ("recover", []) => {
             let catalog = manager.recover()?;
             println!("Reset profile {profile} to bundled defaults.\nAny previous settings were backed up in {}.\nExternal artifacts remain available for reinstallation.", catalog.location);
@@ -232,6 +294,47 @@ fn print_catalog(catalog: &Catalog) -> Result<()> {
         }
     }
     Ok(())
+}
+fn print_trust(trust: &Trust) {
+    let path = trust
+        .path
+        .as_ref()
+        .map_or("none".into(), |path| path.display().to_string());
+    match &trust.status {
+        trust::Status::Absent => println!(
+            "Trust file: {path} (not present)\nAny publisher with a valid signature can run external plugins."
+        ),
+        trust::Status::Missing => println!(
+            "Trust file: {path} (named by {}, but not present)\nStatus: no external plugin can run until the file exists or {} is unset",
+            trust::PATH_ENV,
+            trust::PATH_ENV
+        ),
+        trust::Status::Invalid { reason } => println!(
+            "Trust file: {path}\nStatus: unusable, so no external plugin can run\nProblem: {reason}"
+        ),
+        trust::Status::Ready(policy) => {
+            println!("Trust file: {path}\nOnly trusted publishers can run external plugins.\n");
+            if policy.publishers.is_empty() {
+                println!("Trusted publishers: none");
+            } else {
+                println!("Trusted publishers:");
+                for publisher in &policy.publishers {
+                    match &publisher.name {
+                        Some(name) => println!("  {} {name}", publisher.publisher),
+                        None => println!("  {}", publisher.publisher),
+                    }
+                }
+            }
+            println!(
+                "Self-developed: {}",
+                if policy.allow_self_developed {
+                    "allowed (plugins signed with your saved Buzz human identity)"
+                } else {
+                    "not allowed"
+                }
+            );
+        }
+    }
 }
 fn print_managed(managed: &Managed) {
     match managed {

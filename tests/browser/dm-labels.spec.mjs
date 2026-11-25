@@ -1,5 +1,6 @@
 import { openChannelDetails } from "./channel-details.mjs";
 import { test, expect } from "./fixture.mjs";
+import { peerPresenceAdmitted } from "./presence.mjs";
 import { open } from "./timeline.mjs";
 
 test.use({
@@ -140,13 +141,7 @@ for (const cold of [false, true]) {
       ).toContainText("Alice Fixture");
       expect(labelReads()).toHaveLength(before);
       await expect(dm.locator(".buzz-avatar")).toHaveText("A");
-      await expect
-        .poll(() =>
-          app.report.presenceSnapshots.some((snapshot) =>
-            snapshot.filter.authors.includes(app.participants[0]),
-          ),
-        )
-        .toBe(true);
+      await peerPresenceAdmitted(app);
     } finally {
       app.relay.releaseProfiles();
     }

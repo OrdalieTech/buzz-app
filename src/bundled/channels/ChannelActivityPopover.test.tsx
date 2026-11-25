@@ -233,6 +233,72 @@ test("activity keeps profile loading lazy, explains stale results and opens the 
   );
 });
 
+test("dates unread activity by day count for under a week, then by date, with the year outside this year", async () => {
+  const user = userEvent.setup();
+  // Local noon keeps each calendar day the same in every time zone.
+  const now = new Date(2026, 10, 16, 12).getTime() / 1000;
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now * 1000);
+  const thread = (preview: string, createdAt: number): ThreadActivityItem => ({
+    channelId: "studio",
+    rootId: preview,
+    latestMessageId: preview,
+    authorId: "alex",
+    createdAt,
+    preview,
+    unreadCount: 1,
+  });
+  const snapshot: ThreadActivitySnapshot = {
+    channelId: "studio",
+    items: [
+      thread("Under a week", now - 604799),
+      thread("A week", now - 604800),
+      thread("Another year", new Date(2023, 10, 14, 12).getTime() / 1000),
+    ],
+    coverage: "observed",
+    freshness: "observed",
+  };
+  const profiles = new Map([["alex", { name: "Alex" }]]);
+  const session = {
+    agentChoices: { snapshot: () => ({ identities: [] }) },
+    unread: { activity: () => snapshot, subscribeActivity: () => () => {} },
+    profiles: {
+      snapshot: () => profiles,
+      subscribe: () => () => {},
+      ensure: async () => {},
+    },
+    inboxFeed: settledFeed,
+  } as unknown as RelaySession;
+  try {
+    render(
+      <ChannelActivityPopover
+        session={session}
+        channelId="studio"
+        channelName="Studio"
+        trigger={<Button>Activity</Button>}
+        onOpenThread={vi.fn()}
+        onOpenMention={vi.fn()}
+      />,
+    );
+    screen.getByRole("button", { name: "Activity" }).focus();
+    await user.keyboard("{Enter}");
+    await screen.findByRole("dialog", { name: "Activity in Studio" });
+    for (const [preview, time] of [
+      ["Under a week", "6d"],
+      ["A week", "Nov 9"],
+      ["Another year", "Nov 14, 2023"],
+    ] as const)
+      expect(
+        within(
+          screen.getByRole("button", {
+            name: `Open unread thread from Alex: ${preview}`,
+          }),
+        ).getByText(time),
+      ).toBeVisible();
+  } finally {
+    clock.mockRestore();
+  }
+});
+
 test("unread mentions open activity alone, list above threads, open by message and read by message", async () => {
   const user = userEvent.setup();
   const mention: MentionActivityItem = {

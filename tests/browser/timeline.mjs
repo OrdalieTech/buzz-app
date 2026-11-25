@@ -181,17 +181,21 @@ export async function edge(page, direction, scroller = history(page)) {
   let remaining = await distance();
   if (remaining < 4)
     await page.mouse.wheel(0, direction * Math.max(1, remaining));
-  // A gesture can end short of the edge, as one did 199px from the top in
-  // Linux WebKit (see upper). Each further gesture must make real progress,
-  // so an immobile timeline still fails.
-  for (let gesture = 0; remaining >= 4 && gesture < 4; gesture++) {
-    await wheel(page, direction * remaining, scroller);
+  // A gesture can end short of the edge: Linux WebKit moves one about 1.5k px
+  // at most. Each further gesture must make real progress, so an immobile
+  // timeline still fails.
+  // A page landing beyond the edge adds height, not lost progress.
+  const height = () => scroller.evaluate((element) => element.scrollHeight);
+  for (let gesture = 0; remaining >= 4 && gesture < 40; gesture++) {
     const before = remaining;
+    const grown = await height();
+    await wheel(page, direction * remaining, scroller);
     remaining = await distance();
     if (remaining >= 4)
-      expect(remaining, "edge gesture moves toward the edge").toBeLessThan(
-        before,
-      );
+      expect(
+        remaining - Math.max(0, (await height()) - grown),
+        "edge gesture moves toward the edge",
+      ).toBeLessThan(before);
   }
   await expect
     .poll(distance, { message: "wheel reaches timeline edge" })
@@ -201,12 +205,32 @@ export async function edge(page, direction, scroller = history(page)) {
     4,
   );
 }
+/** Scroll to the top for the next older read. Gestures stop once the app's
+ * reach starts that read, and the rest of the way is short: a held read waits
+ * only for that, not for a whole Linux scroll past its deadline. With `top`
+ * false, a read the app's read-ahead starts, before the call or during a
+ * gesture, is the next read where the reader is. */
+export async function toOlder(
+  page,
+  app,
+  { top = true } = {},
+  scroller = history(page),
+) {
+  await scroller.hover();
+  for (let gesture = 0; !app.pending.length && gesture < 40; gesture++) {
+    const offset = await scroller.evaluate((element) => element.scrollTop);
+    if (offset < 4) break;
+    await wheel(page, -offset, scroller);
+  }
+  if (top || !app.pending.length) await edge(page, -1, scroller);
+  await expect.poll(() => app.pending.length).toBe(1);
+}
 export async function end(page) {
   await edge(page, 1);
 }
 // `cold` reaches Messages by its tab, for journeys that need conversations
 // unread by the app: search previews the results it highlights on the way.
-export async function open(page, app, { cold = false } = {}) {
+export async function open(page, app, { cold = false, hold = false } = {}) {
   await page.goto(app.origin);
   if (cold)
     await page.getByRole("tab", { name: "Messages", exact: true }).click();
@@ -214,6 +238,68 @@ export async function open(page, app, { cold = false } = {}) {
   await composer(page, "Alpha").waitFor();
   await expect(history(page).locator(rowSelector).first()).toBeVisible();
   await settle(page);
+  return readAhead(page, app, { hold });
+}
+/** Opening reads older history ahead of a reader at the bottom. Release it
+ * until the reader has the prefetch distance or the channel's first message
+ * above them, or a read fails, so a journey's baseline starts after it.
+ * `hold` leaves the first read pending for a journey that lands it itself.
+ * Returns the reads it released. */
+export async function readAhead(page, app, { hold = false } = {}) {
+  const channel = await history(page).evaluate(
+    (element) =>
+      element.closest("[data-channel-timeline]").dataset.channelTimeline,
+  );
+  const rows = app.histories
+    .get(`primary/${channel}`)
+    .filter((event) => event.kind === 9);
+  const first = Math.min(...rows.map((event) => event.created_at));
+  const start = rows
+    .filter((event) => event.created_at === first)
+    .map((event) => event.id);
+  const done = () =>
+    history(page).evaluate(
+      (element, start) =>
+        element.scrollTop >= Math.max(3000, element.clientHeight * 6) ||
+        start.every((id) =>
+          element.querySelector(`[data-message-id="${id}"]`),
+        ) ||
+        !!element.querySelector('[role="alert"]'),
+      start,
+    );
+  const released = [];
+  // At most the visit's five fill pages.
+  for (let read = 0; read < 5; read++) {
+    if (hold) {
+      await expect
+        .poll(async () => app.pending.length > 0 || (await done()), {
+          message: "opening reads ahead or has history above the reader",
+        })
+        .toBe(true);
+      return released;
+    }
+    // A read-ahead starts once the opening is idle, within 500ms; none starts
+    // when the loaded history is all there is.
+    await expect
+      .poll(async () => app.pending.length > 0 || (await done()), {
+        timeout: 2000,
+      })
+      .toBe(true)
+      .catch(() => {});
+    // The app's own reach can take one page more than `done` (Linux WebKit
+    // did): give that read its start window too, so none is left held.
+    if (!app.pending.length)
+      await expect
+        .poll(() => app.pending.length, { timeout: 1000 })
+        .toBeGreaterThan(0)
+        .catch(() => {});
+    const pending = app.pending.shift();
+    if (!pending) return released;
+    pending.release();
+    released.push(pending);
+    await settle(page);
+  }
+  return released;
 }
 export async function upper(page) {
   await end(page);

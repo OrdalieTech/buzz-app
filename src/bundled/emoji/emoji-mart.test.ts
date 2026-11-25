@@ -1,14 +1,87 @@
 // @vitest-environment jsdom
-import { SearchIndex } from "emoji-mart";
-import { afterEach, expect, it, vi } from "vitest";
+import { FrequentlyUsed, SearchIndex } from "emoji-mart";
+import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { mountEmojiMart } from "./emoji-mart";
 import { PREVIEW_ACTION_SLOT } from "./add-emoji";
 import { SKIN_TONE_SLOT } from "./skin-tone";
 
 afterEach(() => {
+  vi.useRealTimers();
   document.body.replaceChildren();
   vi.unstubAllGlobals();
+});
+
+it("cancels Mart's pending theme update when the picker closes", async () => {
+  for (const name of ["ResizeObserver", "IntersectionObserver"])
+    vi.stubGlobal(
+      name,
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+  // Frequent names the custom emoji that dispose() deletes from Mart's Data.
+  // Only this mount's read is answered, so Mart's module-level Frequent index
+  // and its persisted copy stay as the other tests expect them. Mart's types
+  // misname `get` as `_get1`.
+  const frequent = vi
+    .spyOn(FrequentlyUsed as unknown as { get(): string[] }, "get")
+    .mockReturnValueOnce(["buzz-custom/fixture/stamp"]);
+  onTestFinished(() => frequent.mockRestore());
+  // Mart's deferred render runs in a Preact microtask, so a crash there never
+  // reaches this test's stack: it surfaces as an unhandled rejection.
+  const rejections: unknown[] = [];
+  const rejected = (reason: unknown) => rejections.push(reason);
+  process.on("unhandledRejection", rejected);
+  onTestFinished(() => void process.off("unhandledRejection", rejected));
+  const host = document.body.appendChild(document.createElement("div"));
+  const dispose = mountEmojiMart({
+    host,
+    autoFocus: false,
+    scope: "fixture",
+    perLine: 8,
+    emojiSize: 24,
+    emojiButtonSize: 36,
+    search: "",
+    searchSelection: { current: undefined },
+    searchChange() {},
+    entries: [{ shortcode: "stamp", url: "https://a.test/stamp.png" }],
+    media: (url) => url,
+    select() {},
+    close() {},
+  });
+  const picker = host.querySelector("em-emoji-picker") as HTMLElement & {
+    component?: object;
+  };
+  await vi.waitFor(() => {
+    if (!picker.shadowRoot?.querySelector(`button[title=":stamp:"]`))
+      throw new Error("Frequent has not rendered the custom emoji");
+  });
+  vi.useFakeTimers();
+  // A keyboard-navigation mark re-syncs appearance with an unchanged theme;
+  // re-setting it would arm Mart's deferred render on every key.
+  document.documentElement.dataset.keyboardNavigation = "";
+  await Promise.resolve();
+  expect(picker).toHaveAttribute("data-keyboard-navigation");
+  expect(vi.getTimerCount()).toBe(0);
+  delete document.documentElement.dataset.keyboardNavigation;
+  await Promise.resolve();
+  expect(picker).not.toHaveAttribute("data-keyboard-navigation");
+  expect(vi.getTimerCount()).toBe(0);
+  const theme = picker.getAttribute("theme") === "dark" ? "light" : "dark";
+  picker.setAttribute("theme", theme);
+  // The private field dispose() clears; a rename must fail here, not in CI.
+  expect(picker.component).toHaveProperty("nextStateTimer");
+  dispose();
+  expect(vi.getTimerCount()).toBe(0);
+  // Were a timer still pending, flush it and let its render settle: Node
+  // reports the rejection before the next real task.
+  vi.runAllTimers();
+  vi.useRealTimers();
+  await new Promise((resolve) => setTimeout(resolve));
+  expect(rejections).toEqual([]);
 });
 
 it("adds fuzzy shortcode matches after Mart's own results", async () => {

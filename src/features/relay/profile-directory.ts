@@ -22,7 +22,7 @@ import {
   PROFILE_ENTRY_BYTES,
 } from "./budget";
 import type { Profile } from "./contracts";
-import type { RelayEvent } from "./events";
+import type { ReadFilter, RelayEvent } from "./events";
 import { newer } from "./events";
 import { foldProfiles } from "./profiles";
 import type { Priority, RelayReader } from "./reader";
@@ -32,8 +32,13 @@ import { archiveHides, type IdentityArchives } from "./identity-archives";
 export interface ProfileQueries {
   snapshot(): ReadonlyMap<string, Profile>;
   subscribe(listener: () => void): () => void;
-  /** Fetch missing profiles; optional enrichment can yield to conversation reads. */
-  ensure(ids: readonly string[], priority?: Priority): Promise<void>;
+  /** Fetch missing profiles; optional enrichment can yield to conversation reads.
+   * A view that shows these people's statuses reads them beside the profiles. */
+  ensure(
+    ids: readonly string[],
+    priority?: Priority,
+    options?: { withStatuses?: boolean },
+  ): Promise<void>;
   /** The winning signed kind 0 retained for one identity, for provenance checks. */
   event?(pubkey: string): RelayEvent | undefined;
   /** Identities a completed read found no profile for, until one arrives. */
@@ -104,6 +109,13 @@ export function createProfileDirectory(
     ): (() => void) | undefined;
   },
   archives?: Pick<IdentityArchives, "snapshot" | "subscribe" | "ensure">,
+  statuses?: {
+    prefetch(
+      authors: readonly string[],
+    ):
+      | { filter: ReadFilter; settle(events?: readonly RelayEvent[]): void }
+      | undefined;
+  },
 ) {
   let limit = PROFILE_CACHE_BASE;
   // DM partners: eviction takes them last, so a large roster cannot turn a
@@ -428,6 +440,7 @@ export function createProfileDirectory(
     ids: readonly string[],
     priority: Priority = "foreground",
     refresh = false,
+    withStatuses = false,
   ) {
     if (closed) throw new DOMException("Session closed", "AbortError");
     const unique = [...new Set(ids)];
@@ -535,6 +548,17 @@ export function createProfileDirectory(
       for (const id of authors) pending.set(id, batch);
       waiting.add(batch.work);
     }
+    // Its own request at the names' priority, so a status answer can never
+    // cost the names; waited on so the caller can warm status images with
+    // avatars.
+    const status = withStatuses ? statuses?.prefetch(unique) : undefined;
+    if (status)
+      waiting.add(
+        reader.read([status.filter], { signal, priority }).then(
+          (events) => status.settle(events),
+          () => status.settle(),
+        ),
+      );
     await Promise.all(waiting);
     // Every caller sees its names published when its ensure resolves, also
     // one that joined another caller's read.
@@ -620,7 +644,11 @@ export function createProfileDirectory(
         listeners.delete(listener);
       };
     },
-    ensure,
+    ensure: (
+      ids: readonly string[],
+      priority?: Priority,
+      options?: { withStatuses?: boolean },
+    ) => ensure(ids, priority, false, options?.withStatuses),
     event: (pubkey: string) => events.peek(pubkey),
     unnamed: () => unnamed,
     generation: () => generation,

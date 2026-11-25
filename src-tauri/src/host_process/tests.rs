@@ -1187,9 +1187,21 @@ fn every_process_is_told_the_buzz_version_a_plugin_cannot_change() {
             ("NOSTR_KEY", "from-profile"),
         ]
         .map(|(name, value)| (name.into(), value.into()));
+        let agent_env = [
+            ("PROFILE_SETTING", "from-list"),
+            ("PLUGIN_SETTING", "from-list"),
+            ("LIST_SETTING", "listed"),
+            ("BUZZ_FROM_LIST", "1"),
+            ("NOSTR_FROM_LIST", "1"),
+        ]
+        .map(|(name, value)| (name.into(), value.into()));
         set_environment(
             &mut command,
             &login_shell,
+            &crate::agent_env::Lists {
+                own: agent_env.to_vec(),
+                ..Default::default()
+            },
             OsStr::new("/bin"),
             &environment,
             "0.7.12",
@@ -1200,11 +1212,121 @@ fn every_process_is_told_the_buzz_version_a_plugin_cannot_change() {
         assert_eq!(get(&command, "PATH").as_deref(), Some("/bin"));
         assert_eq!(
             get(&command, "PROFILE_SETTING").as_deref(),
-            Some("forwarded")
+            Some("from-list")
         );
+        assert_eq!(get(&command, "LIST_SETTING").as_deref(), Some("listed"));
+        assert_eq!(get(&command, "BUZZ_FROM_LIST"), None);
+        assert_eq!(get(&command, "NOSTR_FROM_LIST"), None);
         assert_eq!(get(&command, "BUZZ_RESOLVING_ENVIRONMENT"), None);
         assert_eq!(get(&command, "NOSTR_KEY"), None);
     }
+}
+
+/// The Anthropic key a Claude turn's child sees, through the spawn's own list
+/// read, environment and secret grants, its harness removing any inherited
+/// key as `claude.ts` does. `own_setup`: the person's own Claude setup works,
+/// so the launch isn't granted `claude_key::SECRET`.
+#[cfg(unix)]
+async fn claude_child_key(
+    own_setup: bool,
+    own: Option<&str>,
+    device: Option<&str>,
+    shared: Option<&str>,
+) -> Option<String> {
+    use crate::agent_env::tests::{envs, set, FakeStore, ADA};
+    let (lists, _) = envs();
+    let mut rows = vec![set("DEVICE_SETTING", "kept")];
+    rows.extend(device.map(|key| set("ANTHROPIC_API_KEY", key)));
+    lists.set_device(rows).await.unwrap();
+    let rows = own
+        .map(|key| set("ANTHROPIC_API_KEY", key))
+        .into_iter()
+        .collect();
+    lists.set(ADA, rows, || Ok(true)).await.unwrap();
+    let store = Arc::new(FakeStore::default());
+    *store.text.lock().unwrap() = shared.map(str::to_owned);
+    let shared = crate::claude_key::ClaudeKey::with(Box::new(store));
+    let mut secrets = vec![crate::agent_env::SECRET.to_owned()];
+    if !own_setup {
+        secrets.push(crate::claude_key::SECRET.to_owned());
+    }
+    let agent_env = lists.for_process(Some(ADA)).await;
+    let removed = HashMap::from([("ANTHROPIC_API_KEY".to_owned(), None)]);
+    let inherited = [("ANTHROPIC_API_KEY".into(), "sk-ant-inherited".into())];
+    let mut command = Command::new("/usr/bin/printenv");
+    set_environment(
+        &mut command,
+        &inherited,
+        &agent_env,
+        OsStr::new("/usr/bin:/bin"),
+        &removed,
+        "0",
+    )
+    .unwrap();
+    grant_secrets(
+        &mut command,
+        &secrets,
+        "buzz.claude-code",
+        "claude-sh",
+        &agent_env,
+        &shared,
+    )
+    .await
+    .unwrap();
+    let output = String::from_utf8(command.output().await.unwrap().stdout).unwrap();
+    let get = |name: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")).map(str::to_owned))
+    };
+    assert_eq!(get("DEVICE_SETTING").as_deref(), Some("kept"));
+    get("ANTHROPIC_API_KEY")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_device_anthropic_key_never_replaces_the_persons_own_claude_setup() {
+    let (own, device, shared) = (
+        Some("sk-ant-own"),
+        Some("sk-ant-device"),
+        Some("sk-ant-shared"),
+    );
+    // Own setup: only the agent's own key overrides it.
+    for shared in [shared, None] {
+        assert_eq!(claude_child_key(true, None, device, shared).await, None);
+        assert_eq!(
+            claude_child_key(true, own, device, shared).await.as_deref(),
+            own
+        );
+        assert_eq!(
+            claude_child_key(true, own, None, shared).await.as_deref(),
+            own
+        );
+    }
+    // A launch that needs a key: the agent's own, the device's, then shared.
+    assert_eq!(
+        claude_child_key(false, None, device, shared)
+            .await
+            .as_deref(),
+        device
+    );
+    assert_eq!(
+        claude_child_key(false, None, device, None).await.as_deref(),
+        device
+    );
+    assert_eq!(
+        claude_child_key(false, own, device, shared)
+            .await
+            .as_deref(),
+        own
+    );
+    assert_eq!(
+        claude_child_key(false, None, None, shared).await.as_deref(),
+        shared
+    );
+    // An inherited key stays removed.
+    assert_eq!(claude_child_key(true, None, None, None).await, None);
+    assert_eq!(claude_child_key(false, None, None, None).await, None);
 }
 
 #[cfg(unix)]

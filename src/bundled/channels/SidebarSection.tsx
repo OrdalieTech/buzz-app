@@ -49,6 +49,7 @@ import type { SidebarSortMode } from "../../features/relay/sidebar-sort";
 import type { SidebarFilter } from "./useSidebarFilters";
 import { SidebarGroupIcon } from "./SidebarGroupIcon";
 import { SidebarStarIcon } from "./SidebarStarIcon";
+import { isChannelSectionKey } from "./sidebar-sections";
 import { ChannelSidebarMenuItem } from "./ChannelSidebarMenuItem";
 import styles from "./Channels.module.css";
 
@@ -182,7 +183,7 @@ export function SidebarSection({
     >
       <NavigationSectionHeading
         disclosure
-        revealActions
+        revealActions={isChannelSectionKey(sectionKey) ? "overlay" : true}
         actions={
           <>
             {!hideMoreActions && (

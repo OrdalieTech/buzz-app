@@ -21,17 +21,14 @@ test("independent packed author consumer and native-installed contribution survi
   let server;
   try {
     const author = join(temp, "author");
+    const archive = join(temp, "buzz-author.tgz");
     run("pnpm", ["author:build", author]);
-    run("pnpm", ["pack", "--pack-destination", temp], author);
+    run("pnpm", ["pack", "--out", archive], author);
     const source = join(temp, "consumer");
     await cp(join(root, "tests/fixtures/conversation-consumer"), source, {
       recursive: true,
     });
-    run(
-      "pnpm",
-      ["add", "-D", join(temp, "buzz-author-0.0.0-preview.1.tgz")],
-      source,
-    );
+    run("pnpm", ["add", "-D", archive], source);
     run("pnpm", ["build"], source);
     // The global producer is a separate test-only artifact, never part of the consumer.
     const toolSource = join(temp, "timestamp-tool");

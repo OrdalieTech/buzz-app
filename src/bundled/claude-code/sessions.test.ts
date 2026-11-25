@@ -52,6 +52,7 @@ function sessions(
     started: (sessionId: string, systemPrompt: string) => void;
     /** Each process's own settings env. */
     env: Record<string, string>;
+    resumed: (sessionId: string, systemPrompt: string) => void;
     agent: Readonly<{ pubkey: string; relay: string }>;
     /** The host refuses every process, as at its process limit. */
     full: boolean;
@@ -61,6 +62,7 @@ function sessions(
   const fake = fakeSpawn(options.known, options.env);
   const store = options.store ?? memoryStore();
   let model = "opus";
+  let sections = "default";
   let ids = 0;
   const spawn = (id: string, spawnOptions?: object) => {
     if (options.full) return Promise.reject(PROCESS_LIMIT);
@@ -96,8 +98,10 @@ function sessions(
       };
     },
     fingerprint: () => model,
+    sections: () => sections,
     newId: () => `new-${++ids}`,
     ...(options.started ? { started: options.started } : {}),
+    ...(options.resumed ? { resumed: options.resumed } : {}),
   });
   const claudes = () =>
     fake.processes.filter((process) => process.id === "claude");
@@ -109,6 +113,9 @@ function sessions(
     live: () => claudes().filter((process) => !process.killed),
     setModel: (next: string) => {
       model = next;
+    },
+    setSections: (next: string) => {
+      sections = next;
     },
   };
 }
@@ -538,7 +545,8 @@ it("resumes a saved conversation after its process stops", async () => {
   vi.useFakeTimers();
   const store = memoryStore();
   const started = vi.fn();
-  const { pool, claudes } = sessions({ store, started });
+  const again = vi.fn();
+  const { pool, claudes } = sessions({ store, started, resumed: again });
   await pool.deliver("c/root", "first", 1);
   const first = claudes()[0];
   vi.advanceTimersByTime(IDLE_MS + 1);
@@ -550,8 +558,10 @@ it("resumes a saved conversation after its process stops", async () => {
   expect(resumed?.options.args).toContain("new-1");
   expect(resumed?.prompts).toEqual(["later"]);
   expect(store.get("c/root")).toMatchObject({ id: "new-1", seen: 5 });
-  // Only the new session tells what it started with; the resume does not.
+  // Only the new session tells what it started with; the resume tells what
+  // it was resumed with.
   expect(started.mock.calls).toEqual([["new-1", "prompt", undefined]]);
+  expect(again.mock.calls).toEqual([["new-1", "prompt"]]);
 });
 
 it("offers the conversation used longest ago that is doing nothing, to stop", async () => {
@@ -742,6 +752,45 @@ it("applies new settings over background work once no reply is running", async (
   );
 });
 
+it("keeps background work through a section change until a new turn needs the new prompt", async () => {
+  const { pool, claudes, setSections } = sessions({ hold: true });
+  const first = pool.deliver("c/root", "start a build", 1);
+  await flush();
+  const [process] = claudes();
+  backgroundTasks(process, {});
+  // A plugin changes the conversation's sections while the reply runs.
+  setSections("plugin");
+  process?.finish();
+  await first;
+  pool.reconfigure();
+  await flush();
+  expect(process?.killed).toBe(false);
+  // Once the work ends, the process waits for the next turn.
+  backgroundTasks(process);
+  await flush();
+  expect(process?.killed).toBe(false);
+  const again = pool.deliver("c/root", "again", 2);
+  await flush();
+  expect(process?.killed).toBe(true);
+  expect(claudes().at(-1)?.options.args).toEqual(
+    expect.arrayContaining(["--resume", "new-1"]),
+  );
+  claudes().at(-1)?.finish();
+  await again;
+});
+
+it("gives an idle session new sections as its reply ends", async () => {
+  const { pool, claudes, setSections } = sessions({ hold: true });
+  const first = pool.deliver("c/root", "hello", 1);
+  await flush();
+  const [process] = claudes();
+  setSections("plugin");
+  process?.finish();
+  await first;
+  await flush();
+  expect(process?.killed).toBe(true);
+});
+
 it("starts over when a saved session no longer loads", async () => {
   const store = memoryStore();
   store.set("c/root", { id: "lost", seen: 4, at: 1 });
@@ -833,6 +882,36 @@ it("runs a turn with the model and effort it was delivered with, starting over i
   expect(fresh?.prompts).toEqual(["hello again", "next"]);
   expect(fresh?.models).toEqual(["haiku", "opus"]);
   expect(fresh?.efforts).toEqual(["low", "high"]);
+});
+
+it("asks a model route for a new turn's pick, and not for a steer", async () => {
+  const { pool, claudes } = sessions({ hold: true });
+  const route = vi.fn(async () => ({ model: "haiku", effort: "low" }));
+  const first = pool.deliver("c/root", "first", 1, { route });
+  await flush();
+  const process = claudes()[0];
+  if (!process) throw new Error("no process");
+  const steer = vi.fn(async () => ({ model: "sonnet" }));
+  const second = pool.deliver("c/root", "plain", 2, {
+    steer: "steer",
+    route: steer,
+  });
+  await flush();
+  expect(process.prompts).toEqual(["first", "steer"]);
+  expect(process.models).toEqual(["haiku", "haiku"]);
+  expect(route).toHaveBeenCalledTimes(1);
+  expect(steer).not.toHaveBeenCalled();
+  process.finish();
+  await expect(first).resolves.toEqual({ ok: true });
+  await expect(second).resolves.toEqual({ ok: true });
+});
+
+it("sends nothing when a model route's choice was stopped", async () => {
+  const { pool, claudes } = sessions();
+  await expect(
+    pool.deliver("c/root", "hello", 1, { route: async () => undefined }),
+  ).resolves.toEqual({ ok: true, undelivered: true });
+  expect(claudes().flatMap((process) => process.prompts)).toEqual([]);
 });
 
 it("runs any number of conversations at once", async () => {

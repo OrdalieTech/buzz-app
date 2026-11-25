@@ -71,8 +71,8 @@ function disk() {
       startup = { ...startup, ...structuredClone(patch) };
     }),
     readProfiles: vi.fn(async () => structuredClone(profiles)),
-    writeProfiles: vi.fn(async (events) => {
-      profiles = structuredClone([...events]);
+    writeProfiles: vi.fn(async (events, optional = []) => {
+      profiles = structuredClone([...events, ...optional]);
     }),
     read: vi.fn(async () => structuredClone(heads)),
     write: vi.fn(async (value) => {
@@ -850,6 +850,68 @@ describe("device-local startup", () => {
     expect(
       next.owner.session.profiles.snapshot().get(stranger.pubkey)?.name,
     ).toBe("Stranger");
+  });
+
+  it("restores statuses a previous session showed, with the names", async () => {
+    const storage = disk();
+    const stranger = keypair();
+    const busy = signed(stranger, {
+      kind: 30315,
+      created_at: 1_700_000_000,
+      content: "Heads down",
+      tags: [["d", "general"]],
+    });
+    const first = setup(storage);
+    await first.owner.restore();
+    const reply = first.query.getMockImplementation();
+    first.query.mockImplementation(async (filters) =>
+      filters.some((filter) => filter.kinds?.includes(0))
+        ? [profile(stranger, { name: "Stranger" })]
+        : filters.some((filter) => filter.kinds?.includes(30315))
+          ? [busy]
+          : (reply?.(filters) ?? []),
+    );
+    await first.owner.session.profiles.ensure([stranger.pubkey]);
+    await vi.waitFor(
+      async () => expect(await storage.readProfiles?.()).toHaveLength(1),
+      { timeout: 3000 },
+    );
+    // The status lands after the names settled, so only it saves the mirror.
+    const { statuses } = first.owner.session;
+    const unwatch = statuses.watch([stranger.pubkey]);
+    await vi.waitFor(() =>
+      expect(statuses.snapshot().get(stranger.pubkey)?.text).toBe("Heads down"),
+    );
+    // Off screen and offline, the status is still saved for the next start.
+    unwatch();
+    await vi.waitFor(
+      async () => expect(await storage.readProfiles?.()).toHaveLength(2),
+      { timeout: 3000 },
+    );
+    // Optional, so the store fits it in the room the saved rosters leave.
+    expect(storage.writeProfiles).toHaveBeenLastCalledWith(
+      [expect.objectContaining({ kind: 0 })],
+      [eventDto(busy)],
+    );
+    const next = setup(storage, true);
+    await next.owner.restore();
+    expect(
+      next.owner.session.statuses.snapshot().get(stranger.pubkey)?.text,
+    ).toBe("Heads down");
+  });
+
+  it("restores a saved copy holding names, verified names and statuses", async () => {
+    const storage = disk();
+    const named = profile(keypair(), { name: "Kept" });
+    // Past twice the base count, records that fail their check do not hide it.
+    await storage.writeProfiles?.([named, ...Array(2100).fill({})]);
+    const next = setup(storage, true);
+    await next.owner.restore();
+    await vi.waitFor(() =>
+      expect(
+        next.owner.session.profiles.snapshot().get(named.pubkey)?.name,
+      ).toBe("Kept"),
+    );
   });
 
   it.each([

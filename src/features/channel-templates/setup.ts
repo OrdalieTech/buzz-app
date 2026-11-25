@@ -16,6 +16,8 @@ export type ChannelCreationInput = Readonly<{
   labels?: readonly string[] | undefined;
   /** Create a NIP-CL system channel: left out of channel lists. */
   system?: true | undefined;
+  /** Source label for an imported channel creation. */
+  migration?: string | undefined;
   setup?: ChannelSetup | undefined;
 }>;
 /** Whether a request asks for anything beyond the channel itself. A template

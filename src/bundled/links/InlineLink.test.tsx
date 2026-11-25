@@ -1,11 +1,7 @@
 // @vitest-environment jsdom
 import { expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import {
-  HashIcon,
-  LockIcon,
-  TableIcon,
-} from "../../shared/design-system/icons/index";
+import { TableIcon } from "../../shared/design-system/icons/index";
 import styles from "../../shared/InlineReference.module.css";
 import { InlineLink, LinkLabel, linkKind } from "./InlineLink";
 import { apply } from "./index";
@@ -57,6 +53,12 @@ it.each([
     "Thread",
     "message-2",
   ],
+  [
+    "buzz://plugin-install?repository=example-org%2Fexample-plugin&ref=main",
+    "plugin",
+    "Plugin",
+    "layout-grid",
+  ],
 ])(
   "renders semantic Buzz labels and icons for %s",
   (href, kind, label, icon) => {
@@ -68,18 +70,23 @@ it.each([
   },
 );
 
+it("keeps an install link's authored label beside the plugin icon", () => {
+  const href =
+    "buzz://plugin-install?repository=example-org%2Fexample-plugin&ref=main";
+  const markup = renderToStaticMarkup(
+    <InlineLink href={href}>Click to install</InlineLink>,
+  );
+  expect(markup).toContain("tabler-icon-layout-grid");
+  expect(textOf(markup)).toBe("Click to install");
+});
+
 it("renders private channel links with the design-system lock icon", () => {
   const markup = renderToStaticMarkup(
     <LinkChannelKindContext value="private">
       <InlineLink href="buzz://channel/private">#private</InlineLink>
     </LinkChannelKindContext>,
   );
-  // A little apart from the name, where a public channel's hash sits flush.
-  expect(markup).toContain(
-    renderToStaticMarkup(
-      <LockIcon className={`${styles.icon} ${styles.snug}`} />,
-    ),
-  );
+  expect(markup).toContain("tabler-icon-lock");
   expect(textOf(markup)).toBe("private");
 });
 
@@ -94,15 +101,11 @@ it("uses the Solo bubble and keeps the full authored chat title", () => {
   expect(textOf(markup)).toBe("#Design notes");
 });
 
-it("renders public channel links with the hash flush against the name", () => {
+it("renders public channel links with the hash icon", () => {
   const markup = renderToStaticMarkup(
     <InlineLink href="buzz://channel/public">#public</InlineLink>,
   );
-  expect(markup).toContain(
-    renderToStaticMarkup(
-      <HashIcon className={`${styles.icon} ${styles.flush}`} />,
-    ),
-  );
+  expect(markup).toContain("tabler-icon-hash");
   expect(textOf(markup)).toBe("public");
 });
 
@@ -275,9 +278,7 @@ it.each([false, true])(
         <InlineLink href={href}>the tracker</InlineLink>
       </LinkContentContext>,
     );
-    expect(markup).toContain(
-      renderToStaticMarkup(<TableIcon className={styles.icon} />),
-    );
+    expect(markup).toContain("tabler-icon-table");
     expect(markup).toContain(`href="${href}"`);
     expect(textOf(markup)).toBe("the tracker");
   },

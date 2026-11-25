@@ -144,6 +144,10 @@ struct State {
     /// the same lock as the change itself: derived agent credentials minted
     /// or stored under an older value are retired.
     retirements: u64,
+    /// Bumped with every installed session, under the same lock: an agent
+    /// assertion minted before a sign-in is never reused after it, because a
+    /// server-side sign-out may have cut off the tokens issued before it.
+    sign_ins: u64,
     /// Set by an explicit sign-out and kept on disk (`Inner::signed_out`):
     /// the next sign-in asks for credentials instead of finishing on the
     /// browser's session as the account just signed out. Only a completed
@@ -335,6 +339,7 @@ impl FederatedIdentity {
                 restore_retry_at: None,
                 closed: false,
                 retirements: 0,
+                sign_ins: 0,
                 cancellation: CancellationToken::new(),
                 callback: None,
                 renewal: None,
@@ -553,6 +558,7 @@ impl FederatedIdentity {
             _ => SessionChange::Refreshed,
         };
         state.account = Some(email);
+        state.sign_ins += 1;
         self.signal(change);
     }
     /// Make `session` current and watch for its expiry. The caller publishes
@@ -655,6 +661,10 @@ impl FederatedIdentity {
     /// How many times derived agent credentials have been retired this run.
     pub(crate) fn retirements(&self) -> u64 {
         self.state().retirements
+    }
+    /// How many sessions have been installed this run.
+    pub(crate) fn sign_ins(&self) -> u64 {
+        self.state().sign_ins
     }
     /// Whether the identity was closed for good; nothing derived acts again.
     pub(crate) fn closed(&self) -> bool {

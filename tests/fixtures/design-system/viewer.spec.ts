@@ -106,9 +106,7 @@ test("built viewer loads every specimen and foundation without app connections",
     "Glass",
     "Motion",
     "Base UI backing",
-    "Maintaining the system",
     "Design guide",
-    "Agent guide",
   ]) {
     await nav.getByRole("link", { name, exact: true }).click();
     await expect(page.locator("main h1")).toBeVisible();

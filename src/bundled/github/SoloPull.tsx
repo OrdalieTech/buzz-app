@@ -10,8 +10,8 @@ import type { ChatIconProps } from "../../features/conversation/service";
 import type { RelayData } from "../../features/relay/service";
 import type { RelaySession } from "../../features/relay/session";
 import { useChannelList } from "../../features/relay/react";
-import { ownSolo } from "../../features/solo/labels";
-import { writeLink, type SoloPulls } from "./solo-pull";
+import { useAgentOwnerEvidence } from "../../features/profiles/useAgentOwnerEvidence";
+import { linksSolo, writeLink, type SoloPulls } from "./solo-pull";
 import { describePull, pullTone, stateIcons } from "./pull-state-view";
 import styles from "./GitHub.module.css";
 import { useOpenGitHubLinksInBuzz } from "./link-preference";
@@ -113,6 +113,29 @@ function useSoloPull(pulls: SoloPulls, channelId: string) {
   return useSyncExternalStore(subscribe, () => pulls.get(channelId));
 }
 
+/** Whether the viewer manages the chat's link: their own Solo chat, or one an
+ * agent attested as theirs started for them. `check` false reads nothing. */
+function useLinksSolo(
+  session: RelaySession,
+  channel: Parameters<typeof linksSolo>[0],
+  check = true,
+) {
+  const creator =
+    check &&
+    channel?.channelType === "solo" &&
+    channel.creator !== session.viewer
+      ? channel.creator
+      : undefined;
+  const ownership = useAgentOwnerEvidence(session, creator);
+  return linksSolo(
+    channel,
+    session.viewer,
+    ownership.status === "ready" && ownership.owner === session.viewer
+      ? creator
+      : undefined,
+  );
+}
+
 /** Links the pull request in the panel to the Solo chat it was opened from,
  * where the person's app can write the link. */
 export function SoloPullLink({
@@ -154,7 +177,8 @@ function SessionPullLink({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const channel = list.channels.find((item) => item.id === channelId);
-  if (!ownSolo(channel, session.viewer)) return null;
+  const manages = useLinksSolo(session, channel);
+  if (!manages) return null;
   const change = async (next: string | null) => {
     setBusy(true);
     setError(undefined);
@@ -204,13 +228,8 @@ export function SoloPullMenu({
   const [busy, setBusy] = useState(false);
   const notify = useToastNotification();
   const channel = list.channels.find((item) => item.id === channelId);
-  if (
-    !pull ||
-    !ownSolo(channel, session.viewer) ||
-    channel?.archived ||
-    channel?.readOnly
-  )
-    return null;
+  const manages = useLinksSolo(session, channel, !!pull);
+  if (!pull || !manages || channel?.archived || channel?.readOnly) return null;
   return (
     <MenuItem
       disabled={busy || !session.configArtifactWriter || !session.snapshotRead}

@@ -1,4 +1,6 @@
 import {
+  agentPolicyMessage,
+  agentPolicyRefusal,
   NEEDS_HISTORY_CHOICE,
   validDirectMessageParticipants,
 } from "./direct-message-policy";
@@ -9,8 +11,10 @@ import type { RelayReader } from "./reader";
 import type { Outbox } from "./outbox";
 import type { ProfileSearch } from "./profile-search";
 import type { ProfileQueries } from "./profile-directory";
-import { newer, type RelayEvent } from "./events";
+import { hasEventProof, newer, type RelayEvent } from "./events";
 import { typedPublicKey } from "../../shared/identity/public-key";
+import { attestedOwner } from "../agents/owner-attestation";
+import type { IdentityNameView } from "../identity-names/service";
 import {
   verifiedProfile,
   verifiedProfileFilter,
@@ -44,10 +48,44 @@ export function createDirectMessages(
   verifiedAuthority: () => VerifiedProfileAuthority | undefined,
   /** The shared profile cache. A first message reads its 1:1 partner's
    * agent flag from it, and the people directory stays outside it. */
-  profiles?: Pick<ProfileQueries, "ensure">,
+  profiles?: Pick<ProfileQueries, "ensure" | "snapshot" | "event">,
+  /** Identity labels, which tell namesakes apart, for an agent's refusal. */
+  names?: Pick<IdentityNameView, "resolve">,
 ) {
   const available = !!transport?.openDirectMessage && !!outbox?.supports(9);
   const opened = new Set<(id: string) => void>();
+  /** `error`, or, for an agent's add-policy refusal, what to show with the
+   * agent and its verified owner named, so the person knows whom to ask. A
+   * failed read still refuses, without that name. */
+  async function refused(error: unknown, adding: boolean, signal: AbortSignal) {
+    const refusal = agentPolicyRefusal(
+      error instanceof Error ? error.message : undefined,
+    );
+    if (!refusal) return error;
+    const label = (key: string) => {
+      const profile = profiles?.snapshot().get(key);
+      const name =
+        profile && !profile.nameIsFallback ? profile.name : undefined;
+      return names ? names.resolve(key, name) : name;
+    };
+    await profiles?.ensure([refusal.agent], "foreground").catch(() => {});
+    signal.throwIfAborted();
+    const head = profiles?.event?.(refusal.agent);
+    const owner =
+      refusal.policy === "owner_only" && head && hasEventProof(head)
+        ? await attestedOwner(head)
+        : undefined;
+    if (owner) await profiles?.ensure([owner], "foreground").catch(() => {});
+    signal.throwIfAborted();
+    return new Error(
+      agentPolicyMessage(
+        adding,
+        refusal,
+        label(refusal.agent),
+        owner && label(owner),
+      ),
+    );
+  }
   /** The DM `id` as signed discovery shows it, once it holds `required`.
    * Only signed discovery can admit it: never trust a receipt as membership. */
   async function confirmed(
@@ -203,11 +241,15 @@ export function createDirectMessages(
         throw new Error("Choose between one and eight other people.");
       const active = AbortSignal.any([lifetime, signal]);
       active.throwIfAborted();
-      const id = await transport.openDirectMessage(
-        pubkeys,
-        active,
-        includeHistory ? { includeHistory } : undefined,
-      );
+      const id = await transport
+        .openDirectMessage(
+          pubkeys,
+          active,
+          includeHistory ? { includeHistory } : undefined,
+        )
+        .catch(async (error: unknown) => {
+          throw await refused(error, false, active);
+        });
       active.throwIfAborted();
       // The relay may return the DM of these people with agents they did
       // not name: it decides who is an agent, so only who is named is checked.
@@ -243,10 +285,10 @@ export function createDirectMessages(
       active.throwIfAborted();
       const id = await transport
         .openDirectMessage(pubkeys, active, { channelId, includeHistory })
-        .catch((error: unknown) => {
+        .catch(async (error: unknown) => {
           throw error instanceof Error && error.message === NEEDS_HISTORY_CHOICE
             ? new NeedsHistoryChoice()
-            : error;
+            : await refused(error, true, active);
         });
       active.throwIfAborted();
       await confirmed(id, [transport.viewer, ...pubkeys], active);

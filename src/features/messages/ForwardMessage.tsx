@@ -33,7 +33,7 @@ import {
   RecipientPicker,
   type RecipientChannel,
 } from "../direct-messages/RecipientPicker";
-import type { Recipient } from "../direct-messages/usePeople";
+import { recipientView, type Recipient } from "../direct-messages/usePeople";
 import {
   useVerifiedNames,
   withVerifiedNames,
@@ -512,8 +512,14 @@ function ForwardMessageDialog({
                   channelId: source.channelId,
                   forward: source.forward,
                 },
-                people,
-                channel,
+                people: people.map(recipientView),
+                // The picker's summary carries the roster, which can exceed
+                // the outbox's recovery budget in large channels.
+                channel: channel && {
+                  id: channel.id,
+                  name: channel.name,
+                  private: channel.private,
+                },
                 note,
               }),
             },
@@ -522,6 +528,8 @@ function ForwardMessageDialog({
           people,
           channel,
         };
+        // This dialog's own send keeps its selection, avatars included.
+        if (!saved) restored.current = sent.id;
       }
       await session.directMessages.delivered(
         sent.id,

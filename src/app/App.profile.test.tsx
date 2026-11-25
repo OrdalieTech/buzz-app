@@ -1111,3 +1111,85 @@ it.each(["Close", "Back"] as const)(
   },
   15_000,
 );
+
+// Whole-app journeys through several Settings sections run slower in CI.
+it("opens Software updates and checks from the macOS menu request, not behind a modal", async () => {
+  const user = await setup();
+  if (!services) throw new Error("Missing services");
+  const updates = services.updates;
+  const request = () =>
+    act(() => {
+      window.dispatchEvent(new Event("buzz:check-for-updates"));
+    });
+  const confirmation = document.createElement("div");
+  confirmation.setAttribute("role", "alertdialog");
+  confirmation.setAttribute("aria-modal", "true");
+  document.body.append(confirmation);
+  try {
+    request();
+    await act(async () => {});
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+    expect(updates.snapshot().state).toBe("idle");
+  } finally {
+    confirmation.remove();
+  }
+  // Settings is itself a modal. A section opened outside the selected
+  // community's scope, with an unsaved edit, asks before the request leaves it.
+  // Keeping the edit cancels the request, so nothing is checked.
+  const current = services;
+  await act(async () => {
+    void current.navigation.open({
+      version: 1,
+      kind: "settings",
+      section: "profile",
+    });
+  });
+  const settings = await screen.findByRole("dialog", { name: "Settings" });
+  const name = await within(settings).findByRole("textbox", {
+    name: "Display name",
+  });
+  await waitFor(() => expect(name).toHaveValue("Community name"));
+  await user.clear(name);
+  await user.type(name, "Unsaved name");
+  const discard = () =>
+    screen.findByRole("alertdialog", { name: "Discard changes?" });
+  request();
+  await user.click(
+    within(await discard()).getByRole("button", { name: "Keep editing" }),
+  );
+  await act(async () => {});
+  expect(name).toHaveValue("Unsaved name");
+  expect(updates.snapshot().state).toBe("idle");
+  request();
+  await user.click(
+    within(await discard()).getByRole("button", { name: "Discard changes" }),
+  );
+  expect(
+    await within(settings).findByRole("heading", { name: "Software updates" }),
+  ).toBeVisible();
+  await waitFor(() => expect(updates.snapshot().state).not.toBe("idle"));
+  // From a section in the selected community's scope, as its sidebar opens
+  // them, the request switches section without a discard prompt.
+  const { viewer, selected } = current.communities.snapshot();
+  if (!viewer || !selected) throw new Error("Missing selected community");
+  await act(async () => {
+    void current.navigation.open({
+      version: 1,
+      kind: "settings",
+      section: "profile",
+      scope: { viewer, communityOrigin: communityDestination(selected).url },
+    });
+  });
+  const scopedName = await within(settings).findByRole("textbox", {
+    name: "Display name",
+  });
+  await user.clear(scopedName);
+  await user.type(scopedName, "Unsaved name");
+  request();
+  expect(
+    await within(settings).findByRole("heading", { name: "Software updates" }),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("alertdialog", { name: "Discard changes?" }),
+  ).toBeNull();
+}, 15_000);

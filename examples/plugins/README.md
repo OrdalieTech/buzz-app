@@ -6,7 +6,7 @@ All example plugins live here with `manifest.json` and prebuilt `plugin.js` file
 - `shortcut-counter`: offline keyboard-shortcut consumer; Command+Shift+G /
   Control+Shift+G increments through the injected host service. Requires `shortcuts`.
 - `broken-page`: intentionally fails when its page renders to exercise error handling.
-- `host-controls`: offline switch and name dialog built from the host's `ui` controls, with a
+- `host-controls`: offline switch, name dialog and actions menu built from the host's `ui` controls, with a
   notice on hosts without them.
 
 ## Try the offline playgrounds
@@ -65,7 +65,7 @@ you can extend `counter/manifest.json` like this:
 }
 ```
 
-Choose the category from the [recognized Settings categories](../../docs/plugin-architecture.md#writing-plugin-discovery-metadata).
+Choose the category from the [recognized Settings categories](../../src/app/plugin-categories.ts).
 The description explains the behavior; tags add useful search terms. These
 optional fields do not change the runtime API version.
 Older hosts reject `description` and `discovery`, so omit both when targeting them.
@@ -85,7 +85,3 @@ Explore a plugin page with a simple click counter.
    from page navigation.
 2. Click the counter button to increment the count.
 ```
-
-See [plugin README guidance](../../docs/plugin-architecture.md#writing-the-plugin-readme)
-and [packaging limits](../../docs/plugin-architecture.md#loading-from-folders-and-repositories)
-before adding README or branding files to a build.

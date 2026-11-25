@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 // Each screen's raw-HTML, image and URL policy, recorded before the shared
 // renderer existed. Only Attention changes: it gained GFM autolinks.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, expect, it } from "vitest";
 import { PluginReadme } from "../../app/PluginReadme";
@@ -133,11 +139,15 @@ async function observe(screenName: string, element: ReactElement) {
   const { container } = render(element, { wrapper: ToastProvider });
   if (screenName === "memory")
     fireEvent.click(await screen.findByRole("button", { name: "core" }));
+  if (screenName === "transcript")
+    fireEvent.click(screen.getByText("Ada", { selector: "summary span" }));
   const selector = BODIES[screenName];
   const root = selector
-    ? (((await screen.findAllByText(() => true)) &&
-        container.querySelector(selector)) ??
-      container)
+    ? await waitFor(() => {
+        const body = container.querySelector(selector);
+        if (!body) throw new Error(`Waiting for ${screenName} Markdown`);
+        return body;
+      })
     : container;
   const record = {
     elements: ["script", "mark", "img"]

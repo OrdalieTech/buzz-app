@@ -95,3 +95,58 @@ it("renders controlled native reply grouping through a retained reader's UI", as
     screen.queryByRole("button", { name: /View .* replies?/ }),
   ).not.toBeInTheDocument();
 });
+
+it("gives plugins the host image viewer for an image outside any message", async () => {
+  const host = new Context();
+  const relayed = "https://relay.fixture.test/media/abc.png";
+  // A session without transport reads no media, as before connecting.
+  let media = (_url: string): string | undefined => undefined;
+  const snapshot = {
+    origin: "https://relay.fixture.test",
+    session: { media: (url: string) => media(url) },
+  };
+  host.provide("relay", {
+    snapshot: () => snapshot,
+    subscribe: () => () => {},
+  } as never);
+  const runtime = new PluginRuntime(host, async () => ({ apply() {} }));
+  const conversation = new ConversationService(host);
+  dispose.push(async () => {
+    await runtime.dispose();
+    await host.fiber.dispose();
+  });
+
+  function Picture({ src }: { src: string }) {
+    const [open, setOpen] = useState(true);
+    return open
+      ? createElement(conversation.ui.ImageViewer, {
+          src,
+          name: "Screenshot",
+          onClose: () => setOpen(false),
+        })
+      : null;
+  }
+
+  // Third-party images load directly, whatever the session can read.
+  const external = render(
+    createElement(Picture, { src: "https://fixture.test/screenshot.png" }),
+  );
+  expect(
+    screen.getByRole("dialog", { name: "Image viewer" }),
+  ).toHaveTextContent("Screenshot");
+  expect(screen.getByRole("img")).toHaveAttribute(
+    "src",
+    "https://fixture.test/screenshot.png",
+  );
+  await userEvent.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  external.unmount();
+
+  // Relay media gets the session's signed read, as message media does.
+  media = (url) => `/api/relay/media?url=${encodeURIComponent(url)}`;
+  render(createElement(Picture, { src: relayed }));
+  expect(screen.getByRole("img")).toHaveAttribute(
+    "src",
+    `/api/relay/media?url=${encodeURIComponent(relayed)}`,
+  );
+});

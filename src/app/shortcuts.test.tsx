@@ -62,6 +62,7 @@ function harness(platform = "Win32") {
     openSettings,
     true,
     reload,
+    bindings,
   );
   return {
     ctx,
@@ -603,6 +604,46 @@ it.each([
     } finally {
       remove();
       controller.dispose();
+      await h.dispose();
+    }
+  },
+);
+
+it("macOS desktop leaves the default Mod+, to the Settings menu, not a rebound chord", async () => {
+  const h = harness("MacIntel");
+  const comma = { key: ",", metaKey: true, ctrlKey: false };
+  try {
+    // Unhandled, the key reaches Buzz → Settings…, which flashes and opens it.
+    expect(press(document.body, comma).defaultPrevented).toBe(false);
+    expect(h.openSettings).not.toHaveBeenCalled();
+    window.dispatchEvent(new Event("buzz:open-settings"));
+    expect(h.openSettings).toHaveBeenCalledOnce();
+    act(() => h.bindings.set("settings", { key: ";", mod: true }));
+    expect(press(document.body, { ...comma, key: ";" }).defaultPrevented).toBe(
+      true,
+    );
+    expect(h.openSettings).toHaveBeenCalledTimes(2);
+    expect(press(document.body, comma).defaultPrevented).toBe(false);
+    expect(h.openSettings).toHaveBeenCalledTimes(2);
+  } finally {
+    await h.dispose();
+  }
+});
+
+it.each([
+  [true, "Win32", { ctrlKey: true }],
+  [false, "MacIntel", { metaKey: true, ctrlKey: false }],
+])(
+  "desktop=%s, platform=%s: the page opens Settings with Mod+,",
+  async (desktop, platform, mod) => {
+    vi.mocked(isTauri).mockReturnValue(desktop);
+    const h = harness(platform);
+    try {
+      expect(press(document.body, { key: ",", ...mod }).defaultPrevented).toBe(
+        true,
+      );
+      expect(h.openSettings).toHaveBeenCalledOnce();
+    } finally {
       await h.dispose();
     }
   },

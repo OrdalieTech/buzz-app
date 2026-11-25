@@ -124,6 +124,8 @@ struct Slot {
 struct Cached {
     /// The owner's retirements when it was minted; any later one retires it.
     retirements: u64,
+    /// The owner's sign-ins before it was minted; any later one retires it.
+    sign_ins: u64,
     /// The account that enrolled its grant; any other signed-in account retires it.
     account: String,
     relay: String,
@@ -576,9 +578,11 @@ impl AgentTokens {
             return Err(DELETED.into());
         }
         let retirements = self.admit().await?;
+        let sign_ins = self.0.identity.sign_ins();
         let account = self.account();
         if let Some(cached) = &slot.assertion {
             if cached.retirements == retirements
+                && cached.sign_ins == sign_ins
                 && account
                     .as_ref()
                     .is_none_or(|account| *account == cached.account)
@@ -657,6 +661,7 @@ impl AgentTokens {
         }
         let cached = Cached {
             retirements,
+            sign_ins,
             grants: lock(&self.0.incarnations)
                 .get(&agent.pubkey)
                 .copied()
@@ -940,6 +945,7 @@ impl AgentTokens {
             received: super::assertion::Received::at(monotonic_now, wall_now),
             grants: 0,
             retirements: 0,
+            sign_ins: 0,
             account: grant.account.clone(),
             relay,
         })

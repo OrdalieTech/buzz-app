@@ -1,13 +1,21 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, assert, expect, it, vi } from "vitest";
+import { verifyEvent } from "nostr-tools";
 import { createRelaySession, type RelaySession } from "../relay/session";
-import { PublishRejected, type OutgoingEvent } from "../relay/outbox";
+import {
+  PublishRejected,
+  type OutboxStorage,
+  type OutgoingEvent,
+} from "../relay/outbox";
 import { matchesEvent } from "../relay/projection";
 import { keypair, roster, signed } from "../relay/testing";
 import type { RelayEvent } from "../relay/events";
+import { acceptPublish } from "../relay/transport";
 import {
   addChannelMember,
   addChannelMembersAtOnce,
   canAddMembers,
+  canAddToDirectMessage,
+  canShareSoloChat,
 } from "./members";
 
 const cleanups: (() => void)[] = [];
@@ -597,27 +605,43 @@ it.each(["rejected", "unknown", "unconfirmed"])(
   },
 );
 
-it("allows a new explicit addition after an expired failed request is dismissed", async () => {
+it.each([undefined, "example-import"])(
+  "replaces an expired failed request on a new explicit addition (migration=%s)",
+  async (migration) => {
+    const t = setup();
+    await t.ready();
+    const add = () =>
+      t.session.memberAdditions.add(t.id, t.person.pubkey, { migration });
+    t.setFail("Rejected addition");
+    await expect(add()).rejects.toThrow(/Rejected addition/);
+    const first = t.publish.mock.calls[0]?.[0].id;
+    if (!first) throw new Error("Expected invitation");
+    t.setFail("");
+    afterInvitationWindow(t);
+    await add();
+    expect(t.publish).toHaveBeenCalledTimes(2);
+    const replacement = t.publish.mock.calls[1]?.[0];
+    expect(replacement?.id).not.toBe(first);
+    expect(replacement?.tags.filter(([tag]) => tag === "migration")).toEqual(
+      migration === undefined ? [] : [["migration", migration]],
+    );
+    expect(t.records().find((item) => item.event.id === first)).toBeUndefined();
+  },
+);
+
+it("doesn't replace an expired failed request on Retry", async () => {
   const t = setup();
   await t.ready();
   t.setFail("Rejected addition");
   await expect(t.managedAdd()).rejects.toThrow(/Rejected addition/);
   const first = t.publish.mock.calls[0]?.[0].id;
-  if (!first) throw new Error("Expected invitation");
-  const now = vi
-    .spyOn(Date, "now")
-    .mockReturnValue(Date.now() + 16 * 60 * 1000);
-  try {
-    await expect(t.managedAdd()).rejects.toThrow(/addition expired/);
-  } finally {
-    now.mockRestore();
-  }
-  await t.session.outbox?.dismiss(first);
-  expect(t.session.outbox?.snapshot()).toEqual([]);
   t.setFail("");
-  await t.managedAdd();
-  expect(t.publish).toHaveBeenCalledTimes(2);
-  expect(t.publish.mock.calls[1]?.[0].id).not.toBe(first);
+  afterInvitationWindow(t);
+  await expect(
+    t.session.memberAdditions.add(t.id, t.person.pubkey, { retry: true }),
+  ).rejects.toThrow(/addition expired/);
+  expect(t.publish).toHaveBeenCalledOnce();
+  expect(t.records()).toMatchObject([{ event: { id: first } }]);
 });
 
 it("keeps the exact failed request when durable dismissal fails", async () => {
@@ -1335,12 +1359,15 @@ function batchSetup(applyAll = true) {
   let clock = 1700000000;
   let records: readonly OutgoingEvent[] = [];
   const published: RelayEvent[] = [];
-  let onPublish = () => {};
+  let onPublish: (event: RelayEvent) => unknown = () => {};
+  let onSign: () => void | Promise<void> = () => {};
+  let onLockWait = () => {};
+  let onJournalRead: () => void | Promise<void> = () => {};
   let rosterReads = 0;
   let failRosterRead = 0;
   let rosterDown = false;
   const publish = vi.fn(async (event: RelayEvent) => {
-    onPublish();
+    await onPublish(event);
     const named = event.tags.flatMap(([tag, value]) =>
       tag === "p" && value ? [value] : [],
     );
@@ -1348,64 +1375,97 @@ function batchSetup(applyAll = true) {
     clock++;
     published.push(event);
   });
-  const owner = createRelaySession(
-    {
-      viewer: viewer.pubkey,
-      relayAuthor: relay.pubkey,
-      media: () => undefined,
-      readAgentLibrary: async () => ({
-        definitions: [],
-        identities: [{ pubkey: agent.pubkey, name: "Agent" }],
-      }),
-      writer: {
-        kinds: [9, 9000, 9007],
-        sign: async (template) => signed(viewer, template),
-        publish: async (event) => {
-          await publish(event);
-        },
+  const transport: Parameters<typeof createRelaySession>[0] = {
+    viewer: viewer.pubkey,
+    relayAuthor: relay.pubkey,
+    media: () => undefined,
+    readAgentLibrary: async () => ({
+      definitions: [],
+      identities: [{ pubkey: agent.pubkey, name: "Agent" }],
+    }),
+    writer: {
+      kinds: [9, 9000, 9007],
+      sign: async (template) => {
+        await onSign();
+        return signed(viewer, template);
       },
-      query: async (filters) => {
-        if (filters.some((filter) => filter.kinds?.includes(39002)))
-          if (++rosterReads === failRosterRead || rosterDown)
-            throw new Error("Roster unavailable");
-        return [
-          signed(relay, {
-            kind: 39000,
-            content: "",
-            tags: [
-              ["d", id],
-              ["t", "stream"],
-              ["private"],
-              ["join_role", "guest"],
-              ["name", "Design"],
-            ],
-          }),
-          roster(relay, id, members, clock),
-        ].filter((event) =>
-          filters.some((filter) => matchesEvent(event, filter)),
-        );
+      publish: async (event) => {
+        await publish(event);
       },
     },
-    {
-      outboxStorage: {
-        load: () => records,
-        save: (next) => {
-          records = structuredClone(next);
-        },
-      },
+    query: async (filters) => {
+      if (filters.some((filter) => filter.kinds?.includes(39002)))
+        if (++rosterReads === failRosterRead || rosterDown)
+          throw new Error("Roster unavailable");
+      return [
+        signed(relay, {
+          kind: 39000,
+          content: "",
+          tags: [
+            ["d", id],
+            ["t", "stream"],
+            ["private"],
+            ["join_role", "guest"],
+            ["name", "Design"],
+          ],
+        }),
+        roster(relay, id, members, clock),
+      ].filter((event) =>
+        filters.some((filter) => matchesEvent(event, filter)),
+      );
     },
-  );
-  cleanups.push(() => owner.dispose());
+  };
+  const locks = new Map<string, Promise<unknown>>();
+  const storage: OutboxStorage = {
+    lock(id, run) {
+      const before = locks.get(id);
+      if (before) onLockWait();
+      const work = (before ?? Promise.resolve()).then(run, run);
+      locks.set(id, work);
+      const clear = () => {
+        if (locks.get(id) === work) locks.delete(id);
+      };
+      void work.then(clear, clear);
+      return work;
+    },
+    async load(options) {
+      if (options?.readOnly) await onJournalRead();
+      return records;
+    },
+    save: (next) => {
+      records = structuredClone(next);
+    },
+  };
+  const openWindow = () => {
+    const owner = createRelaySession(transport, { outboxStorage: storage });
+    cleanups.push(owner.dispose);
+    return owner.session;
+  };
+  const session = openWindow();
   return {
-    session: owner.session,
+    session,
+    openWindow,
     id,
     agent,
     published,
+    publish,
     records: () => records,
+    dismissInAnotherWindow(id: string) {
+      records = records.filter((item) => item.event.id !== id);
+    },
     members: () => members,
     /** Runs as the relay receives each write, e.g. another owner's admission. */
-    onPublish(run: () => void) {
+    onPublish(run: typeof onPublish) {
       onPublish = run;
+    },
+    onSign(run: typeof onSign) {
+      onSign = run;
+    },
+    onLockWait(run: typeof onLockWait) {
+      onLockWait = run;
+    },
+    onJournalRead(run: typeof onJournalRead) {
+      onJournalRead = run;
     },
     /** Fails the relay's nth roster read from now. */
     failRosterRead(nth: number) {
@@ -1419,21 +1479,25 @@ function batchSetup(applyAll = true) {
       members = [...members, key];
       clock++;
     },
-    async ready() {
-      owner.session.channels.ensureList();
-      await vi.waitFor(() =>
-        expect(owner.session.channels.list().status).toBe("ready"),
-      );
-      await owner.session.agentChoices.refresh();
+    async ready(view = session) {
+      view.channels.ensureList();
+      await vi.waitFor(() => expect(view.channels.list().status).toBe("ready"));
+      await view.agentChoices.refresh();
     },
     addAll: (keys: readonly string[]) =>
-      Promise.all(
-        keys.map((key) => owner.session.memberAdditions.add(id, key)),
-      ),
+      Promise.all(keys.map((key) => session.memberAdditions.add(id, key))),
   };
 }
 const people = (count: number) =>
   Array.from({ length: count }, () => keypair().pubkey);
+
+function gate<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((finish) => {
+    resolve = finish;
+  });
+  return { promise, resolve };
+}
 
 it("adds people requested together in one write per role and 100 people", async () => {
   const t = batchSetup();
@@ -1457,18 +1521,398 @@ it("adds people requested together in one write per role and 100 people", async 
   expect(t.records().filter((item) => !item.acknowledged)).toEqual([]);
 });
 
-it("adds anyone a relay without batch support missed one at a time", async () => {
-  const t = batchSetup(false);
+it.each([undefined, "slack"])(
+  "adds missed people individually on a legacy relay (migration=%s)",
+  async (migration) => {
+    const t = batchSetup(false);
+    await t.ready();
+    const [first = "", second = "", third = ""] = people(3);
+    await Promise.all(
+      [first, second, third].map((key) =>
+        t.session.memberAdditions.add(t.id, key, { migration }),
+      ),
+    );
+    expect(
+      t.published.map((event) =>
+        event.tags.flatMap(([tag, value]) => (tag === "p" ? [value] : [])),
+      ),
+    ).toEqual([[first, second, third], [second], [third]]);
+    for (const event of t.published) {
+      expect(verifyEvent(structuredClone(event))).toBe(true);
+      expect(event.tags.filter(([tag]) => tag === "migration")).toEqual(
+        migration === undefined ? [] : [["migration", "slack"]],
+      );
+    }
+    expect(t.members()).toEqual(expect.arrayContaining([first, second, third]));
+    expect(t.session.memberAdditions.snapshot()).toEqual([]);
+  },
+);
+
+it("sends separate signed membership batches for each source", async () => {
+  const t = batchSetup();
   await t.ready();
-  const [first = "", second = "", third = ""] = people(3);
-  await t.addAll([first, second, third]);
+  const [a = "", b = "", c = "", d = "", e = "", f = ""] = people(6);
+  await Promise.all([
+    t.session.memberAdditions.add(t.id, a, { migration: "slack" }),
+    t.session.memberAdditions.add(t.id, b),
+    t.session.memberAdditions.add(t.id, c, { migration: "example-import" }),
+    t.session.memberAdditions.add(t.id, d, { migration: "slack" }),
+    t.session.memberAdditions.add(t.id, e),
+    t.session.memberAdditions.add(t.id, f, { migration: "example-import" }),
+  ]);
+  expect(t.published).toHaveLength(3);
   expect(
-    t.published.map((event) =>
-      event.tags.flatMap(([tag, value]) => (tag === "p" ? [value] : [])),
+    t.published.map(({ tags }) =>
+      tags.filter(([tag]) => tag === "p" || tag === "migration"),
     ),
-  ).toEqual([[first, second, third], [second], [third]]);
-  expect(t.members()).toEqual(expect.arrayContaining([first, second, third]));
-  expect(t.session.memberAdditions.snapshot()).toEqual([]);
+  ).toEqual(
+    expect.arrayContaining([
+      [
+        ["p", a],
+        ["p", d],
+        ["migration", "slack"],
+      ],
+      [
+        ["p", b],
+        ["p", e],
+      ],
+      [
+        ["p", c],
+        ["p", f],
+        ["migration", "example-import"],
+      ],
+    ]),
+  );
+});
+
+it.each([
+  [
+    429,
+    { error: "rate-limited: quota exceeded; retry in 5s" },
+    "rate-limited: quota exceeded; retry in 5s",
+  ],
+  [502, {}, "Relay delivery could not be confirmed (502)"],
+] as const)(
+  "stops a migration batch after HTTP delivery fails (%s)",
+  async (status, refusal, message) => {
+    const t = batchSetup();
+    await t.ready();
+    t.onPublish((event) =>
+      acceptPublish(Response.json(refusal, { status }), event.id),
+    );
+    const members = [...people(2), t.agent.pubkey];
+    const add = () =>
+      Promise.allSettled(
+        members.map((key) =>
+          t.session.memberAdditions.add(t.id, key, { migration: "slack" }),
+        ),
+      );
+    const results = await add();
+    expect(results).toEqual(
+      Array.from({ length: 3 }, () => ({
+        status: "rejected",
+        reason: new Error(message),
+      })),
+    );
+    expect(t.publish).toHaveBeenCalledOnce();
+    const [event] = t.publish.mock.lastCall ?? [];
+    expect(event?.tags.filter(([tag]) => tag === "p")).toHaveLength(2);
+    expect(event?.tags).toContainEqual(["migration", "slack"]);
+    const [saved] = t.records().filter((item) => !item.acknowledged);
+    expect(saved?.signed).toEqual(structuredClone(event));
+    await add();
+    expect(
+      t.publish.mock.calls.map(([attempt]) => structuredClone(attempt)),
+    ).toEqual([saved?.signed, saved?.signed]);
+    expect(t.records().filter((item) => !item.acknowledged)).toHaveLength(1);
+  },
+);
+
+it.each([
+  { missing: 1, dismissed: true },
+  { missing: 2, dismissed: true },
+  { missing: 1, dismissed: false },
+  { missing: 2, dismissed: false },
+])(
+  "Retry checks batch ownership with $missing missing and dismissed=$dismissed",
+  async ({ missing, dismissed }) => {
+    const t = batchSetup();
+    await t.ready();
+    const members = people(3);
+    const add = (batchReceipt?: string) =>
+      Promise.allSettled(
+        members.map((key) =>
+          t.session.memberAdditions.add(t.id, key, {
+            migration: "slack",
+            batchReceipt,
+          }),
+        ),
+      );
+    t.onPublish(() => {
+      throw new PublishRejected("Not sent");
+    });
+    const initial = await add();
+    expect(initial.every((result) => result.status === "rejected")).toBe(true);
+    const [original] = t.records();
+    if (!original) throw new Error("Expected the saved batch");
+    for (const key of members.slice(missing)) t.admit(key);
+    if (dismissed) t.dismissInAnotherWindow(original.event.id);
+    t.onPublish(() => {});
+    await add(original.event.id);
+    if (dismissed) expect(t.publish).toHaveBeenCalledOnce();
+    else {
+      expect(t.publish).toHaveBeenCalledTimes(2);
+      expect(t.published[0]?.tags).toContainEqual(["migration", "slack"]);
+      expect(t.published[0]?.tags.filter(([kind]) => kind === "p")).toEqual(
+        members.slice(0, missing).map((key) => ["p", key]),
+      );
+    }
+    expect(t.session.outbox?.snapshot()).toEqual([]);
+  },
+);
+
+it("reuses the signed narrowed batch across windows and successive roster changes", async () => {
+  const t = batchSetup();
+  await t.ready();
+  const members = people(4);
+  const add = (
+    batchReceipt?: string,
+    session = t.session,
+    requested = members,
+  ) =>
+    Promise.allSettled(
+      requested.map((key) =>
+        session.memberAdditions.add(t.id, key, {
+          migration: "slack",
+          batchReceipt,
+        }),
+      ),
+    );
+  t.onPublish(() => {
+    throw new PublishRejected("Not sent");
+  });
+  await add();
+  const [original] = t.records();
+  if (!original) throw new Error("Expected the saved batch");
+  const stale = t.openWindow();
+  await t.ready(stale);
+  t.admit(members[0] ?? "");
+  await add(original.event.id);
+  await add(original.event.id, stale);
+  const smaller = t.publish.mock.calls[1]?.[0];
+  if (!smaller) throw new Error("Expected a narrowed batch");
+  t.admit(members[1] ?? "");
+  await add(smaller.id, stale, members.slice(1));
+  await add(original.event.id);
+  const narrowest = t.publish.mock.calls[3]?.[0];
+  expect(narrowest?.tags.filter(([tag]) => tag === "p")).toEqual(
+    members.slice(2).map((key) => ["p", key]),
+  );
+  expect(t.publish.mock.calls.map(([event]) => event.id)).toEqual([
+    original.event.id,
+    smaller.id,
+    smaller.id,
+    narrowest?.id,
+    narrowest?.id,
+  ]);
+  expect(t.records()).toHaveLength(3);
+  t.dismissInAnotherWindow(original.event.id);
+  await add(original.event.id);
+  expect(t.publish).toHaveBeenCalledTimes(5);
+});
+
+it("waits for the original batch when a different window loaded it before signing", async () => {
+  const t = batchSetup();
+  await t.ready();
+  const members = people(3);
+  const signing = gate();
+  const signed = gate();
+  const delivery = gate();
+  const receipt = gate();
+  const retryProgress = gate<string>();
+  t.onSign(() => {
+    signing.resolve();
+    return signed.promise;
+  });
+  const add = (session: RelaySession, batchReceipt?: string) =>
+    Promise.allSettled(
+      members.map((key) =>
+        session.memberAdditions.add(t.id, key, {
+          migration: "slack",
+          batchReceipt,
+        }),
+      ),
+    );
+  const initial = add(t.session);
+  let retry: ReturnType<typeof add> | undefined;
+  try {
+    await signing.promise;
+    const original = t.records()[0];
+    if (!original) throw new Error("Expected the original batch intent");
+    expect(original.signed).toBeUndefined();
+    const stale = t.openWindow();
+    await t.ready(stale);
+    t.admit(members[0] ?? "");
+    t.onPublish((event) => {
+      if (event.id !== original.event.id) {
+        retryProgress.resolve("sent a replacement");
+        return;
+      }
+      delivery.resolve();
+      return receipt.promise;
+    });
+    signed.resolve();
+    await delivery.promise;
+    t.onLockWait(() => retryProgress.resolve("waited for delivery"));
+    retry = add(stale, original.event.id);
+    expect(await retryProgress.promise).toBe("waited for delivery");
+  } finally {
+    signed.resolve();
+    receipt.resolve();
+    await initial;
+    if (retry)
+      expect(await retry).toEqual(
+        members.map(() => ({ status: "fulfilled", value: undefined })),
+      );
+  }
+  expect(t.publish).toHaveBeenCalledOnce();
+});
+
+it("retries the exact labeled single after restart and refuses a different source", async () => {
+  const t = setup();
+  await t.ready();
+  const add = (options?: Parameters<typeof t.session.memberAdditions.add>[2]) =>
+    t.session.memberAdditions.add(t.id, t.person.pubkey, options);
+  t.setFail("Connection lost after dispatch", true);
+  await expect(add({ migration: "slack" })).rejects.toThrow(/Connection lost/);
+  const original = structuredClone(t.publish.mock.lastCall?.[0]);
+  expect(original?.tags).toContainEqual(["migration", "slack"]);
+  await vi.waitFor(() => expect(t.records()[0]?.signed).toEqual(original));
+  t.restart();
+  await t.ready();
+  await expect(add()).rejects.toThrow(/different migration source/);
+  expect(t.publish).toHaveBeenCalledOnce();
+  t.setFail("rate-limited: quota exceeded; retry in 2s");
+  await expect(add({ migration: "slack", retry: true })).rejects.toThrow(
+    /^rate-limited:/,
+  );
+  t.setFail("");
+  await add({ migration: "slack", retry: true });
+  await add();
+  expect(t.publish.mock.calls.map(([event]) => structuredClone(event))).toEqual(
+    [original, original, original],
+  );
+});
+
+it("stops a migration single retry when the member joins while recovery waits", async () => {
+  const t = batchSetup();
+  await t.ready();
+  const person = keypair().pubkey;
+  const add = (retry?: true) =>
+    t.session.memberAdditions.add(t.id, person, {
+      migration: "slack",
+      ...(retry && { retry }),
+    });
+  t.onPublish(() => {
+    throw new PublishRejected("Not sent");
+  });
+  await expect(add()).rejects.toThrow("Not sent");
+  const [receipt] = t.records();
+  const outbox = t.session.outbox;
+  if (!receipt?.recovery || !outbox?.withRecovery)
+    throw new Error("Expected a recoverable addition");
+
+  const entered = gate();
+  const releaseAdoption = gate();
+  const releaseReplay = gate();
+  const adoptionQueued = gate();
+  const otherQueued = gate();
+  const replayQueued = gate();
+  const { recovery } = receipt;
+  const holdAdoption = outbox.withRecovery(receipt.event.id, recovery, () => {
+    entered.resolve();
+    return releaseAdoption.promise;
+  });
+  const work = [holdAdoption];
+  try {
+    await entered.promise;
+    t.onLockWait(adoptionQueued.resolve);
+    t.onPublish(() => {});
+    const retry = add(true);
+    const outcome = expect(retry).rejects.toThrow(
+      "Membership changed during retry. Try again.",
+    );
+    work.push(retry);
+    void outcome.catch(() => {});
+    await adoptionQueued.promise;
+    // Queue a second window's lock between receipt adoption and publication.
+    const other = t.openWindow().outbox;
+    if (!other?.withRecovery)
+      throw new Error("Expected recovery in both windows");
+    t.onLockWait(otherQueued.resolve);
+    work.push(
+      other.withRecovery(
+        receipt.event.id,
+        recovery,
+        () => releaseReplay.promise,
+      ),
+    );
+    await otherQueued.promise;
+    t.onLockWait(replayQueued.resolve);
+    releaseAdoption.resolve();
+    await replayQueued.promise;
+    t.admit(person);
+    await t.session.channelWrites.refreshMembership(t.id);
+    releaseReplay.resolve();
+    await outcome;
+  } finally {
+    releaseAdoption.resolve();
+    releaseReplay.resolve();
+    await Promise.allSettled(work);
+  }
+  expect(t.publish).toHaveBeenCalledOnce();
+});
+
+it("checks fresh migration recipients after reading the journal before publishing", async () => {
+  const t = batchSetup();
+  await t.ready();
+  const first = keypair().pubkey;
+  const second = keypair().pubkey;
+  const entered = gate();
+  const release = gate();
+  t.onJournalRead(() => {
+    // Pause the batch's receipt lookup after the initial pending singles read.
+    t.onJournalRead(() => {
+      entered.resolve();
+      return release.promise;
+    });
+  });
+  const add = () =>
+    Promise.allSettled(
+      [first, second].map((key) =>
+        t.session.memberAdditions.add(t.id, key, { migration: "slack" }),
+      ),
+    );
+  const initial = add();
+  try {
+    await entered.promise;
+    t.admit(first);
+    await t.session.channelWrites.refreshMembership(t.id);
+  } finally {
+    release.resolve();
+    await initial;
+  }
+  expect(await initial).toEqual(
+    [first, second].map(() => ({
+      status: "rejected",
+      reason: new Error("Membership changed before the addition. Try again."),
+    })),
+  );
+  expect(t.publish).not.toHaveBeenCalled();
+  await add();
+  expect(
+    t.published.map((event) => event.tags.filter(([tag]) => tag === "p")),
+  ).toEqual([[["p", second]]]);
 });
 
 it("leaves a pending single addition to resume, never batching its person again", async () => {
@@ -1662,3 +2106,88 @@ it("leaves out someone archived while the roster is read", async () => {
     ),
   ).toEqual([[first, second]]);
 });
+
+it("keeps invitation and Solo sharing viewer gates independent of unloaded peers", () => {
+  const session = { viewer: "viewer", outbox: { supports: () => true } };
+  const channel = {
+    id: "channel",
+    name: "Updates",
+    channelType: "stream" as const,
+    viewerMembership: { pubkey: "viewer", joined: true },
+  };
+  expect(canAddMembers(session, channel)).toBe(true);
+  expect(canAddMembers(session, { ...channel, viewerRole: "guest" })).toBe(
+    false,
+  );
+  expect(canAddMembers(session, { ...channel, archived: true })).toBe(false);
+  expect(
+    canAddMembers(session, {
+      ...channel,
+      members: ["viewer"],
+      viewerMembership: { pubkey: "viewer", joined: false },
+    }),
+  ).toBe(false);
+  const soloSession = setup("solo").session;
+  assert(soloSession.viewer);
+  const solo = {
+    ...channel,
+    channelType: "solo" as const,
+    viewerMembership: { pubkey: soloSession.viewer, joined: true },
+  };
+  expect(canShareSoloChat(soloSession, solo)).toBe(true);
+  expect(canShareSoloChat(soloSession, { ...solo, cached: true })).toBe(false);
+  expect(
+    canShareSoloChat(soloSession, {
+      ...solo,
+      viewerRole: "guest",
+      readOnly: true,
+    }),
+  ).toBe(false);
+});
+
+it.each([
+  ["legacy roster", { members: ["viewer", "peer"] }, true],
+  [
+    "joined without a roster cannot exclude the moderation DM",
+    { viewerMembership: { pubkey: "viewer", joined: true } },
+    false,
+  ],
+  [
+    "joined with peer evidence but no viewer roster entry",
+    { members: ["peer"], viewerMembership: { pubkey: "viewer", joined: true } },
+    true,
+  ],
+  [
+    "moderation DM",
+    {
+      members: ["viewer", "relay"],
+      viewerMembership: { pubkey: "viewer", joined: true },
+    },
+    false,
+  ],
+  [
+    "denied with retained peers",
+    {
+      members: ["viewer", "peer"],
+      viewerMembership: { pubkey: "viewer", joined: false },
+    },
+    false,
+  ],
+])(
+  "uses viewer authority for DM additions: %s",
+  (_membership, evidence, expected) => {
+    const session = {
+      viewer: "viewer",
+      relayAuthor: "relay",
+      directMessages: { available: true },
+    };
+    expect(
+      canAddToDirectMessage(session, {
+        id: "dm",
+        name: "Direct message",
+        channelType: "dm",
+        ...evidence,
+      }),
+    ).toBe(expected);
+  },
+);

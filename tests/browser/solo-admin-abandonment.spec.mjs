@@ -284,6 +284,12 @@ for (const mode of ["cross-window", "same-window", "failed-storage"])
             exact: true,
           });
           await composer.fill("Continue with current roles");
+          // A fresh window's own-Solo composer reads its saved model picks
+          // from IndexedDB first; until then Send is disabled and Enter is a
+          // no-op that keeps the draft. Wait for the composer's own readiness.
+          await expect(
+            other.getByRole("button", { name: "Send message", exact: true }),
+          ).toBeEnabled();
           await composer.press("Enter");
           await expect
             .poll(

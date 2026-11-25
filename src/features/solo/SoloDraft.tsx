@@ -1,3 +1,5 @@
+import { hostComposerProvenance } from "../messages/mention-draft";
+import { sendWithOwnerMentions } from "../relay/owner-mentions";
 import { linkedDraftKey, readLinkedChat, type LinkedChat } from "./linked-chat";
 import {
   canonicalDetailsName,
@@ -289,7 +291,7 @@ export function SoloDraft({
         settingsRevision = nextSettings;
         setDraftSettings(readDraftSettings(scope, draftKey));
       }
-    });
+    }, [projectKey, settingsKey]);
   }, [scope, draftKey, projectId]);
   const prompt = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -377,6 +379,7 @@ export function SoloDraft({
     picks?: MentionPicks,
     draftPicks?: DraftPicks,
     draftPicksRevision?: string | null,
+    explicitRecipientIds?: readonly string[],
   ) {
     const text = composerMarkdown(draft);
     if (submitting.current || !text.trim() || !available) return;
@@ -403,6 +406,13 @@ export function SoloDraft({
     const draftModelPicksKey = soloModelPicksKey(`${draftKey}:new-draft`);
     const chatModelPicksKey = soloModelPicksKey(channelId);
     const startingDraftPicks = draftPicks ?? {};
+    // The toolbar's own selection, an emptied one included, read before the
+    // start clears it, so a refused start gives back exactly what was picked.
+    const toolbar = readView<unknown>(
+      scope,
+      `${draftKey}:new-draft:agents`,
+      null,
+    );
     try {
       if (typeof name !== "string")
         throw new Error("The chat name could not be verified.");
@@ -600,22 +610,27 @@ export function SoloDraft({
       );
       try {
         signMessageTokens(draftTokens(draft), () =>
-          references.length || Object.keys(firstPicks).length
-            ? session.messages.send(
-                channelId,
-                text,
-                recipients,
-                uploaded,
-                undefined,
-                references,
-                firstPicks,
-              )
-            : session.messages.send(
-                channelId,
-                text,
-                recipients,
-                ...(uploaded.length ? [uploaded] : []),
-              ),
+          sendWithOwnerMentions(
+            session,
+            explicitRecipientIds?.filter((id) => recipients.includes(id)),
+            () =>
+              references.length || Object.keys(firstPicks).length
+                ? session.messages.send(
+                    channelId,
+                    text,
+                    recipients,
+                    uploaded,
+                    undefined,
+                    references,
+                    firstPicks,
+                  )
+                : session.messages.send(
+                    channelId,
+                    text,
+                    recipients,
+                    ...(uploaded.length ? [uploaded] : []),
+                  ),
+          ),
         );
         files.clear();
         writeView(
@@ -791,14 +806,20 @@ export function SoloDraft({
                   missing.push("settings");
                 if (!writeView(scope, `${draftKey}:new-project`, project))
                   missing.push("workspace");
-                // The pill's agents, when it routed the send; the composer reads
-                // them as it mounts. Tags in the text carry their own; when those
-                // are only references, the pill routed the send too.
+                // The pill's agents, as the viewer picked them, an emptied
+                // pill included; the composer reads them as it mounts. Without
+                // a pick, those the pill stood in with, beside the text's own
+                // tags (only references, when it alone routed the send).
+                // A pick made in New chat since the start cleared it is newer
+                // than this one, so it stays.
                 const typed = new Set(draft.recipients.map((p) => p.pubkey));
-                const pill =
-                  addressed?.filter((p) => !typed.has(p.pubkey)) ?? [];
+                const pill = Array.isArray(toolbar)
+                  ? toolbar
+                  : (addressed?.filter((p) => !typed.has(p.pubkey)) ?? []);
                 if (
-                  pill.length &&
+                  (Array.isArray(toolbar) || pill.length) &&
+                  readView(scope, `${draftKey}:new-draft:agents`, null) ===
+                    null &&
                   !writeView(scope, `${draftKey}:new-draft:agents`, pill)
                 )
                   missing.push("agents");
@@ -873,6 +894,7 @@ export function SoloDraft({
   const composer = (
     <div id="new-chat-prompt" ref={prompt}>
       <MessageComposer
+        evidenceOwner={hostComposerProvenance}
         key={restored.count}
         focusRequest={restored.focus ? restored.count : 0}
         chatPresentation
@@ -914,8 +936,24 @@ export function SoloDraft({
             unsaved.current = held;
           },
           onDraftChange: draftEdited,
-          submit: (draft, files, addressed, picks, draftPicks, revision) => {
-            void start(draft, files, addressed, picks, draftPicks, revision);
+          submit: (
+            draft,
+            files,
+            addressed,
+            picks,
+            draftPicks,
+            revision,
+            explicitRecipientIds,
+          ) => {
+            void start(
+              draft,
+              files,
+              addressed,
+              picks,
+              draftPicks,
+              revision,
+              explicitRecipientIds,
+            );
           },
         }}
       />

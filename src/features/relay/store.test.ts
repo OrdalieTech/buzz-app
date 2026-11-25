@@ -1,6 +1,7 @@
 import { assert, describe, expect, it, vi } from "vitest";
 import { huddleDescription } from "../huddle/lifecycle";
 import { ReadError } from "./errors";
+import { listByteSize } from "./budget";
 import { createRelaySession } from "./session";
 import type { LiveCallbacks } from "./live";
 import type { HeadPersistence, SavedStartup } from "./persistence";
@@ -8,6 +9,7 @@ import type { RelayEvent } from "./events";
 import {
   bounds,
   flush,
+  isNoticeRead,
   keypair,
   message,
   metadata,
@@ -203,6 +205,1070 @@ describe("channel store", () => {
       owner.dispose();
     }
   });
+  it("reads an older page of the asked size", async () => {
+    const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+    const queries = createRelaySession(scripted.transport).session.channels;
+    queries.ensure("c");
+    const newer = message(alice, "c", "newer", 20);
+    scripted.next().respond([
+      newer,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 20, id: newer.id },
+      }),
+    ]);
+    await flush();
+    const limits = [];
+    let cursor = newer;
+    for (const rows of [5, 120, 900]) {
+      queries.loadOlder("c", rows);
+      const page = scripted.pending.find(
+        (read) => read.filters[0]?.until && !read.filters[0]?.include_aux,
+      );
+      assert(page);
+      scripted.pending.splice(scripted.pending.indexOf(page), 1);
+      limits.push(page.filters[0]?.limit);
+      const older = message(alice, "c", `older ${rows}`, cursor.created_at - 1);
+      page.respond([
+        older,
+        bounds(relay, "c", `${cursor.created_at}:${cursor.id}`, {
+          has_more: true,
+          next_cursor: { created_at: older.created_at, id: older.id },
+        }),
+      ]);
+      cursor = older;
+      await flush();
+    }
+    // The asked size, within the relay's read limit.
+    expect(limits).toEqual([5, 120, 200]);
+  });
+  it("pages again after an older read is cancelled under the window", async () => {
+    const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+    const queries = createRelaySession(scripted.transport).session.channels;
+    queries.ensure("c");
+    const newer = message(alice, "c", "newer", 20);
+    scripted.next().respond([
+      newer,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 20, id: newer.id },
+      }),
+    ]);
+    await flush();
+    const older = () =>
+      scripted.pending.find((read) => read.filters[0]?.until === 20);
+    queries.loadOlder("c");
+    const first = older();
+    assert(first);
+    scripted.pending.splice(scripted.pending.indexOf(first), 1);
+    // A stream drop cancels every relay read, this page's included.
+    first.fail(new DOMException("Relay read cancelled", "AbortError"));
+    await flush();
+    expect(queries.window("c").loadingOlder).toBe(false);
+    queries.loadOlder("c");
+    expect(older()).toBeDefined();
+  });
+  describe("an older page's aux closure", () => {
+    const newer = message(alice, "c", "newer", 20);
+    const row = (at: number) => message(alice, "c", `row ${at}`, at);
+    const on = (kind: number, target: RelayEvent, content = "") =>
+      signed(alice, {
+        kind,
+        content,
+        created_at: 30,
+        tags: [
+          ["e", target.id],
+          ["h", "c"],
+        ],
+      });
+    const below = (cursor: RelayEvent, last?: RelayEvent) =>
+      bounds(relay, "c", `${cursor.created_at}:${cursor.id}`, {
+        has_more: !!last,
+        next_cursor: last ? { created_at: last.created_at, id: last.id } : null,
+      });
+    async function opened(budget = {}, whileHeadReads?: RelayEvent) {
+      const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+      let live!: LiveCallbacks;
+      const store = createRelaySession(
+        {
+          ...scripted.transport,
+          subscribe(callbacks) {
+            live = callbacks;
+            return { update() {}, retry() {}, dispose() {} };
+          },
+        },
+        budget,
+      );
+      const queries = store.session.channels;
+      live.receive([roster(relay, "c", [viewer.pubkey])]);
+      queries.ensure("c");
+      if (whileHeadReads) live.receive([whileHeadReads]);
+      scripted.next().respond([
+        newer,
+        bounds(relay, "c", "head", {
+          has_more: true,
+          next_cursor: { created_at: 20, id: newer.id },
+        }),
+      ]);
+      await flush();
+      const take = (aux: boolean) => {
+        const read = scripted.pending.find(
+          (entry) =>
+            !!entry.filters[0]?.until &&
+            !!entry.filters[0]?.include_aux === aux,
+        );
+        assert(read);
+        scripted.pending.splice(scripted.pending.indexOf(read), 1);
+        return read;
+      };
+      /** Page once, below `cursor`, to `rows` shown bare. */
+      const page = async (cursor: RelayEvent, ...rows: RelayEvent[]) => {
+        queries.loadOlder("c");
+        take(false).respond([...rows, below(cursor, rows[0])]);
+        await flush();
+      };
+      return { queries, take, page, scripted, store, live };
+    }
+    it("withdraws a held edit its aux read deletes", async () => {
+      const { queries, take, page } = await opened();
+      const target = row(10);
+      const edit = on(40003, target, "edited");
+      await page(newer, target, edit);
+      expect(queries.window("c").rows[0]?.content).toBe("edited");
+      take(true).respond([target, edit, on(5, edit), below(newer)]);
+      await flush();
+      expect(queries.window("c").rows[0]?.content).toBe("row 10");
+    });
+    it("reads a page's aux only once its channel is open again", async () => {
+      const { queries, take, scripted } = await opened();
+      const first = row(10);
+      queries.loadOlder("c");
+      queries.ensure("d");
+      take(false).respond([first, below(newer, first)]);
+      await flush();
+      expect(
+        scripted.pending.some(
+          (read) => read.filters[0]?.until && read.filters[0]?.include_aux,
+        ),
+      ).toBe(false);
+      queries.ensure("c");
+      expect(take(true).filters[0]).toMatchObject({ until: 20 });
+    });
+    it("reads a page too large for a response again in default pages", async () => {
+      const { queries, take } = await opened();
+      queries.loadOlder("c", 200);
+      const large = take(false);
+      expect(large.filters[0]).toMatchObject({ limit: 200, until: 20 });
+      large.fail(
+        new ReadError(
+          "invalid-response",
+          "Relay response exceeds the read budget",
+        ),
+      );
+      await flush();
+      expect(take(false).filters[0]).toMatchObject({ limit: 20, until: 20 });
+      expect(queries.window("c")).toMatchObject({
+        loadingOlder: true,
+        error: undefined,
+      });
+    });
+    it("ends a newer page a stream drop cancels", async () => {
+      const { queries, page, scripted } = await opened({ maxHistoryRows: 2 });
+      const [a, b, c] = [row(10), row(8), row(6)];
+      await page(newer, a);
+      await page(a, b);
+      await page(b, c);
+      expect(queries.window("c").hasNewer).toBe(true);
+      const before = new Set(scripted.pending);
+      queries.loadNewer?.("c");
+      expect(queries.window("c").loadingNewer).toBe(true);
+      const read = scripted.pending.find((entry) => !before.has(entry));
+      assert(read);
+      read.fail(new DOMException("Relay read cancelled", "AbortError"));
+      await flush();
+      expect(queries.window("c").loadingNewer).toBeFalsy();
+    });
+    it("reads a closure too large for a response again in smaller parts", async () => {
+      const { take, page } = await opened();
+      await page(newer, row(10), row(9), row(8));
+      const large = take(true);
+      expect(large.filters[0]).toMatchObject({ limit: 3, until: 20 });
+      large.fail(
+        new ReadError(
+          "invalid-response",
+          "Relay response exceeds the read budget",
+        ),
+      );
+      await flush();
+      expect(take(true).filters[0]).toMatchObject({ limit: 2, until: 20 });
+    });
+    it("reads past a failing aux page to the pages behind it", async () => {
+      const { take, page } = await opened();
+      const [a, b] = [row(10), row(8)];
+      await page(newer, a);
+      const failing = take(true);
+      await page(a, b);
+      // One row's closure past the response budget: it reads no smaller.
+      failing.fail(
+        new ReadError(
+          "invalid-response",
+          "Relay response exceeds the read budget",
+        ),
+      );
+      await flush();
+      // The same fill reads the page behind it.
+      expect(take(true).filters[0]).toMatchObject({ until: a.created_at });
+    });
+    it("an aux slide forgets the live rows it drops", async () => {
+      const late = message(alice, "c", "late", 25);
+      const target = row(10);
+      const edit = on(40003, target, "edited");
+      const { queries, take, page, scripted, live } = await opened({
+        maxHistoryBytes: listByteSize([newer, late, target, edit]) - 1,
+      });
+      live.receive([late]);
+      await flush();
+      await page(newer, target);
+      take(true).respond([target, edit, below(newer)]);
+      await flush();
+      // The slide drops the live row for the rows paged to.
+      expect(queries.window("c").hasNewer).toBe(true);
+      expect(queries.window("c").rows.map((row) => row.content)).toEqual([
+        "edited",
+        "newer",
+      ]);
+      // A head without the live row (deleted meanwhile) shows only its own.
+      queries.attach?.("c");
+      const head = scripted.pending.find(
+        (read) => read.filters[0]?.top_level && !read.filters[0]?.until,
+      );
+      head?.respond([
+        newer,
+        bounds(relay, "c", "head", {
+          has_more: true,
+          next_cursor: { created_at: 20, id: newer.id },
+        }),
+      ]);
+      await flush();
+      expect(queries.window("c").rows.map((row) => row.id)).toEqual([newer.id]);
+    });
+    it("drops a read-ahead page past the budget and stays at the head", async () => {
+      const target = row(10);
+      const { queries, take, scripted } = await opened({
+        maxHistoryBytes: listByteSize([newer, target]) - 1,
+      });
+      queries.loadOlder("c", 20, true);
+      take(false).respond([target, below(newer, target)]);
+      await flush();
+      expect(queries.window("c")).toMatchObject({
+        loadingOlder: false,
+        rows: [{ id: newer.id }],
+      });
+      expect(queries.window("c").hasNewer).toBeFalsy();
+      // Read-ahead stops; the reader's own paging still reads.
+      queries.loadOlder("c", 20, true);
+      expect(scripted.pending.some((read) => read.filters[0]?.until)).toBe(
+        false,
+      );
+      queries.loadOlder("c");
+      expect(take(false).filters[0]).toMatchObject({ until: 20 });
+    });
+    it("trims a read-ahead page's closure past the budget at the head", async () => {
+      const target = row(10);
+      const edit = on(40003, target, "edited");
+      const { queries, take } = await opened({
+        maxHistoryBytes: listByteSize([newer, target, edit]) - 1,
+      });
+      queries.loadOlder("c", 20, true);
+      take(false).respond([target, below(newer, target)]);
+      await flush();
+      take(true).respond([target, edit, below(newer)]);
+      await flush();
+      expect(queries.window("c").hasNewer).toBeFalsy();
+      expect(queries.window("c").rows.map((row) => row.id)).toEqual([newer.id]);
+    });
+    it("a read-ahead closure trim forgets the live rows it drops", async () => {
+      const target = row(10);
+      const edit = on(40003, target, "edited");
+      // A late send in the oldest second, sorting below the row paged to.
+      let late = message(alice, "c", "late", 10);
+      for (let n = 0; late.id < target.id; n++)
+        late = message(alice, "c", `late ${n}`, 10);
+      const { queries, take, live, scripted } = await opened({
+        maxHistoryBytes: listByteSize([newer, late, target, edit]) - 1,
+      });
+      queries.loadOlder("c", 20, true);
+      take(false).respond([target, below(newer, target)]);
+      await flush();
+      live.receive([late]);
+      await flush();
+      expect(queries.window("c").rows.map((row) => row.id)).toContain(late.id);
+      take(true).respond([target, edit, below(newer)]);
+      await flush();
+      expect(queries.window("c").rows.map((row) => row.id)).not.toContain(
+        late.id,
+      );
+      // Nor does a head that meets the rows held.
+      queries.refresh?.("c");
+      for (const read of scripted.pending.filter(
+        (entry) => entry.filters[0]?.top_level && !entry.filters[0]?.until,
+      ))
+        read.respond([
+          newer,
+          target,
+          bounds(relay, "c", "head", {
+            has_more: true,
+            next_cursor: { created_at: 10, id: target.id },
+          }),
+        ]);
+      await flush();
+      expect(queries.window("c").rows.map((row) => row.id)).not.toContain(
+        late.id,
+      );
+    });
+    it("keeps a live row from the head read when aux merges", async () => {
+      const late = message(alice, "c", "late", 25);
+      const { queries, take, page } = await opened({}, late);
+      const target = row(10);
+      await page(newer, target);
+      take(true).respond([target, on(7, target, "+"), below(newer)]);
+      await flush();
+      expect(queries.window("c").rows.map((row) => row.content)).toEqual([
+        "row 10",
+        "newer",
+        "late",
+      ]);
+    });
+    it("reads a cancelled aux read again with the next fill", async () => {
+      const { take, page } = await opened();
+      const first = row(10);
+      await page(newer, first);
+      // A stream drop cancels every relay read, this aux read's included.
+      take(true).fail(new DOMException("Relay read cancelled", "AbortError"));
+      await flush();
+      await page(first, row(8));
+      expect(take(true).filters[0]).toMatchObject({ until: 20 });
+    });
+    it("slides an aux closure past the budget down to the rows paged to", async () => {
+      const target = row(10);
+      const edit = on(40003, target, "edited");
+      const { queries, take, page } = await opened({
+        maxHistoryBytes: listByteSize([newer, target, edit]) - 1,
+      });
+      await page(newer, target);
+      take(true).respond([target, edit, below(newer)]);
+      await flush();
+      const window = queries.window("c");
+      expect(window).toMatchObject({
+        hasNewer: true,
+        rows: [{ id: target.id, content: "edited" }],
+      });
+      expect(window?.historyLimited).toBeFalsy();
+      // The next older page slides on within the budget.
+      const older = row(8);
+      await page(target, older);
+      expect(queries.window("c")).toMatchObject({
+        hasNewer: true,
+        rows: [{ id: older.id }, { id: target.id, content: "edited" }],
+      });
+    });
+    it("applies an aux closure larger than the whole budget", async () => {
+      const target = row(10);
+      const edit = on(40003, target, "edited");
+      const { queries, take, page } = await opened({
+        maxHistoryBytes: listByteSize([target, edit]) - 1,
+      });
+      await page(newer, target);
+      expect(queries.window("c").historyLimited).toBeFalsy();
+      take(true).respond([target, edit, below(newer)]);
+      await flush();
+      expect(queries.window("c")).toMatchObject({
+        rows: [{ id: target.id, content: "edited" }, { id: newer.id }],
+      });
+    });
+    it("does not slide to rows an aux closure deletes", async () => {
+      const [a, b] = [row(10), row(8)];
+      const edit = on(40003, a, "edited ".repeat(200));
+      const { queries, take, page } = await opened({
+        maxHistoryBytes: listByteSize([newer, a, b]) + 400,
+      });
+      await page(newer, a, b);
+      take(true).respond([a, b, edit, on(5, b), below(newer)]);
+      await flush();
+      expect(queries.window("c")).toMatchObject({
+        rows: [{ id: a.id, content: edit.content }, { id: newer.id }],
+      });
+    });
+    it("skips the aux read of a page the window has slid past", async () => {
+      const { queries, take, page, scripted } = await opened({
+        maxHistoryRows: 2,
+      });
+      const [a, b, c, d] = [row(10), row(8), row(6), row(4)];
+      await page(newer, a);
+      const held = take(true);
+      await page(a, b);
+      await page(b, c);
+      await page(c, d);
+      // The window holds c and d: b's page is gone, c's is next.
+      held.respond([a, below(newer)]);
+      await flush();
+      // The dropped row stays dropped.
+      expect(queries.window("c")).toMatchObject({
+        hasNewer: true,
+        rows: [{ id: d.id }, { id: c.id }],
+      });
+      expect(take(true).filters[0]).toMatchObject({ until: b.created_at });
+      // Newer history reads up from b, the newest row slid past: a day above
+      // the ceiling (history-seek), not above the row the late aux held.
+      queries.loadNewer?.("c");
+      const newerRead = scripted.pending.find((read) =>
+        read.filters[0]?.["#h"]?.includes("c"),
+      );
+      expect(newerRead?.filters[0]?.until).toBe(b.created_at + 86_400);
+    });
+    it("keeps a row live traffic drops out while its aux read is in flight", async () => {
+      const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+      let live!: LiveCallbacks;
+      const queries = createRelaySession(
+        {
+          ...scripted.transport,
+          subscribe(callbacks) {
+            live = callbacks;
+            return { update() {}, retry() {}, dispose() {} };
+          },
+        },
+        { maxHistoryRows: 3 },
+      ).session.channels;
+      live.receive([roster(relay, "c", [viewer.pubkey])]);
+      queries.ensure("c");
+      scripted.next().respond([
+        newer,
+        bounds(relay, "c", "head", {
+          has_more: true,
+          next_cursor: { created_at: 20, id: newer.id },
+        }),
+      ]);
+      await flush();
+      const [a, b] = [row(10), row(8)];
+      queries.loadOlder("c");
+      const bare = scripted.pending.find((read) => read.filters[0]?.until);
+      assert(bare);
+      bare.respond([a, b, below(newer, b)]);
+      await flush();
+      const held = scripted.pending.find(
+        (read) => read.filters[0]?.include_aux,
+      );
+      assert(held);
+      const fresh = message(alice, "c", "fresh", 25);
+      live.receive([fresh]);
+      held.respond([a, b, below(newer)]);
+      await flush();
+      // The window stays at the head, without the dropped row.
+      expect(queries.window("c").hasNewer).toBeFalsy();
+      expect(queries.window("c").rows.map((row) => row.id)).toEqual([
+        a.id,
+        newer.id,
+        fresh.id,
+      ]);
+    });
+    it.each([false, true])(
+      "reads an aux read an access purge cancels again (resolved first: %s)",
+      async (resolved) => {
+        const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+        const queries = createRelaySession(scripted.transport).session.channels;
+        queries.ensure("c");
+        scripted.next().respond([
+          newer,
+          bounds(relay, "c", "head", {
+            has_more: true,
+            next_cursor: { created_at: 20, id: newer.id },
+          }),
+        ]);
+        await flush();
+        queries.loadOlder("c");
+        const bare = scripted.pending.find((read) => read.filters[0]?.until);
+        assert(bare);
+        bare.respond([row(10), below(newer)]);
+        await flush();
+        const auxRead = () =>
+          scripted.pending.find(
+            (read) => read.filters[0]?.include_aux && read.filters[0]?.until,
+          );
+        const held = auxRead();
+        assert(held);
+        scripted.pending.splice(scripted.pending.indexOf(held), 1);
+        if (resolved) held.respond([below(newer)]);
+        // Another channel's denied head read purges access everywhere.
+        queries.ensure("x");
+        const other = scripted.pending.find((read) =>
+          read.filters[0]?.["#h"]?.includes("x"),
+        );
+        assert(other);
+        other.fail(new ReadError("denied", "Forbidden", 403));
+        await flush();
+        // Opening the other channel paused the aux work; returning resumes it.
+        queries.ensure("c");
+        expect(auxRead()?.filters[0]).toMatchObject({ until: 20 });
+      },
+    );
+    it("reads a refused aux read again when its retry hint expires", async () => {
+      const { queries, take, page } = await opened();
+      await page(newer, row(10));
+      vi.useFakeTimers({
+        toFake: ["performance", "setTimeout", "clearTimeout"],
+      });
+      try {
+        // A fractional hint: the timer fires at whole milliseconds.
+        take(true).fail(new ReadError("unavailable", "Quota", 429, 60_000.6));
+        await vi.advanceTimersByTimeAsync(0);
+        queries.ensure("c");
+        expect(() => take(true), "no aux read inside the hint").toThrow();
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(take(true).filters[0]).toMatchObject({ until: 20 });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+    it("cancels a refused aux read's retry when the session is disposed", async () => {
+      const { take, page, store } = await opened();
+      await page(newer, row(10));
+      vi.useFakeTimers({
+        toFake: ["performance", "setTimeout", "clearTimeout"],
+      });
+      try {
+        take(true).fail(new ReadError("unavailable", "Quota", 429, 60_000));
+        await vi.advanceTimersByTimeAsync(0);
+        store.dispose();
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(() => take(true), "no aux read after disposal").toThrow();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+    it("reads a failed aux read again when the channel is revisited", async () => {
+      const { queries, take, page } = await opened();
+      await page(newer, row(10));
+      take(true).fail(new Error("denied"));
+      await flush();
+      queries.ensure("c");
+      expect(take(true).filters[0]).toMatchObject({ until: 20 });
+    });
+    it("cancels an aux read when another channel opens and reads it again on return", async () => {
+      const { queries, take, page, scripted } = await opened();
+      await page(newer, row(10));
+      const held = take(true);
+      queries.ensure("d");
+      expect(held.signal?.aborted).toBe(true);
+      await flush();
+      scripted.pending.length = 0;
+      queries.ensure("c");
+      expect(take(true).filters[0]).toMatchObject({ until: 20 });
+    });
+    async function revisited(head: RelayEvent[]) {
+      let clock = 1_000_000;
+      const { queries, take, page, scripted } = await opened({
+        prepared: true,
+        now: () => clock,
+      });
+      const older = row(10);
+      await page(newer, older);
+      take(true).respond([older, below(newer)]);
+      await flush();
+      queries.ensure("d");
+      await flush();
+      scripted.pending.length = 0;
+      clock += 61_000;
+      const query = vi.spyOn(scripted.transport, "query");
+      queries.ensure("c");
+      const last = head.at(-1);
+      assert(last);
+      const read = scripted.next();
+      read.respond([
+        ...head,
+        bounds(relay, "c", "head", {
+          has_more: true,
+          next_cursor: { created_at: last.created_at, id: last.id },
+        }),
+      ]);
+      await flush();
+      return {
+        ids: queries.window("c").rows.map((row) => row.id),
+        older,
+        read,
+        noticeReads: query.mock.calls.filter(([filters]) =>
+          isNoticeRead(filters),
+        ).length,
+      };
+    }
+    const latest = message(alice, "c", "latest", 25);
+    it("merges a newer head into the paged rows on a revisit past the lease", async () => {
+      const { ids, older, read, noticeReads } = await revisited([
+        latest,
+        newer,
+      ]);
+      expect(ids).toEqual([older.id, newer.id, latest.id]);
+      // The head read its newest notices, so none are read apart from it.
+      expect(read.filters[1]).toMatchObject({ kinds: [40099] });
+      expect(noticeReads).toBe(0);
+    });
+    it("replaces the paged rows with a newer head that does not meet them", async () => {
+      const after = message(alice, "c", "after", 24);
+      expect(await revisited([latest, after])).toMatchObject({
+        ids: [after.id, latest.id],
+      });
+    });
+    it("a failed return to the head keeps the aux work of the rows it shows", async () => {
+      const { queries, take, page, scripted } = await opened({
+        maxHistoryRows: 2,
+      });
+      const [a, b] = [row(10), row(8)];
+      await page(newer, a);
+      const held = take(true);
+      await page(a, b);
+      expect(queries.window("c").hasNewer).toBe(true);
+      queries.attach?.("c");
+      expect(held.signal?.aborted).toBe(true);
+      await flush();
+      // No aux read while the head loads.
+      expect(
+        scripted.pending.some(
+          (read) => read.filters[0]?.include_aux && read.filters[0]?.until,
+        ),
+      ).toBe(false);
+      const head = scripted.pending.find(
+        (read) => !read.filters[0]?.until && read.filters[0]?.["#h"],
+      );
+      assert(head);
+      scripted.pending.splice(scripted.pending.indexOf(head), 1);
+      head.fail(new ReadError("unavailable", "Relay is down"));
+      await flush();
+      expect(queries.window("c").hasNewer).toBe(true);
+      expect(take(true).filters[0]).toMatchObject({ until: 20 });
+    });
+    it("returning to the head ends the aux work of the rows it replaces", async () => {
+      const { queries, take, page, scripted } = await opened({
+        maxHistoryRows: 2,
+      });
+      const [a, b] = [row(10), row(8)];
+      await page(newer, a);
+      const held = take(true);
+      await page(a, b);
+      expect(queries.window("c").hasNewer).toBe(true);
+      queries.attach?.("c");
+      expect(held.signal?.aborted).toBe(true);
+      // The cancelled read is not read again: paging once reads one aux part.
+      const head = scripted.pending.find(
+        (read) => !read.filters[0]?.until && read.filters[0]?.["#h"],
+      );
+      assert(head);
+      scripted.pending.splice(scripted.pending.indexOf(head), 1);
+      head.respond([
+        newer,
+        bounds(relay, "c", "head", {
+          has_more: true,
+          next_cursor: { created_at: 20, id: newer.id },
+        }),
+      ]);
+      await flush();
+      await page(newer, a);
+      take(true).respond([a, below(newer)]);
+      await flush();
+      expect(
+        scripted.pending.filter((read) => read.filters[0]?.include_aux),
+      ).toEqual([]);
+    });
+  });
+  // 40 held rows at 1000..961, two of them sharing 981, and an older page of
+  // 40 rows at 960..921.
+  const held = Array.from({ length: 40 }, (_, i) =>
+    message(alice, "c", `held ${i}`, i === 18 ? 981 : 1000 - i),
+  );
+  const older = Array.from({ length: 40 }, (_, i) =>
+    message(alice, "c", `older ${i}`, 960 - i),
+  );
+  // A withdrawn edit and a removed reaction on the two newest older rows.
+  const about = (kind: number, target: RelayEvent, content = "") =>
+    signed(alice, {
+      kind,
+      content,
+      created_at: 999,
+      tags: [
+        ["e", target.id],
+        ["h", "c"],
+      ],
+    });
+  const edit = about(40003, older[0] as RelayEvent, "withdrawn edit");
+  const reaction = about(7, older[1] as RelayEvent, "👍");
+  const aux = [edit, about(5, edit), reaction, about(5, reaction)];
+  // The page and the 20 oldest held rows: the 21st shares its second with the
+  // 22nd, which the budget leaves out.
+  const kept = [...older, ...held.filter((row) => row.created_at < 981)];
+  const notices = Array.from({ length: 150 }, (_, i) =>
+    signed(relay, {
+      kind: 40099,
+      content: JSON.stringify({
+        type: "member_joined",
+        actor: alice.pubkey,
+        target: keypair().pubkey,
+      }),
+      created_at: 1001 + i,
+      tags: [["h", "c"]],
+    }),
+  );
+  it.each([
+    [
+      "byte",
+      0,
+      {
+        maxHistoryBytes: listByteSize([
+          ...kept,
+          ...aux,
+          held[18] as RelayEvent,
+        ]),
+      },
+    ],
+    ["row", 0, { maxHistoryRows: 61 }],
+    ["row", notices.length, { maxHistoryRows: 61 }],
+  ])(
+    "an older page past the %s budget, with %i notices shown, slides the window down to it",
+    async (_, shown, budget) => {
+      const scripted = scriptedTransport(viewer.pubkey, relay.pubkey, {
+        notices: true,
+      });
+      const queries = createRelaySession(scripted.transport, budget).session
+        .channels;
+      queries.ensure("c");
+      const last = held[39] as RelayEvent;
+      scripted.next().respond([
+        ...held,
+        bounds(relay, "c", "head", {
+          has_more: true,
+          next_cursor: { created_at: last.created_at, id: last.id },
+        }),
+      ]);
+      await flush();
+      scripted.next().respond(notices.slice(0, shown));
+      await flush();
+      expect(queries.window("c").rows).toHaveLength(40 + shown);
+      queries.loadOlder("c", 200);
+      const page = scripted.pending.find((read) => read.filters[0]?.until);
+      assert(page);
+      const oldest = older[39] as RelayEvent;
+      page.respond([
+        ...older,
+        ...aux,
+        bounds(relay, "c", `${last.created_at}:${last.id}`, {
+          has_more: true,
+          next_cursor: { created_at: oldest.created_at, id: oldest.id },
+        }),
+      ]);
+      await flush();
+      const window = queries.window("c");
+      expect(window).toMatchObject({
+        status: "ready",
+        hasMore: true,
+        hasNewer: true,
+        loadingOlder: false,
+      });
+      expect(window.historyLimited).toBeFalsy();
+      expect(window.rows.map((row) => row.id)).toEqual(
+        kept
+          .sort((a, b) => a.created_at - b.created_at)
+          .map((event) => event.id),
+      );
+      // The withdrawn edit and removed reaction stay withdrawn.
+      const row = (event?: RelayEvent) =>
+        window.rows.find((item) => item.id === event?.id);
+      expect(row(older[0])?.content).toBe("older 0");
+      expect(row(older[1])?.reactions).toEqual([]);
+    },
+  );
+  it("replaces paged rows with a revisit head that meets only their live tail", async () => {
+    const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+    let live!: LiveCallbacks;
+    let clock = 1_000_000;
+    const queries = createRelaySession(
+      {
+        ...scripted.transport,
+        subscribe(callbacks) {
+          live = callbacks;
+          return { update() {}, retry() {}, dispose() {} };
+        },
+      },
+      { prepared: true, now: () => clock },
+    ).session.channels;
+    live.receive([roster(relay, "c", [viewer.pubkey])]);
+    queries.ensure("c");
+    const [older, head, stray, tail, latest] = [5, 10, 20, 30, 40].map((at) =>
+      message(alice, "c", `at ${at}`, at),
+    );
+    assert(older && head && stray && tail && latest);
+    const take = () => {
+      const read = scripted.pending.find(
+        (entry) =>
+          entry.filters[0]?.top_level && !entry.filters[0]?.include_aux,
+      );
+      assert(read);
+      scripted.pending.splice(scripted.pending.indexOf(read), 1);
+      return read;
+    };
+    scripted.next().respond([
+      head,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 10, id: head.id },
+      }),
+    ]);
+    await flush();
+    queries.loadOlder("c");
+    take().respond([
+      older,
+      bounds(relay, "c", `10:${head.id}`, {
+        has_more: false,
+        next_cursor: null,
+      }),
+    ]);
+    await flush();
+    // The stream delivers a row; what it missed before it is unknown.
+    live.receive([stray, tail]);
+    queries.ensure("d");
+    await flush();
+    scripted.pending.length = 0;
+    clock += 61_000;
+    queries.ensure("c");
+    const revisit = scripted.pending.find(
+      (entry) => entry.filters[0]?.top_level && !entry.filters[0]?.until,
+    );
+    assert(revisit);
+    revisit.respond([
+      latest,
+      tail,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 30, id: tail.id },
+      }),
+    ]);
+    await flush();
+    expect(queries.window("c").rows.map((row) => row.id)).toEqual([
+      tail.id,
+      latest.id,
+    ]);
+  });
+  it("a revisit head drops live rows below its cursor in the cursor's second", async () => {
+    const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+    let live!: LiveCallbacks;
+    let clock = 1_000_000;
+    const queries = createRelaySession(
+      {
+        ...scripted.transport,
+        subscribe(callbacks) {
+          live = callbacks;
+          return { update() {}, retry() {}, dispose() {} };
+        },
+      },
+      { prepared: true, now: () => clock },
+    ).session.channels;
+    live.receive([roster(relay, "c", [viewer.pubkey])]);
+    queries.ensure("c");
+    const [older, head, latest] = [5, 10, 40].map((at) =>
+      message(alice, "c", `at ${at}`, at),
+    );
+    // Relay order at a tie is ID ascending: `after` sorts below the cursor.
+    const [tail, after] = ["a", "c"]
+      .map((name) => message(alice, "c", name, 30))
+      .sort((a, b) => a.id.localeCompare(b.id));
+    assert(older && head && latest && tail && after);
+    scripted.next().respond([
+      head,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 10, id: head.id },
+      }),
+    ]);
+    await flush();
+    queries.loadOlder("c");
+    const page = scripted.pending.find(
+      (entry) => entry.filters[0]?.until && !entry.filters[0]?.include_aux,
+    );
+    assert(page);
+    scripted.pending.splice(scripted.pending.indexOf(page), 1);
+    page.respond([
+      older,
+      bounds(relay, "c", `10:${head.id}`, {
+        has_more: false,
+        next_cursor: null,
+      }),
+    ]);
+    await flush();
+    live.receive([tail, after]);
+    queries.ensure("d");
+    await flush();
+    scripted.pending.length = 0;
+    clock += 61_000;
+    queries.ensure("c");
+    const revisit = scripted.pending.find(
+      (entry) => entry.filters[0]?.top_level && !entry.filters[0]?.until,
+    );
+    assert(revisit);
+    revisit.respond([
+      latest,
+      tail,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 30, id: tail.id },
+      }),
+    ]);
+    await flush();
+    expect(queries.window("c").rows.map((row) => row.id)).toEqual([
+      tail.id,
+      latest.id,
+    ]);
+  });
+  it("a live trim of late rows below the floor keeps the older cursor", async () => {
+    const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+    let live!: LiveCallbacks;
+    const head = message(alice, "c", "head", 30);
+    const [ten, five] = [
+      message(alice, "c", "ten", 10),
+      message(alice, "c", "five", 5),
+    ];
+    const queries = createRelaySession(
+      {
+        ...scripted.transport,
+        subscribe(callbacks) {
+          live = callbacks;
+          return { update() {}, retry() {}, dispose() {} };
+        },
+      },
+      { maxHistoryBytes: listByteSize([head, ten]) },
+    ).session.channels;
+    live.receive([roster(relay, "c", [viewer.pubkey])]);
+    queries.ensure("c");
+    scripted.next().respond([
+      head,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 30, id: head.id },
+      }),
+    ]);
+    await flush();
+    live.receive([ten, five]);
+    await flush();
+    queries.loadOlder("c");
+    expect(
+      scripted.pending.find((read) => read.filters[0]?.until)?.filters[0],
+    ).toMatchObject({ until: 30, before_id: head.id });
+  });
+  it("a live trim keeps the older cursor for rows below it in the cursor's second", async () => {
+    const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+    let live!: LiveCallbacks;
+    // The relay orders a second's rows by ID: the head read ends at `head`.
+    const [head, unseen, liveA, liveB] = ["a", "b", "c", "d"]
+      .map((name) => message(alice, "c", name, 30))
+      .sort((a, b) => a.id.localeCompare(b.id));
+    assert(head && unseen && liveA && liveB);
+    const queries = createRelaySession(
+      {
+        ...scripted.transport,
+        subscribe(callbacks) {
+          live = callbacks;
+          return { update() {}, retry() {}, dispose() {} };
+        },
+      },
+      { maxHistoryBytes: listByteSize([head, liveA]) },
+    ).session.channels;
+    live.receive([roster(relay, "c", [viewer.pubkey])]);
+    queries.ensure("c");
+    scripted.next().respond([
+      head,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 30, id: head.id },
+      }),
+    ]);
+    await flush();
+    live.receive([liveA, liveB]);
+    await flush();
+    queries.loadOlder("c");
+    expect(
+      scripted.pending.find((read) => read.filters[0]?.until)?.filters[0],
+    ).toMatchObject({ until: 30, before_id: head.id });
+  });
+  it("a full window drops its oldest rows for live traffic, but not under an older read", async () => {
+    const scripted = scriptedTransport(viewer.pubkey, relay.pubkey);
+    let live!: LiveCallbacks;
+    const queries = createRelaySession(
+      {
+        ...scripted.transport,
+        subscribe(callbacks) {
+          live = callbacks;
+          return { update() {}, retry() {}, dispose() {} };
+        },
+      },
+      { maxHistoryRows: 2 },
+    ).session.channels;
+    live.receive([roster(relay, "c", [viewer.pubkey])]);
+    queries.ensure("c");
+    const one = message(alice, "c", "one", 1);
+    const two = message(alice, "c", "two", 2);
+    scripted.next().respond([
+      two,
+      one,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 1, id: one.id },
+      }),
+    ]);
+    await flush();
+    const three = message(alice, "c", "three", 3);
+    live.receive([three]);
+    expect(queries.window("c")).toMatchObject({ hasMore: true });
+    expect(queries.window("c").rows.map((row) => row.content)).toEqual([
+      "two",
+      "three",
+    ]);
+    // The next older page reads the dropped row again; traffic while it is
+    // in flight does not cancel it.
+    await flush();
+    queries.loadOlder("c");
+    const older = scripted.pending.find((read) => read.filters[0]?.until);
+    expect(older?.filters[0]).toMatchObject({ until: 2, before_id: two.id });
+    live.receive([message(alice, "c", "four", 4)]);
+    expect(older?.signal?.aborted).toBe(false);
+    older?.respond([
+      one,
+      bounds(relay, "c", `2:${two.id}`, { has_more: false, next_cursor: null }),
+    ]);
+    await flush();
+    // It lands below the rows held and slides the window within its budget.
+    expect(queries.window("c")).toMatchObject({
+      hasNewer: true,
+      loadingOlder: false,
+    });
+    expect(queries.window("c").rows.map((row) => row.content)).toEqual([
+      "one",
+      "two",
+    ]);
+    // The slide forgets the live row it dropped: a head without it (deleted
+    // meanwhile) shows only its own rows.
+    queries.attach?.("c");
+    const head = scripted.pending.find(
+      (read) => read.filters[0]?.top_level && !read.filters[0]?.until,
+    );
+    head?.respond([
+      three,
+      two,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 2, id: two.id },
+      }),
+    ]);
+    await flush();
+    expect(queries.window("c").rows.map((row) => row.content)).toEqual([
+      "two",
+      "three",
+    ]);
+  });
   it("pages a window by the relay cursor, prepends older rows, and fetches missing profiles once", async () => {
     const { store, queries, next, pending } = setup();
     const listener = vi.fn();
@@ -249,10 +1315,10 @@ describe("channel store", () => {
       until: 20,
       before_id: newer.id,
       top_level: true,
-      include_aux: true,
       include_summaries: true,
       limit: 20,
     });
+    expect(page.filters[0]).not.toHaveProperty("include_aux");
     // Older rows prepend; the duplicated `newer` row is deduped; alice is already pending so no second profile query.
     page.respond([
       older,
@@ -269,6 +1335,37 @@ describe("channel store", () => {
       loadingOlder: false,
       rows: [{ id: older.id }, { id: newer.id }],
     });
+    // The same page then reads in full, adding its aux closure to the rows:
+    // as many rows as it showed.
+    const aux = next();
+    expect(aux.filters[0]).toMatchObject({
+      until: 20,
+      before_id: newer.id,
+      include_aux: true,
+      limit: 2,
+    });
+    expect(aux.filters[0]).not.toHaveProperty("include_summaries");
+    aux.respond([
+      older,
+      newer,
+      signed(viewer, {
+        kind: 7,
+        content: "+",
+        created_at: 11,
+        tags: [
+          ["h", "c"],
+          ["e", older.id],
+        ],
+      }),
+      bounds(relay, "c", `20:${newer.id}`, {
+        has_more: false,
+        next_cursor: null,
+      }),
+    ]);
+    await flush();
+    expect(queries.window("c").rows[0]?.reactions).toMatchObject([
+      { content: "+" },
+    ]);
     expect(pending.length).toBe(0);
     profiles.respond([profile(alice, { name: "Alice" })]);
     await flush();
@@ -278,6 +1375,225 @@ describe("channel store", () => {
     queries.loadOlder("c");
     expect(pending.length).toBe(0);
     expect(listener.mock.calls.length).toBeGreaterThanOrEqual(4);
+  });
+  it("cancelling an older read aborts it and leaves the window to read it again", async () => {
+    const { queries, next, pending } = setup();
+    queries.ensure("c");
+    const newer = message(alice, "c", "newer", 20);
+    next().respond([
+      newer,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 20, id: newer.id },
+      }),
+    ]);
+    await flush();
+    queries.loadOlder("c", 200);
+    const page = pending.find((read) => read.filters[0]?.until);
+    assert(page);
+    queries.cancelOlder?.("c");
+    expect(page.signal?.aborted).toBe(true);
+    expect(queries.window("c")).toMatchObject({
+      loadingOlder: false,
+      hasMore: true,
+      error: undefined,
+      rows: [{ id: newer.id }],
+    });
+    await flush();
+    queries.loadOlder("c");
+    expect(pending.at(-1)?.filters[0]).toMatchObject({
+      until: 20,
+      before_id: newer.id,
+    });
+  });
+  it("reads a large page's aux closure in 50-row parts by the relay cursor", async () => {
+    const { queries, pending } = setup();
+    queries.ensure("c");
+    const newer = message(alice, "c", "newer", 200);
+    const take = () => {
+      const read = pending.find((entry) => entry.filters[0]?.top_level);
+      assert(read);
+      pending.splice(pending.indexOf(read), 1);
+      return read;
+    };
+    take().respond([
+      newer,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 200, id: newer.id },
+      }),
+    ]);
+    await flush();
+    queries.loadOlder("c", 120);
+    const page = take();
+    expect(page.filters[0]).toMatchObject({ limit: 120 });
+    expect(page.filters[0]).not.toHaveProperty("include_aux");
+    const rows = Array.from({ length: 120 }, (_, n) =>
+      message(alice, "c", `older ${n}`, 199 - n),
+    );
+    const last = rows.at(-1);
+    assert(last);
+    page.respond([
+      ...rows,
+      bounds(relay, "c", `200:${newer.id}`, {
+        has_more: true,
+        next_cursor: { created_at: last.created_at, id: last.id },
+      }),
+    ]);
+    await flush();
+    const parts = [];
+    let cursor = newer;
+    for (const size of [50, 50, 20]) {
+      const aux = take();
+      parts.push(aux.filters[0]);
+      const part = rows.slice(
+        rows.indexOf(cursor) + 1,
+        rows.indexOf(cursor) + 1 + size,
+      );
+      const end = part.at(-1);
+      assert(end);
+      aux.respond([
+        ...part,
+        bounds(relay, "c", `${cursor.created_at}:${cursor.id}`, {
+          has_more: true,
+          next_cursor: { created_at: end.created_at, id: end.id },
+        }),
+      ]);
+      cursor = end;
+      await flush();
+    }
+    expect(parts).toMatchObject([
+      { include_aux: true, limit: 50, until: 200 },
+      { include_aux: true, limit: 50, until: rows[49]?.created_at },
+      { include_aux: true, limit: 20, until: rows[99]?.created_at },
+    ]);
+    expect(pending.filter((entry) => entry.filters[0]?.top_level)).toEqual([]);
+  });
+  it("reads on past a row written into a page's range until its aux covers every row", async () => {
+    const { queries, pending } = setup();
+    queries.ensure("c");
+    const newer = message(alice, "c", "newer", 200);
+    const take = () => {
+      const read = pending.find((entry) => entry.filters[0]?.top_level);
+      assert(read);
+      pending.splice(pending.indexOf(read), 1);
+      return read;
+    };
+    take().respond([
+      newer,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 200, id: newer.id },
+      }),
+    ]);
+    await flush();
+    queries.loadOlder("c");
+    const rows = [190, 180, 170].map((at) =>
+      message(alice, "c", `older ${at}`, at),
+    );
+    const [first, second, last] = rows;
+    assert(first && second && last);
+    take().respond([
+      ...rows,
+      bounds(relay, "c", `200:${newer.id}`, {
+        has_more: true,
+        next_cursor: { created_at: last.created_at, id: last.id },
+      }),
+    ]);
+    await flush();
+    // A backdated row takes a place in the limited aux read.
+    const backdated = message(alice, "c", "backdated", 175);
+    const aux = take();
+    expect(aux.filters[0]).toMatchObject({ include_aux: true, limit: 3 });
+    aux.respond([
+      first,
+      second,
+      backdated,
+      bounds(relay, "c", `200:${newer.id}`, {
+        has_more: true,
+        next_cursor: { created_at: backdated.created_at, id: backdated.id },
+      }),
+    ]);
+    await flush();
+    const rest = take();
+    expect(rest.filters[0]).toMatchObject({
+      include_aux: true,
+      limit: 1,
+      until: backdated.created_at,
+      before_id: backdated.id,
+    });
+    const reaction = signed(viewer, {
+      kind: 7,
+      content: "+",
+      created_at: 171,
+      tags: [
+        ["h", "c"],
+        ["e", last.id],
+      ],
+    });
+    rest.respond([
+      last,
+      reaction,
+      bounds(relay, "c", `175:${backdated.id}`, {
+        has_more: true,
+        next_cursor: { created_at: last.created_at, id: last.id },
+      }),
+    ]);
+    await flush();
+    expect(
+      queries.window("c").rows.find((row) => row.id === last.id)?.reactions,
+    ).toHaveLength(1);
+    // Every row of the page is covered: no further aux read.
+    expect(pending.filter((entry) => entry.filters[0]?.top_level)).toEqual([]);
+  });
+  it("evicting a window aborts its pages' aux read and drops the rest", async () => {
+    const { queries, pending } = setup(1);
+    queries.ensure("c");
+    const newer = message(alice, "c", "newer", 20),
+      older = message(alice, "c", "older", 10),
+      oldest = message(alice, "c", "oldest", 5);
+    const window = () => pending.filter((read) => read.filters[0]?.top_level);
+    const take = () => {
+      const [read] = window();
+      assert(read);
+      pending.splice(pending.indexOf(read), 1);
+      return read;
+    };
+    take().respond([
+      newer,
+      bounds(relay, "c", "head", {
+        has_more: true,
+        next_cursor: { created_at: 20, id: newer.id },
+      }),
+    ]);
+    await flush();
+    for (const [row, cursor] of [
+      [older, newer],
+      [oldest, older],
+    ] as const) {
+      queries.loadOlder("c");
+      const page = window().find((read) => !read.filters[0]?.include_aux);
+      assert(page);
+      pending.splice(pending.indexOf(page), 1);
+      page.respond([
+        row,
+        bounds(relay, "c", `${cursor.created_at}:${cursor.id}`, {
+          has_more: true,
+          next_cursor: { created_at: row.created_at, id: row.id },
+        }),
+      ]);
+      await flush();
+    }
+    // One aux read at a time: the first page's, with the second queued.
+    const aux = window();
+    expect(aux.map((read) => read.filters[0]?.until)).toEqual([20]);
+    queries.ensure("d");
+    expect(aux[0]?.signal?.aborted).toBe(true);
+    expect(
+      window().filter(
+        (read) => read.filters[0]?.["#h"]?.[0] === "c" && !read.signal?.aborted,
+      ),
+    ).toEqual([]);
   });
   it("keeps rows older than a paged window's history bound out until a page reaches them", async () => {
     // Agents, search and previews read single old messages through the
@@ -567,6 +1883,48 @@ it("stamps rosterAsOf only when a complete roster read commits", async () => {
     const exact = test.queries.list();
     expect(exact.asOf).toBeGreaterThan(complete ?? Infinity);
     expect(exact.rosterAsOf).toBe(complete);
+  } finally {
+    test.store.dispose();
+  }
+});
+it("keeps rosterAsOf through a failed refresh and its retry", async () => {
+  const test = setup();
+  const { queries, next, pending } = test;
+  try {
+    await discovered(test);
+    const complete = queries.list().rosterAsOf;
+    expect(complete).toBeDefined();
+    queries.refreshList?.();
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    next().fail(new Error("offline"));
+    await vi.waitFor(() => expect(queries.list().status).toBe("error"));
+    expect(queries.list()).toMatchObject({
+      coverage: "partial",
+      rosterAsOf: complete,
+    });
+    // The retry republishes the kept channels as loading, then page by page.
+    const seen: unknown[] = [];
+    const stop = queries.subscribeList(() => seen.push(queries.list()));
+    queries.refreshList?.();
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    expect(queries.list()).toMatchObject({
+      status: "loading",
+      rosterAsOf: complete,
+    });
+    next().respond([
+      roster(relay, "a", [viewer.pubkey]),
+      metadata(relay, "a", "Alpha"),
+      roster(relay, "b", [viewer.pubkey]),
+      metadata(relay, "b", "Beta"),
+    ]);
+    await vi.waitFor(() =>
+      expect(test.store.session.live.snapshot().roster.state).toBe("verified"),
+    );
+    stop();
+    expect(seen.length).toBeGreaterThan(0);
+    for (const list of seen) expect(list).toHaveProperty("rosterAsOf");
+    expect(queries.list().status).toBe("ready");
+    expect(queries.list().coverage).toBeUndefined();
   } finally {
     test.store.dispose();
   }
@@ -1013,6 +2371,7 @@ it("does not rewrite the profile mirror when only cache hits reorder it", async 
     await load([bob.pubkey], [profile(bob, { name: "Bob" })]);
     expect(writeProfiles).toHaveBeenLastCalledWith(
       expect.arrayContaining([expect.anything(), expect.anything()]),
+      [],
     );
     writeProfiles.mockClear();
     // A hit reorders the cache; an unanswered name notifies without a new profile.

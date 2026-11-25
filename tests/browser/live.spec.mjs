@@ -7,7 +7,7 @@ import {
   upper,
   expectAnchor,
   end,
-  edge,
+  toOlder,
   anchor,
 } from "./timeline.mjs";
 
@@ -202,15 +202,24 @@ test("production WS → broker → mounted UI delivers messages and retries a pa
  * reconnect must keep both the paged range and the reading position. */
 async function pagedReader(page, app) {
   await ready(page, app);
-  await edge(page, -1);
-  await expect.poll(() => app.pending.length).toBe(1);
+  // Read ahead fills screens above the reader: take its read where it starts,
+  // so the held read does not wait out a Linux scroll to the top.
+  await toOlder(page, app, { top: false });
   await settle(page);
   const before = await anchor(page);
   const pageOne = app.pending.shift();
   pageOne.release();
-  await expect(
-    history(page).locator(`[data-message-id="${pageOne.events[0].id}"]`),
-  ).toBeAttached();
+  // The page landed: its aux closure is read next.
+  await expect
+    .poll(() =>
+      app.report.queries.some(
+        ({ filter }) =>
+          filter.include_aux &&
+          !filter.include_summaries &&
+          filter.until === pageOne.filter.until,
+      ),
+    )
+    .toBe(true);
   await settle(page);
   await expectAnchor(page, before);
   return { pageOne, reading: await upper(page) };
@@ -218,8 +227,7 @@ async function pagedReader(page, app) {
 
 /** The paged cursor survived: the next older page continues below page one. */
 async function pageOnward(page, app, pageOne) {
-  await edge(page, -1);
-  await expect.poll(() => app.pending.length).toBe(1);
+  await toOlder(page, app, { top: false });
   const pageTwo = app.pending.shift();
   expect(pageTwo.filter.until).toBeLessThan(pageOne.filter.until);
   pageTwo.release();

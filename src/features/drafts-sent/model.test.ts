@@ -1,12 +1,6 @@
 import { expect, it } from "vitest";
 import { activityOf, indexContext } from "./context";
-import {
-  dayLabel,
-  matches,
-  preview,
-  sentEntries,
-  type ReadEvent,
-} from "./model";
+import { matches, preview, sentEntries, type ReadEvent } from "./model";
 
 const viewer = "a".repeat(64);
 const root = "b".repeat(64);
@@ -250,10 +244,4 @@ it("previews are one bounded line of words, with spoilers hidden from display an
   expect(Array.from(preview("a".repeat(2000), ""))).toHaveLength(200);
   expect(matches(preview("||secret||", ""), "Research", "research")).toBe(true);
   expect(matches(preview("||secret||", ""), "Team", "secret")).toBe(false);
-});
-
-it("labels days", () => {
-  const at = (minutesAgo: number) => (NOW - minutesAgo * 60000) / 1000;
-  expect(dayLabel(at(5), NOW)).toBe("Today");
-  expect(dayLabel(at(60 * 26), NOW)).toBe("Yesterday");
 });

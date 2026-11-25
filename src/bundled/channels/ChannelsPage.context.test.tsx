@@ -152,7 +152,12 @@ async function channelsPage({ root = true, cached = false } = {}) {
           filters.some((filter) => matchesEvent(event, filter)),
         );
       const channelId = window["#h"]?.[0];
-      if (channelId === "alpha" && window.until !== undefined)
+      // An older page's background aux read is served without waiting.
+      if (
+        channelId === "alpha" &&
+        window.until !== undefined &&
+        !window.include_aux
+      )
         await new Promise<void>((resolve, reject) =>
           held.push((error) => (error ? reject(error) : resolve())),
         );

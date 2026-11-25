@@ -13,6 +13,7 @@ import {
   searchCustomEmoji,
   type EmojiMatch,
 } from "./emoji-search";
+import { emojiUsage, recordEmojiUsage } from "./emoji-usage";
 
 const OPTICAL_SAMPLE_SIZE = 64;
 const OPTICAL_CANVAS_SIZE = 128;
@@ -105,6 +106,7 @@ function NativeEmojiPreview({ emoji }: { emoji: string }) {
 
 export function EmojiCompletion({
   session,
+  scope,
   query,
   publish,
 }: ComposerCompletionProps) {
@@ -122,6 +124,7 @@ export function EmojiCompletion({
     let live = true;
     let withdraw: (() => void) | false = false;
     const custom = catalog.entries.filter((item) => !!session.media(item.url));
+    const uses = emojiUsage(scope);
     const items = (matches: readonly EmojiMatch[]) => {
       const counts = new Map<string, number>();
       for (const item of matches)
@@ -141,6 +144,7 @@ export function EmojiCompletion({
           <NativeEmojiPreview emoji={item.text} />
         ),
         edit: { text: item.text },
+        onSelect: () => recordEmojiUsage(scope, item.id),
       }));
     };
     // Suggestions may be partial; automatic replacement needs both catalogs.
@@ -149,10 +153,10 @@ export function EmojiCompletion({
       if (catalog.status === "error") void session.emoji.refresh();
     };
     withdraw = publish({
-      items: items(searchCustomEmoji(query.query, custom)),
+      items: items(searchCustomEmoji(query.query, custom, uses)),
       status: "Searching emoji…",
     });
-    void searchEmoji(query.query, custom)
+    void searchEmoji(query.query, custom, uses)
       .then((matches) => {
         if (!live) return;
         if (withdraw) withdraw();
@@ -173,7 +177,7 @@ export function EmojiCompletion({
         if (!live) return;
         if (withdraw) withdraw();
         withdraw = publish({
-          items: items(searchCustomEmoji(query.query, custom)),
+          items: items(searchCustomEmoji(query.query, custom, uses)),
           status: "Unicode emoji unavailable. Custom matches shown.",
           retry: retrySearch,
         });
@@ -187,6 +191,6 @@ export function EmojiCompletion({
       unsubscribe();
       if (withdraw) withdraw();
     };
-  }, [session, query.query, publish, catalog, attempt]);
+  }, [session, scope, query.query, publish, catalog, attempt]);
   return null;
 }

@@ -1,4 +1,11 @@
 import {
+  AnimatePresence,
+  motion,
+  useIsPresent,
+  usePresenceData,
+  useReducedMotion,
+} from "motion/react";
+import {
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
@@ -16,6 +23,7 @@ import type {
   ComposerInputElement,
   ComposerLinkEdit,
 } from "./composer-dom";
+import { useScrollEdges } from "../../shared/design-system/ui/useScrollEdges";
 import { Textarea } from "../../shared/design-system/ui/Textarea";
 import {
   documentEditorDraft,
@@ -109,7 +117,10 @@ export type DocumentEditorSelection = {
 export type DocumentEditorHandle = {
   focusEnd(): void;
   selection(): DocumentEditorSelection | undefined;
-  focusSelection(selection: DocumentEditorSelection): void;
+  focusSelection(
+    selection: DocumentEditorSelection,
+    options?: FocusOptions,
+  ): void;
 };
 
 export type DocumentEditorProps = {
@@ -119,17 +130,57 @@ export type DocumentEditorProps = {
   children?: ReactNode;
   onChange(value: string): void;
   disabled?: boolean;
+  variant?: "field";
+  "aria-describedby"?: string | undefined;
+  "aria-invalid"?: boolean;
   destinations?: readonly { label: string; href: string }[];
   label?: string;
   placeholder?: string;
   maxLength: number;
-  linkOpen: boolean;
-  onLinkOpenChange(open: boolean): void;
-  onSave(): void;
+  linkOpen?: boolean;
+  onLinkOpenChange?(open: boolean): void;
+  onSave?(): void;
   toolbarTarget?: HTMLElement | null;
-  source: boolean;
-  onSourceChange(source: boolean): void;
+  source?: boolean;
+  onSourceChange?(source: boolean): void;
 };
+
+function DocumentFormattingToolbar({
+  surfaceRef,
+  children,
+}: {
+  surfaceRef: Ref<HTMLFieldSetElement>;
+  children: ReactNode;
+}) {
+  const present = useIsPresent();
+  const instant: boolean = usePresenceData();
+  const hidden = { opacity: 0, y: instant ? "0rem" : "0.75rem" };
+  return (
+    <div className={styles.toolbarAnchor}>
+      <motion.fieldset
+        ref={surfaceRef}
+        className={styles.editorToolbar}
+        aria-label="Document formatting"
+        aria-hidden={!present || undefined}
+        inert={!present}
+        initial={hidden}
+        animate={{ opacity: 1, y: "0rem" }}
+        exit={hidden}
+        transition={{
+          duration: instant ? 0 : 0.22,
+          ease: [0.645, 0.045, 0.355, 1],
+        }}
+      >
+        {children}
+      </motion.fieldset>
+    </div>
+  );
+}
+
+function documentContent(value: string, field: boolean) {
+  const draft = documentEditorDraft(value);
+  return { draft, literal: field && documentEditorMarkdown(draft) !== value };
+}
 
 /** A document body using the composer's editing engine, without chat behavior. */
 export function DocumentEditor({
@@ -139,22 +190,38 @@ export function DocumentEditor({
   children,
   onChange,
   disabled = false,
+  variant,
+  "aria-describedby": describedBy,
+  "aria-invalid": invalid,
   destinations,
   label = "Document body",
   placeholder = "Write…",
   maxLength,
-  linkOpen,
-  onLinkOpenChange,
+  linkOpen: controlledLinkOpen,
+  onLinkOpenChange: setControlledLinkOpen,
   onSave,
   toolbarTarget = null,
-  source,
+  source: sourceMode = false,
   onSourceChange,
 }: DocumentEditorProps) {
+  const field = variant === "field";
+  const [content, setContent] = useState(() => documentContent(value, field));
+  const { draft, literal } = content;
+  const source = sourceMode || literal;
+  const [localLinkOpen, setLocalLinkOpen] = useState(false);
+  const linkOpen = controlledLinkOpen ?? localLinkOpen;
+  const onLinkOpenChange = setControlledLinkOpen ?? setLocalLinkOpen;
   const stack = useRef<HTMLDivElement>(null);
   const updateEditorScroller = useRef<() => HTMLElement | null>(null);
   const toolbarSurface = useRef<HTMLFieldSetElement>(null);
   const input = useRef<ComposerInputElement>(null);
   const sourceInput = useRef<HTMLTextAreaElement>(null);
+  const scrollRef = useScrollEdges("block");
+  useLayoutEffect(() => {
+    scrollRef(
+      field && editing ? (source ? sourceInput.current : input.current) : null,
+    );
+  }, [editing, field, scrollRef, source]);
   useImperativeHandle(
     ref,
     () => ({
@@ -163,11 +230,14 @@ export function DocumentEditor({
         if (!field?.contains(document.activeElement)) return;
         return { start: field.selectionStart, end: field.selectionEnd, source };
       },
-      focusSelection(selection) {
+      focusSelection(selection, options) {
         if (!editing || disabled) return;
         const field = source ? sourceInput.current : input.current;
-        field?.focus();
-        field?.setSelectionRange(selection.start, selection.end);
+        if (!field) return;
+        // Set the caret first when preserving scroll so focus cannot reveal its old position.
+        if (!options?.preventScroll) field.focus();
+        field.setSelectionRange(selection.start, selection.end);
+        if (options?.preventScroll) field.focus(options);
       },
       focusEnd() {
         if (!editing || disabled) return;
@@ -180,7 +250,6 @@ export function DocumentEditor({
     }),
     [editing, disabled, source],
   );
-  const [draft, setDraft] = useState(() => documentEditorDraft(value));
   const [formats, setFormats] = useState<readonly ComposerFormat[]>([]);
   const [link, setLink] = useState<ComposerLinkEdit>();
   const emitted = useRef(value);
@@ -206,7 +275,7 @@ export function DocumentEditor({
   // committed render so only accepted content survives, before the next paint.
   useLayoutEffect(() => {
     syncing.current = false;
-    if (source) return;
+    if (sourceMode) return;
     if (value === emitted.current) {
       rememberAccepted();
       return;
@@ -218,8 +287,8 @@ export function DocumentEditor({
       // Restore the accepted document, selection and undo state without an edit
       // transaction that could normalize Markdown or notify the plugin again.
       previous.restore();
-      setDraft(previous.draft);
-    } else setDraft(documentEditorDraft(value));
+      setContent({ draft: previous.draft, literal: false });
+    } else setContent(documentContent(value, field));
   });
   useLayoutEffect(() => {
     // The engine emits native select events even when formatting is unchanged.
@@ -232,16 +301,16 @@ export function DocumentEditor({
       setLink(undefined);
       return;
     }
-    if (source) onSourceChange(false);
+    if (sourceMode) onSourceChange?.(false);
     setLink((old) => old ?? input.current?.editLink() ?? undefined);
-  }, [linkOpen, source, onSourceChange]);
+  }, [linkOpen, sourceMode, onSourceChange]);
   const editLink = (edit?: ComposerLinkEdit) => {
     const next = edit ?? input.current?.editLink();
     if (!next) return;
     setLink(next);
     onLinkOpenChange(true);
   };
-  const showFormatting = editing && !source;
+  const showFormatting = editing && !source && !field;
   useLayoutEffect(() => {
     const editor = stack.current;
     if (!showFormatting || !editor) return;
@@ -280,56 +349,71 @@ export function DocumentEditor({
     const scroller = updateEditorScroller.current?.();
     if (scroller) scroller.scrollTop += Math.ceil(overlap);
   };
-  const toolbar = showFormatting && (
-    <div className={styles.toolbarAnchor}>
-      <fieldset
-        ref={toolbarSurface}
-        className={styles.editorToolbar}
-        aria-label="Document formatting"
-      >
-        <ComposerFormattingTools
-          persistent
-          markdownMode="document"
-          disabled={disabled}
-          activeFormats={formats}
-          toggleFormat={(format) => input.current?.toggleFormat(format)}
-          editLink={() => editLink()}
-        >
-          {null}
-        </ComposerFormattingTools>
-      </fieldset>
-    </div>
+  const reduceMotion = useReducedMotion();
+  const instant =
+    !!reduceMotion ||
+    (typeof document !== "undefined" &&
+      document.documentElement.hasAttribute("data-keyboard-navigation"));
+  const toolbar = (
+    <AnimatePresence custom={instant}>
+      {showFormatting && (
+        <DocumentFormattingToolbar surfaceRef={toolbarSurface}>
+          <ComposerFormattingTools
+            persistent
+            markdownMode="document"
+            disabled={disabled}
+            activeFormats={formats}
+            toggleFormat={(format) => input.current?.toggleFormat(format)}
+            editLink={() => editLink()}
+          >
+            {null}
+          </ComposerFormattingTools>
+        </DocumentFormattingToolbar>
+      )}
+    </AnimatePresence>
   );
   return (
     <div
       ref={stack}
-      className={`${styles.stack} ${editing && source ? styles.sourceEditor : ""}`}
+      className={`${styles.stack} ${field ? styles.field : ""} ${editing && source ? styles.sourceEditor : ""}`}
       data-formatting={showFormatting || undefined}
+      data-disabled={(field && disabled) || undefined}
     >
-      <section className={styles.editorBody} aria-label="Document content">
+      <section
+        className={`${styles.editorBody} text-message`}
+        aria-label="Document content"
+      >
         <div hidden={!editing}>
           {source ? (
             <Textarea
               ref={sourceInput}
-              aria-label="Markdown"
+              aria-label={field ? label : "Markdown"}
+              aria-describedby={describedBy}
+              aria-invalid={invalid || undefined}
               value={value}
               rows={4}
               maxLength={maxLength}
-              variant="code"
+              variant={field ? "text" : "code"}
+              appearance={field ? "outlined" : "field"}
               disabled={disabled || !editing}
               onKeyDown={(event) => {
                 if (disabled || !editing) return;
-                if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                if (
+                  onSave &&
+                  (event.metaKey || event.ctrlKey) &&
+                  event.key === "Enter"
+                ) {
                   event.preventDefault();
                   onSave();
                 }
               }}
               onChange={(event) => {
+                if (literal) emitted.current = event.target.value;
                 onChange(event.target.value);
               }}
             />
           ) : (
-            <div className={`text-body ${markdownStyles.documentScale}`}>
+            <div className={field ? undefined : markdownStyles.documentScale}>
               <EditableInput
                 ref={input}
                 draft={draft}
@@ -337,12 +421,15 @@ export function DocumentEditor({
                 disabled={disabled || !editing}
                 placeholder={placeholder}
                 aria-label={label}
+                aria-describedby={describedBy}
+                aria-invalid={invalid || undefined}
                 maxLength={Math.min(maxLength, MAX_MARKDOWN_LENGTH)}
                 markdownMode="document"
+                preservePlainTextLineBreaks={field}
                 decorationsFor={noDecorations}
                 onDraftChange={(next) => {
                   if (syncing.current) return;
-                  setDraft(next);
+                  setContent({ draft: next, literal: false });
                   const markdown = documentEditorMarkdown(next);
                   if (markdown !== value) {
                     emitted.current = markdown;
@@ -396,7 +483,7 @@ export function DocumentEditor({
 
                   if (event.key === "Enter") {
                     event.preventDefault();
-                    if (event.metaKey || event.ctrlKey) onSave();
+                    if (event.metaKey || event.ctrlKey) onSave?.();
                     else
                       input.current?.insertLineBreak(
                         event.shiftKey ? "hard" : "paragraph",
@@ -424,8 +511,7 @@ export function DocumentEditor({
         </div>
         {!editing && children}
       </section>
-      {toolbar &&
-        (toolbarTarget ? createPortal(toolbar, toolbarTarget) : toolbar)}
+      {toolbarTarget ? createPortal(toolbar, toolbarTarget) : toolbar}
       {editing && linkOpen && link && (
         <ComposerLinkDialog
           edit={link}

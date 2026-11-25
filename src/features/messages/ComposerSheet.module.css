@@ -1,0 +1,419 @@
+@reference "../../shared/styles/globals.css";
+
+.scrim {
+  position: fixed;
+  top: var(--scrim-top);
+  left: var(--scrim-left);
+  width: var(--scrim-width);
+  height: var(--scrim-height);
+  z-index: 1;
+  border-radius: var(--scrim-radius);
+  clip-path: inset(var(--scrim-inset));
+  background: var(--bg-scrim);
+  opacity: 0.15;
+  transition: opacity var(--duration-settle) var(--easing-enter);
+}
+/* Inside another sheet, whose material places it, the scrim dims all of
+   that sheet, header included. */
+.sheet .scrim {
+  inset: 0;
+  width: auto;
+  height: auto;
+  border-radius: 0;
+  clip-path: none;
+}
+.scrim:is([data-starting-style], [data-ending-style]) {
+  opacity: 0;
+}
+.scrim[data-ending-style] {
+  transition-duration: var(--duration-fast);
+}
+
+.sheet {
+  @apply floating-surface;
+  /* The sheet is raised; its received bubbles take the raised bubble step. */
+  --surface-message: var(--surface-message-raised);
+  --surface-message-hover: var(--surface-message-raised-hover);
+  /* Medium dialog insets, reduced at narrow widths as dialogs are. */
+  --dialog-padding: var(--space-8);
+  --sheet-gap: var(--space-2);
+  --sheet-border-width: 1px;
+  /* A thread's header: its compact controls inside its padding. */
+  --thread-header-height: calc(2 * var(--space-4) + var(--size-control-sm));
+  --sheet-header-height: var(--thread-header-height);
+  --sheet-top: max(8rem, calc(var(--view-top) + var(--space-4)));
+  --sheet-max-height: calc(
+    var(--dock-bottom) +
+    var(--sheet-gap) -
+    var(--sheet-top)
+  );
+  /* Drawn in its composer's dock, around the composer. */
+  position: absolute;
+  left: calc(-1 * var(--sheet-gap));
+  right: calc(-1 * var(--sheet-gap));
+  bottom: calc(-1 * var(--sheet-gap));
+  z-index: 1;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  max-height: var(--sheet-max-height);
+  overflow: hidden;
+  /* Concentric with the composer it surrounds. */
+  border-radius: calc(var(--composer-radius) + var(--sheet-gap));
+  color: var(--text-standard);
+  outline: 0;
+  transform-origin: bottom center;
+}
+@media (max-height: 40rem) {
+  .sheet {
+    --sheet-top: calc(var(--view-top) + var(--space-4));
+  }
+}
+@media (max-width: 30rem) {
+  .sheet {
+    --dialog-padding: var(--space-4);
+  }
+}
+
+/* Header and reading body; the composer's space stays below them. */
+.content {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  opacity: 1;
+  transition: opacity var(--duration-settle) var(--easing-enter);
+}
+.sheet:is([data-starting-style], [data-ending-style]) > .content {
+  opacity: 0;
+}
+.sheet[data-ending-style] > .content {
+  transition-duration: var(--duration-fast);
+}
+/* Close sits as far from the top as from the side, in the sheet's corner. */
+.header {
+  position: relative;
+  flex: none;
+  align-items: center;
+  padding: var(--space-5) var(--space-5) 0 var(--dialog-padding);
+}
+.byline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.name {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The intro's pill reaches past the short title it highlights. */
+.name[data-spotlight] {
+  overflow: visible;
+}
+.time {
+  flex: none;
+  white-space: nowrap;
+}
+.body {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: var(--space-4) var(--dialog-padding) var(--dialog-padding);
+}
+.reader {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+.composerSpace {
+  flex: none;
+  height: calc(var(--composer-height) + var(--sheet-gap));
+}
+
+/* A thread fits its content and grows with it up to the sheet's maximum, its
+   own reply box taking the composer's place and footprint. */
+.sheet[data-contained-composer] > .content {
+  flex: 0 1 auto;
+  opacity: 1;
+  transition: none;
+}
+.sheet[data-contained-composer] > .content > .body {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+.sheet[data-contained-composer] > .content > .body > .reader,
+.sheet[data-contained-composer] [data-reading-surface],
+.sheet[data-contained-composer] [data-thread-history-frame],
+.sheet[data-contained-composer] [data-message-scroller] {
+  flex: 0 1 auto;
+}
+/* The reader extends behind the header, as in ordinary form dialogs, under
+   the same progressive material. */
+.sheet[data-contained-composer] > .content > .header {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 2;
+  padding: var(--space-4);
+}
+.headerMaterial {
+  display: block;
+  position: absolute;
+  inset: 0 0 calc(-1 * var(--space-3));
+  z-index: -1;
+  pointer-events: none;
+}
+/* What a thread's reader shows first starts where the header's material
+   ends. A row brings its own top padding, which lies under that fade rather
+   than below it; the unread line has none, so it keeps the row's lead. */
+.sheet[data-contained-composer] {
+  --thread-row-lead: calc(var(--space-3) + var(--space-half));
+  --thread-reader-top: calc(
+    var(--sheet-header-height) +
+    var(--space-3) -
+    var(--thread-row-lead)
+  );
+}
+:where(html[data-message-density="compact"]) .sheet[data-contained-composer] {
+  --thread-row-lead: calc(var(--space-1) + var(--space-half));
+}
+.sheet[data-contained-composer]
+  [data-thread-history-frame]
+  > [data-message-scroller] {
+  padding-top: var(--thread-reader-top);
+  scroll-padding-top: var(--thread-reader-top);
+  /* The edge materials replace the conversation history's scroll fade. */
+  mask-image: none;
+}
+.sheet[data-contained-composer]
+  [data-thread-history-frame]
+  > [data-message-scroller]
+  [data-new-messages-boundary] {
+  scroll-margin-top: var(--thread-row-lead);
+}
+/* The reader fades into the raised surface above the reply box too. */
+.sheet[data-contained-composer]
+  [data-thread-history-frame]
+  > [class~="buzz-dialog-bar-material"] {
+  display: block;
+}
+.sheet[data-contained-composer] [data-thread-history-frame] {
+  opacity: 1;
+  transition: opacity var(--duration-settle) var(--easing-enter);
+}
+.sheet[data-contained-composer]:is([data-starting-style], [data-ending-style])
+  [data-thread-history-frame] {
+  opacity: 0;
+}
+.sheet[data-contained-composer][data-ending-style] [data-thread-history-frame] {
+  transition-duration: var(--duration-fast);
+}
+/* Match Show more's composer footprint. The floating surface's 1px border
+   counts toward the surrounding gap; only the reader grows above the editor. */
+.sheet[data-height="content"][data-contained-composer] [data-composer-dock] {
+  /* With the sheets and scrim it holds, above this sheet's header. */
+  z-index: 3;
+  width: calc(100% + 2 * var(--sheet-border-width) - 2 * var(--sheet-gap));
+  margin: 0 auto calc(var(--sheet-gap) - var(--sheet-border-width));
+}
+html[data-keyboard-navigation]
+  .sheet[data-contained-composer]
+  [data-thread-history-frame] {
+  transition: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sheet[data-contained-composer] [data-thread-history-frame] {
+    transition: none;
+  }
+}
+
+html[data-keyboard-navigation] :is(.scrim, .content) {
+  transition: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  :is(.scrim, .content) {
+    transition: none;
+  }
+}
+
+/* A panel, such as a profile or a pull request, reads at the full height over
+   the composer it covers. Its renderer keeps its own padding and scrolling. */
+.sheet[data-reader-only] {
+  /* Its header, when the panel reads beneath it. */
+  --sheet-header-height: calc(var(--space-5) + var(--size-control-sm));
+  height: var(--sheet-max-height);
+}
+/* So does a layer over another sheet; details keep the composer's space at
+   the bottom of the height they fill. */
+.sheet[data-reader-only] > .content,
+.sheet .sheet > .content {
+  flex: 1;
+}
+.sheet[data-reader-only] > .content > .body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+  padding: var(--space-4) 0 0;
+}
+
+/* A thread under a layer grows to fit it, so the layer over its reply box is
+   not as small as a short thread; it settles back after. The layer publishes
+   the height it needs (`--layer-height`: a panel's is the full height), and
+   the thread adds the strip of itself that shows above it. */
+.sheet[data-contained-composer] {
+  min-height: 0;
+  transition: min-height var(--duration-settle) var(--easing-enter);
+}
+.sheet[data-contained-composer][data-tall] {
+  min-height: min(
+    var(--sheet-max-height),
+    calc(
+      var(--layer-height, 0px) +
+      var(--space-4) +
+      2 *
+      var(--sheet-border-width)
+    )
+  );
+}
+.sheet[data-contained-composer][data-tall] > .content,
+.sheet[data-contained-composer][data-tall] > .content > .body,
+.sheet[data-contained-composer][data-tall] > .content > .body > .reader,
+.sheet[data-contained-composer][data-tall]
+  > .content
+  > .body
+  > .reader
+  :is(
+    [data-reading-surface],
+    [data-thread-history-frame],
+    [data-message-scroller]
+  ) {
+  flex: 1 1 auto;
+}
+html[data-keyboard-navigation] .sheet[data-contained-composer] {
+  transition: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sheet[data-contained-composer] {
+    transition: none;
+  }
+}
+
+/* A panel that draws to the sheet's edges, such as a profile, reads under the
+   header, which takes the material once that panel scrolls beneath it. */
+.sheet[data-reader-only]:has([data-full-bleed]) > .content > .header {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 2;
+}
+.sheet[data-reader-only]:has([data-full-bleed]) > .content > .body {
+  padding-top: 0;
+}
+.sheet[data-reader-only] .headerMaterial {
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--easing-state);
+}
+.sheet[data-reader-only]:not(:has([data-full-bleed])) .headerMaterial {
+  display: none;
+}
+.sheet[data-reader-only][data-scrolled] .headerMaterial {
+  opacity: 1;
+}
+
+/* Over a composer inside another sheet, details and panels stack tightly
+   over it, covering its header: only a strip of the sheet beneath shows
+   above. */
+.sheet .sheet {
+  --sheet-top: calc(var(--view-top) + var(--space-4));
+  height: var(--sheet-max-height);
+}
+
+/* A thread's quick open. The sheet is placed in this box, which
+   clips it only while its open motion runs on the compositor (a transform
+   pair, see revealFrom). Its top reaches far above the dock and it never
+   takes the pointer. */
+.sheetClip {
+  --sheet-gap: var(--space-2);
+  position: absolute;
+  top: -200vh;
+  left: calc(-1 * var(--sheet-gap));
+  right: calc(-1 * var(--sheet-gap));
+  bottom: calc(-1 * var(--sheet-gap));
+  z-index: 1;
+  pointer-events: none;
+}
+.sheetClip[data-moving] {
+  overflow: hidden;
+  border-bottom-left-radius: calc(var(--composer-radius) + var(--sheet-gap));
+  border-bottom-right-radius: calc(var(--composer-radius) + var(--sheet-gap));
+}
+.sheetClip > .sheet {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: auto;
+}
+/* It opens straight to its full height; a short thread leaves space. */
+.sheet[data-quick] {
+  height: var(--sheet-max-height);
+}
+.sheet[data-contained-composer][data-quick] > .content,
+.sheet[data-contained-composer][data-quick] > .content > .body,
+.sheet[data-contained-composer][data-quick] > .content > .body > .reader,
+.sheet[data-contained-composer][data-quick] [data-reading-surface],
+html .sheet[data-contained-composer][data-quick] [data-thread-history-frame] {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+/* The thread mounts hidden and is drawn in one frame once it is ready. */
+.sheet[data-contained-composer][data-quick]:not([data-revealed])
+  > .content
+  > .body {
+  opacity: 0;
+  pointer-events: none;
+}
+html .sheet[data-contained-composer][data-quick] [data-thread-history-frame],
+html .sheet[data-contained-composer][data-quick] [data-thread-rows] {
+  transition: none;
+}
+/* Only a slow read shows that it is still reading. */
+.quickLoader {
+  position: absolute;
+  inset: var(--sheet-header-height) 0
+    calc(var(--composer-height) + 2 * var(--sheet-gap));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-subtle);
+  pointer-events: none;
+  opacity: 0;
+  animation: quick-loader-in var(--duration-state, 150ms) ease-out 400ms
+    forwards;
+}
+.sheet[data-revealed] .quickLoader {
+  display: none;
+}
+@keyframes quick-loader-in {
+  to {
+    opacity: 1;
+  }
+}
+/* The header is drawn once the sheet has reached its full height, rather than
+   being uncovered by the rising edge at the end of the motion. It comes in in
+   one frame, the one that draws a thread that is ready by then, so it never
+   lands after its rows. */
+.sheet[data-contained-composer][data-quick]:not([data-opened])
+  > .content
+  > .header {
+  opacity: 0;
+}

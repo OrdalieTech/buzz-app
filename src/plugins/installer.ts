@@ -1,5 +1,6 @@
 import { Service, type Context } from "@deepseek-ai/cordis";
 import type { PluginManager } from "./manager";
+import { resolveOwner } from "./owner";
 import { providePluginReviewHold } from "./review-access";
 import {
   createPluginUpdateCapabilityBridge,
@@ -683,8 +684,8 @@ export function createPluginInstallCore({
     ): Promise<PluginInstallOutcome> {
       const checked = parsePluginInstallSource(source);
       if (!checked) throw new Error(invalidSource);
-      const { configuration } = plugins.snapshot();
-      if (!plugins.imports || configuration.status !== "ready")
+      const snapshot = plugins.snapshot();
+      if (!plugins.imports || snapshot.configuration.status !== "ready")
         return "unavailable";
       let admitted: number | undefined;
       let stopWatching: () => void;
@@ -696,9 +697,7 @@ export function createPluginInstallCore({
         return "unavailable";
       }
       try {
-        const own = configuration.catalog.plugins.find(
-          (plugin) => plugin.manifest.id === caller.id,
-        );
+        const own = resolveOwner(snapshot, caller.id);
         const origin = {
           id: caller.id,
           name: displayName(own?.manifest.name ?? "", caller.id),

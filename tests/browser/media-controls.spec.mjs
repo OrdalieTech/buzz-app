@@ -295,6 +295,395 @@ test("unavailable media keeps its explanation readable and recovery visible", as
   await expect(dialog.getByRole("heading", { name: "Comments" })).toBeVisible();
 });
 
+// Browser-only: avatar and pill geometry, where the engines size an absolutely
+// positioned avatar slot differently.
+for (const [working, query, row] of [
+  ["conversation indicator", "agent-working", ""],
+  // The step follows the viewer's own comment, inside its own comment row.
+  ["recorded step", "agent-working&agent-update", "[data-review-comment] "],
+])
+  test(`media comments keep a working agent's ${working} avatar in the comment avatar column`, async ({
+    page,
+  }) => {
+    await page.goto(`/tests/fixtures/media-review.html?photo&${query}`);
+    const drawer = page
+      .getByRole("dialog", { name: "Image viewer", exact: true })
+      .getByRole("complementary", { name: "Media comments" });
+    // The agent's comment is first; the viewer's own comment is the last.
+    const comment = drawer.locator("[data-review-comment]").first();
+    const indicator = drawer.locator(`${row}[data-agent-response-preview]`);
+    await expect(indicator).toBeVisible();
+    // A recorded step replaces the conversation indicator: one pill, not two.
+    await expect(drawer.locator("[data-agent-response-preview]")).toHaveCount(
+      1,
+    );
+    for (const density of ["default", "compact"]) {
+      await page.evaluate((density) => {
+        document.documentElement.dataset.messageDensity = density;
+      }, density);
+      await expect
+        .poll(
+          async () => {
+            const [avatar, bubble, agentAvatar, pill] = await Promise.all(
+              [
+                comment.locator("[data-avatar-shape]").first(),
+                comment.locator('[class*="messageBubble"]').first(),
+                indicator.locator("[data-avatar-shape]").first(),
+                indicator.locator('[class*="messageBubble"]').first(),
+              ].map((part) => part.boundingBox()),
+            );
+            return {
+              size: [agentAvatar.width, agentAvatar.height],
+              column: agentAvatar.x - avatar.x,
+              pillEdge: pill.x - bubble.x,
+              gap: pill.x - (agentAvatar.x + agentAvatar.width),
+              commentGap: bubble.x - (avatar.x + avatar.width),
+              // Beside its pill, not on top of it.
+              clear:
+                agentAvatar.x + agentAvatar.width <= pill.x ||
+                agentAvatar.y + agentAvatar.height <= pill.y ||
+                agentAvatar.y >= pill.y + pill.height,
+              // Bubbles end on the avatar's bottom edge; a flat list centres
+              // the avatar on the first line's top edge.
+              block:
+                density === "compact"
+                  ? agentAvatar.y + agentAvatar.height / 2 - pill.y
+                  : agentAvatar.y + agentAvatar.height - pill.y - pill.height,
+              commentBlock:
+                density === "compact"
+                  ? avatar.y + avatar.height / 2 - bubble.y
+                  : avatar.y + avatar.height - bubble.y - bubble.height,
+            };
+          },
+          { message: density },
+        )
+        .toEqual({
+          size: [24, 24],
+          column: 0,
+          pillEdge: 0,
+          gap: density === "compact" ? 10 : 4,
+          commentGap: density === "compact" ? 10 : 4,
+          clear: true,
+          block: 0,
+          commentBlock: 0,
+        });
+    }
+  });
+
+test("media comments stack a working agent's recorded step under its own comment", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/fixtures/media-review.html?photo&agent-working&agent-update=own",
+  );
+  const drawer = page
+    .getByRole("dialog", { name: "Image viewer", exact: true })
+    .getByRole("complementary", { name: "Media comments" });
+  const rows = drawer.locator("[data-review-comment]");
+  await expect(rows).toHaveCount(4);
+  // The agent's comment, then its working step: one group, named once.
+  const own = rows.nth(2);
+  const step = rows.nth(3);
+  const pill = step.locator("[data-agent-response-preview]");
+  await expect(pill).toBeVisible();
+  await expect(drawer.locator("[data-agent-response-preview]")).toHaveCount(1);
+  await expect(own.locator('[class*="byline"]')).toHaveText(/Alex/);
+  await expect(step.locator('[class*="byline"]')).toHaveCount(0);
+  for (const density of ["default", "compact"]) {
+    await page.evaluate((density) => {
+      document.documentElement.dataset.messageDensity = density;
+    }, density);
+    // Bubbles end the group with its avatar; a flat list starts with it.
+    const [bare, held] = density === "compact" ? [step, own] : [own, step];
+    await expect(bare.locator('[class*="messageAvatar"]'), density).toHaveCount(
+      0,
+    );
+    await expect
+      .poll(
+        async () => {
+          const [column, avatar, bubble, stepPill] = await Promise.all(
+            [
+              rows.first().locator("[data-avatar-shape]").first(),
+              held.locator('[class*="messageAvatar"] [data-avatar-shape]'),
+              own.locator('[class*="messageBubble"]').first(),
+              pill.locator('[class*="messageBubble"]').first(),
+            ].map((part) => part.boundingBox()),
+          );
+          return {
+            size: [avatar.width, avatar.height],
+            column: avatar.x - column.x,
+            pillEdge: stepPill.x - bubble.x,
+            // The thread's stacked-row gap, not the space between comments.
+            gap: stepPill.y - (bubble.y + bubble.height),
+          };
+        },
+        { message: density },
+      )
+      .toEqual({
+        size: [24, 24],
+        column: 0,
+        pillEdge: 0,
+        gap: density === "compact" ? 8 : 2,
+      });
+  }
+});
+
+// Earlier steps are history lines here, so a working step under one is not
+// part of a drawn group: it names its agent and shows its avatar itself.
+for (const [order, query] of [
+  ["an earlier step of its run", "steps"],
+  ["its own comment and an earlier step", "own-steps"],
+  // Sam has no picture and Alex has one, so the image is Alex's.
+  ["another agent's step", "agents"],
+])
+  test(`media comments attribute a working agent's recorded step after ${order}`, async ({
+    page,
+  }) => {
+    await page.goto(
+      `/tests/fixtures/media-review.html?photo&agent-working&agent-update=${query}`,
+    );
+    const drawer = page
+      .getByRole("dialog", { name: "Image viewer", exact: true })
+      .getByRole("complementary", { name: "Media comments" });
+    const rows = drawer.locator("[data-review-comment]");
+    const step = rows.last();
+    const pill = step.locator("[data-agent-response-preview]");
+    await expect(pill).toBeVisible();
+    await expect(drawer.locator("[data-agent-response-preview]")).toHaveCount(
+      1,
+    );
+    const history = rows.nth(-2);
+    await expect(history).toContainText("Opening the clip");
+    await expect(
+      drawer.locator("[data-stack-next], [data-stack-previous]"),
+    ).toHaveCount(0);
+    for (const density of ["default", "compact"]) {
+      await page.evaluate((density) => {
+        document.documentElement.dataset.messageDensity = density;
+      }, density);
+      await expect(step.locator('[class*="byline"]'), density).toHaveText(
+        /Alex/,
+      );
+      const avatar = step.locator(
+        '[class*="messageAvatar"] [data-avatar-shape]',
+      );
+      await expect(avatar.locator("img"), density).toHaveCount(1);
+      if (query === "own-steps")
+        await expect(
+          rows.nth(-3).locator('[class*="messageAvatar"] [data-avatar-shape]'),
+          density,
+        ).toHaveCount(1);
+      await expect
+        .poll(
+          async () => {
+            const [column, box] = await Promise.all(
+              [rows.first().locator("[data-avatar-shape]").first(), avatar].map(
+                (part) => part.boundingBox(),
+              ),
+            );
+            return { size: [box.width, box.height], column: box.x - column.x };
+          },
+          { message: density },
+        )
+        .toEqual({ size: [24, 24], column: 0 });
+    }
+  });
+
+// Browser-only: where focus goes when its element is removed, and where the
+// next Tab starts from, are the engine's sequential focus navigation.
+test("media comments keep keyboard focus on a recorded step when its agent's work ends", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/fixtures/media-review.html?photo&agent-working&agent-update",
+  );
+  const dialog = page.getByRole("dialog", {
+    name: "Image viewer",
+    exact: true,
+  });
+  const drawer = dialog.getByRole("complementary", { name: "Media comments" });
+  const step = drawer.locator("[data-review-comment]").last();
+  const disclosure = step.getByRole("button", {
+    name: /Rechecking the second cut/,
+  });
+  await expect(step.locator("[data-agent-response-preview]")).toBeVisible();
+  await disclosure.focus();
+  await expect(disclosure).toBeFocused();
+  await page.evaluate(() =>
+    window.dispatchEvent(new Event("fixture-agent-done")),
+  );
+  // The step is now a history line: the same row, a replacement disclosure.
+  await expect(drawer.locator("[data-agent-response-preview]")).toHaveCount(0);
+  await expect(step).toContainText("Rechecking the second cut");
+  await expect(disclosure).toBeFocused();
+  // Tab moves on from the row to the composer below it, not to the viewer's
+  // first control.
+  await page.keyboard.press("Tab");
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const comments = document.querySelector(
+          '[aria-label="Media comments"]',
+        );
+        const row = [...comments.querySelectorAll("[data-review-comment]")].at(
+          -1,
+        );
+        const active = document.activeElement;
+        return {
+          inComments: comments.contains(active),
+          afterRow: !!(
+            row.compareDocumentPosition(active) &
+            Node.DOCUMENT_POSITION_FOLLOWING
+          ),
+          inRow: row.contains(active),
+        };
+      }),
+    )
+    .toEqual({ inComments: true, afterRow: true, inRow: false });
+});
+
+// Browser-only, as above: the focused link is removed with the row's old
+// container, by either route that makes a working step a history line.
+for (const [route, event] of [
+  ["its agent's work ends", "fixture-agent-done"],
+  ["a newer step arrives", "fixture-agent-step"],
+]) {
+  const open = async (page) => {
+    await page.goto(
+      "/tests/fixtures/media-review.html?photo&agent-working&agent-update=link",
+    );
+    const drawer = page
+      .getByRole("dialog", { name: "Image viewer", exact: true })
+      .getByRole("complementary", { name: "Media comments" });
+    const step = drawer
+      .locator("[data-review-comment]")
+      .filter({ hasText: "Rechecking the second cut" });
+    const link = step.getByRole("link", { name: "https://example.org/cut" });
+    await expect(step.locator("[data-agent-response-preview]")).toBeVisible();
+    await step.getByRole("button", { name: /Rechecking/ }).click();
+    await expect(link).toBeVisible();
+    return {
+      drawer,
+      link,
+      // The step is then a history line: the same row, replacement details.
+      async change() {
+        await page.evaluate(
+          (event) => window.dispatchEvent(new Event(event)),
+          event,
+        );
+        await expect(step.locator("[data-agent-response-preview]")).toHaveCount(
+          0,
+        );
+        await expect(link).toBeVisible();
+      },
+    };
+  };
+
+  test(`media comments keep keyboard focus on a link in a step's open details when ${route}`, async ({
+    page,
+  }) => {
+    const { link, change } = await open(page);
+    await link.focus();
+    await expect(link).toBeFocused();
+    await change();
+    await expect(link).toBeFocused();
+  });
+
+  test(`media comments leave focus outside a step's open details when ${route}`, async ({
+    page,
+  }) => {
+    const { drawer, link, change } = await open(page);
+    const composer = drawer.getByRole("textbox", { name: "Reply to thread" });
+    // Focus that has left the row is not pulled back into it.
+    await link.focus();
+    await composer.focus();
+    await expect(composer).toBeFocused();
+    await change();
+    await expect(composer).toBeFocused();
+  });
+}
+
+// Browser-only: the measured gaps come from wrapper spacing the stylesheet
+// picks by selector.
+test("media comments keep a finished step's spacing when its details open", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/fixtures/media-review.html?photo&agent-update=between",
+  );
+  const drawer = page
+    .getByRole("dialog", { name: "Image viewer", exact: true })
+    .getByRole("complementary", { name: "Media comments" });
+  const rows = drawer.locator("[data-review-comment]");
+  await expect(rows).toHaveCount(4);
+  const step = rows.nth(2);
+  const disclosure = step.getByRole("button", {
+    name: /Rechecking the second cut/,
+  });
+  const entry = step.locator("[data-message-id]").first();
+  // One read of one layout. The details open and close over a height
+  // transition and are removed when the close ends, which shortens the line
+  // in a single step; separate reads can land on either side of that step.
+  const read = () =>
+    rows.evaluateAll((nodes) => {
+      const step = nodes[2];
+      const line = step.querySelector("button[aria-expanded]");
+      const box = step
+        .querySelector("[data-message-id]")
+        .getBoundingClientRect();
+      const panel = step.querySelector('[class*="audienceBody"]');
+      // The row's content box: its own spacing is what is measured.
+      const content = (node) => {
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return {
+          top: rect.top + Number.parseFloat(style.paddingTop),
+          bottom: rect.bottom - Number.parseFloat(style.paddingBottom),
+        };
+      };
+      const moving =
+        panel?.hasAttribute("data-starting-style") ||
+        step.getAnimations({ subtree: true }).length > 0;
+      return {
+        // Settled closed: the details are gone. Settled open: they are in
+        // place and nothing in the row is still animating.
+        state:
+          line.getAttribute("aria-expanded") === "true"
+            ? moving
+              ? "opening"
+              : "open"
+            : panel
+              ? "closing"
+              : "closed",
+        above:
+          Math.round(
+            (line.getBoundingClientRect().top - content(nodes[1]).bottom) * 2,
+          ) / 2,
+        below: Math.round((content(nodes[3]).top - box.bottom) * 2) / 2,
+      };
+    });
+  for (const density of ["default", "compact"]) {
+    await page.evaluate((density) => {
+      document.documentElement.dataset.messageDensity = density;
+    }, density);
+    await expect
+      .poll(async () => (await read()).state, { message: density })
+      .toBe("closed");
+    const closed = await read();
+    expect(closed.state, density).toBe("closed");
+    await disclosure.click();
+    await expect(
+      entry.getByText("Rechecking the second cut").last(),
+      density,
+    ).toBeVisible();
+    await expect
+      .poll(read, { message: density })
+      .toEqual({ ...closed, state: "open" });
+    await disclosure.click();
+    await expect(disclosure, density).toHaveAttribute("aria-expanded", "false");
+  }
+});
+
 // Inline previews have a much shorter media area than the expanded player.
 test("narrow video thumbnails keep play clear of the progress controls", async ({
   page,

@@ -4,7 +4,7 @@ import type {
   HostProcessOptions,
 } from "../../features/host/service";
 import script from "./codex.sh?raw";
-import type { Wire } from "./rpc";
+import type { Spawn, Wire } from "./rpc";
 import {
   buzzHome,
   checkCodex,
@@ -513,4 +513,28 @@ it("quotes at most 500 characters of Codex's words, marking the cut", () => {
 it("leaves a notice it can't explain exactly as Codex's runtime wrote it", () => {
   const notice = "Codex could not finish: model busy.";
   expect(explainTurn(notice, SETTINGS)).toBe(notice);
+});
+
+it("asks for no agent environment variables to install, use, sign in or find homes", async () => {
+  const asked: string[] = [];
+  const watched =
+    (spawn: Spawn): Spawn =>
+    (id, options) => {
+      if (options?.secrets?.includes("agent-env")) asked.push(id);
+      return spawn(id, options);
+    };
+  const { spawn, request, state } = releases("0.163.0");
+  await new CodexSetup(watched(spawn), request).run("install");
+  expect(state.used).toEqual(["0.163.0"]);
+  const steps = scripted({
+    home: { stdout: "/buzz/codex-home\n" },
+    review: { stdout: "/buzz/review-home\n/buzz/review-state\nworkspace-1\n" },
+  });
+  await new CodexSetup(watched(steps.spawn)).run("login");
+  await buzzHome(watched(steps.spawn));
+  await reviewHome(watched(steps.spawn));
+  expect(steps.calls.map((call) => call.id)).toEqual(
+    expect.arrayContaining(["login", "home", "review"]),
+  );
+  expect(asked).toEqual([]);
 });

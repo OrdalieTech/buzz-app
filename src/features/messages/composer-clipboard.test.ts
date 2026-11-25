@@ -282,3 +282,23 @@ it.each(["chat", "document"] as const)(
     expect(copied.html.match(/<a /g)).toHaveLength(2);
   },
 );
+// `data-copy-skip` marks chrome in the live timeline only. Any page can write
+// it into clipboard HTML, where it must not make a paste drop text.
+it("keeps pasted text that carries the timeline's copy-skip marker", () => {
+  expect(
+    buzzCopyDocument(
+      '<div data-buzz-copy="timeline"><p>Pay <span data-copy-skip>Alice, not </span>Mallory</p><p data-copy-skip>Thanks</p></div>',
+    )?.toJSON(),
+  ).toEqual({
+    type: "doc",
+    content: [
+      {
+        type: "paragraph",
+        content: [{ type: "text", text: "Pay Alice, not Mallory" }],
+      },
+      // Timeline paragraphs paste a blank line apart.
+      { type: "paragraph" },
+      { type: "paragraph", content: [{ type: "text", text: "Thanks" }] },
+    ],
+  });
+});

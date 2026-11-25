@@ -29,6 +29,7 @@ const reads = {
     id === "planning"
       ? { name: LONG, private: true, channelType: "stream" }
       : { name: "general", channelType: "stream" },
+  ownerReadable: () => true,
 } as unknown as AgentReads;
 const { ActivityTab } = createTabs({
   setup: new ClaudeSetup(undefined),

@@ -1,4 +1,5 @@
 import { validChannelLabel } from "../src/features/relay/channel-labels.ts";
+import { isMigrationSource } from "../src/features/relay/migration.ts";
 // Host signing allowlist. No arbitrary kinds, roles or metadata edits.
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export function validChannelCommand(event) {
@@ -17,9 +18,15 @@ export function validChannelCommand(event) {
   )
     return false;
   let tags = event.tags;
-  if ([9000, 9007].includes(event.kind) && tags.at(-1)?.[0] === "client-id") {
-    const clientId = tags.at(-1);
-    if (clientId.length !== 2 || !uuid.test(clientId[1])) return false;
+  const client = tags.at(-1)?.[0] === "client-id" ? tags.at(-1) : undefined;
+  if (client) {
+    if (client.length !== 2 || !uuid.test(client[1])) return false;
+    tags = tags.slice(0, -1);
+  }
+  const migration = tags.at(-1)?.[0] === "migration" ? tags.at(-1) : undefined;
+  if (migration) {
+    if (migration.length !== 2 || !isMigrationSource(migration[1]))
+      return false;
     tags = tags.slice(0, -1);
   }
   const [h] = tags;
@@ -106,7 +113,8 @@ export function validChannelCommand(event) {
         (role.length === 2 &&
           (role[1] === "member" ||
             role[1] === "guest" ||
-            (role[1] === "bot" && people.length > 1))))
+            (role[1] === "bot" &&
+              (people.length > 1 || (!!migration && !!client))))))
     );
   }
   return false;

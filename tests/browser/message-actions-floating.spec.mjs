@@ -965,7 +965,11 @@ test("menus keep their actions showing; pickers and dialogs cover them", async (
   });
   const composerBox = await composer.boundingBox();
   // The menu's modal overlay receives the outside click before the editor does.
-  await page.mouse.click(composerBox.x + 20, composerBox.y + 10);
+  // The composer's far end is clear of the menu, which opens over its start.
+  await page.mouse.click(
+    composerBox.x + composerBox.width - 80,
+    composerBox.y + 10,
+  );
   await expect(menu).toBeHidden();
   await composer.click();
   await expect(actions).toHaveCSS("opacity", "0");

@@ -240,6 +240,7 @@ export class ClaudeProcess {
    * starts anew, so a stopped turn's tool calls stay stopped. */
   private workLifetime = new AbortController();
   private callEpoch = 0;
+  private turnLifetime = new AbortController();
   /** The owner's Stop awaiting Claude's answer, for the work it stopped;
    * another Stop of that work shares it. */
   private stopRequest:
@@ -933,7 +934,6 @@ export class ClaudeProcess {
     return this.readingEffort;
   }
   private settle(settled: Settled) {
-    this.callEpoch++;
     this.pending = 0;
     this.receipts.clear();
     this.activeReceipts.clear();
@@ -941,8 +941,14 @@ export class ClaudeProcess {
     this.stopping = false;
     this.stopped = false;
     this.compacting = false;
+    this.endTurn();
     for (const resolve of this.waiters.splice(0)) resolve(settled);
     if (!this.alive) this.releaseIdle();
+  }
+  private endTurn() {
+    this.callEpoch++;
+    this.turnLifetime.abort(new Error("The Claude turn has ended"));
+    this.turnLifetime = new AbortController();
   }
 
   private readError(data: string) {
@@ -1010,10 +1016,9 @@ export class ClaudeProcess {
         this.continuation = "running";
       if (!this.working && (this.continuation === "running" || this.stopping))
         this.continuation = undefined;
-      if (!this.working) this.callEpoch++;
       // A turn of its own, such as a background task's, is new work.
       if (starts) this.renew();
-      if (!this.working && this.pending) this.done();
+      if (!this.working) this.done();
       this.edge(active);
       return;
     }
@@ -1109,12 +1114,12 @@ export class ClaudeProcess {
     if (!this.reportsState) {
       const active = this.active;
       this.continuation = undefined;
-      this.callEpoch++;
-      if (this.pending) this.done();
+      this.done();
       this.edge(active);
     }
   }
   private done() {
+    if (!this.pending) return this.endTurn();
     const error = this.lastError;
     this.settle(
       error
@@ -1143,7 +1148,11 @@ export class ClaudeProcess {
         mcp_response: await this.tools(
           this.conversation,
           request.message,
-          AbortSignal.any([this.protectionLifetime.signal, work.signal]),
+          AbortSignal.any([
+            this.protectionLifetime.signal,
+            work.signal,
+            this.turnLifetime.signal,
+          ]),
           () => {
             work.signal.throwIfAborted();
             if (

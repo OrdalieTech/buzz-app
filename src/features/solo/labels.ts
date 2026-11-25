@@ -1,3 +1,4 @@
+import { viewerMember } from "../relay/membership.ts";
 import type { ChannelSummary } from "../relay/contracts.ts";
 
 /** Presentation provenance in the relay's existing NIP-CL labels, never access. */
@@ -67,6 +68,6 @@ export function eligibleSolo(
       ownSolo(channel, viewer) ||
       (!!viewer &&
         channel.viewerRole === "guest" &&
-        !!channel.members?.includes(viewer)))
+        viewerMember(channel, viewer)))
   );
 }

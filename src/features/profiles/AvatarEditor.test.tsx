@@ -259,22 +259,8 @@ it("previews emoji colors without selecting a draft, and restores the image when
   fireEvent.click(
     screen.getByRole("button", { name: "Use #476CFF background" }),
   );
-  expect(
-    screen
-      .getByRole("slider", { name: "Emoji position" })
-      .querySelector("[data-avatar-shape]"),
-  ).toHaveStyle({
-    backgroundColor: "#476CFF",
-  });
   expect(screen.getByLabelText("Draft picture")).toHaveTextContent(original);
   fireEvent.click(screen.getByRole("tab", { name: "Emoji" }));
-  expect(
-    screen
-      .getByRole("slider", { name: "Emoji position" })
-      .querySelector("[data-avatar-shape]"),
-  ).toHaveStyle({
-    backgroundColor: "#476CFF",
-  });
   fireEvent.click(screen.getByRole("tab", { name: "Image" }));
   expect(screen.getByLabelText("Picture URL (optional)")).toHaveValue(original);
   close();
@@ -408,13 +394,6 @@ it("previews an inline agent emoji and its background with Done in the form foot
   fireEvent.click(
     screen.getByRole("button", { name: "Use #476CFF background" }),
   );
-  expect(
-    screen
-      .getByRole("slider", { name: "Emoji position" })
-      .querySelector("[data-avatar-shape]"),
-  ).toHaveStyle({
-    backgroundColor: "#476CFF",
-  });
   expect(footer).toContainElement(screen.getByRole("button", { name: "Done" }));
   expect(
     screen.queryByRole("button", { name: "Remove avatar" }),

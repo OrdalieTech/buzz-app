@@ -8,7 +8,7 @@ import {
   settingsDialog,
 } from "./navigation.mjs";
 import { test, expect } from "./fixture.mjs";
-import { open, edge, settle } from "./timeline.mjs";
+import { open, settle, wheel } from "./timeline.mjs";
 
 test.use({ pluginFixtures: true, historyCounts: { alpha: 1, beta: 0 } });
 const button = (page, name) => page.getByRole("button", { name, exact: true });
@@ -303,9 +303,57 @@ test("interface zoom preserves an open emoji search and scales its controls", as
   );
 });
 
+async function wheelToScaledHistoryTop(page, history, messageIds) {
+  const position = () =>
+    history.evaluate((element, ids) => {
+      const { top, bottom } = element.getBoundingClientRect();
+      const row = [...element.querySelectorAll("[data-message-id]")].find(
+        (row) => {
+          const bounds = row.getBoundingClientRect();
+          return bounds.bottom > top && bounds.top < bottom;
+        },
+      );
+      const index = ids.indexOf(row?.dataset.messageId);
+      if (index === -1 && element.scrollTop >= 4)
+        throw new Error("No visible scaled-history message below the top");
+      return {
+        scrollTop: element.scrollTop,
+        index,
+        inset: row ? row.getBoundingClientRect().top - top : 0,
+      };
+    }, messageIds);
+
+  await history.hover();
+  let current = await position();
+  if (current.scrollTop < 4) {
+    // A wheel at the top can request older history without moving the list.
+    await page.mouse.wheel(0, -Math.max(1, current.scrollTop));
+    await settle(page, history);
+  }
+  // Row measurement can increase scrollTop while the reader moves up. Keep
+  // stepping within the journey's deadline while the visible position advances.
+  while (current.scrollTop >= 4) {
+    const before = current;
+    await wheel(page, -Math.min(2000, before.scrollTop), history);
+    current = await position();
+    if (current.scrollTop >= 4) {
+      expect(
+        current.index === before.index
+          ? current.inset - before.inset
+          : before.index - current.index,
+        "wheel moves toward older scaled-history messages",
+      ).toBeGreaterThan(0);
+    }
+  }
+  expect(
+    await history.evaluate((element) => element.scrollTop),
+    "wheel reaches the physical top of scaled history",
+  ).toBeLessThan(4);
+}
+
 test.describe("scaled history", () => {
-  test.use({ historyCounts: { alpha: 21, beta: 0 } });
-  // Twenty rows fill one page; the extra row proves the virtualized paging edge.
+  test.use({ historyCounts: { alpha: 300, beta: 0 } });
+  // History remains past the read ahead on open, for the virtualized paging edge.
   // Real layout and pointer coordinates cannot be established by a DOM emulator.
   test("interface zoom keeps timeline paging and sidebar resizing usable", async ({
     page,
@@ -349,9 +397,51 @@ test.describe("scaled history", () => {
       .poll(async () => (await sidebar.boundingBox()).width)
       .toBeCloseTo(before.width + 100, 0);
     await settle(page);
-    await edge(page, -1);
-    await expect.poll(() => app.pending.length).toBe(1);
+    const messages = app.histories.get("primary/alpha");
+    // Paging starts before the wheel reaches the top. Hold the relay reader's
+    // 10s timer with its response while native scrolling and layout settle.
+    const readDeadlines = await page.evaluateHandle(() => {
+      const schedule = window.setTimeout;
+      const cancel = window.clearTimeout;
+      const deferred = new Map();
+      const resumed = new Map();
+      let nextId = 0;
+      window.setTimeout = (callback, delay, ...args) => {
+        if (delay !== 10_000 || typeof callback !== "function")
+          return schedule.call(window, callback, delay, ...args);
+        deferred.set(--nextId, () => callback.apply(window, args));
+        return nextId;
+      };
+      window.clearTimeout = (id) => {
+        if (deferred.delete(id)) return;
+        cancel.call(window, resumed.get(id) ?? id);
+        resumed.delete(id);
+      };
+      return () => {
+        window.setTimeout = schedule;
+        for (const [id, callback] of deferred) {
+          const timer = schedule.call(
+            window,
+            () => {
+              resumed.delete(id);
+              callback();
+            },
+            10_000,
+          );
+          resumed.set(id, timer);
+        }
+        deferred.clear();
+      };
+    });
+    let pageRows = [];
     try {
+      await wheelToScaledHistoryTop(
+        page,
+        history,
+        messages.map(({ id }) => id),
+      );
+      await expect.poll(() => app.pending.length).toBe(1);
+      pageRows = app.pending[0].events;
       const loading = history.getByRole("button", {
         name: "Loading older…",
         exact: true,
@@ -366,15 +456,27 @@ test.describe("scaled history", () => {
       ).toBe(true);
     } finally {
       app.pending.shift()?.release();
+      await readDeadlines.evaluate((resume) => resume());
+      await readDeadlines.dispose();
     }
+    // The page's newest row lands just above the reader.
+    const newest = pageRows.reduce((a, b) =>
+      b.created_at > a.created_at ? b : a,
+    );
     await expect(
-      history.getByRole("button", { name: "Loading older…", exact: true }),
-    ).toHaveCount(0);
-    await expect(
-      history.locator(
-        `[data-message-id="${app.histories.get("primary/alpha")[0].id}"]`,
-      ),
+      history.locator(`[data-message-id="${newest.id}"]`),
     ).toBeVisible();
+    // A reader at the top reads on to the channel start.
+    const loading = history.getByRole("button", {
+      name: "Loading older…",
+      exact: true,
+    });
+    for (let read = 0; read < 5 && (await loading.count()); read++) {
+      await expect.poll(() => app.pending.length).toBe(1);
+      app.pending.shift().release();
+      await settle(page);
+    }
+    await expect(loading).toHaveCount(0);
   });
 });
 
