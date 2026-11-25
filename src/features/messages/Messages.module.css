@@ -4585,6 +4585,9 @@ html[data-keyboard-navigation]
   align-items: flex-start;
   min-width: 0;
 }
+/* Expanded or not, the body takes the bubble's width, so a wide table
+   scrolls inside it rather than widening it. */
+.detailsBody,
 .detailsClip {
   align-self: stretch;
   min-width: 0;

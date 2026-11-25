@@ -104,7 +104,7 @@ export function DetailsMessage({
       {/* biome-ignore lint/a11y/noStaticElementInteractions: Show more is the keyboard path; this only widens the pointer target. */}
       <div
         ref={clip}
-        className={expanded ? undefined : styles.detailsClip}
+        className={expanded ? styles.detailsBody : styles.detailsClip}
         onClick={(event) => {
           // Links, mentions and selected text keep their own meaning.
           if (

@@ -100,6 +100,35 @@ test.describe("Side panel", () => {
     details(app, "Tab findings", root);
     await expandsInPlace(page, side(page), "Tab findings");
     await expect(reply(side(page))).toBeVisible();
+    // Expanded, a wide table scrolls inside the bubble, not past its edge,
+    // even one that was hidden while collapsed.
+    const cell = "a long cell that will not wrap ".repeat(6);
+    details(
+      app,
+      `Wide findings\n\nHidden until expanded.\n\n| A | B |\n| - | - |\n| ${cell} | ${cell} |`,
+      root,
+    );
+    const wide = side(page)
+      .locator("[data-message-id]")
+      .filter({ hasText: "Wide findings" });
+    await wide.getByRole("button", { name: "Show more", exact: true }).click();
+    await expect(
+      wide.getByRole("button", { name: "Show less", exact: true }),
+    ).toBeVisible();
+    const right = (locator) =>
+      locator.evaluate((element) => element.getBoundingClientRect().right);
+    expect(await right(wide.getByRole("table"))).toBeLessThanOrEqual(
+      await right(wide.locator("[data-bubble]")),
+    );
+    // A wheel scrolls it; a clipped table with overflow hidden would not.
+    const table = wide.getByRole("table");
+    await table.hover();
+    await expect
+      .poll(async () => {
+        await page.mouse.wheel(200, 0);
+        return table.evaluate((element) => element.scrollLeft);
+      })
+      .toBeGreaterThan(0);
   });
 });
 
