@@ -71,8 +71,8 @@ function disk() {
       startup = { ...startup, ...structuredClone(patch) };
     }),
     readProfiles: vi.fn(async () => structuredClone(profiles)),
-    writeProfiles: vi.fn(async (events) => {
-      profiles = structuredClone([...events]);
+    writeProfiles: vi.fn(async (events, optional = []) => {
+      profiles = structuredClone([...events, ...optional]);
     }),
     read: vi.fn(async () => structuredClone(heads)),
     write: vi.fn(async (value) => {
@@ -888,72 +888,16 @@ describe("device-local startup", () => {
       async () => expect(await storage.readProfiles?.()).toHaveLength(2),
       { timeout: 3000 },
     );
+    // Optional, so the store fits it in the room the saved rosters leave.
+    expect(storage.writeProfiles).toHaveBeenLastCalledWith(
+      [expect.objectContaining({ kind: 0 })],
+      [eventDto(busy)],
+    );
     const next = setup(storage, true);
     await next.owner.restore();
     expect(
       next.owner.session.statuses.snapshot().get(stranger.pubkey)?.text,
     ).toBe("Heads down");
-  });
-
-  it("saves whole statuses only in the room the names leave", async () => {
-    const storage = disk();
-    const first = setup(storage);
-    await first.owner.restore();
-    const named = keypair();
-    const people = Array.from({ length: 40 }, () => keypair());
-    // Each is a whole signed event near a relay frame's size.
-    const large = new Map(
-      people.map((person, index) => [
-        person.pubkey,
-        signed(person, {
-          kind: 30315,
-          created_at: 1_700_000_000 + index,
-          content: `Busy ${index}`,
-          tags: [
-            ["d", "general"],
-            ["note", "x".repeat(256 * 1024)],
-          ],
-        }),
-      ]),
-    );
-    const reply = first.query.getMockImplementation();
-    first.query.mockImplementation(async (filters) =>
-      filters.some((filter) => filter.kinds?.includes(0))
-        ? [profile(named, { name: "Named" })]
-        : filters.some((filter) => filter.kinds?.includes(30315))
-          ? filters.flatMap(
-              (filter) =>
-                filter.authors?.flatMap((id) => large.get(id) ?? []) ?? [],
-            )
-          : (reply?.(filters) ?? []),
-    );
-    await first.owner.session.profiles.ensure([named.pubkey]);
-    // Viewed over time: one read stays within the relay read budget.
-    for (const batch of [people.slice(0, 20), people.slice(20)]) {
-      const shown = first.owner.session.statuses.snapshot().size;
-      first.owner.session.statuses.watch(batch.map((person) => person.pubkey));
-      await vi.waitFor(() =>
-        expect(first.owner.session.statuses.snapshot().size).toBe(shown + 20),
-      );
-    }
-    let saved: RelayEvent[] = [];
-    await vi.waitFor(
-      async () => {
-        saved = ((await storage.readProfiles?.()) ?? []) as RelayEvent[];
-        expect(
-          saved.filter((event) => event.kind === 30315).length,
-        ).toBeGreaterThan(20);
-      },
-      { timeout: 3000 },
-    );
-    expect(byteSize(saved)).toBeLessThanOrEqual(8 * 1024 * 1024);
-    expect(saved.filter((event) => event.kind === 0)).toHaveLength(1);
-    const statuses = saved.filter((event) => event.kind === 30315);
-    expect(statuses.length).toBeGreaterThan(20);
-    expect(statuses.length).toBeLessThan(40);
-    // Whole signed events, never cut to fit.
-    for (const event of statuses)
-      expect(event).toMatchObject(eventDto(large.get(event.pubkey)));
   });
 
   it("restores a saved copy holding names, verified names and statuses", async () => {

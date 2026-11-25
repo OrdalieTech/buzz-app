@@ -681,6 +681,26 @@ it("restores in the order live events replace: the same second keeps the lower I
   owner.accept([high]);
   expect(owner.saved()).toEqual([low]);
 });
+it("saves statuses in the order they changed, so an update moves its author last", () => {
+  const carol = keypair();
+  const read = vi.fn<RelayReader["read"]>(async () => []);
+  const owner = createUserStatuses({ read });
+  owners.push(owner);
+  const status = (key: typeof bob, content: string, time = now) =>
+    signed(key, {
+      kind: 30315,
+      created_at: time,
+      content,
+      tags: [["d", "general"]],
+    });
+  const first = status(bob, "First");
+  const other = status(carol, "Other");
+  owner.restore([first, other]);
+  expect(owner.saved()).toEqual([first, other]);
+  const update = status(bob, "Update", now + 1);
+  owner.accept([update]);
+  expect(owner.saved()).toEqual([other, update]);
+});
 it("drops a saved status a successful read no longer returns, but not after a failure or a live event", async () => {
   const carol = keypair();
   const saved = (author: typeof bob, content: string, time = now) =>

@@ -138,10 +138,15 @@ export function createUserStatuses(
         continue;
       const status = parse(event);
       if (!status || !replaces(event)) continue;
-      records.set(event.pubkey, { event, status });
+      keep(event, status);
       unconfirmed.delete(event.pubkey);
     }
     publish();
+  }
+  /** Moves the author last, so `saved` lists statuses in the order they changed. */
+  function keep(event: RelayEvent, status: UserStatus) {
+    records.delete(event.pubkey);
+    records.set(event.pubkey, { event, status });
   }
   /** Replaceable-event order: the newer event wins, then the lower ID. */
   function replaces(event: RelayEvent) {
@@ -479,7 +484,8 @@ export function createUserStatuses(
       live = next;
       settleIdle();
     },
-    /** The statuses shown now, for a copy saved with the profiles. */
+    /** The statuses shown now, least recently changed first, for a copy saved
+     * with the profiles. */
     saved() {
       const now = Date.now() / 1000;
       return [...records.values()]
@@ -493,7 +499,7 @@ export function createUserStatuses(
       for (const event of events) {
         const status = parse(event);
         if (!status || !shown(status) || !replaces(event)) continue;
-        records.set(event.pubkey, { event, status });
+        keep(event, status);
         unconfirmed.add(event.pubkey);
         if (!watched.has(event.pubkey) && event.pubkey !== viewer)
           idle.add(event.pubkey);

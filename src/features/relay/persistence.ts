@@ -28,7 +28,12 @@ export interface HeadPersistence {
   writeStartup?(patch: SavedStartup): Promise<void>;
   /** Signed kind 0 and verified-profile (30382) events mirrored from the profile directory. */
   readProfiles?(): Promise<unknown[]>;
-  writeProfiles?(events: readonly unknown[]): Promise<void>;
+  /** Saves `events`, then the `optional` events that fit in the room the
+   * startup store leaves, whole and in order; the earliest give way first. */
+  writeProfiles?(
+    events: readonly unknown[],
+    optional?: readonly unknown[],
+  ): Promise<void>;
   write(head: SavedHead): Promise<void>;
   remove(channelId: string): Promise<void>;
   retain(channelIds: readonly string[]): Promise<void>;
@@ -41,6 +46,9 @@ const DB = "buzz-channel-heads-v1";
 const STORE = "heads";
 const STARTUP = "startup";
 const MIRROR = ":profiles";
+type StartupRow = { key: string; bytes: number; savedAt: number };
+/** Optional profile mirrors give way before any saved roster. */
+const mirror = (row: { key: string }) => Number(row.key.endsWith(MIRROR));
 /** The largest row saved; a larger one is not written at all. */
 export const MAX_BYTES = 8 * 1024 * 1024;
 const MAX_HEADS = 64;
@@ -125,20 +133,16 @@ export function createHeadPersistence(
   /** Keep the startup store, across identities, within its byte budget.
    * Optional profile mirrors give way before any saved roster. */
   function prune(store: IDBObjectStore, then: Then) {
-    then(
-      store.getAll(),
-      (rows: { key: string; bytes: number; savedAt: number }[]) => {
-        const mirror = (row: { key: string }) =>
-          Number(row.key.endsWith(MIRROR));
-        let total = 0;
-        for (const row of rows.sort(
-          (a, b) => mirror(a) - mirror(b) || b.savedAt - a.savedAt,
-        )) {
-          total += row.bytes;
-          if (total > MAX_BYTES) store.delete(row.key);
-        }
-      },
-    );
+    then(store.getAll(), (rows: StartupRow[]) => evict(store, rows));
+  }
+  function evict(store: IDBObjectStore, rows: StartupRow[]) {
+    let total = 0;
+    for (const row of rows.sort(
+      (a, b) => mirror(a) - mirror(b) || b.savedAt - a.savedAt,
+    )) {
+      total += row.bytes;
+      if (total > MAX_BYTES) store.delete(row.key);
+    }
   }
   async function transact<T>(
     mode: IDBTransactionMode,
@@ -231,22 +235,35 @@ export function createHeadPersistence(
           then(store.get(profiles), (row) => done(row?.data ?? [])),
         STARTUP,
       ),
-    writeProfiles: (events) =>
+    writeProfiles: (events, optional = []) =>
       transact(
         "readwrite",
-        (store, done, then) => {
-          const bytes = byteSize(events);
-          if (bytes <= MAX_BYTES) {
-            store.put({
-              key: profiles,
-              data: events,
-              bytes,
-              savedAt: Date.now(),
-            });
-            prune(store, then);
-          }
-          done(undefined);
-        },
+        (store, done, then) =>
+          then(store.getAll(), (rows: StartupRow[]) => {
+            // Rows outranking this newest mirror in `evict` keep their room.
+            const others = rows.filter((row) => row.key !== profiles);
+            const room =
+              MAX_BYTES -
+              others.reduce(
+                (sum, row) => (mirror(row) ? sum : sum + row.bytes),
+                0,
+              );
+            let bytes = byteSize(events);
+            const kept: unknown[] = [];
+            for (const event of [...optional].reverse()) {
+              // Its bytes, plus a comma once the list holds any.
+              const size = byteSize(event) + (bytes > 2 ? 1 : 0);
+              if (bytes + size > room) continue;
+              bytes += size;
+              kept.push(event);
+            }
+            if (bytes <= MAX_BYTES) {
+              const row = { key: profiles, bytes, savedAt: Date.now() };
+              store.put({ ...row, data: [...events, ...kept.reverse()] });
+              evict(store, [...others, row]);
+            }
+            done(undefined);
+          }),
         STARTUP,
       ),
     read: () =>

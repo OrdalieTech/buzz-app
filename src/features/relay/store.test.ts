@@ -2371,6 +2371,7 @@ it("does not rewrite the profile mirror when only cache hits reorder it", async 
     await load([bob.pubkey], [profile(bob, { name: "Bob" })]);
     expect(writeProfiles).toHaveBeenLastCalledWith(
       expect.arrayContaining([expect.anything(), expect.anything()]),
+      [],
     );
     writeProfiles.mockClear();
     // A hit reorders the cache; an unanswered name notifies without a new profile.

@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { byteSize } from "./budget";
 import { createHeadPersistence, type HeadPersistence } from "./persistence";
 
 afterEach(() => {
@@ -121,29 +122,33 @@ it("swallows a follow-up request thrown by a browser-initiated abort", async () 
   expect(vi.getTimerCount()).toBe(0);
 });
 
-it("evicts the profile mirror before any saved roster", async () => {
-  vi.useFakeTimers();
-  const MB = 1024 * 1024;
-  const rows = {
-    onsuccess: () => {},
-    result: [
-      { key: "viewer:relay", bytes: 6.5 * MB, savedAt: 1 },
-      { key: "viewer:relay:profiles", bytes: 2 * MB, savedAt: 2 },
-    ],
-  };
+const MB = 1024 * 1024;
+/** A startup store holding `held`, recording what one profile write keeps. */
+function startupStore(held: { key: string; bytes: number; savedAt: number }[]) {
+  const rows = { onsuccess: () => {}, result: held };
   const store = {
     put: vi.fn(),
     delete: vi.fn(),
     getAll: () => rows as unknown as IDBRequest,
   };
+  return { rows, store };
+}
+
+it("evicts the profile mirror before any saved roster", async () => {
+  vi.useFakeTimers();
+  const { rows, store } = startupStore([
+    { key: "viewer:relay", bytes: 6.5 * MB, savedAt: 1 },
+  ]);
   const { tx, result } = transaction(
     () => {},
-    (cache) => cache.writeProfiles?.([]) ?? Promise.resolve(),
+    (cache) =>
+      cache.writeProfiles?.([{ name: "x".repeat(2 * MB) }]) ??
+      Promise.resolve(),
     store,
   );
   await vi.advanceTimersByTimeAsync(0);
-  expect(store.put).toHaveBeenCalledOnce();
   rows.onsuccess();
+  expect(store.put).toHaveBeenCalledOnce();
   expect(store.delete.mock.calls).toEqual([["viewer:relay:profiles"]]);
   tx.oncomplete();
   await expect(result).resolves.toBeUndefined();
@@ -184,4 +189,36 @@ it("measures only this viewer and relay's saved records", async () => {
   const usage = createHeadPersistence("viewer", "relay").usage?.();
   request.onsuccess();
   await expect(usage).resolves.toBe(23);
+});
+
+it("saves optional events whole in the room saved rosters leave, the earliest giving way", async () => {
+  vi.useFakeTimers();
+  const { rows, store } = startupStore([
+    { key: "viewer:relay", bytes: 7 * MB, savedAt: 1 },
+    { key: "viewer:relay:profiles", bytes: 3 * MB, savedAt: 2 },
+    { key: "other:relay:profiles", bytes: MB / 2, savedAt: 0 },
+  ]);
+  const names = [{ id: "name" }];
+  const optional = ["a", "b", "c"].map((id) => ({
+    id,
+    note: "x".repeat(400 * 1024),
+  }));
+  const { tx, result } = transaction(
+    () => {},
+    (cache) => cache.writeProfiles?.(names, optional) ?? Promise.resolve(),
+    store,
+  );
+  await vi.advanceTimersByTimeAsync(0);
+  rows.onsuccess();
+  const data = [...names, optional[1], optional[2]];
+  expect(store.put).toHaveBeenCalledExactlyOnceWith({
+    key: "viewer:relay:profiles",
+    data,
+    bytes: byteSize(data),
+    savedAt: expect.any(Number),
+  });
+  // The new copy fits beside the roster; only another identity's gives way.
+  expect(store.delete.mock.calls).toEqual([["other:relay:profiles"]]);
+  tx.oncomplete();
+  await expect(result).resolves.toBeUndefined();
 });
