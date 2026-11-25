@@ -514,12 +514,20 @@ test.describe("pages inside one second", () => {
         .poll(() => history(page).evaluate((e) => e.scrollHeight))
         .toBeGreaterThan(height);
       await expectAnchor(page, before);
+      // Linux WebKit animates a wheel over several frames, and any scroll
+      // write ends it there. A row measuring meanwhile moves nothing above
+      // the reader, so it must not cost them the rest of the wheel.
       const wheeled = await history(page).evaluateHandle((e) => {
         const state = { wheel: false };
-        e.addEventListener("wheel", () => (state.wheel = true), {
-          once: true,
-          passive: true,
-        });
+        e.addEventListener(
+          "wheel",
+          () => {
+            state.wheel = true;
+            const rows = e.querySelectorAll("[data-message-id]");
+            rows[rows.length - 1].style.paddingBottom = "10px";
+          },
+          { once: true, passive: true },
+        );
         return state;
       });
       await page.mouse.wheel(0, -40);
