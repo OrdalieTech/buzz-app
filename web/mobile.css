@@ -59,7 +59,9 @@
     padding: var(--space-1) var(--space-2);
     border-top: 1px solid var(--border-subtle, var(--border-standard));
   }
-  :root[data-keyboard-open] .shell-side-dock {
+  /* While typing, the conversation's own header is the top bar: the search
+     row above it would leave a small phone a strip of messages. */
+  :root[data-keyboard-open] :is(.shell-side-dock, .shell-header) {
     display: none;
   }
   /* Its four destinations (two pages, the community, you) share the bar

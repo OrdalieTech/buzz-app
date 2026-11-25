@@ -86,29 +86,65 @@ if (viewport) {
   viewport.addEventListener("scroll", sync);
   sync();
 }
-
-// Tapping send would move focus to the button and drop the keyboard after
-// every message. Keep focus in the editor and click for the tap instead.
+// With the keyboard up, iOS pans the whole page under a drag on anything that
+// doesn't scroll itself (the top bar, the composer's tools), so the app slides
+// off and back. Only what scrolls takes the drag; pinch zoom stays.
 document.addEventListener(
-  "touchend",
+  "touchmove",
   (event) => {
-    const send = (event.target as Element).closest<HTMLButtonElement>(
-      'button[aria-label="Send message"]',
-    );
-    const point = first(event.changedTouches);
-    if (
-      !phone.matches ||
-      !send ||
-      send.disabled ||
-      !send.closest("form")?.contains(document.activeElement) ||
-      !send.contains(document.elementFromPoint(point.clientX, point.clientY))
-    )
+    if (!root.hasAttribute("data-keyboard-open") || event.touches.length > 1)
       return;
-    event.preventDefault();
-    send.click();
+    const target = event.target as Element;
+    for (let el: Element | null = target; el; el = el.parentElement)
+      if (
+        el.scrollHeight > el.clientHeight &&
+        /auto|scroll/.test(getComputedStyle(el).overflowY)
+      )
+        return;
+    if (!scrollsSideways(target)) event.preventDefault();
   },
-  { capture: true },
+  { passive: false },
 );
+
+// Tapping send, or a suggestion in a list under the composer (@mentions,
+// emoji), moves focus off the editor, so iOS drops the keyboard (the option's
+// pointerdown preventDefault keeps focus only for a mouse). Keep focus in the
+// editor and click for the tap, unless the finger moved: that was a scroll.
+{
+  const KEEP_FOCUS =
+    'button[aria-label="Send message"], [role="listbox"] [role="option"]';
+  let start: { x: number; y: number } | null = null;
+  document.addEventListener(
+    "touchstart",
+    (event) => {
+      const point = first(event.touches);
+      start = { x: point.clientX, y: point.clientY };
+    },
+    { capture: true, passive: true },
+  );
+  document.addEventListener(
+    "touchend",
+    (event) => {
+      const target = (event.target as Element).closest<HTMLElement>(KEEP_FOCUS);
+      const point = first(event.changedTouches);
+      if (
+        !phone.matches ||
+        !target ||
+        target.matches(":disabled") ||
+        !document.activeElement?.matches(TEXT_INPUT) ||
+        !start ||
+        Math.hypot(point.clientX - start.x, point.clientY - start.y) > 10 ||
+        !target.contains(
+          document.elementFromPoint(point.clientX, point.clientY),
+        )
+      )
+        return;
+      event.preventDefault();
+      target.click();
+    },
+    { capture: true },
+  );
+}
 
 // The drawer follows the finger: swipe right on a screen to pull it open,
 // swipe it left to put it away; release settles by position or flick. The

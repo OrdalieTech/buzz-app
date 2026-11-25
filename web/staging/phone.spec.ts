@@ -165,6 +165,20 @@ for (const [device, engine] of [
         page.locator("[data-message-id]", { hasText: lines[0] as string }),
       ).toContainText(lines.at(-1) as string);
     }
+    // Tapping a mention suggestion keeps focus, so the keyboard, in the editor.
+    await composer.tap();
+    await page.keyboard.type("Thanks @Phone");
+    await page
+      .getByRole("listbox", { name: /suggestions/ })
+      .getByRole("option", { name: new RegExp(`Phone ${name}`) })
+      .tap();
+    await expect(composer).toBeFocused();
+    await expect(composer.locator('[data-kind="person"]')).toHaveCount(1);
+    // Still the editor's keys, after read-on-touch had its say.
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.press("Backspace");
+    await expect(composer).toHaveText("");
+    await expect(composer).toBeFocused();
     await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
     // Actions stay hidden until a long press.
     await expect(
@@ -304,6 +318,21 @@ for (const [device, engine] of [
         (field.closest("form") as Element).getBoundingClientRect().bottom,
     );
     expect(bottom).toBeLessThanOrEqual(height - keyboard);
+    // Typing, the search row goes like the tab bar, and a drag on what doesn't
+    // scroll is held so iOS can't pan the page; a pinch still zooms.
+    await expect(page.locator(".shell-header")).toBeHidden();
+    const held = (touches: number) =>
+      reply.evaluate((field, touches) => {
+        const move = new Event("touchmove", {
+          bubbles: true,
+          cancelable: true,
+        });
+        Object.defineProperty(move, "touches", { value: { length: touches } });
+        (field.closest("form") as Element).dispatchEvent(move);
+        return move.defaultPrevented;
+      }, touches);
+    expect(await held(1)).toBe(true);
+    expect(await held(2)).toBe(false);
     await shot(page, `${name}-5-keyboard`);
 
     // Back in the foreground after a deploy, the app reloads into the new
