@@ -66,7 +66,7 @@ Each line is the main call. Read the types for every field.
 | `settingsCards` | A Settings destination | `ctx.settingsCards.register({ id, title, component })`. The host supplies navigation and the column, not a heading. |
 | `accountActions` | An account menu entry | `ctx.accountActions.register({ id, title, component })` |
 | `sidebarSections` (optional) | A Team sidebar section | `register({ version: 1, id, title, icon, rows, select })` |
-| `conversation` | Composer and message UI | `registerAccessory`, `registerMessage`, `registerMessageAction`, `registerLink`, `registerLinkPreview`, `registerSendGate`, and host components under `ctx.conversation.ui` (Markdown, DocumentEditor, ImageViewer, MembersDialog, Workspace) |
+| `conversation` | Composer and message UI | `registerAccessory`, `registerMessage`, `registerMessageAction`, `registerLink`, `registerLinkPreview` (a link-preview renderer that needs setup first adds `status()`, `subscribe(listener)` and `settings`, its Settings card id; while `status()` is `"needs-setup"` the host draws a card that opens that Settings card), `registerSendGate`, and host components under `ctx.conversation.ui` (Markdown, DocumentEditor, ImageViewer, MembersDialog, Workspace) |
 | `agents` | Agent tools and instructions | `ctx.agents.addTool({ name, description, inputSchema, call })`; `addInstructions({ id, text })`; `wake`; hooks need `host.agentHooks` |
 | `shortcuts` | Key bindings | `ctx.shortcuts.register({ id, title, binding, run })` |
 | `navigation` | Open a destination | `await ctx.navigation.open({ version: 1, kind: "plugin", pluginId, pageId? })` |

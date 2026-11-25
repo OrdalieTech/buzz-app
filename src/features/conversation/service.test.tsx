@@ -2,6 +2,7 @@ import { Context } from "@deepseek-ai/cordis";
 import { afterEach, expect, it, vi } from "vitest";
 import { PluginRuntime } from "../../plugins/runtime";
 import { ConversationService } from "./service";
+import { SettingsCardsService } from "../settings/service";
 import { ChannelMembersDialog } from "../../bundled/channels/ChannelMembersDialog";
 import { ChannelGeneralAccess } from "../../bundled/channels/ChannelGeneralAccess";
 import { DocumentEditor } from "../messages/DocumentEditor";
@@ -299,16 +300,45 @@ it("registers link previews and withdraws them with their plugin", async () => {
           component: Component,
         } as never),
       ).toThrow("matcher");
+      const status = () => "ready" as const;
+      const subscribe = () => () => {};
+      for (const partial of [
+        { status },
+        { subscribe },
+        { status, subscribe },
+        { status, subscribe, settings: "" },
+        { status, subscribe, settings: "tracker/setup" },
+        { status, subscribe, settings: "Setup" },
+        { status, subscribe, settings: "x".repeat(129) },
+        { settings: 7 },
+        { settings: "-setup" },
+      ])
+        expect(() =>
+          ctx.conversation.registerLinkPreview({
+            ...base,
+            id: "partial",
+            ...partial,
+            component: Component,
+          } as never),
+        ).toThrow(/status|settings/);
       ctx.conversation.registerLinkPreview({
         ...base,
         order: 100,
+        component: Component,
+      });
+      ctx.conversation.registerLinkPreview({
+        ...base,
+        id: "needs-setup",
+        status: () => "needs-setup",
+        subscribe,
+        settings: "setup",
         component: Component,
       });
     },
   });
   h.runtime.reconcile([h.plugin]);
   await vi.waitFor(() =>
-    expect(h.service.linkPreviews.snapshot()).toHaveLength(1),
+    expect(h.service.linkPreviews.snapshot()).toHaveLength(2),
   );
   h.runtime.reconcile([]);
   await vi.waitFor(() =>
@@ -611,4 +641,64 @@ it("retires plugin chat menu contributions when their plugin is disabled", async
   await vi.waitFor(() =>
     expect(h.service.chatMenus.snapshot()).toHaveLength(0),
   );
+});
+
+it("reports which plugin Settings cards a link preview setup card can open", async () => {
+  const root = new Context();
+  root.provide("pluginStatus", {
+    isActive: () => true,
+    subscribe: () => () => {},
+  });
+  new SettingsCardsService(root);
+  const service = new ConversationService(root);
+  const listener = vi.fn();
+  const stop = service.settings.subscribe(listener);
+  expect(service.settings.has("tracker/setup")).toBe(false);
+  let visible: boolean | "pending" = false;
+  const visibilityListeners = new Set<() => void>();
+  const setVisible = (next: typeof visible) => {
+    visible = next;
+    for (const each of [...visibilityListeners]) each();
+  };
+  const fiber = root
+    .extend({ pluginOwner: { id: "tracker", revision: "one" } })
+    .plugin((ctx) => {
+      ctx.settingsCards.register({
+        id: "setup",
+        title: "Tracker",
+        component: () => null,
+      });
+      ctx.settingsCards.register({
+        id: "gated",
+        title: "Tracker admin",
+        visibility: {
+          snapshot: () => visible,
+          subscribe: (each) => {
+            visibilityListeners.add(each);
+            return () => visibilityListeners.delete(each);
+          },
+          ensure: () => () => {},
+        },
+        component: () => null,
+      });
+    });
+  await fiber.await();
+  expect(service.settings.has("tracker/setup")).toBe(true);
+  expect(service.settings.has("other/setup")).toBe(false);
+  expect(listener).toHaveBeenCalled();
+  expect(service.settings.has("tracker/gated")).toBe(false);
+  listener.mockClear();
+  setVisible(true);
+  expect(listener).toHaveBeenCalled();
+  expect(service.settings.has("tracker/gated")).toBe(true);
+  setVisible("pending");
+  expect(service.settings.has("tracker/gated")).toBe(false);
+  setVisible(false);
+  expect(service.settings.has("tracker/gated")).toBe(false);
+  setVisible(true);
+  await fiber.dispose();
+  expect(service.settings.has("tracker/setup")).toBe(false);
+  expect(service.settings.has("tracker/gated")).toBe(false);
+  stop();
+  await root.fiber.dispose();
 });

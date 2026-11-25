@@ -57,6 +57,7 @@ function DrillInFixture({ target, context }: PanelProps) {
 
 declare global {
   interface Window {
+    fixtureLinkSetup?: (status: "checking" | "ready" | "needs-setup") => void;
     stalePanelClose?: () => void;
     fixtureNavigation?: Navigation;
     fixtureNotify?: (input: NotificationInput) => Promise<boolean>;
@@ -745,6 +746,62 @@ export const fixturePlugins: readonly BundledPlugin[] = [
           title: "Legacy",
           primary: true,
           component: Legacy,
+        });
+      },
+    },
+  },
+  {
+    manifest: {
+      id: "fixture.link-setup",
+      name: "Tracker previews",
+      apiVersion: 1,
+    },
+    module: {
+      inject: ["conversation", "settingsCards"],
+      apply(ctx) {
+        let status: "checking" | "ready" | "needs-setup" = "needs-setup";
+        const listeners = new Set<() => void>();
+        const set = (next: typeof status) => {
+          status = next;
+          for (const listener of [...listeners]) listener();
+        };
+        window.fixtureLinkSetup = set;
+        ctx.conversation.registerLinkPreview({
+          id: "tracker",
+          title: "Tracker",
+          matches: (url) => new URL(url).host === "tracker.example",
+          order: 0,
+          status: () => status,
+          subscribe(listener) {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+          },
+          settings: "setup",
+          component: ({ url }) => (
+            <p data-tracker-card>Tracker issue {new URL(url).pathname}</p>
+          ),
+        });
+        function TrackerSetup() {
+          const current = useSyncExternalStore(
+            (listener) => {
+              listeners.add(listener);
+              return () => listeners.delete(listener);
+            },
+            () => status,
+          );
+          return current === "ready" ? (
+            <p>Signed in to Tracker</p>
+          ) : (
+            <button type="button" onClick={() => set("ready")}>
+              Sign in to Tracker
+            </button>
+          );
+        }
+        ctx.settingsCards.register({
+          id: "setup",
+          title: "Tracker previews",
+          group: "Plugins",
+          component: TrackerSetup,
         });
       },
     },
