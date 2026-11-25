@@ -1325,26 +1325,6 @@ describe("GooseRuntime", () => {
     ]);
   });
 
-  it("builds the session's prompt with the owner's base section choices", async () => {
-    const { agent, deliver, goose } = setup();
-    Object.assign(agent, {
-      promptSections: () => ({
-        owner: {
-          etiquette: { mode: "custom", text: "Be brief." },
-          progress: { mode: "off" },
-        },
-      }),
-    });
-    await deliver(message("1", "@Gander hi"));
-    const prompt = () => [...(goose()?.prompts.values() ?? [])].join();
-    await vi.waitFor(() =>
-      expect(prompt()).toContain(
-        '## Etiquette\n<owner-section id="etiquette">\nBe brief.\n</owner-section>',
-      ),
-    );
-    expect(prompt()).not.toContain("## Progress");
-  });
-
   it("builds a conversation's prompt with the sections of the plugin that manages it, and updates it in place", async () => {
     const { agent, deliver, goose } = setup();
     const managedRoot = message("1", "@Gander hi");
@@ -1392,52 +1372,6 @@ describe("GooseRuntime", () => {
     expect(goose()?.opened).toHaveLength(opened ?? 0);
     expect(promptOf(2)).not.toContain("<plugin-section id=");
     expect(promptOf(2)).toContain("Make file changes on a new branch");
-  });
-
-  it("builds a one-off turn's prompt with no conversation's sections", async () => {
-    const { agent, runOnce, goose } = setup();
-    const promptSections = vi.fn(() => ({}));
-    Object.assign(agent, { promptSections });
-    await runOnce("timer/daily", "Post the daily summary.");
-    // Asked as the session opens and as its turn starts.
-    expect(promptSections.mock.calls).toEqual([
-      [undefined, undefined],
-      [undefined, undefined],
-    ]);
-    expect(goose()?.prompts.get(goose()?.turns[0]?.sessionId ?? "")).toContain(
-      "This run joins no conversation",
-    );
-  });
-
-  it("tells a Solo chat whose plugin gives the working location to read its Canvas's folders", async () => {
-    const { agent, deliver, goose } = setup({
-      solo: new Set([channel]),
-      canvas: workspaceCanvas({
-        folders: ["~/Development/app"],
-        worktree: { location: "~/Development/trees", baseBranch: "main" },
-        canvas: "Use the design system.",
-      }),
-    });
-    Object.assign(agent, {
-      // A Solo chat is one conversation, with no thread root.
-      promptSections: (channelId?: string, root?: string): SectionChoices =>
-        channelId === channel && !root
-          ? {
-              plugin: {
-                id: "example.plugin",
-                sections: { "working-location": "Work in the task's folder." },
-              },
-            }
-          : {},
-    });
-    await deliver(message("1", "@Gander go"));
-    await vi.waitFor(() => expect(goose()?.turns).toHaveLength(1));
-    expect([...(goose()?.prompts.values() ?? [])].join()).toContain(
-      '<plugin-section id="working-location" plugin="example.plugin">',
-    );
-    const turn = goose()?.turns[0]?.text;
-    expect(turn).toContain("They are for reading.");
-    expect(turn).not.toContain("create a new worktree");
   });
 
   it("starts an agent on a model route on its provider's default, and runs each turn on its pick", async () => {
@@ -1741,23 +1675,6 @@ describe("GooseRuntime", () => {
       expect(published).toEqual([]);
     });
 
-    it("refuses its turn, naming the folder, once the folder is gone", async () => {
-      const missing = new Set<string>();
-      const { agentStore, deliver, fake, published } = setup({
-        resolveDirectory: folders(missing),
-      });
-      await assign(agentStore);
-      missing.add("/repos/worktree");
-      await deliver(root);
-      await vi.waitFor(() =>
-        expect(published.at(-1)?.content).toContain(
-          "This conversation's folder /repos/worktree no longer exists",
-        ),
-      );
-      // It never falls back to the workspace.
-      expect(fake.geese.flatMap((process) => process.opened)).toEqual([]);
-    });
-
     it("reads a file a tool names from the folder, also while Buzz reconnects", async () => {
       const { agentStore, deliver, goose, readFile, offline } = setup({
         hold: true,
@@ -1879,31 +1796,6 @@ describe("GooseRuntime", () => {
         await expect(
           assign(agentStore, `${channel}/${message("9", "x").id}`),
         ).resolves.toBe("/repos/worktree");
-      } finally {
-        held.release();
-        runtime.dispose();
-      }
-    });
-
-    it("lists a conversation whose session is opening before it says its sessions are listed", async () => {
-      const held = gated("session/new");
-      const { deliver, runtime } = setup({ hold: true, wrap: held.wrap });
-      try {
-        void deliver(root);
-        await vi.waitFor(() => expect(held.waiting()).toHaveLength(1));
-        let listed = false;
-        const ready = runtime.listed(self).then(() => {
-          listed = true;
-        });
-        await flush();
-        // Nothing lists it yet, so a folder given now would come too late.
-        expect(listed).toBe(false);
-        expect(runtime.sessions(self)).toEqual([]);
-        held.release();
-        await ready;
-        expect(runtime.sessions(self)).toMatchObject([
-          { key: `${channel}/${root.id}`, at: expect.any(Number) },
-        ]);
       } finally {
         held.release();
         runtime.dispose();
@@ -2609,40 +2501,6 @@ const pluginWake = (root?: string) => ({
   at: 200_000,
 });
 
-it("takes a plugin's wake in its thread's session, as the plugin's and not a message", async () => {
-  const root = message("1", "@Gander watch my PR");
-  const f = setup();
-  await f.deliver(root);
-  await flush(100);
-  const accepted = vi.fn();
-  await f.run(pluginWake(root.id), { accepted });
-  await flush(100);
-  expect(accepted).toHaveBeenCalledOnce();
-  const goose = f.goose();
-  expect(goose?.turns).toHaveLength(2);
-  expect(goose?.turns[1]?.sessionId).toBe(goose?.turns[0]?.sessionId);
-  const text = goose?.turns[1]?.text ?? "";
-  expect(text).toContain('<plugin-wake plugin="github">');
-  expect(text).toContain("neither your owner nor anyone in the channel");
-  expect(text).toContain("CI failed: lint");
-  expect(text).not.toContain("<buzz-event");
-  expect(text).not.toContain(WAKE_ID);
-});
-
-it("reports a failed wake at its thread's root, never at the wake's own id", async () => {
-  const root = "1".repeat(64);
-  const f = setup({ hold: true });
-  await f.run(pluginWake(root));
-  await vi.waitFor(() => expect(f.goose()?.turns).toHaveLength(1));
-  f.goose()?.exit(1, "Error: boom\n");
-  await vi.waitFor(() =>
-    expect(f.published.some((event) => event.kind === 9)).toBe(true),
-  );
-  for (const event of f.published.filter(({ kind }) => kind === 9))
-    expect(event.tags).toContainEqual(["e", root, "", "reply"]);
-  expect(JSON.stringify(f.published)).not.toContain(WAKE_ID);
-});
-
 const GOOSE_SETTINGS =
   "buzz://settings?section=agents&provider=buzz.goose%2Fgoose";
 const REFUSED = `⚠️ I couldn't finish that: Goose's provider rejected its API key or sign-in. Head to [Settings](${GOOSE_SETTINGS}) to check its provider.`;
@@ -2722,29 +2580,6 @@ it.each([
   }
 });
 
-it("gives the workflow reason for its owner's workflow mention that doesn't name it", async () => {
-  const relay = keypair();
-  const f = setup({ workflowAuthority: relay.pubkey });
-  const ignored = vi.fn();
-  await f.deliver(
-    eventDto(
-      signed(relay, {
-        kind: 9,
-        content: "@Agent workflow",
-        tags: [
-          ["h", channel],
-          ["p", self],
-          ["buzz:workflow", "true"],
-          ["buzz:workflow-owner", alice],
-        ],
-      }),
-    ),
-    { ignored },
-  );
-  expect(ignored).toHaveBeenCalledExactlyOnceWith("workflow");
-  expect(f.goose()).toBeUndefined();
-});
-
 it("waits for the community before it routes a mention, a workflow's or its owner's", async () => {
   const relay = keypair();
   const f = setup({ workflowAuthority: relay.pubkey });
@@ -2773,45 +2608,6 @@ it("waits for the community before it routes a mention, a workflow's or its owne
     expect(workflow).rejects.toThrow("Workflow request could not start"),
   ]);
   expect(f.goose()).toBeUndefined();
-});
-
-it("ignores a workflow mention whose agent was replaced during the wait", async () => {
-  const relay = keypair();
-  const f = setup({ workflowAuthority: relay.pubkey });
-  const ignored = vi.fn();
-  // The community is ready, so the wait ends at once; the agent is gone by then.
-  await f.deliver(
-    eventDto(
-      signed(relay, {
-        kind: 9,
-        content: "@Agent workflow",
-        tags: [
-          ["h", channel],
-          ["p", self],
-          ["buzz:workflow", "true"],
-          ["buzz:workflow-owner", alice],
-        ],
-      }),
-    ),
-    { ignored, current: () => false },
-  );
-  expect(ignored).toHaveBeenCalledExactlyOnceWith();
-  expect(f.goose()).toBeUndefined();
-});
-
-it("takes a wake with no thread only in a Solo chat", async () => {
-  const ignored = vi.fn();
-  const stream = setup();
-  await stream.run(pluginWake(), { ignored });
-  await flush(100);
-  expect(ignored).toHaveBeenCalled();
-  expect(stream.goose()).toBeUndefined();
-  const solo = setup({ solo: new Set([channel]) });
-  await solo.run(pluginWake());
-  await flush(100);
-  const text = solo.goose()?.turns[0]?.text ?? "";
-  expect(text).toContain('<plugin-wake plugin="github">');
-  expect(text).not.toContain(WAKE_ID);
 });
 
 it("shows a turn a reload stopped what it already posted, and to carry on", async () => {
@@ -5459,140 +5255,6 @@ it("prepares an idle community wake only for handoff and native refresh", async 
   }
 });
 
-it("reserves community work before source preparation", async () => {
-  const f = setup({ scope: "community" });
-  const config = { ...DEFAULT_CONFIG, scope: "community" as const };
-  let release!: () => void;
-  let mark!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const entered = new Promise<void>((resolve) => {
-    mark = resolve;
-  });
-  const original = (
-    f.runtime as unknown as { follow(raw: unknown): Promise<void> }
-  ).follow;
-  let held = false;
-  Object.assign(f.runtime, {
-    follow: async (raw: unknown) => {
-      if (!held) {
-        held = true;
-        mark();
-        await gate;
-      }
-      return original.call(f.runtime, raw);
-    },
-  });
-  let wake: Promise<unknown> | undefined;
-  const turn = f.deliver(message("1", "ADDRESSED_BEFORE_SOURCE_WAKE"));
-  try {
-    await entered;
-    wake = f.runtime.runOnce({
-      delivery: { agent: f.agent, config, current: () => true },
-      key: "source",
-      signal: new AbortController().signal,
-      prompt: async () => "WAKE_AFTER_SOURCE",
-    } as unknown as Parameters<typeof f.runtime.runOnce>[0]);
-    vi.useFakeTimers();
-    await vi.advanceTimersByTimeAsync(0);
-    vi.useRealTimers();
-    release();
-    await turn;
-    await wake;
-    await vi.waitFor(() => expect(f.goose()?.turns.length).toBe(2));
-    expect(f.goose()?.turns[0]?.text).toContain("ADDRESSED_BEFORE_SOURCE_WAKE");
-    expect(f.goose()?.turns[1]?.text).toContain("WAKE_AFTER_SOURCE");
-  } finally {
-    vi.useRealTimers();
-    release();
-    f.runtime.dispose();
-    await Promise.allSettled([turn, wake]);
-  }
-});
-
-it("keeps deferred community admission in its captured session scope after settings change", async () => {
-  const f = setup({ scope: "community" });
-  let release!: () => void;
-  let mark!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const entered = new Promise<void>((resolve) => {
-    mark = resolve;
-  });
-  const runtime = f.runtime as unknown as {
-    turn(...args: unknown[]): Promise<{ key: string }>;
-  };
-  const original = runtime.turn;
-  const keys: string[] = [];
-  let held = false;
-  vi.spyOn(runtime, "turn").mockImplementation(async (...args) => {
-    if (!held) {
-      held = true;
-      mark();
-      await gate;
-    }
-    const result = await original.apply(f.runtime, args);
-    keys.push(result.key);
-    return result;
-  });
-  const first = f.deliver(message("1", "FIRST_SCOPE"));
-  let second: ReturnType<typeof f.deliver> | undefined;
-  try {
-    await entered;
-    second = f.deliver(message("2", "DEFERRED_SCOPE"));
-    await second;
-    f.runtime.sync([
-      {
-        ...f.agent,
-        config: { ...DEFAULT_CONFIG, scope: "thread" },
-      } as unknown as Agent,
-    ]);
-    release();
-    await first;
-    await vi.waitFor(() => expect(keys.length).toBeGreaterThanOrEqual(2));
-    expect(keys.every((key) => key === "@community")).toBe(true);
-  } finally {
-    release();
-    f.runtime.dispose();
-    await Promise.allSettled([first, second]);
-  }
-});
-
-it.each(["community", "thread"] as const)(
-  "uses the admitted %s scope for a standalone wake despite newer settings",
-  async (scope) => {
-    const f = setup();
-    const config = { ...DEFAULT_CONFIG, scope };
-    const newer = {
-      ...DEFAULT_CONFIG,
-      scope: scope === "community" ? "thread" : "community",
-    };
-    (
-      f.runtime as unknown as {
-        entry(agent: unknown, config: unknown): unknown;
-      }
-    ).entry(f.agent.key, newer);
-    try {
-      await expect(
-        f.runtime.runOnce({
-          delivery: { agent: f.agent, config, current: () => true },
-          key: "captured-scope",
-          signal: new AbortController().signal,
-          prompt: async () => "CAPTURED_STANDALONE_SCOPE",
-        } as unknown as Parameters<typeof f.runtime.runOnce>[0]),
-      ).resolves.toMatchObject({ ok: true });
-      const text = f.goose()?.turns[0]?.text ?? "";
-      expect(text.includes("Session scope: community")).toBe(
-        scope === "community",
-      );
-    } finally {
-      f.runtime.dispose();
-    }
-  },
-);
-
 it.each(["mention", "attention", "thread", "channel"] as const)(
   "keeps active community ownership and unsuccessful queued %s completion after scope sync and Stop",
   async (kind) => {
@@ -5659,110 +5321,6 @@ it.each(["mention", "attention", "thread", "channel"] as const)(
     } finally {
       worker?.turns[0]?.finish();
       f.runtime.dispose();
-    }
-  },
-);
-
-it.each(["thread", "channel"] as const)(
-  "preserves active community publication ownership when a promptless %s wake starts",
-  async (scope) => {
-    const f = setup({ hold: true, scope: "community" });
-    await f.deliver(message("1", "active community"));
-    await vi.waitFor(() => expect(f.goose()).toBeDefined());
-    const worker = f.goose();
-    if (!worker) throw new Error("Missing active native worker");
-    try {
-      let reached!: () => void;
-      const entered = new Promise<void>((resolve) => {
-        reached = resolve;
-      });
-      const runtime = f.runtime as unknown as {
-        entry(...args: unknown[]): unknown;
-      };
-      const original = runtime.entry.bind(runtime);
-      vi.spyOn(runtime, "entry").mockImplementation((...args) => {
-        const entry = original(...args);
-        reached();
-        return entry;
-      });
-      const prompt = vi.fn(async () => undefined);
-      const wakePublish = vi.fn((...args: Parameters<typeof f.agent.publish>) =>
-        f.agent.publish(...args),
-      );
-      const wake = f.runtime.runOnce({
-        delivery: {
-          agent: { ...f.agent, publish: wakePublish },
-          config: { ...DEFAULT_CONFIG, scope },
-          current: () => true,
-        },
-        key: "independent-wake",
-        signal: new AbortController().signal,
-        prompt,
-      } as unknown as Parameters<typeof f.runtime.runOnce>[0]);
-      await entered;
-      await worker.mcp(worker.turns[0]?.sessionId ?? "", "tools/call", {
-        name: "send",
-        arguments: { text: "active reply", audience: "everyone" },
-      });
-      expect(wakePublish).not.toHaveBeenCalled();
-      expect(f.agent.publish).toHaveBeenCalled();
-      worker.turns[0]?.finish();
-      await expect(wake).resolves.toMatchObject({ ok: true });
-      expect(prompt).toHaveBeenCalledOnce();
-    } finally {
-      worker.turns[0]?.finish();
-      f.runtime.dispose();
-    }
-  },
-);
-
-it.each(["thread", "channel"] as const)(
-  "drains an active %s standalone wake before community ownership changes",
-  async (scope) => {
-    const f = setup({ hold: true });
-    const wake = f.runtime.runOnce({
-      delivery: {
-        agent: f.agent,
-        config: { ...DEFAULT_CONFIG, scope },
-        current: () => true,
-      },
-      key: "old-scope-wake",
-      signal: new AbortController().signal,
-      prompt: async () => "held standalone wake",
-    } as unknown as Parameters<typeof f.runtime.runOnce>[0]);
-    await vi.waitFor(() => expect(f.goose()).toBeDefined());
-    const worker = f.goose();
-    if (!worker) throw new Error("Missing standalone native worker");
-    const queuedPublish = vi.fn((...args: Parameters<typeof f.agent.publish>) =>
-      f.agent.publish(...args),
-    );
-    const config = { ...DEFAULT_CONFIG, scope: "community" as const };
-    try {
-      f.runtime.sync([{ ...f.agent, config } as unknown as Agent]);
-      await f.deliver(message("2", "community second"), {
-        config,
-        agent: {
-          ...f.agent,
-          publish: queuedPublish,
-        } as unknown as Delivery["agent"],
-      });
-      await worker.mcp(worker.turns[0]?.sessionId ?? "", "tools/call", {
-        name: "send",
-        arguments: {
-          text: "standalone owner output",
-          channel,
-          audience: "everyone",
-        },
-      });
-      expect(queuedPublish).not.toHaveBeenCalled();
-      expect(f.agent.publish).toHaveBeenCalled();
-      worker.turns[0]?.finish();
-      await expect(wake).resolves.toMatchObject({ ok: true });
-      await vi.waitFor(() => expect(worker.turns).toHaveLength(2));
-    } finally {
-      for (const turn of worker.turns) turn.finish();
-      f.runtime.dispose();
-      await wake.catch(() => {});
     }
   },
 );

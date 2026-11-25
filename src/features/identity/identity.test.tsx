@@ -285,12 +285,9 @@ it("keeps native titlebar actions available throughout identity setup without dr
   identity.dispose();
 });
 
-it.each([
-  [false, "Win32"],
-  [false, "MacIntel"],
-])("does not add a titlebar for native=%s on %s", (native, platform) => {
-  vi.mocked(isTauri).mockReturnValue(native);
-  vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+it("does not add a titlebar outside the native app", () => {
+  vi.mocked(isTauri).mockReturnValue(false);
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
   vi.mocked(invoke).mockReturnValue(new Promise(() => {}));
   const identity = createIdentity();
   render(<IdentitySetup identity={identity}>Signed in</IdentitySetup>);

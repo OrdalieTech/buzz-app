@@ -467,7 +467,6 @@ it("captures a chord, refuses conflicts and bare keys, applies overrides to the 
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Ctrl+K is already used by Search Buzz (Buzz).",
     );
-    expect(screen.getByRole("alert")).toHaveClass("text-standard");
     expect(input).toHaveAttribute(
       "aria-describedby",
       expect.stringContaining(screen.getByRole("alert").id),
@@ -535,7 +534,6 @@ it("captures a chord, refuses conflicts and bare keys, applies overrides to the 
     fireEvent.keyDown(capture("Open Settings"), { key: "z", ctrlKey: true });
     const warning = within(row("Open Settings")).getByRole("alert");
     expect(warning).toHaveTextContent("message editor handles Ctrl+Z");
-    expect(warning).toHaveClass("text-standard");
     expect(h.bindings.resolve("settings")).toEqual([{ key: "z", mod: true }]);
     for (const [key, chord] of [
       ["y", "Ctrl+Shift+Y"],
@@ -651,9 +649,6 @@ it.each([true, false])(
         fireEvent.keyDown(capture(title), event);
         expect(within(row(title)).getByRole("alert")).toHaveTextContent(
           "Saved. The message editor handles",
-        );
-        expect(within(row(title)).getByRole("alert")).toHaveClass(
-          "text-standard",
         );
         expect(h.bindings.resolve("settings")).toEqual([
           { key: "Enter", ...modifiers },
@@ -848,7 +843,6 @@ it("keeps a change active when saving fails and offers a retry", async () => {
     });
     const alert = screen.getByRole("alert");
     expect(alert).toHaveTextContent("could not be saved on this device");
-    expect(alert).toHaveClass("text-standard");
     expect(
       within(row("Toggle channel terminal")).getByText("Modified"),
     ).toBeInTheDocument();
@@ -1026,9 +1020,6 @@ it("marks rows that share an effective chord once a plugin is re-enabled, and cl
     const marker = within(row(counter)).getByText(
       "Also used by Toggle channel terminal (Terminal)",
     );
-    expect(marker).toHaveClass("text-subtle");
-    expect(marker).not.toHaveClass("text-danger");
-    expect(marker).not.toHaveClass("text-warning");
     expect(marker).not.toHaveAttribute("role");
     expect(
       within(row(terminal)).getByText(

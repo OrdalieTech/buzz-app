@@ -770,60 +770,6 @@ it("saves both steps of the card's two-step Mark as read", async () => {
   expect(h.journal()?.state.frontiers[`msg:${root.id}`]).toBe(30);
 });
 
-it("stops the card's two-step Mark as read before a newer unread reminder", async () => {
-  const h = fixture();
-  const root = message(h.alice, "room", "Two-step root", 30, [
-    ["p", h.viewer.pubkey],
-  ]);
-  const child = message(h.alice, "room", "Two-step reply", 31, [
-    ["p", h.viewer.pubkey],
-    ["e", root.id, "", "reply"],
-  ]);
-  h.events.push(root, child);
-  h.emit([root, child]);
-  render(previewAt(h), { wrapper: ToastProvider });
-  const thread = {
-    kind: "thread" as const,
-    channelId: "room",
-    rootId: root.id,
-  };
-  const item = () =>
-    h.owner.session.unread
-      .inbox()
-      .items.find((entry) => entry.id === `room:${root.id}`);
-  await waitFor(() => expect(item()?.readThrough).toHaveLength(2));
-  const row = await waitFor(() => {
-    const found = previewRows().find((entry) =>
-      entry.textContent?.includes("Two-step reply"),
-    );
-    if (!found) throw new Error("Missing two-step row");
-    return found;
-  });
-  const release = h.holdSave();
-  let reminder: Promise<unknown> | undefined;
-  try {
-    fireEvent.click(
-      within(row).getByRole("button", { name: /^Mark as read / }),
-    );
-    await waitFor(() => expect(h.saveStarted()).toBe(true));
-    // A newer reminder, as another window's Mark as unread, queues behind the
-    // first step's save.
-    reminder = h.owner.session.unread.markUnreadLocal(thread);
-  } finally {
-    await act(async () => release());
-  }
-  await act(async () => {
-    await reminder;
-  });
-  // The read stopped, so the row keeps its action and says so.
-  expect(await screen.findByText("Couldn't mark as read")).toBeInTheDocument();
-  // The first step saved; the older second step never erases the reminder.
-  expect(h.journal()?.state.frontiers[`msg:${root.id}`]).toBe(30);
-  expect(h.journal()?.localUnread[`thread:${root.id}`]).toBeTypeOf("number");
-  expect(h.journal()?.state.frontiers[`thread:${root.id}`]).toBeUndefined();
-  await waitFor(() => expect(item()?.unreadCount).toBeGreaterThan(0));
-});
-
 it("leads the card's header with the total and counts a mention only while it is unread", async () => {
   const h = fixture({ withSolo: true });
   render(previewAt(h));

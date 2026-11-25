@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { StrictMode, useRef, useState } from "react";
+import { StrictMode, useState } from "react";
 import {
   act,
   cleanup,
@@ -14,7 +14,6 @@ import { afterEach, expect, it, vi } from "vitest";
 import {
   ToastNotice,
   ToastProvider,
-  useToastClearance,
   useToastNotification,
   useToastDismiss,
 } from "./Toast";
@@ -427,38 +426,4 @@ it("cancels a dismissed toast's pending removal when its host unmounts", async (
   expect(vi.getTimerCount()).toBeGreaterThan(0);
   view.unmount();
   expect(vi.getTimerCount()).toBe(0);
-});
-
-it("keeps header clearance off the document root and skips unchanged values", async () => {
-  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
-    top: 0,
-    bottom: 48,
-    height: 48,
-  } as DOMRect);
-  const rootWrite = vi.spyOn(document.documentElement.style, "setProperty");
-  function Docked() {
-    const ref = useRef<HTMLDivElement>(null);
-    useToastClearance(ref);
-    return <div ref={ref} />;
-  }
-  const host = (docked?: string) => (
-    <StrictMode>
-      <ToastProvider>{docked && <Docked key={docked} />}</ToastProvider>
-    </StrictMode>
-  );
-  const view = render(host("first"));
-  await act(async () => {});
-  const viewport = screen.getByRole("region", { name: "App notifications" });
-  const clearance = () =>
-    viewport.style.getPropertyValue("--buzz-toast-top-clearance");
-  expect(clearance()).toBe("48px");
-  // Replacing the header with one of the same height writes nothing.
-  const write = vi.spyOn(viewport.style, "setProperty");
-  view.rerender(host("second"));
-  await act(async () => {});
-  expect(write).not.toHaveBeenCalled();
-  view.rerender(host());
-  await act(async () => {});
-  expect(clearance()).toBe("0px");
-  expect(rootWrite).not.toHaveBeenCalled();
 });

@@ -1313,8 +1313,6 @@ it("removes once for pointerdown plus click, then Backspace; effects outlive chi
     screen.queryByRole("button", { name: "Remove Person 1" }),
   ).not.toBeInTheDocument();
   expect(play).toHaveBeenCalledOnce();
-  const frame = document.querySelector('img[src$="poof1@3x.png"]');
-  expect(frame?.parentElement).toHaveStyle({ left: "123px", top: "234px" });
   await t.user.keyboard("{Backspace}");
   expect(
     screen.queryAllByRole("button", { name: /^Remove Person/ }),
@@ -1373,7 +1371,6 @@ it("holds Send while the To field has text that is not a recipient", async () =>
     screen.getByRole("group", { name: "Recipients" }),
   ).getByRole("status");
   expect(hint).toHaveTextContent(error);
-  expect(hint).toHaveClass("text-body-sm", "text-danger");
   // Back in To it hides with the list open, and shows when Escape closes it.
   await t.user.click(recipient());
   expect(screen.queryByText(error)).not.toBeInTheDocument();

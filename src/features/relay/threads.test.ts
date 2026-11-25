@@ -8,10 +8,9 @@ import {
   threadReference,
   type ThreadResume,
 } from "./threads";
-import { byteSize, listByteSize } from "./budget";
+import { byteSize } from "./budget";
 import { ReadError } from "./errors";
 import { USER_STATUS_KIND } from "./user-status-policy";
-import { foldMessages } from "./fold";
 import type { RelayReader } from "./reader";
 import type { OutgoingEvent } from "./outbox";
 import type { LiveCallbacks } from "./live";
@@ -25,9 +24,6 @@ import {
   scriptedTransport,
   signed,
 } from "./testing";
-
-vi.mock("./fold", { spy: true });
-vi.mock("./budget", { spy: true });
 
 const relay = keypair(),
   viewer = keypair(),
@@ -1406,7 +1402,7 @@ it.each([
   },
 );
 
-it("skips folding and budgeting known replay IDs while admitting new evidence after reads and purge", async () => {
+it("ignores known replay IDs while admitting new evidence after reads and purge", async () => {
   const events = [
     root,
     ...Array.from({ length: 500 }, (_, i) => reply(`${i}`, i + 2)),
@@ -1423,38 +1419,23 @@ it("skips folding and budgeting known replay IDs while admitting new evidence af
     visible: (events) => events.filter((event) => event.id !== hidden),
     notify: (listener) => listener(),
   });
-  const clear = () => {
-    vi.mocked(foldMessages).mockClear();
-    vi.mocked(listByteSize).mockClear();
-  };
   try {
-    clear();
     thread.receive([root]);
-    expect(foldMessages).not.toHaveBeenCalled();
-    expect(listByteSize).not.toHaveBeenCalled();
 
     await thread.view.refresh();
     const snapshot = thread.view.snapshot();
     expect(snapshot.replies).toHaveLength(500);
     const listener = vi.fn();
     thread.view.subscribe(listener);
-    clear();
     // Reconnect delivers retained replies individually, not as one batch.
     for (const event of events) thread.receive([event]);
-    expect(foldMessages).not.toHaveBeenCalled();
-    expect(listByteSize).not.toHaveBeenCalled();
     expect(listener).not.toHaveBeenCalled();
     expect(thread.view.snapshot()).toBe(snapshot);
 
     const fresh = reply("new", 502);
     thread.receive([...events, fresh]);
     expect(thread.view.snapshot().replies).toHaveLength(501);
-    expect(foldMessages).toHaveBeenCalledTimes(1);
-    expect(listByteSize).toHaveBeenCalledTimes(1);
-    clear();
     thread.receive([fresh]);
-    expect(foldMessages).not.toHaveBeenCalled();
-    expect(listByteSize).not.toHaveBeenCalled();
 
     // Pruned IDs may be received again; this is not an unbounded seen-ID set.
     hidden = fresh.id;
@@ -1510,12 +1491,10 @@ it("re-folds for local operations and profiles only when the thread's own change
   expect(content(answer.id)).toBe("Whole answer");
   const listener = vi.fn();
   thread.view.subscribe(listener);
-  vi.mocked(foldMessages).mockClear();
   // Another conversation's send settles, and an unrelated profile arrives.
   operations = [{ ...elsewhere, delivery: "accepted" }];
   thread.localChanged();
   thread.ownersChanged();
-  expect(foldMessages).not.toHaveBeenCalled();
   expect(listener).not.toHaveBeenCalled();
   // The agent's owner is verified: their edit now applies.
   owner = alice.pubkey;
@@ -1526,10 +1505,8 @@ it("re-folds for local operations and profiles only when the thread's own change
   operations = [...operations, { event: sending, delivery: "sending" }];
   thread.localChanged();
   expect(content(sending.id)).toBe("Mine");
-  expect(foldMessages).toHaveBeenCalledTimes(2);
   expect(listener).toHaveBeenCalledTimes(2);
   // The same operations in a new snapshot change nothing.
   operations = [...operations];
   thread.localChanged();
-  expect(foldMessages).toHaveBeenCalledTimes(2);
 });

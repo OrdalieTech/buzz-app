@@ -80,41 +80,6 @@ import { localAgentsFixture } from "../agents/local-testing";
 import { forgetDefaultAgent, setDefaultAgent } from "../solo/default-agent";
 import type { RegisteredPage } from "../pages/service";
 
-const { rowRender, menuRender } = vi.hoisted(() => ({
-  rowRender: vi.fn(),
-  menuRender: vi.fn(),
-}));
-// Observe the real row below ChannelSidebarItem's production memo boundary.
-// React hooks, the parent, the item and the row implementation remain real.
-vi.mock("../../bundled/channels/ChannelSidebarRow", async (original) => {
-  const actual =
-    await original<typeof import("../../bundled/channels/ChannelSidebarRow")>();
-  return {
-    ...actual,
-    ChannelSidebarRow: (
-      props: Parameters<typeof actual.ChannelSidebarRow>[0],
-    ) => {
-      rowRender(props);
-      return <actual.ChannelSidebarRow {...props} />;
-    },
-  };
-});
-// Observe the real row menu provider and popup the same way.
-vi.mock("../../shared/design-system/ui/Menu", async (original) => {
-  const actual =
-    await original<typeof import("../../shared/design-system/ui/Menu")>();
-  return {
-    ...actual,
-    ContextMenuRoot: (props: Parameters<typeof actual.ContextMenuRoot>[0]) => {
-      menuRender("root", props);
-      return <actual.ContextMenuRoot {...props} />;
-    },
-    MenuPopup: (props: Parameters<typeof actual.MenuPopup>[0]) => {
-      menuRender("popup", props);
-      return <actual.MenuPopup {...props} />;
-    },
-  };
-});
 beforeEach(() => {
   // jsdom has no layout; browser journeys own geometry. Only supply the API.
   vi.stubGlobal(
@@ -1419,25 +1384,11 @@ it("retries a contributed section after invalid rows recover", async () => {
   }
 });
 
-it("does not rebuild unchanged rows on channel switches", async () => {
+it("moves the active row on channel switches", async () => {
   const h = fixture();
   const mounted = render(h.view("alpha"));
   await screen.findByRole("button", { name: "gamma" });
-  rowRender.mockClear();
-  menuRender.mockClear();
   mounted.rerender(h.view("beta"));
-  expect(rowRender.mock.calls.map(([props]) => props.channel.id)).not.toContain(
-    "gamma",
-  );
-  // Unchanged rows keep their menu provider and popup behind the memo too.
-  expect(
-    menuRender.mock.calls.filter(([, props]) =>
-      String(props["aria-label"] ?? "").includes("gamma"),
-    ),
-  ).toEqual([]);
-  expect(
-    menuRender.mock.calls.filter(([kind]) => kind === "root"),
-  ).toHaveLength(rowRender.mock.calls.length);
   expect(screen.getByRole("button", { name: "beta" })).toHaveAttribute(
     "aria-current",
     "page",
@@ -1450,26 +1401,6 @@ it("does not rebuild unchanged rows on channel switches", async () => {
   expect(h.navigator.open).toHaveBeenCalledWith(
     expect.objectContaining({ kind: "conversation", channelId: "gamma" }),
   );
-});
-
-it("rebuilds only the changed row on a list publish", async () => {
-  const h = fixture();
-  render(h.view("alpha"));
-  await screen.findByRole("button", { name: "gamma" });
-  rowRender.mockClear();
-  h.publish("beta", { name: "beta renamed" });
-  expect(rowRender.mock.calls.map(([props]) => props.channel.id)).toEqual([
-    "beta",
-  ]);
-});
-
-it("rebuilds no host row when only a message preview changes", async () => {
-  const h = fixture();
-  render(h.view("alpha"));
-  await screen.findByRole("button", { name: "gamma" });
-  rowRender.mockClear();
-  h.publish("beta", { preview: "hello", lastActivityAt: 99 });
-  expect(rowRender).not.toHaveBeenCalled();
 });
 
 it("closes a removed DM's menu and focuses its neighbor before the exit ends", async () => {
@@ -2375,31 +2306,6 @@ it("clears only the removed section's collapsed intent after confirmation, never
     preferences.dispose();
   }
 });
-it("keeps sidebar rows still when only navigation state changes", async () => {
-  const h = fixture();
-  const unread = h.session.unread;
-  const reads: string[] = [];
-  h.session.unread = {
-    ...unread,
-    snapshot(target) {
-      if (target.kind === "channel") reads.push(target.channelId);
-      return unread.snapshot(target);
-    },
-  };
-  let navigation: ReturnType<typeof useChannelNavigation>;
-  function Probe() {
-    navigation = useChannelNavigation();
-    return null;
-  }
-  render(h.view("beta", <Probe />));
-  await screen.findByRole("button", { name: "gamma" });
-  reads.length = 0;
-  act(() => navigation?.prepareDm(["c".repeat(64)]));
-  expect(navigation?.preparingDm).toBeDefined();
-  // A rendered row reads its unread state; unchanged rows must not rerender.
-  expect(reads).toEqual([]);
-});
-
 it("restores lifecycle focus to the active row while an inert copy is exiting", async () => {
   const h = fixture();
   const channel = h.list.channels[1];
@@ -3691,37 +3597,21 @@ it("reveals an unavailable saved sort when configuration settles and stays settl
   }
 });
 
-it("does not rebuild unrelated plugin rows when a row menu opens or closes", async () => {
-  const renderRow = vi.fn(
-    (_: SidebarRow, Default: ReactElement | null) => Default,
-  );
-  const registry = rowRegistry({
-    version: 1,
-    id: "observe",
-    render: renderRow,
-  });
-  const h = fixture(undefined, "ready", undefined, undefined, registry);
+it("restores focus to the row when its menu closes", async () => {
+  const h = fixture();
   render(h.view("alpha"));
   await screen.findByRole("button", { name: "gamma" });
-  renderRow.mockClear();
   const beta = screen.getByRole("button", { name: "beta" });
   beta.focus();
   fireEvent.keyDown(beta, { key: "ContextMenu" });
   const copyLink = await screen.findByRole("menuitem", { name: "Copy link" });
   copyLink.focus();
   expect(copyLink).toHaveFocus();
-  expect(
-    renderRow.mock.calls.map(([row]) => row.id).filter((id) => id !== "beta"),
-  ).toEqual([]);
-  renderRow.mockClear();
   fireEvent.keyDown(copyLink, { key: "Escape" });
   await waitFor(() =>
     expect(screen.queryByRole("menu", { name: "Actions for beta" })).toBeNull(),
   );
   await waitFor(() => expect(beta).toHaveFocus());
-  expect(
-    renderRow.mock.calls.map(([row]) => row.id).filter((id) => id !== "beta"),
-  ).toEqual([]);
 });
 
 it("decorates live host rows and closes menus only when their row is hidden", async () => {

@@ -723,11 +723,6 @@
         16.8, 18.1
       ]
     },
-    "tests/browser/design-system.spec.mjs": {
-      "shared tokens reach app controls without history or chip overrides": [
-        10.7, 24.6
-      ]
-    },
     "tests/browser/dialog-actions.spec.mjs": {
       "community dialog keeps oversized actions intact, reachable and keyboard operable": [
         5.2, 12.4
@@ -1545,9 +1540,6 @@
       "Cmd+Up edits in the existing composer and restores native focus, draft history and attachments": [
         15.9, 12.9
       ]
-    },
-    "tests/browser/message-files-polish.spec.mjs": {
-      "files message presentation": [3.8, 6]
     },
     "tests/browser/message-gallery-polish.spec.mjs": {
       "layout message presentation": [4.5, 6.2]
@@ -2611,12 +2603,6 @@
         17.3, 49.2
       ]
     },
-    "tests/browser/sidebar-geometry.spec.mjs": {
-      "Team and Solo working badges share the painted row inset": [3.5, 9.7],
-      "a presence badge preserves the sidebar avatar center and header insets": [
-        9.3, 11
-      ]
-    },
     "tests/browser/sidebar-headings.spec.mjs": {
       "sidebar headings keep readable space and compact disclosure targets at enlarged sizes": [
         8.5, 25.3
@@ -2874,18 +2860,6 @@
       ],
       "saved DM labels › restores the sidebar name even when the DM was never opened": [
         10.3, 15.7
-      ]
-    },
-    "tests/browser/surface-consumers.spec.mjs": {
-      "availability retains semantic state fills in dark": [13.8, 15],
-      "availability retains semantic state fills in light": [13.4, 16]
-    },
-    "tests/browser/surface-interactions.spec.mjs": {
-      "surface contexts preserve controls and nested resets in dark": [
-        11, 10.7
-      ],
-      "surface contexts preserve controls and nested resets in light": [
-        10.1, 11.3
       ]
     },
     "tests/browser/tab-close-others.spec.mjs": {
@@ -3524,7 +3498,6 @@
     "src/bundled/focus/state.test.ts": 0,
     "src/bundled/focus/status.test.ts": 0,
     "src/bundled/github/AuthorSettings.test.tsx": 1.6,
-    "src/bundled/github/GitHub.module.test.ts": 0,
     "src/bundled/github/GitHubBody.test.tsx": 1.6,
     "src/bundled/github/GitHubPanel.test.tsx": 6.2,
     "src/bundled/github/PullLink.test.tsx": 0.6,

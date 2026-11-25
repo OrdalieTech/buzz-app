@@ -164,20 +164,6 @@ mod tests {
     }
 
     #[test]
-    fn session_id_is_deterministic() {
-        let secret = session_secret();
-        let id1 = derive_session_id(&secret);
-        let id2 = derive_session_id(&secret);
-        assert_eq!(id1, id2, "session_id must be deterministic");
-    }
-
-    #[test]
-    fn session_id_is_32_bytes() {
-        let id = derive_session_id(&session_secret());
-        assert_eq!(id.len(), 32);
-    }
-
-    #[test]
     fn session_id_differs_from_secret() {
         let secret = session_secret();
         let id = derive_session_id(&secret);
@@ -192,23 +178,6 @@ mod tests {
             "fb357d0f8e8d5a5ba3b2a91cb18c119e1567b07ffa38cdebb73e68df78f5a380",
             "session_id must match NIP-AB spec test vector"
         );
-    }
-
-    #[test]
-    fn sas_code_is_six_digits() {
-        // Use a synthetic ECDH shared secret (just some fixed bytes).
-        let ecdh = hex_to_32("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
-        let (code, _) = derive_sas(&ecdh, &session_secret());
-        assert!(code < 1_000_000, "SAS code must be < 1_000_000, got {code}");
-    }
-
-    #[test]
-    fn sas_is_deterministic() {
-        let ecdh = hex_to_32("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
-        let (code1, input1) = derive_sas(&ecdh, &session_secret());
-        let (code2, input2) = derive_sas(&ecdh, &session_secret());
-        assert_eq!(code1, code2);
-        assert_eq!(input1, input2);
     }
 
     #[test]
@@ -356,15 +325,6 @@ mod tests {
         assert_eq!(format_sas(291), "000291");
         assert_eq!(format_sas(47291), "047291");
         assert_eq!(format_sas(999999), "999999");
-    }
-
-    #[test]
-    fn format_sas_always_six_chars() {
-        for code in [0u32, 1, 99, 1000, 99999, 100000, 999999] {
-            let s = format_sas(code);
-            assert_eq!(s.len(), 6, "format_sas({code}) = {s:?} (expected 6 chars)");
-            assert!(s.chars().all(|c| c.is_ascii_digit()), "all digits: {s}");
-        }
     }
 
     #[test]

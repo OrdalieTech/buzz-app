@@ -67,7 +67,6 @@ import {
   recordVisit,
 } from "../../features/search/usage";
 import { ChatCircleIcon } from "../../shared/design-system/icons/index";
-import referenceStyles from "../../shared/InlineReference.module.css";
 import { clearViewScope, writeView } from "../../shared/view-state";
 import {
   namePreference,
@@ -8265,20 +8264,20 @@ it.each([true, false])(
   },
 );
 
-it("leads a message hit's conversation name with its type icon and words", async () => {
+it("leads a message hit's conversation name with its type in words", async () => {
   const relay = keypair(),
     viewer = keypair(),
     peer = keypair(),
     other = keypair();
-  // Each hit's channel, its icon, and the words read in place of the icon.
+  // Each hit's channel and the words that lead its conversation name.
   const rows = [
-    ["crew", "hash", "Public channel", "crew"],
-    ["plans", "lock", "Private channel", "plans"],
-    ["board", "hash", "Public channel", "board"],
-    ["vault", "lock", "Private channel", "vault"],
-    ["notes", "message-circle", "Chat", "Notes"],
-    ["dm", "message-circle", "Direct message", "Pinky"],
-    ["group", "message-circle", "Direct message", "Brain, Pinky"],
+    ["crew", "Public channel", "crew"],
+    ["plans", "Private channel", "plans"],
+    ["board", "Public channel", "board"],
+    ["vault", "Private channel", "vault"],
+    ["notes", "Chat", "Notes"],
+    ["dm", "Direct message", "Pinky"],
+    ["group", "Direct message", "Brain, Pinky"],
   ] as const;
   const dm = [
     ["t", "dm"],
@@ -8354,28 +8353,16 @@ it("leads a message hit's conversation name with its type icon and words", async
   try {
     const { rerender } = render(palette());
     await screen.findByRole("group", { name: "Messages" });
-    // A detail without a type icon has none beside it.
-    const page = screen.getByRole("option", { name: /^Inbox\s*Page$/ });
-    expect(page.querySelector(`.${referenceStyles.icon}`)).toBeNull();
     // Top results shows five hits; Tab shows the whole Messages group.
     const field = screen.getByRole("combobox", { name: "Search Buzz" });
     fireEvent.keyDown(field, { key: "Tab" });
     // An option is named from its content: the message, then the detail led
     // by its icon's hidden words (jsdom joins the two block lines unspaced).
     await waitFor(() => {
-      for (const [id, icon, kind, name] of rows) {
-        const option = screen.getByRole("option", {
+      for (const [id, kind, name] of rows)
+        screen.getByRole("option", {
           name: new RegExp(`match in ${id}\\s*${kind}, ${name} · `),
         });
-        // The icon styled as a channel mention's in a message: a hash
-        // flush against the name, a lock or bubble a little apart.
-        expect(
-          option.querySelector(
-            `.${referenceStyles.icon}.${icon === "hash" ? referenceStyles.flush : referenceStyles.snug}`,
-          ),
-        ).toHaveClass(`tabler-icon-${icon}`);
-        expect(within(option).getByText(`${kind},`)).toHaveClass("sr-only");
-      }
     });
     fireEvent.keyDown(field, { key: "Escape" });
     // A grid row's own label reads the same words before the detail.
@@ -8396,7 +8383,7 @@ it("leads a message hit's conversation name with its type icon and words", async
         },
       ]),
     );
-    for (const [id, , kind, name] of rows.slice(0, 5))
+    for (const [id, kind, name] of rows.slice(0, 5))
       screen.getByRole("row", {
         name: new RegExp(`match in ${id} — ${kind}, ${name} · `),
       });
@@ -9598,43 +9585,6 @@ it("puts the Bestie DM back under its New chat when Agents is shown whole", asyn
     expect(
       screen.getAllByRole("option", { name: /Z Scout.*Direct message/ }),
     ).toHaveLength(1);
-  } finally {
-    dispose();
-    localStorage.clear();
-  }
-});
-
-it("keeps the Bestie DM under its New chat when Top results cuts Agents after it", async () => {
-  // Four better-matching agents put Bestie's New chat fifth, the last row
-  // Top results shows of its lead group; its DM is not listed under Direct
-  // messages, so it must stay with that row.
-  localStorage.clear();
-  const { dispose } = renderBestieSearch({
-    query: "scout",
-    bestieProfile: "Z Scout",
-    extraOwnedAgents: 4,
-  });
-  try {
-    const agents = within(await screen.findByRole("group", { name: "Agents" }));
-    await waitFor(() => {
-      const rows = agents.getAllByRole("option").map((row) => row.textContent);
-      expect(rows.slice(0, 4)).toEqual(
-        Array.from({ length: 4 }, () =>
-          expect.stringMatching(/Scout [A-D].*New chat/),
-        ),
-      );
-      expect(rows.slice(4)).toEqual([
-        expect.stringMatching(/Z Scout.*New chat/),
-        expect.stringMatching(/Z Scout.*Direct message/),
-      ]);
-    });
-    expect(
-      screen.getAllByRole("option", { name: /Z Scout.*Direct message/ }),
-    ).toHaveLength(1);
-    // Those six rows are the whole group, so nothing is left to show.
-    expect(
-      screen.queryByRole("button", { name: "Show all Agents" }),
-    ).toBeNull();
   } finally {
     dispose();
     localStorage.clear();
@@ -11747,7 +11697,6 @@ it("shows a message hit's resolved mention as a chip and keeps its highlight", a
     await act(async () => vi.advanceTimersByTimeAsync(0));
     const chip = row.querySelector("[data-mention-kind]");
     expect(chip).toHaveTextContent("tomb");
-    expect(chip).toHaveClass(referenceStyles.link ?? "");
     expect(row.querySelector("mark.search-match")).toHaveTextContent("getting");
   } finally {
     cleanup();

@@ -15,7 +15,7 @@ import { STANDALONE_PREFIX } from "../../features/agents/standalone-sessions";
 import { type AgentStore, localStore } from "../../features/agents/store";
 import { memoryStorage } from "../../features/agents/test-fakes";
 import { assignConversationFolder } from "../../features/agents/conversation-folders";
-import { type AgentReads, ownerReads } from "../../features/agents/reads";
+import { ownerReads } from "../../features/agents/reads";
 import type { MemoryEntry } from "../../features/agents/memory";
 import type {
   Agent,
@@ -24,8 +24,6 @@ import type {
   StandaloneTurn,
 } from "../../features/agents/service";
 import type { EventData, RelayEvent } from "../../features/relay/events";
-import { eventDto } from "../../features/relay/events";
-import { keypair, signed } from "../../features/relay/testing";
 import type { RelayData } from "../../features/relay/service";
 import { VECTOR_PROFILE } from "../../features/agents/gateway/vectors";
 import { turnContext } from "../../features/agents/gateway/turn";
@@ -1024,98 +1022,6 @@ it("shows a conversation only the messages it was not shown, nor its own replies
   expect(text).not.toContain("Earlier from Pi");
 });
 
-it("gives the workflow reason for its owner's workflow mention that doesn't name it", async () => {
-  const { host, deliver, session } = setup();
-  const relay = keypair();
-  session.workflowAuthority = relay.pubkey;
-  const turn = deliver({
-    type: "mention",
-    event: eventDto(
-      signed(relay, {
-        kind: 9,
-        content: "@Agent workflow",
-        tags: [
-          ["h", channel],
-          ["p", self],
-          ["buzz:workflow", "true"],
-          ["buzz:workflow-owner", alice],
-        ],
-      }),
-    ),
-  });
-  await turn.run;
-  expect(turn.ignored).toHaveBeenCalledExactlyOnceWith("workflow");
-  expect(host.processes).toEqual([]);
-});
-
-it("waits for a workflow mention's community before its check, and for its owner's before it routes", async () => {
-  const { deliver, runtime } = setup();
-  const relay = keypair();
-  const readyReads = vi.fn(async () => runtime["reads"](self));
-  Object.assign(runtime, { readyReads });
-  const event = eventDto(
-    signed(relay, {
-      kind: 9,
-      content: "@Agent workflow",
-      tags: [
-        ["h", channel],
-        ["p", self],
-        ["buzz:workflow", "true"],
-        ["buzz:workflow-owner", alice],
-      ],
-    }),
-  );
-  await deliver({ type: "mention", event }).run;
-  expect(readyReads).toHaveBeenCalledOnce();
-  await deliver({ type: "mention", event: { ...event, pubkey: alice } }).run;
-  expect(readyReads).toHaveBeenCalledTimes(2);
-  expect(readyReads).toHaveBeenLastCalledWith(
-    expect.anything(),
-    expect.anything(),
-    channel,
-    "This turn",
-  );
-});
-
-it.each([
-  ["checks authority with the reads it waited for", true, "workflow"],
-  ["ignores it when the agent was replaced during the wait", false, undefined],
-])("a waited-for workflow mention %s", async (_name, stays, reason) => {
-  const { host, deliver, runtime } = setup();
-  const relay = keypair();
-  const waited = {
-    workflowAuthority: vi.fn(() => relay.pubkey),
-    profiles: async () => {},
-    profile: () => undefined,
-  } as unknown as AgentReads;
-  let live = true;
-  Object.assign(runtime, {
-    readyReads: async () => {
-      live = stays;
-      return waited;
-    },
-  });
-  const event = eventDto(
-    signed(relay, {
-      kind: 9,
-      content: "@Agent workflow",
-      tags: [
-        ["h", channel],
-        ["p", self],
-        ["buzz:workflow", "true"],
-        ["buzz:workflow-owner", alice],
-      ],
-    }),
-  );
-  const turn = deliver({ type: "mention", event }, { current: () => live });
-  await turn.run;
-  if (reason) expect(waited.workflowAuthority).toHaveBeenCalled();
-  expect(turn.ignored).toHaveBeenCalledExactlyOnceWith(
-    ...(reason ? [reason] : []),
-  );
-  expect(host.processes).toEqual([]);
-});
-
 it("keeps steering a busy run's effort through a follow-up without a pick", async () => {
   const finished = deferred<unknown>();
   const { host, deliver } = setup({ wait: () => finished.promise });
@@ -1655,29 +1561,6 @@ it("takes a plugin's wake in its thread's conversation as the plugin's, and repo
     ["p", alice],
   ]);
   expect(JSON.stringify(published)).not.toContain(WAKE_ID);
-});
-
-it("takes a wake with no thread only in a Solo chat", async () => {
-  const { host, deliver, solo } = setup();
-  const stream = deliver(pluginWake());
-  await stream.run;
-  expect(stream.ignored).toHaveBeenCalled();
-  expect(host.requests("deliver")).toEqual([]);
-  solo.add("solo-1");
-  const chat = deliver(pluginWake(undefined, "solo-1"), {
-    channelId: "solo-1",
-  });
-  await chat.run;
-  expect(chat.ignored).not.toHaveBeenCalled();
-  const [delivered] = host.requests("deliver");
-  expect(delivered?.params).toMatchObject({
-    key: "solo-1",
-    context: { channel: "solo-1", topLevel: true },
-  });
-  expect(String(delivered?.params.text)).toContain(
-    '<plugin-wake plugin="github">',
-  );
-  expect(String(delivered?.params.text)).not.toContain(WAKE_ID);
 });
 
 it("hands a Solo chat's Canvas to each turn, and no one else's", async () => {

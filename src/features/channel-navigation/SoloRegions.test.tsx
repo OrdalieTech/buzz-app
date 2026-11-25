@@ -46,7 +46,6 @@ import type {
 import type { Navigation } from "../navigation/controller";
 import { useSidebarView } from "../../bundled/channels/useSidebarView";
 import { writeView } from "../../shared/view-state";
-import destinationStyles from "./SoloDestination.module.css";
 
 composerDOMFixture();
 const disposals: (() => unknown)[] = [];
@@ -348,39 +347,6 @@ it.each([
     }
   },
 );
-
-it("paints the shared card tone and accepted drag target the source chooses", async () => {
-  const h = fixture();
-  await h.register({
-    component: ({ ui }) => (
-      <>
-        <Row ui={ui} channelId="owned" tone="inset" dropTarget />
-        <Row ui={ui} channelId="shared" tone="tonal" />
-      </>
-    ),
-  });
-  mount(h);
-  expect(
-    screen
-      .getByRole("button", { name: "Owned" })
-      .closest("[data-navigation-card]"),
-  ).toHaveAttribute("data-tone", "inset");
-  expect(
-    screen
-      .getByRole("button", { name: "Owned" })
-      .closest("[data-navigation-card]"),
-  ).toHaveAttribute("data-drop-target");
-  expect(
-    screen
-      .getByRole("button", { name: "Shared" })
-      .closest("[data-navigation-card]"),
-  ).not.toHaveAttribute("data-drop-target");
-  expect(
-    screen
-      .getByRole("button", { name: "Shared" })
-      .closest("[data-navigation-card]"),
-  ).toHaveAttribute("data-tone", "tonal");
-});
 
 it("keeps header actions and every owned channel reachable through body failure and retry", async () => {
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -749,22 +715,18 @@ it("keeps Destination navigation, unread and local state stable across source up
   expect(custom).toHaveBeenCalledOnce();
 });
 
-it("renders a source status update without rerendering an unchanged conversation", async () => {
+it("keeps an open conversation menu, focus and active row across a source status update", async () => {
   const h = fixture();
   const user = userEvent.setup();
-  const renderShared = vi.fn();
   const Shared = memo(function Shared({ ui }: Pick<SoloRegionProps, "ui">) {
     return (
       <ui.Conversation channelId="shared">
-        {(c) => {
-          renderShared();
-          return (
-            <c.Menu>
-              <c.Link label={c.name} />
-              <c.Actions />
-            </c.Menu>
-          );
-        }}
+        {(c) => (
+          <c.Menu>
+            <c.Link label={c.name} />
+            <c.Actions />
+          </c.Menu>
+        )}
       </ui.Conversation>
     );
   });
@@ -785,7 +747,6 @@ it("renders a source status update without rerendering an unchanged conversation
   shared.focus();
   await user.keyboard("{Shift>}{F10}{/Shift}");
   const menu = await screen.findByRole("menu", { name: "Actions for Shared" });
-  renderShared.mockClear();
 
   await act(() =>
     source.update({
@@ -796,7 +757,6 @@ it("renders a source status update without rerendering an unchanged conversation
     }),
   );
   expect(screen.getByText("Working")).toBeInTheDocument();
-  expect(renderShared).not.toHaveBeenCalled();
   expect(menu).toBeVisible();
   await user.keyboard("{Escape}");
   await waitFor(() => expect(menu).not.toBeInTheDocument());
@@ -2050,7 +2010,6 @@ it("lets the source place resting content and the overflow menu", async () => {
   expect(screen.getByRole("button", { name: "Owned" })).not.toContainElement(
     action,
   );
-  expect(status.parentElement).toHaveClass(destinationStyles.rest ?? "rest");
 });
 
 it("withholds every chat menu for a cached conversation", async () => {

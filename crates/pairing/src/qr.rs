@@ -257,50 +257,20 @@ mod tests {
         }
     }
 
-    // 1. Round-trip encode/decode
+    // Round-trip encode/decode, with relay URLs holding reserved characters.
     #[test]
-    fn round_trip_single_relay() {
-        let original = make_payload(vec!["wss://relay.example.com".to_string()]);
+    fn round_trip_multiple_relays() {
+        let original = make_payload(vec![
+            "wss://relay1.example.com".to_string(),
+            "wss://relay2.example.com/path?token=abc&flag=1".to_string(),
+            "wss://relay3.example.com/path#frag%20ment".to_string(),
+        ]);
         let uri = encode_qr(&original);
         let decoded = decode_qr(&uri).expect("decode should succeed");
 
         assert_eq!(original.source_pubkey, decoded.source_pubkey);
         assert_eq!(original.session_secret, decoded.session_secret);
-        assert_eq!(original.relays, decoded.relays);
-    }
-
-    // 7. Handle multiple relays
-    #[test]
-    fn round_trip_multiple_relays() {
-        let original = make_payload(vec![
-            "wss://relay1.example.com".to_string(),
-            "wss://relay2.example.com".to_string(),
-            "wss://relay3.example.com".to_string(),
-        ]);
-        let uri = encode_qr(&original);
-        let decoded = decode_qr(&uri).expect("decode should succeed");
-
-        assert_eq!(decoded.relays.len(), 3);
         assert_eq!(decoded.relays, original.relays);
-    }
-
-    // 8. Handle URL-encoded relay URLs
-    #[test]
-    fn url_encoding_round_trip() {
-        let relay = "wss://relay.example.com/path";
-        let encoded = url_encode(relay);
-        // NON_ALPHANUMERIC encodes dots too — stricter than necessary but safe.
-        assert_eq!(encoded, "wss%3A%2F%2Frelay%2Eexample%2Ecom%2Fpath");
-        let decoded = url_decode(&encoded);
-        assert_eq!(decoded, relay);
-    }
-
-    #[test]
-    fn round_trip_relay_with_path() {
-        let original = make_payload(vec!["wss://relay.example.com/nostr".to_string()]);
-        let uri = encode_qr(&original);
-        let decoded = decode_qr(&uri).expect("decode should succeed");
-        assert_eq!(decoded.relays[0], "wss://relay.example.com/nostr");
     }
 
     // 2. Reject missing scheme
@@ -452,51 +422,6 @@ mod tests {
         assert!(uri.contains(&payload.source_pubkey.to_hex()));
         assert!(uri.contains("secret="));
         assert!(uri.contains("relay="));
-    }
-
-    #[test]
-    fn url_decode_case_insensitive() {
-        // %3a and %2f (lowercase) should also decode
-        assert_eq!(
-            url_decode("wss%3a%2f%2frelay.example.com"),
-            "wss://relay.example.com"
-        );
-    }
-
-    #[test]
-    fn round_trip_relay_with_query_params() {
-        // Relay URL with query parameters containing &, =, and ?
-        let original = make_payload(vec![
-            "wss://relay.example.com/path?token=abc&flag=1".to_string()
-        ]);
-        let uri = encode_qr(&original);
-        let decoded = decode_qr(&uri).expect("decode should succeed");
-        assert_eq!(
-            decoded.relays[0],
-            "wss://relay.example.com/path?token=abc&flag=1"
-        );
-    }
-
-    #[test]
-    fn round_trip_relay_with_percent_and_hash() {
-        let original = make_payload(vec!["wss://relay.example.com/path#frag%20ment".to_string()]);
-        let uri = encode_qr(&original);
-        let decoded = decode_qr(&uri).expect("decode should succeed");
-        assert_eq!(
-            decoded.relays[0],
-            "wss://relay.example.com/path#frag%20ment"
-        );
-    }
-
-    #[test]
-    fn url_encode_reserved_chars() {
-        let encoded = url_encode("wss://relay.com/path?a=1&b=2#frag");
-        assert!(!encoded.contains('&'), "& must be encoded");
-        assert!(!encoded.contains('='), "= must be encoded");
-        assert!(!encoded.contains('?'), "? must be encoded");
-        assert!(!encoded.contains('#'), "# must be encoded");
-        let decoded = url_decode(&encoded);
-        assert_eq!(decoded, "wss://relay.com/path?a=1&b=2#frag");
     }
 
     // Version field tests

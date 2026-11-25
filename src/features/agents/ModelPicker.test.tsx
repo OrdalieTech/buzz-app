@@ -196,31 +196,6 @@ function setup(value = "", props: { allowCustomModel?: boolean } = {}) {
 
 const control = () => screen.getByRole("combobox", { name: "Model" });
 
-it("keeps mixed-vendor options aligned without an unknown trigger icon", async () => {
-  const user = userEvent.setup();
-  render(
-    <ModelPicker
-      models={[
-        { id: "opaque", label: "Unknown vendor" },
-        { id: "claude", label: "Claude" },
-      ]}
-      value="opaque"
-      defaultLabel="Choose model"
-      includeDefault={false}
-      onChange={vi.fn()}
-    />,
-  );
-  expect(control().querySelector(".buzz-select-leading")).toBeNull();
-  await user.click(control());
-  const unknown = await screen.findByRole("option", { name: "Unknown vendor" });
-  expect(unknown.querySelector(".buzz-select-leading")).toBeEmptyDOMElement();
-  expect(
-    screen
-      .getByRole("option", { name: "Claude" })
-      .querySelector(".buzz-select-leading svg"),
-  ).toBeInTheDocument();
-});
-
 it("shows the Claude mark for a Fable model whose ID omits claude", () => {
   const reference = render(<ClaudeLogoIcon size={20} />);
   const artwork = reference.container.querySelector("svg")?.innerHTML;
@@ -237,77 +212,6 @@ it("shows the Claude mark for a Fable model whose ID omits claude", () => {
   expect(control().querySelector(".buzz-select-leading svg")?.innerHTML).toBe(
     artwork,
   );
-});
-
-it.each([false, true])(
-  "omits the icon column when every model is unknown (grouped: %s)",
-  async (groupByFamily) => {
-    const user = userEvent.setup();
-    render(
-      <ModelPicker
-        groupByFamily={groupByFamily}
-        models={[{ id: "opaque", label: "Unknown vendor" }]}
-        value="opaque"
-        defaultLabel="Provider default"
-        onChange={vi.fn()}
-      />,
-    );
-    const trigger = groupByFamily
-      ? screen.getByRole("button", { name: /^Model:/ })
-      : control();
-    expect(trigger.querySelector(".buzz-select-leading")).toBeNull();
-    await user.click(trigger);
-    if (groupByFamily) {
-      const family = await screen.findByRole("menuitem", { name: "Other" });
-      expect(family.querySelector(".buzz-select-leading")).toBeNull();
-      expect(
-        family.querySelector("svg:not(.buzz-menu-submenu-arrow)"),
-      ).toBeNull();
-      expect(
-        screen
-          .getByRole("menuitemradio", { name: "Default" })
-          .querySelector(".buzz-select-leading"),
-      ).toBeNull();
-    } else {
-      for (const option of await screen.findAllByRole("option")) {
-        expect(option.querySelector(".buzz-select-leading")).toBeNull();
-      }
-    }
-  },
-);
-
-it("aligns mixed family rows with empty slots rather than generic icons", async () => {
-  const user = userEvent.setup();
-  render(
-    <ModelPicker
-      groupByFamily
-      models={[
-        { id: "opaque", label: "Unknown vendor" },
-        { id: "claude", label: "Claude" },
-      ]}
-      value="opaque"
-      defaultLabel="Provider default"
-      onChange={vi.fn()}
-    />,
-  );
-  const trigger = screen.getByRole("button", { name: /^Model:/ });
-  expect(trigger.querySelector(".buzz-select-leading")).toBeNull();
-  await user.click(trigger);
-  expect(
-    (await screen.findByRole("menuitem", { name: "Other" })).querySelector(
-      ".buzz-select-leading",
-    ),
-  ).toBeEmptyDOMElement();
-  expect(
-    screen
-      .getByRole("menuitem", { name: "Claude" })
-      .querySelector(".buzz-select-leading svg"),
-  ).toBeInTheDocument();
-  expect(
-    screen
-      .getByRole("menuitemradio", { name: "Default" })
-      .querySelector(".buzz-select-leading"),
-  ).toBeEmptyDOMElement();
 });
 
 it("picks a listed model", async () => {

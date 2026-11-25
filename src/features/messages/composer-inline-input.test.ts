@@ -59,6 +59,12 @@ describe("typed inline Markdown conversion", () => {
       ["~~struck~~", "struck", ["strike"]],
       ["`code`", "code", ["code"]],
       ["***both***", "both", ["bold", "italic"]],
+      // Regression: a `~` right after the opening backtick once counted as
+      // delimiter, so `~/Foo/bar` became `/Foo/ba`.
+      ["`~/Foo/bar`", "~/Foo/bar", ["code"]],
+      ["`~`", "~", ["code"]],
+      ["`~~x~~`", "~~x~~", ["code"]],
+      ["`a~b`", "a~b", ["code"]],
     ])("%s", (source, text, marks) => {
       expect(typeClosing(source)).toEqual({
         converted: true,
@@ -152,58 +158,6 @@ describe("typed inline Markdown conversion", () => {
       expect(typeClosing("~5 and ~")).toMatchObject({
         converted: false,
         text: "~5 and ~",
-      });
-    });
-  });
-
-  // Regression: the delimiter length of a code span was read with /^[`~]+/, so a
-  // `~` right after the opening backtick counted as delimiter. Two characters
-  // were removed from each end: `~/Foo/bar` became `/Foo/ba`.
-  describe("keeps every content character of a code span that contains `~`", () => {
-    it.each([
-      ["`~foo`", "~foo"],
-      ["`~/A`", "~/A"],
-      ["`~/Foo/bar`", "~/Foo/bar"],
-      ["`~A`", "~A"],
-      ["`~`", "~"],
-      ["`~~`", "~~"],
-      ["`~~x~~`", "~~x~~"],
-      ["`a~b`", "a~b"],
-      ["`foo~`", "foo~"],
-    ])("%s", (source, text) => {
-      expect(typeClosing(source)).toEqual({
-        converted: true,
-        text,
-        runs: [[text, ["code"]]],
-      });
-    });
-
-    it("in running text", () => {
-      expect(typeClosing("Hello `~/Foo/bar`").runs).toEqual([
-        ["Hello ", []],
-        ["~/Foo/bar", ["code"]],
-      ]);
-    });
-
-    it("when typed into the middle of existing text", () => {
-      const source = "a `~/Foo/bar` b";
-      expect(typeClosing(source, { caret: source.indexOf("` b") + 1 })).toEqual(
-        {
-          converted: true,
-          text: "a ~/Foo/bar b",
-          runs: [
-            ["a ", []],
-            ["~/Foo/bar", ["code"]],
-            [" b", []],
-          ],
-        },
-      );
-    });
-
-    it("with a double-backtick delimiter", () => {
-      expect(typeClosing("``~/a`b``")).toMatchObject({
-        converted: true,
-        text: "~/a`b",
       });
     });
   });

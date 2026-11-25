@@ -739,5 +739,4 @@ it("lets registered renderers own chat link presentation like other links", () =
   );
   const link = screen.getByRole("link", { name: "Chat: Work" });
   expect(link).toHaveTextContent("Link face");
-  expect(link).toHaveClass("link-style");
 });

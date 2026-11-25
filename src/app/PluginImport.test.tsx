@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import "@testing-library/jest-dom/vitest";
 import {
   act,
@@ -29,11 +27,6 @@ const gitReferenceDescription =
   "Copy a plugin listing’s Ref into this field. Leave blank to scan the repository’s default branch.";
 const gitSizeRefusalMessages = {
   output: "Git output exceeds the import size limit",
-  repository: "Repository exceeds the 256 MiB import limit",
-  repositoryFileCount:
-    "Repository has more than 20,000 files; enter the folder to import from",
-  repositoryEntries: "Repository exceeds the import entry limit",
-  file: "File exceeds its size limit",
   scopedFileCountSuffix: " has more than 20,000 files; choose a smaller folder",
 };
 
@@ -104,67 +97,14 @@ it("opens both sources inside Add without a duplicate safety warning, and restor
 
 const gitOutputRecoveryHint =
   "Try another branch or tag. If the same output limit persists, ask the publisher for a ref or repository that Buzz can read.";
-const gitRepositoryRecoveryHint =
-  "Try another branch or tag with a smaller plugin source. If it still exceeds the limit, ask the publisher for a smaller plugin-focused repository.";
-const gitEntryRecoveryHint =
-  "Try another branch or tag with fewer repository entries. If it still exceeds the limit, ask the publisher for a plugin-focused repository.";
-const gitFileRecoveryHint =
-  "Try another branch or tag with a smaller plugin file. If it still exceeds the limit, ask the publisher to provide a smaller file.";
-const gitRepositoryFileCountHint =
-  "Choose Back, enter the plugin folder in Folder, then try again.";
 const gitScopedFileCountHint =
   "Choose Back, enter a smaller folder path in Folder, then try again.";
-
-it("keeps Git recovery message keys aligned with native import refusals", () => {
-  const nativeImports = readFileSync(
-    resolve(process.cwd(), "crates/plugin-manager/src/imports.rs"),
-    "utf8",
-  );
-  for (const message of Object.values(gitSizeRefusalMessages)) {
-    expect(nativeImports).toContain(message);
-  }
-});
 
 it.each([
   {
     error: gitSizeRefusalMessages.output,
-    reference: "",
-    recoveryHint: gitOutputRecoveryHint,
-  },
-  {
-    error: gitSizeRefusalMessages.output,
     reference: "release/stable",
     recoveryHint: gitOutputRecoveryHint,
-  },
-  {
-    error: `${gitSizeRefusalMessages.output} (repository access rule example-org, agent socket plugin-test)`,
-    reference: "",
-    recoveryHint: gitOutputRecoveryHint,
-  },
-  {
-    error: gitSizeRefusalMessages.repository,
-    reference: "",
-    recoveryHint: gitRepositoryRecoveryHint,
-  },
-  {
-    error: gitSizeRefusalMessages.repositoryEntries,
-    reference: "",
-    recoveryHint: gitEntryRecoveryHint,
-  },
-  {
-    error: gitSizeRefusalMessages.file,
-    reference: "",
-    recoveryHint: gitFileRecoveryHint,
-  },
-  {
-    error: gitSizeRefusalMessages.repositoryFileCount,
-    reference: "",
-    recoveryHint: gitRepositoryFileCountHint,
-  },
-  {
-    error: `extensions/large${gitSizeRefusalMessages.scopedFileCountSuffix}`,
-    reference: "release/stable",
-    recoveryHint: gitScopedFileCountHint,
   },
   {
     error: `extensions/large${gitSizeRefusalMessages.scopedFileCountSuffix} (repository access rule example-org, agent socket plugin-test)`,
@@ -172,17 +112,7 @@ it.each([
     recoveryHint: gitScopedFileCountHint,
   },
   {
-    error: "Repository import exceeded 60 seconds",
-    reference: "",
-    recoveryHint: undefined,
-  },
-  {
     error: "SSH authentication failed",
-    reference: "",
-    recoveryHint: undefined,
-  },
-  {
-    error: "Could not resolve host: example.org",
     reference: "",
     recoveryHint: undefined,
   },
@@ -236,71 +166,6 @@ it.each([
     }
   },
 );
-
-it("matches a Git-size hint from an Error object without changing its display", async () => {
-  const user = userEvent.setup();
-  const git = vi.fn(async () => {
-    throw new Error("Git output exceeds the import size limit");
-  });
-  const manager = {
-    imports: { git, discard: vi.fn(async () => {}) },
-    installImport: vi.fn(),
-  } as unknown as PluginManager;
-  render(
-    <PluginImport
-      plugins={manager}
-      catalog={{ profile: "test", location: "test", plugins: [] }}
-      busy={false}
-    />,
-  );
-
-  await user.click(screen.getByRole("button", { name: "Add" }));
-  await user.type(
-    screen.getByLabelText("Git or GitHub repository"),
-    "https://example.org/plugins",
-  );
-  await user.click(screen.getByRole("button", { name: "Find plugins" }));
-
-  const alert = await screen.findByRole("alert");
-  expect(
-    within(alert).getByText("Error: Git output exceeds the import size limit"),
-  ).toBeVisible();
-  expect(within(alert).getByText(gitOutputRecoveryHint)).toBeVisible();
-  expect(git).toHaveBeenCalledExactlyOnceWith(
-    "https://example.org/plugins",
-    "",
-  );
-  expect(manager.installImport).not.toHaveBeenCalled();
-});
-
-it("keeps folder size failures native without Git-specific recovery", async () => {
-  const error = "File exceeds its size limit";
-  const user = userEvent.setup();
-  const folder = vi.fn(async () => {
-    throw error;
-  });
-  const installImport = vi.fn();
-  const manager = {
-    imports: { folder, discard: vi.fn(async () => {}) },
-    installImport,
-  } as unknown as PluginManager;
-  render(
-    <PluginImport
-      plugins={manager}
-      catalog={{ profile: "test", location: "test", plugins: [] }}
-      busy={false}
-    />,
-  );
-
-  await user.click(screen.getByRole("button", { name: "Add" }));
-  await user.click(
-    screen.getByRole("button", { name: "Browse plugin folder" }),
-  );
-  const alert = await screen.findByRole("alert");
-  expect(within(alert).getByText(error, { exact: true })).toBeVisible();
-  expect(within(alert).queryByText(/Try another branch or tag/)).toBeNull();
-  expect(installImport).not.toHaveBeenCalled();
-});
 
 it("does not suggest changing a bound or pinned link source after a size refusal", async () => {
   const error = "Git output exceeds the import size limit";

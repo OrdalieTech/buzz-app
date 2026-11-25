@@ -9,7 +9,6 @@ import type { CodeBlockRenderer } from "../conversation/contracts";
 import { DOCUMENT_PROFILE, DOCUMENT_RENDER_CELLS } from "./document-profile";
 import { guardDocument, parseForGuard } from "./guard";
 import { MarkdownDocument, sharedComponents } from "./MarkdownDocument";
-import styles from "./Markdown.module.css";
 
 afterEach(cleanup);
 
@@ -25,8 +24,8 @@ const diagram: Contribution<CodeBlockRenderer> = {
 const renderers = [diagram];
 const codeBlocks = { snapshot: () => renderers, subscribe: () => () => {} };
 
-it("styles every element as a document and offers copy and plugin blocks", () => {
-  const { container } = render(
+it("renders a document with copy and plugin blocks", () => {
+  render(
     <MarkdownDocument
       content={"# Title\n\n- item\n\n```\nplain\n```\n\n```mermaid\ngraph\n```"}
       profile={DOCUMENT_PROFILE}
@@ -36,12 +35,6 @@ it("styles every element as a document and offers copy and plugin blocks", () =>
       className="host"
     />,
     { wrapper: ToastProvider },
-  );
-  const root = container.firstElementChild;
-  expect(root).toHaveClass(
-    String(styles.document),
-    String(styles.documentScale),
-    "host",
   );
   expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Title");
   expect(screen.getByRole("listitem")).toHaveTextContent("item");

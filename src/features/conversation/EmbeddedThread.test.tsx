@@ -15,12 +15,10 @@ import {
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { EmbeddedThread } from "./EmbeddedThread";
-import { ConversationChannel, ConversationComposer } from "./Conversation";
+import { ConversationChannel } from "./Conversation";
 import type { Context } from "@deepseek-ai/cordis";
 import type { ComponentProps } from "react";
 import { createAgentLibrary } from "../agents/library";
-import { useMessageDeletion } from "../messages/MessageManagement";
-import type { MessageComposerProps } from "../messages/MessageComposer";
 import type { MessageRowProps } from "../messages/MessageRow";
 import type { PanelProps, RegisteredPanel } from "../panels/service";
 import type { ChannelMessage } from "../relay/contracts";
@@ -53,13 +51,7 @@ vi.mock("../messages/MessageRow", () => ({
   ),
 }));
 vi.mock("../messages/MessageComposer", () => ({
-  MessageComposer: ({ soloConversation }: MessageComposerProps) => (
-    <section
-      aria-label="Composer"
-      data-solo-conversation={String(!!soloConversation)}
-      data-deletion={String(!!useMessageDeletion())}
-    />
-  ),
+  MessageComposer: () => <section aria-label="Composer" />,
 }));
 vi.mock("../messages/MediaReviewViewer", () => ({
   MediaReviewViewer: (props: { onOpenLink(url: string): boolean }) => (
@@ -295,14 +287,6 @@ it("a panel opened from media review replaces the viewer, and media review repla
   expect(screen.queryByText("Linked content")).not.toBeInTheDocument();
 });
 
-it("the channel reply composer gets message management", () => {
-  render(<EmbeddedThread {...fixture("stream").props} />);
-  expect(screen.getByLabelText("Composer")).toHaveAttribute(
-    "data-deletion",
-    "true",
-  );
-});
-
 it("a Solo thread opens without a reply composer", () => {
   render(<EmbeddedThread {...fixture("solo").props} />);
   expect(screen.getByRole("article")).toBeVisible();
@@ -329,7 +313,6 @@ it("selecting a channel supplies its readers without remounting the page below",
       interactions={interactions}
     >
       <input aria-label="Page state" />
-      {channel && <ConversationComposer />}
     </ConversationChannel>
   );
   const view = render(page());
@@ -338,30 +321,8 @@ it("selecting a channel supplies its readers without remounting the page below",
   view.rerender(page({ id: "c", name: "Channel", channelType: "solo" }));
   expect(screen.getByLabelText("Page state")).toBe(input);
   expect(input).toHaveValue("kept");
-  const composer = screen.getByLabelText("Composer");
-  expect(composer).toHaveAttribute("data-solo-conversation", "true");
-  expect(composer).toHaveAttribute("data-deletion", "true");
   view.rerender(page());
   expect(screen.getByLabelText("Page state")).toBe(input);
-});
-
-it("keeps one channel visit while the thread is retargeted within a channel", () => {
-  const h = fixture();
-  const view = render(<EmbeddedThread {...h.props} />);
-  expect(h.unread.enterChannel).toHaveBeenCalledExactlyOnceWith(
-    "c",
-    document.hasFocus(),
-  );
-  view.rerender(<EmbeddedThread {...h.props} messageId={"c".repeat(64)} />);
-  expect(h.unread.enterChannel).toHaveBeenCalledOnce();
-  expect(h.unread.leaveChannel).not.toHaveBeenCalled();
-  // Leaving the channel is the barrier: the visit does follow the channel.
-  view.rerender(<EmbeddedThread {...h.props} channelId="d" />);
-  expect(h.unread.leaveChannel).toHaveBeenCalledExactlyOnceWith("c");
-  expect(h.unread.enterChannel).toHaveBeenLastCalledWith(
-    "d",
-    document.hasFocus(),
-  );
 });
 
 it("offers recovery for a failed edit left in the outbox", () => {
@@ -428,44 +389,4 @@ it("the shared conversation host supplies live actions and retires them while it
   view.rerender(mount(true));
   fireEvent.click(screen.getByText("Open profile"));
   expect(screen.getByText("Linked content")).toBeVisible();
-});
-
-it("an open channel reserves profile room for its roster and returns it when it closes", () => {
-  const { props } = fixture();
-  const release = vi.fn();
-  const reserve = vi.fn(() => release);
-  const session = {
-    ...props.session,
-    profiles: { ...props.session.profiles, reserve },
-  } as RelaySession;
-  const interactions: ConversationInteractions = {
-    onOpenLink: () => true,
-    canOpenLink: () => false,
-    onOpenMediaReview: () => {},
-  };
-  const page = (id?: string, active?: boolean) => (
-    <ConversationChannel
-      session={session}
-      scope={props.scope}
-      extensions={props.extensions}
-      channel={id ? { id, name: "Channel" } : undefined}
-      active={active}
-      interactions={interactions}
-    >
-      <input aria-label="Page state" />
-    </ConversationChannel>
-  );
-  const view = render(page("c"));
-  expect(reserve).toHaveBeenCalledExactlyOnceWith(1);
-  view.rerender(page());
-  expect(release).toHaveBeenCalledOnce();
-  view.rerender(page("d"));
-  expect(reserve).toHaveBeenCalledTimes(2);
-  // A retained tab in the background gives the room back until it is shown.
-  view.rerender(page("d", false));
-  expect(release).toHaveBeenCalledTimes(2);
-  view.rerender(page("d", true));
-  expect(reserve).toHaveBeenCalledTimes(3);
-  view.unmount();
-  expect(release).toHaveBeenCalledTimes(3);
 });

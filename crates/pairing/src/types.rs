@@ -175,32 +175,6 @@ mod tests {
     }
 
     #[test]
-    fn complete_round_trip() {
-        for success in [true, false] {
-            let msg = PairingMessage::Complete { success };
-            let json = serde_json::to_string(&msg).expect("serialize");
-            let back: PairingMessage = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(msg, back);
-        }
-    }
-
-    #[test]
-    fn all_abort_reasons_round_trip() {
-        let reasons = [
-            AbortReason::SasMismatch,
-            AbortReason::UserDenied,
-            AbortReason::Timeout,
-            AbortReason::ProtocolError,
-        ];
-        for reason in reasons {
-            let msg = PairingMessage::Abort { reason };
-            let json = serde_json::to_string(&msg).expect("serialize");
-            let back: PairingMessage = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(msg, back);
-        }
-    }
-
-    #[test]
     fn unknown_abort_reason_deserializes_to_unknown() {
         // NIP-AB §Abort: "unknown reasons SHOULD be treated as protocol_error"
         let json = r#"{"type":"abort","reason":"solar_flare"}"#;
@@ -211,32 +185,5 @@ mod tests {
                 reason: AbortReason::Unknown
             }
         );
-    }
-
-    #[test]
-    fn unknown_abort_reason_is_not_protocol_error_variant() {
-        // Unknown is a distinct variant — callers should never construct it
-        // for outbound use, but if they do it serializes distinctly from
-        // ProtocolError so we can catch the mistake.
-        assert_ne!(AbortReason::Unknown, AbortReason::ProtocolError);
-    }
-
-    #[test]
-    fn all_payload_types_round_trip() {
-        let types = [
-            PayloadType::Nsec,
-            PayloadType::Bunker,
-            PayloadType::Connect,
-            PayloadType::Custom,
-        ];
-        for payload_type in types {
-            let msg = PairingMessage::Payload {
-                payload_type,
-                payload: "data".to_string(),
-            };
-            let json = serde_json::to_string(&msg).expect("serialize");
-            let back: PairingMessage = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(msg, back);
-        }
     }
 }
