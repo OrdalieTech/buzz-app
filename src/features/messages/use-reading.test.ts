@@ -3,7 +3,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { createElement, useEffect, type ReactNode } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { MessageEditScope, useMessageEditScope } from "./MessageEditScope";
-import { readingPositioned, useReading } from "./use-reading";
+import { ReadingCovers, readingPositioned, useReading } from "./use-reading";
 import type { RelaySession } from "../relay/session";
 
 afterEach(() => {
@@ -33,6 +33,7 @@ function setup({
   concealed = false,
   focus = "element" as "element" | "composer" | "parent" | "outside" | "header",
   trailing = undefined as (() => number | undefined) | undefined,
+  covers = (() => []) as () => readonly DOMRect[],
 } = {}) {
   vi.useFakeTimers();
   vi.spyOn(document, "hasFocus").mockReturnValue(focused);
@@ -143,7 +144,7 @@ function setup({
           MessageEditScope,
           null,
           createElement(Composer, { input: composer }),
-          children,
+          createElement(ReadingCovers, { value: covers }, children),
         ),
       ),
   });
@@ -786,6 +787,23 @@ it.each([
   },
 );
 
+it("rows under a floating overlay are not read until it closes and dwell wakes", () => {
+  let boxes = [new DOMRect(300, 220, 200, 200)];
+  const h = setup({ latestMessageId: "covered", covers: () => boxes });
+  h.setRows([row("visible", 100, 200), row("covered", 250, 350)]);
+  h.mutation();
+  vi.advanceTimersToNextFrame();
+  vi.advanceTimersByTime(300);
+  expect(h.dwelled()?.observe).toHaveBeenCalledExactlyOnceWith(["visible"]);
+  expect(h.dwelled()?.catchUp).not.toHaveBeenCalled();
+  boxes = [];
+  readingPositioned(h.element);
+  vi.advanceTimersByTime(300);
+  expect(h.dwelled()?.catchUp).toHaveBeenCalledExactlyOnceWith(
+    "covered",
+    undefined,
+  );
+});
 it("settled notification starts dwell without changed rows, focus or geometry", () => {
   const h = setup({ focus: "header", settled: false });
   vi.advanceTimersByTime(300);

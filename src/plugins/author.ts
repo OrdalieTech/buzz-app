@@ -93,6 +93,7 @@ export type {
 export type {
   ConversationWorkspaceProps,
   WorkspaceSlots,
+  WorkspaceAsideWidth,
   PageTabTarget,
   PageTabOptions,
   PageTabsProps,

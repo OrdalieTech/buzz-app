@@ -51,10 +51,48 @@
 .soloConversation {
   container: solo-conversation / inline-size;
 }
+/* A workspace's main reader and the page's aside (WorkspaceRow). Isolated, a
+   floating aside stacks over the reader, never over a narrow dock. */
+.workspaceRow {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
 .workspaceReader {
   flex: 1;
   min-height: 0;
   min-width: 0;
+}
+/* The page's aside, from the history's top over its end edge, beside its
+   scrollbar. Docked, it may run to the reader's bottom, beside the composer;
+   floating, it stops at the history's bottom, above the composer. It draws
+   nothing itself: its content draws its card, sizes to it, and scrolls itself
+   when taller. Only that content takes pointer input, so the wheel beside or
+   below it scrolls the history. */
+.workspaceAside {
+  position: absolute;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  inset-block-start: var(--aside-top, 0px);
+  inset-inline-end: var(--aside-scrollbar, 0px);
+  max-block-size: var(--aside-height, 100%);
+  max-inline-size: 100%;
+  pointer-events: none;
+}
+.workspaceAside[data-workspace-aside="docked"] {
+  max-block-size: calc(100% - var(--aside-top, 0px));
+}
+.workspaceAside > * {
+  min-block-size: 0;
+  pointer-events: auto;
+}
+.workspaceAside[hidden] {
+  display: none;
 }
 .conversation
   :is(

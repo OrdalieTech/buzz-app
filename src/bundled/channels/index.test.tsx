@@ -62,7 +62,7 @@ it("declares the workspace slots that Channels renders", () => {
   const registerWorkspace = vi.fn();
   registered(registerWorkspace);
   expect(registerWorkspace).toHaveBeenCalledWith(expect.any(Function), {
-    slots: { headerActions: true, trailing: true },
+    slots: { headerActions: true, trailing: true, aside: true },
   });
 });
 

@@ -90,9 +90,11 @@
 .typing[data-audience="humans"] {
   position: absolute;
   inset-block-end: calc(100% + var(--space-half));
-  inset-inline: var(--space-4);
+  /* Beside a docked workspace aside, as the composer is. */
+  inset-inline: var(--space-4)
+    calc(var(--space-4) + var(--timeline-aside-width, 0px));
   inline-size: min(
-    calc(100% - 2 * var(--space-4)),
+    calc(100% - var(--timeline-aside-width, 0px) - 2 * var(--space-4)),
     var(--buzz-message-width, 52rem)
   );
   margin-inline: auto;
@@ -102,5 +104,10 @@
 }
 /* Matches the composer, which spans a compact list's full width. */
 :where(html[data-message-density="compact"]) .typing[data-audience="humans"] {
-  inline-size: calc(100% - 2 * var(--space-4));
+  inline-size: calc(
+    100% -
+    var(--timeline-aside-width, 0px) -
+    2 *
+    var(--space-4)
+  );
 }

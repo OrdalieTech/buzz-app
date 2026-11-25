@@ -57,6 +57,16 @@
   scrollbar-gutter: stable;
   scrollbar-width: thin;
 }
+/* A docked workspace aside sits over the history's end edge, left of its
+   scrollbar; WorkspaceRow marks the reader and sets --timeline-aside-width to
+   its width. The rows keep to the space beside it. A docked reader is wider
+   than the narrow rules that follow. */
+[data-aside-docked] .feed {
+  padding-inline-end: calc(
+    var(--space-panel-inset) +
+    var(--timeline-aside-width)
+  );
+}
 /* Narrow conversations keep the shared compact inset beside the app dock. */
 @container messages (max-width: 30rem) {
   .feed {
@@ -856,11 +866,16 @@ html[data-keyboard-navigation] .attachmentImage:focus-visible {
   min-width: 0;
   align-self: stretch;
   flex-shrink: 0;
-  width: min(calc(100% - 2 * var(--space-4)), var(--buzz-message-width, 52rem));
+  width: min(
+    calc(100% - var(--timeline-aside-width, 0px) - 2 * var(--space-4)),
+    var(--buzz-message-width, 52rem)
+  );
   margin: 0 auto var(--space-4);
+  /* Beside a docked workspace aside, centered in the history's width. */
+  inset-inline-start: calc(var(--timeline-aside-width, 0px) / -2);
 }
 :where(html[data-message-density="compact"]) .composerDock {
-  width: calc(100% - 2 * var(--space-4));
+  width: calc(100% - var(--timeline-aside-width, 0px) - 2 * var(--space-4));
 }
 @media (max-width: 40.625rem) {
   .composerDock {
@@ -1145,6 +1160,10 @@ html[data-keyboard-navigation] .attachmentImage:focus-visible {
   /* Older-history corrections hide overflow for a task (scroll-correction.ts). */
   scrollbar-gutter: stable;
   scrollbar-width: thin;
+}
+/* Beside a docked workspace aside, as in .feed. */
+[data-aside-docked] .threadHistory {
+  padding-inline-end: calc(var(--space-4) + var(--timeline-aside-width));
 }
 /* Compact gives conversations the window's full width, as list layouts do. */
 :where(html[data-message-density="compact"]) :is(.feed, .threadHistory) {

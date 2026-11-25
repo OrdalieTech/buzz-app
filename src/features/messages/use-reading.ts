@@ -1,4 +1,6 @@
 import {
+  createContext,
+  useContext,
   useEffect,
   useEffectEvent,
   useLayoutEffect,
@@ -57,6 +59,10 @@ type Reading = {
    * shown. */
   trailing?: (() => number | undefined) | undefined;
 };
+/** Boxes of content floating over the rows below: a row any of them overlaps
+ * isn't shown. Its provider wakes dwell, with `readingPositioned`, when they
+ * change. */
+export const ReadingCovers = createContext<() => readonly DOMRect[]>(() => []);
 /** `useReading` for an owner that renders its own `MessageEditScope`. */
 export function Reading(props: Reading) {
   useReading(props);
@@ -80,6 +86,7 @@ export function useReading({
   trailing,
 }: Reading) {
   const composer = useMessageEditScope()?.input;
+  const covers = useContext(ReadingCovers);
   // Read at measurement time: a new latest message mutates the list, which
   // already remeasures in the next frame, so it must not restart observation.
   const latestId = useEffectEvent(() => latestMessageId);
@@ -87,8 +94,10 @@ export function useReading({
   // A ref, not an effect event: unread attention asks whether a row is shown
   // while it renders.
   const trailingEdge = useRef(trailing);
+  const covering = useRef(covers);
   useLayoutEffect(() => {
     trailingEdge.current = trailing;
+    covering.current = covers;
   });
   useEffect(() => {
     if (!enabled || !scroller.current) return;
@@ -187,9 +196,14 @@ export function useReading({
     }
     // Within a pixel: scroll offsets snap to whole pixels but rows sit at
     // fractional ones, so an exact reveal can leave its row a sliver past an edge.
-    function shown(row: HTMLElement, viewport: DOMRect) {
+    function shown(
+      row: HTMLElement,
+      viewport: DOMRect,
+      covers = covering.current(),
+    ) {
       const bounds = row.getBoundingClientRect();
       return (
+        !covered(bounds, covers) &&
         row.dataset.membershipRow === undefined &&
         row.dataset.huddleRow === undefined &&
         bounds.height > 0 &&
@@ -201,6 +215,16 @@ export function useReading({
         bounds.right <= Math.min(viewport.right, window.innerWidth) + 1
       );
     }
+    // Overlapping by more than a pixel, like the edges above.
+    function covered(bounds: DOMRect, covers: readonly DOMRect[]) {
+      return covers.some(
+        (box) =>
+          box.left < bounds.right - 1 &&
+          box.right > bounds.left + 1 &&
+          box.top < bounds.bottom - 1 &&
+          box.bottom > bounds.top + 1,
+      );
+    }
     function shownBottom(viewport: DOMRect) {
       return Math.min(
         viewport.bottom,
@@ -209,9 +233,10 @@ export function useReading({
     }
     function visibleIds() {
       const viewport = element.getBoundingClientRect();
+      const covers = covering.current();
       return [...element.querySelectorAll<HTMLElement>("[data-message-id]")]
         .flatMap((row) =>
-          row.dataset.messageId && shown(row, viewport)
+          row.dataset.messageId && shown(row, viewport, covers)
             ? [row.dataset.messageId]
             : [],
         )
@@ -250,6 +275,7 @@ export function useReading({
       );
       const bounds = row?.getBoundingClientRect();
       return bounds &&
+        !covered(bounds, covering.current()) &&
         bounds.height > 0 &&
         bounds.width > 0 &&
         bounds.bottom > Math.max(viewport.top, 0) &&
