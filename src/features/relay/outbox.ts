@@ -174,6 +174,40 @@ export class PublishRejected extends Error {
  * device, or the relay asked it to wait. Retrying may succeed. */
 export class PublishNotSent extends PublishRejected {}
 
+/** The relay refuses a reaction as `duplicate:` only while the same author's
+ * reaction with the same content to the same message exists, so the intent
+ * is fulfilled and a retry can only be refused again. Other kinds use
+ * `duplicate:` for conflicts that their callers verify, such as a channel ID
+ * that is already taken. */
+function refusedAsExistingReaction(event: EventData, error: unknown) {
+  return (
+    event.kind === 7 &&
+    error instanceof PublishRejected &&
+    !(error instanceof PublishNotSent) &&
+    (error.reason ?? error.message).startsWith("duplicate:")
+  );
+}
+/** Journals written before these refusals were retired kept them with the
+ * error text shown to the user: failed after a first attempt, or still
+ * unknown after a retry of an unconfirmed send was refused. The socket path
+ * saved the relay's raw reason, and the HTTP path saved it without the
+ * `duplicate:` prefix. */
+const SAVED_EXISTING_REACTION_ERRORS = new Set([
+  "duplicate: reaction already exists",
+  "Reaction already exists",
+]);
+const RETRY_BLOCKED_PREFIX = "Retry blocked: ";
+function storedAsExistingReaction(item: OutgoingEvent) {
+  if (item.event.kind !== 7 || item.recovery) return false;
+  const error = item.error ?? "";
+  if (item.delivery === "failed")
+    return SAVED_EXISTING_REACTION_ERRORS.has(error);
+  if (item.delivery !== "unknown" || !error.startsWith(RETRY_BLOCKED_PREFIX))
+    return false;
+  const refusal = error.slice(RETRY_BLOCKED_PREFIX.length);
+  return SAVED_EXISTING_REACTION_ERRORS.has(refusal);
+}
+
 export { browserOutboxStorage } from "./outbox-storage";
 /** The desktop host's answer to a retry the relay would refuse as too old,
  * when the event cannot be read back. */
@@ -567,13 +601,23 @@ export function createOutbox(
       ...(item.error ? { error: clip(item.error) } : {}),
     });
   }
+  function retireFulfilled(id: string) {
+    deliveryWork.delete(id);
+    snapshot = Object.freeze(snapshot.filter((item) => item.event.id !== id));
+    notify();
+    void persist(id).catch(() => {});
+  }
   function restore(restored: readonly OutgoingEvent[]) {
     const pending = restored.filter(
       (item) =>
-        (!(item.event.kind === 9000 && item.acknowledged) &&
+        ((!(item.event.kind === 9000 && item.acknowledged) &&
           item.delivery !== "seen") ||
-        !!item.recovery,
+          !!item.recovery) &&
+        !storedAsExistingReaction(item),
     );
+    // Queued behind hydration; the save drops the retired records from disk.
+    if (restored.some(storedAsExistingReaction))
+      void persist("existing-reactions").catch(() => {});
     if (pending.length > MAX_PENDING)
       throw new Error("Saved pending outbox exceeds its budget");
     for (const item of restored)
@@ -788,6 +832,14 @@ export function createOutbox(
       if (closed) return;
       if (latest && awaitsReceipt(latest.event))
         onReceipt(latest.signed ?? latest.event, undefined);
+      if (
+        latest &&
+        !latest.recovery &&
+        refusedAsExistingReaction(latest.event, error)
+      ) {
+        retireFulfilled(id);
+        return;
+      }
       const delivery: Delivery | undefined =
         latest &&
         (latest.delivery === "seen" || attempt.previousDelivery === "seen"

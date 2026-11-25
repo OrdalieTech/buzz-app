@@ -1,11 +1,5 @@
 import { Button } from "../../shared/design-system/ui/Button";
-import {
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { RelaySession } from "../relay/session";
 import type { EventData } from "../relay/events";
 import type { ComposerTool, ContributionReader } from "./contracts";
@@ -177,11 +171,6 @@ async function retryReaction(session: RelaySession, item: OutgoingEvent) {
   await outbox.dismiss(id);
 }
 
-/** The relay already has this reaction, so nothing is left to deliver. */
-const alreadyThere = (item: OutgoingEvent) =>
-  item.delivery === "failed" &&
-  /reaction already exists/i.test(item.error ?? "");
-
 export function ReactionDelivery({
   session,
   messageId,
@@ -219,13 +208,8 @@ export function ReactionDelivery({
   const ours = operations.filter(
     (item) => session.messages.reactionTarget(item.event) === messageId,
   );
-  const duplicate = ours.find(alreadyThere)?.event.id;
-  useEffect(() => {
-    if (duplicate) outbox?.dismiss(duplicate).catch(() => {});
-  }, [duplicate, outbox]);
-  const operation = ours.find(
-    (item) =>
-      ["failed", "unknown"].includes(item.delivery) && !alreadyThere(item),
+  const operation = ours.find((item) =>
+    ["failed", "unknown"].includes(item.delivery),
   );
   if (!operation) return null;
   return (
