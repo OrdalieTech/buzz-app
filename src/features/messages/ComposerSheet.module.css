@@ -337,3 +337,83 @@ html[data-keyboard-navigation] .sheet[data-contained-composer] {
   --sheet-top: calc(var(--view-top) + var(--space-4));
   height: var(--sheet-max-height);
 }
+
+/* A thread's quick open. The sheet is placed in this box, which
+   clips it only while its open motion runs on the compositor (a transform
+   pair, see revealFrom). Its top reaches far above the dock and it never
+   takes the pointer. */
+.sheetClip {
+  --sheet-gap: var(--space-2);
+  position: absolute;
+  top: -200vh;
+  left: calc(-1 * var(--sheet-gap));
+  right: calc(-1 * var(--sheet-gap));
+  bottom: calc(-1 * var(--sheet-gap));
+  z-index: 1;
+  pointer-events: none;
+}
+.sheetClip[data-moving] {
+  overflow: hidden;
+  border-bottom-left-radius: calc(var(--composer-radius) + var(--sheet-gap));
+  border-bottom-right-radius: calc(var(--composer-radius) + var(--sheet-gap));
+}
+.sheetClip > .sheet {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: auto;
+}
+/* It opens straight to its full height; a short thread leaves space. */
+.sheet[data-quick] {
+  height: var(--sheet-max-height);
+}
+.sheet[data-contained-composer][data-quick] > .content,
+.sheet[data-contained-composer][data-quick] > .content > .body,
+.sheet[data-contained-composer][data-quick] > .content > .body > .reader,
+.sheet[data-contained-composer][data-quick] [data-reading-surface],
+html .sheet[data-contained-composer][data-quick] [data-thread-history-frame] {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+/* The thread mounts hidden and is drawn in one frame once it is ready. */
+.sheet[data-contained-composer][data-quick]:not([data-revealed])
+  > .content
+  > .body {
+  opacity: 0;
+  pointer-events: none;
+}
+html .sheet[data-contained-composer][data-quick] [data-thread-history-frame],
+html .sheet[data-contained-composer][data-quick] [data-thread-rows] {
+  transition: none;
+}
+/* Only a slow read shows that it is still reading. */
+.quickLoader {
+  position: absolute;
+  inset: var(--sheet-header-height) 0
+    calc(var(--composer-height) + 2 * var(--sheet-gap));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-subtle);
+  pointer-events: none;
+  opacity: 0;
+  animation: quick-loader-in var(--duration-state, 150ms) ease-out 400ms
+    forwards;
+}
+.sheet[data-revealed] .quickLoader {
+  display: none;
+}
+@keyframes quick-loader-in {
+  to {
+    opacity: 1;
+  }
+}
+/* The header is drawn once the sheet has reached its full height, rather than
+   being uncovered by the rising edge at the end of the motion. It comes in in
+   one frame, the one that draws a thread that is ready by then, so it never
+   lands after its rows. */
+.sheet[data-contained-composer][data-quick]:not([data-opened])
+  > .content
+  > .header {
+  opacity: 0;
+}

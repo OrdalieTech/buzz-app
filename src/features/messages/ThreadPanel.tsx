@@ -2,6 +2,7 @@
 import { DialogBarMaterial } from "../../shared/design-system/ui/DialogBarMaterial";
 import { hostComposerProvenance } from "./mention-draft";
 import { useComposerScope } from "./composer-overlay";
+import { useSheetReady, useSheetReveal } from "./sheet-reveal";
 import { AgentConnectionSetup } from "../agents/AgentConnectionSetup";
 import { TypingIndicator, useLiveConversationAgents } from "./TypingIndicator";
 import { ActivityExpansion } from "./ActivityExpansion";
@@ -274,6 +275,8 @@ function RetainedThreadPanel(props: ThreadPanelProps) {
   const current = useRef<Opening | undefined>(undefined);
   const [opening, setOpening] = useState<Opening>();
   const [error, setError] = useState<string>();
+  // A failure with its retry is all a quick-opening sheet will show.
+  useSheetReady(!!error && !opening);
   const [failure, setFailure] = useState<{ unavailable: boolean }>();
   // Retry keeps its control mounted and focused until the new attempt settles.
   const [pending, setPending] = useState(false);
@@ -490,6 +493,7 @@ function OwnedThreadPanel({
 }: ThreadPanelProps) {
   const [view, setView] = useState<ThreadView>();
   const [error, setError] = useState<string>();
+  useSheetReady(!!error);
   const [attempt, setAttempt] = useState(0);
   // Allocate in the effect, not render/useMemo: StrictMode must not leak owned views.
   // biome-ignore lint/correctness/useExhaustiveDependencies: attempt is explicit recovery after view allocation fails.
@@ -2358,6 +2362,45 @@ function ThreadMessages({
   useLayoutEffect(() => {
     composerHandle?.expect(composerExpected);
   }, [composerHandle, composerExpected]);
+  // A first window that leaves less than a screen above the reader is demand
+  // for the next page by itself: its root would otherwise sit right above the
+  // newest replies, with the earlier ones missing between them until a
+  // scroll. It reads once per thread, still following the latest reply.
+  // Only then can a quick-opening sheet draw the thread: read, positioned,
+  // and with its reply box mounted if one is coming.
+  const filled = useRef<string | undefined>(undefined);
+  const reveal = useSheetReveal();
+  const placeholder = composerRoot ? replyPlaceholder(composerRoot) : undefined;
+  useLayoutEffect(() => {
+    if (placeholder) reveal?.placeholder(placeholder);
+  }, [reveal, placeholder]);
+  useLayoutEffect(() => {
+    const element = scroller.current;
+    if (!element) return;
+    if (
+      filled.current !== messageId &&
+      !revealSelected &&
+      !snapshot.seeking &&
+      !olderAnchor.current &&
+      snapshot.direction === "older" &&
+      snapshot.status === "ready" &&
+      snapshot.canLoadMore &&
+      element.scrollHeight - element.clientHeight < element.clientHeight
+    ) {
+      filled.current = messageId;
+      captureOlderAnchor(element, true);
+      void view.loadMore();
+      return;
+    }
+    if (
+      reveal &&
+      (snapshot.status === "ready" || snapshot.status === "error") &&
+      !positioning &&
+      !olderAnchor.current &&
+      (!composerExpected || composerRoot)
+    )
+      reveal.ready();
+  });
   const sourceRootId = subthreadId ? composerRoot?.threadRootId : undefined;
   const retryThread = () => {
     if (showOlderPageStatus) {

@@ -229,13 +229,27 @@ test("older-page loading adds no row or layout shift while the request is held, 
   await server.listen();
   try {
     const url = `http://127.0.0.1:${server.httpServer.address().port}/tests/fixtures/messages.html?threadWindow=1`;
+    const viewport = page.viewportSize();
     await page.goto(url);
     const history = page.getByRole("region", { name: "Thread messages" });
     const replies = history.locator("ol [data-message-id]");
     await expect(replies).toHaveCount(10);
-    // The newest replies fit their reader, who is at the first and the latest.
+    // The newest replies fit their reader, so the opening reads the next page
+    // without a gesture and still shows the latest reply.
     await reopen(page, 0);
-    await expect(replies).toHaveCount(10);
+    await expect(replies).toHaveCount(60);
+    await expect
+      .poll(() =>
+        history.evaluate(
+          (el) => el.scrollHeight - el.clientHeight - el.scrollTop,
+        ),
+      )
+      .toBeLessThan(2);
+    const opening = await page.evaluate(
+      () => window.messagesFixture.report.filters,
+    );
+    expect(opening).toHaveLength(2);
+    expect(opening[1].until).toBeDefined();
     // Settle at the top before the held request so native scrolling cannot
     // masquerade as a layout shift caused by a loading row.
     await history.evaluate((el) => {
@@ -255,7 +269,7 @@ test("older-page loading adds no row or layout shift while the request is held, 
       .poll(() =>
         page.evaluate(() => window.messagesFixture.report.filters.length),
       )
-      .toBe(2);
+      .toBe(3);
     const cue = history.getByText("Loading older replies…", { exact: true });
     await expect(cue).toHaveCount(0);
     await expect(history.getByText("Loading thread…")).toHaveCount(0);
@@ -266,39 +280,36 @@ test("older-page loading adds no row or layout shift while the request is held, 
           .top,
       })),
     ).toEqual(before);
-    expect(await replies.count()).toBe(10);
+    expect(await replies.count()).toBe(60);
     await page.evaluate(() => window.messagesFixture.releaseOlderPage());
-    await expect(replies).toHaveCount(60);
+    await expect(replies).toHaveCount(110);
     await expect(cue).toHaveCount(0);
-    await settled(page);
-    await page.evaluate(() => window.messagesFixture.live());
-    await expect(replies).toHaveCount(61);
-    await expect
-      .poll(() =>
-        history.evaluate(
-          (el) => el.scrollHeight - el.clientHeight - el.scrollTop,
-        ),
-      )
-      .toBeLessThan(2);
     // A reader who asked for a page and scrolls back to the latest reply
     // before it lands follows a live reply, and still follows after it lands.
+    // At the first viewport the newest replies overflow it, so it opens on
+    // them alone.
+    await page.setViewportSize(viewport);
     await page.goto(url);
     await expect(replies).toHaveCount(10);
     await reopen(page, 40);
-    await expect(replies).toHaveCount(10);
+    await expect(replies).toHaveCount(60);
     const gap = () =>
       history.evaluate(
         (el) => el.scrollHeight - el.clientHeight - el.scrollTop,
       );
     await expect.poll(gap).toBeLessThan(2);
     await page.evaluate(() => window.messagesFixture.holdOlderPage());
+    await history.evaluate((el) => {
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event("scroll"));
+    });
     await history.hover();
     await page.mouse.wheel(0, -300);
     await expect
       .poll(() =>
         page.evaluate(() => window.messagesFixture.report.filters.length),
       )
-      .toBe(2);
+      .toBe(3);
     await expect.poll(() => history.evaluate((el) => el.scrollTop)).toBe(0);
     await history.evaluate((el) => {
       el.scrollTop = el.scrollHeight;
@@ -307,10 +318,10 @@ test("older-page loading adds no row or layout shift while the request is held, 
     await expect.poll(gap).toBeLessThan(1);
     await settled(page);
     await page.evaluate(() => window.messagesFixture.live());
-    await expect(replies).toHaveCount(11);
+    await expect(replies).toHaveCount(61);
     await expect.poll(gap).toBeLessThan(2);
     await page.evaluate(() => window.messagesFixture.releaseOlderPage());
-    await expect(replies).toHaveCount(61);
+    await expect(replies).toHaveCount(111);
     await settled(page);
     await expect.poll(gap).toBeLessThan(2);
   } finally {
@@ -345,10 +356,10 @@ test("newest window positions immediately; scrollback holds the visible reply in
     const history = panel.getByRole("region", { name: "Thread messages" });
     const replies = history.locator("ol [data-message-id]");
     await expect(replies).toHaveCount(10);
-    // The newest replies overflow their reader by less than the distance that
-    // still counts as the latest reply: scrolling to the first leaves it.
+    // The newest replies overflow their reader by less than a screen, so the
+    // opening reads the next page too, still at the latest reply.
     await reopen(page, 40);
-    await expect(replies).toHaveCount(10);
+    await expect(replies).toHaveCount(60);
     // Loading belongs to history; the composer retains its live region idle.
     await expect(history.getByRole("status")).toHaveCount(0);
     await expect(
@@ -362,24 +373,34 @@ test("newest window positions immediately; scrollback holds the visible reply in
     const initial = await page.evaluate(
       () => window.messagesFixture.report.filters,
     );
-    expect(initial).toHaveLength(1);
+    expect(initial).toHaveLength(2);
     expect(initial[0].thread_window).toBe(true);
-    // A user gesture, not mounting or live reflow, asks for older history.
+    expect(initial[1].until).toBeDefined();
+    // Past that one page, a user gesture, not mounting or live reflow, asks
+    // for older history.
+    await settled(page);
+    expect(
+      await page.evaluate(() => window.messagesFixture.report.filters.length),
+    ).toBe(2);
     await page.evaluate(() => window.messagesFixture.holdOlderPage());
+    await history.evaluate((el) => {
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event("scroll"));
+    });
     await history.hover();
     await page.mouse.wheel(0, -300);
     await expect
       .poll(() =>
         page.evaluate(() => window.messagesFixture.report.filters.length),
       )
-      .toBe(2);
+      .toBe(3);
     // The wheel may still move the viewport after dispatch. Measure only after
     // it rests at the top with the continuation pending, then release it to
     // isolate prepend geometry.
     await expect.poll(() => history.evaluate((el) => el.scrollTop)).toBe(0);
     await settled(page);
     const continuation = await page.evaluate(
-      () => window.messagesFixture.report.filters[1],
+      () => window.messagesFixture.report.filters[2],
     );
     expect(continuation.thread_window).toBe(true);
     expect(continuation.until).toBeDefined();
@@ -404,7 +425,7 @@ test("newest window positions immediately; scrollback holds the visible reply in
       readingReply.evaluate((row) => row.getBoundingClientRect().top);
     const top = await readingTop();
     await page.evaluate(() => window.messagesFixture.releaseOlderPage());
-    await expect(replies).toHaveCount(60);
+    await expect(replies).toHaveCount(110);
     await expect(history.getByText("Loading older replies…")).toHaveCount(0);
     await settled(page);
     expect(Math.abs((await readingTop()) - top)).toBeLessThan(1);
@@ -416,13 +437,13 @@ test("newest window positions immediately; scrollback holds the visible reply in
       ),
     ).toBeGreaterThanOrEqual(50);
     await page.evaluate(() => window.messagesFixture.live());
-    await expect(replies).toHaveCount(61);
+    await expect(replies).toHaveCount(111);
     await expect(readingReply).toBeInViewport();
     await expect(
       history.getByText("Live reply", { exact: true }),
     ).toBeVisible();
     // Demand each remaining older page. No automatic full-history waterfall.
-    for (const count of [111, 161, 211, 261, 305]) {
+    for (const count of [161, 211, 261, 305]) {
       await history.evaluate((el) => {
         el.scrollTop = 0;
         el.dispatchEvent(new Event("scroll"));

@@ -4643,3 +4643,39 @@ html[data-keyboard-navigation]
   display: flex;
   margin-top: var(--space-1);
 }
+
+/* Under a thread's quick open, the view's composer stays drawn
+   over the sheet until the thread's reply box takes its place, and its
+   placeholder turns into the reply box's in place. */
+.composer[data-composer-above] {
+  z-index: 2;
+}
+.composer[data-thread-placeholder]
+  .composerInput:has([data-placeholder])::after {
+  content: var(--thread-placeholder);
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline: var(--space-1);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-metadata);
+  pointer-events: none;
+  animation: thread-placeholder-in 150ms var(--easing-enter) both;
+}
+.composer[data-thread-placeholder] .composerInput > .channelPlaceholder,
+.composer[data-thread-placeholder] .composerInput [data-placeholder]::before {
+  animation: thread-placeholder-out 150ms var(--easing-enter) forwards;
+}
+@keyframes thread-placeholder-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+}
+@keyframes thread-placeholder-out {
+  to {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}

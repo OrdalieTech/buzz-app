@@ -301,7 +301,13 @@ test.describe("Inline", () => {
     const [root] = roots(app);
     app.append("primary", "alpha", `Review ${pull}`, true, false, root.id);
     await clickRow(page, viewThread(page, root));
-    await expect(thread(page)).toBeVisible();
+    // The thread is drawn, and its reply box focused, once it has read.
+    await expect(
+      thread(page).getByRole("textbox", {
+        name: "Reply to thread",
+        exact: true,
+      }),
+    ).toBeFocused();
     const threadVisit = await address(page);
     // The profile reads over the thread's reply box; the thread grows tall
     // beneath it.
@@ -309,8 +315,15 @@ test.describe("Inline", () => {
     await expect(profile(page)).toBeVisible();
     expect((await address(page)).layer).toMatchObject({ rootId: root.id });
     await expect(thread(page)).toHaveAttribute("data-tall", "true");
-    // From the thread, the pull request replaces the profile.
-    await activate(pullLink(thread(page)));
+    // Opening the profile draws the thread again; it takes input once drawn.
+    await expect(thread(page)).toHaveAttribute("data-revealed", "");
+    // From the thread, the pull request replaces the profile. The thread may
+    // still be redrawing from the profile's remount, inert until it shows.
+    await expect(async () => {
+      await pullLink(thread(page)).focus();
+      await expect(pullLink(thread(page))).toBeFocused({ timeout: 500 });
+    }).toPass();
+    await pullLink(thread(page)).press("Enter");
     await expect(pullHeading(github(page))).toBeVisible();
     await expect(profile(page)).toHaveCount(0);
     await expect(thread(page)).toBeVisible();

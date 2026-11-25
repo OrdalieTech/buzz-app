@@ -231,13 +231,91 @@ test.describe("Inline", () => {
       undefined,
       [["audience", "details"]],
     );
+    // The pointer still rests where the last Show more was. The new reply can
+    // land under it, and its hover actions then cover its own Show more.
+    await page.mouse.move(0, 0);
     await showMore(sheet(page), "Long findings").click();
     await expect(sheet(page).getByText("Long findings")).toBeInViewport();
     await page.goBack();
     await expect(sheet(page)).toHaveCount(0);
   });
 
-  test("a thread sheet fits its content, starts at its header's edge and fades into its own surface", async ({
+  test("a thread sheet opens around the fixed composer and draws its thread in one frame", async ({
+    page,
+    app,
+  }) => {
+    await open(page, app);
+    const [, long] = roots(app);
+    for (let index = 0; index < 30; index++) app.reply(long.id, false, false);
+    const composer = page.locator("[data-message-composer]").first();
+    const before = await composer.boundingBox();
+    // The thread's reads land well after the open motion ends, as a slow
+    // relay's would.
+    await page.route("**/query", async (route) => {
+      const filters = route.request().postDataJSON();
+      if (filters.some((filter) => filter["#e"]?.includes(long.id)))
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      await route.continue();
+    });
+    // Every frame from the click on: whether the thread shows, and what of
+    // it is there to show.
+    await page.evaluate(() => {
+      const frames = [];
+      window.__sheetFrames = frames;
+      const sample = () => {
+        const surface = document.querySelector("[data-details-sheet-surface]");
+        const body = surface?.querySelector("[data-sheet-body]");
+        if (body)
+          frames.push({
+            shown: getComputedStyle(body).opacity === "1",
+            rows: body.querySelectorAll(
+              "[data-message-scroller] [data-message-id]",
+            ).length,
+            reply: !!surface.querySelector(
+              '[data-message-composer] [role="textbox"]',
+            ),
+            positioning: !!body.querySelector("[data-positioning]"),
+            composerTop: document
+              .querySelector("[data-composer-above], [data-composer-covered]")
+              ?.getBoundingClientRect().top,
+          });
+        // Until well after it shows: a loaded machine can take seconds to
+        // get there, so the frames are not capped by count.
+        const shown = frames.findIndex((frame) => frame.shown);
+        if (shown < 0 || frames.length - shown < 30)
+          requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    });
+    await clickRow(page, viewThread(page, long));
+    await expect(reply(sheet(page))).toBeFocused();
+    // Focus can land before the next frame is sampled: wait for the frames
+    // after the thread first shows.
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const frames = window.__sheetFrames;
+          const shown = frames.findIndex((frame) => frame.shown);
+          return shown >= 0 && frames.length - shown >= 30;
+        }),
+      )
+      .toBe(true);
+    const frames = await page.evaluate(() => window.__sheetFrames);
+    const first = frames.findIndex((frame) => frame.shown);
+    expect(first).toBeGreaterThan(0);
+    // Hidden until it is ready, then drawn whole: rows, reply box and
+    // position all land in the frame it first shows.
+    expect(frames[first]).toMatchObject({ reply: true, positioning: false });
+    expect(frames[first].rows).toBeGreaterThan(10);
+    for (const frame of frames.slice(first))
+      expect(frame).toMatchObject({ shown: true, reply: true });
+    // The view's composer holds still while the sheet rises around it.
+    for (const frame of frames.slice(0, first))
+      if (frame.composerTop !== undefined)
+        expect(Math.abs(frame.composerTop - before.y)).toBeLessThan(1);
+  });
+
+  test("a thread sheet starts at its header's edge and fades into its own surface", async ({
     page,
     app,
   }) => {
@@ -257,17 +335,15 @@ test.describe("Inline", () => {
             .getBoundingClientRect().bottom,
       );
     await expect.poll(() => sheet(page).evaluate(lead)).toBeLessThan(4);
-    // A short thread hugs its rows instead of taking the full height.
     const room = (element) =>
       Number.parseFloat(getComputedStyle(element).maxHeight) -
       element.getBoundingClientRect().height;
-    await expect.poll(() => sheet(page).evaluate(room)).toBeGreaterThan(100);
     await page.keyboard.press("Escape");
     await expect(sheet(page)).toHaveCount(0);
     for (let index = 0; index < 30; index++) app.reply(long.id, false, false);
     await clickRow(page, viewThread(page, long));
     await expect(sheet(page).getByText("Unread reply 1")).toBeVisible();
-    // A long one grows to the maximum and reads up from its reply box.
+    // A long one takes the maximum and reads up from its reply box.
     await expect.poll(() => sheet(page).evaluate(room)).toBeLessThan(1);
     await sheet(page)
       .locator("[data-message-scroller]")

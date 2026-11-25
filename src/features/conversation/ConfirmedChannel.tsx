@@ -1,5 +1,6 @@
 import { useSyncExternalStore, type ReactNode } from "react";
 import { MessageLoading } from "../messages/MessageLoading";
+import { useSheetReady } from "../messages/sheet-reveal";
 import styles from "../messages/Messages.module.css";
 import type { ChannelSummary } from "../relay/contracts";
 import { viewerMember } from "../relay/membership";
@@ -141,6 +142,9 @@ function Unavailable({
     return roster === "verified" ? DID_NOT_LOAD : undefined;
   };
   const text = reason();
+  // A settled notice is all a quick-opening sheet will show; a loading one is
+  // not settled.
+  useSheetReady(!!text);
   return text ? (
     <p role="status" className={styles.empty}>
       {text}
