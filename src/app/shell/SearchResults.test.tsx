@@ -3383,9 +3383,17 @@ it("holds an early Enter for an open channel over a message that lands first, an
     });
     await act(async () => vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS));
     expect(openConversation).toHaveBeenCalledOnce();
-    const news = message(viewer, "general", "news", 1700000002);
+    // A reply opens with its thread, so the page can place the thread.
+    const root = message(viewer, "general", "root", 1700000000);
+    const news = message(viewer, "general", "news", 1700000002, [
+      ["e", root.id, "", "reply"],
+    ]);
     await act(async () => wire.next().respond([news]));
-    expect(openConversation).toHaveBeenLastCalledWith("general", news.id);
+    expect(openConversation).toHaveBeenLastCalledWith(
+      "general",
+      news.id,
+      root.id,
+    );
   } finally {
     cleanup();
     owner.dispose();

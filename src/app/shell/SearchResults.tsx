@@ -1946,7 +1946,9 @@ export function SearchResults({
       run: () => {
         cancelPersonOpen();
         remember();
-        openConversation(message.channelId, message.id);
+        if (message.threadRootId)
+          openConversation(message.channelId, message.id, message.threadRootId);
+        else openConversation(message.channelId, message.id);
       },
     };
   });

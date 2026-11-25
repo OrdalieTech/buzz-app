@@ -13,6 +13,7 @@ import {
   searchDebounce,
 } from "../../shared/search-debounce";
 import { objectBody } from "../../features/relay/body";
+import { threadReference } from "../../features/relay/thread-reference";
 import { imetaAttachmentUrls } from "../../features/relay/fold";
 import { projectMarkdownAttachments } from "../../features/relay/message-content";
 import type { PreviewMentions } from "../../features/messages/PreviewText";
@@ -58,6 +59,8 @@ export type SearchMessage = Readonly<{
   text: string;
   /** The message's signed mentions, which its chips bind. */
   mentioned: PreviewMentions;
+  /** The thread a reply belongs to, from its signed tags. */
+  threadRootId?: string;
 }>;
 
 /** Message kinds search returns: chat, agent and diff messages. Ranked
@@ -171,6 +174,7 @@ async function readPage(
     // Search returns original indexed events, not an auxiliary edit fold.
     // Exact navigation owns current content/deletion checks when opened.
     const text = searchText(event);
+    const root = threadReference(event)?.rootId;
     const owner = workflowOwner(event, session.workflowAuthority);
     const tagged = (name: string) =>
       event.tags.some(
@@ -193,6 +197,7 @@ async function readPage(
         preview: text.replace(/\s+/g, " ").trim().slice(0, 240) || "Attachment",
         text,
         mentioned: eventMentions(event),
+        ...(root ? { threadRootId: root } : {}),
       },
     ];
   });
