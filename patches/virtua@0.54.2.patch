@@ -102,15 +102,12 @@ index b4a8a1f5d7065a6acb9344cd3f3a07e1c428c172..1848f5f68295f01f32484d2dd0b8f027
                          const e = s();
                          i(n, !0), C(s() - e), z = 2;
                      } else i(n);
-@@ -406,18 +449,24 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
+@@ -406,18 +449,21 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
          }
      };
  }, j = (e, t, o, n, r, s, l, i) => {
 -    let c, f, a = !1, u = !1, d = !1, h = !1;
 +    let c, f, a = !1, u = !1, d = !1, h = !1, jumped = 0, jumpBase, landed;
-+    // Scroll APIs can truncate fractional offsets. Reach the whole edge without
-+    // quantizing interior reading positions or changing RTL normalization.
-+    const edgeOffset = t => t >= e.C() + e.t() - e.o() ? Math.ceil(t) : t;
      const g = r ? "scrollLeft" : "scrollTop", $ = r ? "left" : "top", p = e => s ? -e : e, m = () => p(n[g]), v = (e, t) => {
          n.scrollTo({
              [$]: e,
@@ -130,7 +127,7 @@ index b4a8a1f5d7065a6acb9344cd3f3a07e1c428c172..1848f5f68295f01f32484d2dd0b8f027
      }, b = t => {
          e.T() && !t.ctrlKey && (r ? t.deltaX : t.deltaY) && (a = !0);
      }, R = () => {
-@@ -437,6 +486,9 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
+@@ -437,6 +483,9 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
          F: () => {
              m() !== e.k() ? I() : i && e.h(7, i());
          },
@@ -140,7 +137,7 @@ index b4a8a1f5d7065a6acb9344cd3f3a07e1c428c172..1848f5f68295f01f32484d2dd0b8f027
          D: () => {
              o.removeEventListener("scroll", I), o.removeEventListener("wheel", b), o.removeEventListener("touchstart", R), 
              o.removeEventListener("touchend", O), o.removeEventListener("touchcancel", O), S(f);
-@@ -444,12 +496,25 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
+@@ -444,12 +493,25 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
          K: () => {
              const [t, o] = e.M();
              if (t) {
@@ -159,7 +156,7 @@ index b4a8a1f5d7065a6acb9344cd3f3a07e1c428c172..1848f5f68295f01f32484d2dd0b8f027
 +                // exact target so the remainders don't add up.
 +                const native = m(), carried = Math.abs(native - landed) < 1;
 +                const r = carried ? landed : base + jumped, s = r + t, i = e.C() + e.t() - e.o();
-+                s <= 0 || s >= i || r >= i ? v(p(edgeOffset(s))) : n.scrollBy({
++                s <= 0 || s >= i || r >= i ? v(p(s)) : n.scrollBy({
 +                    [$]: p(carried ? s - native : t),
                      behavior: "instant"
                  }), o && (c && c(), e.o() > e.t() && e.h(1, m()));
@@ -170,16 +167,7 @@ index b4a8a1f5d7065a6acb9344cd3f3a07e1c428c172..1848f5f68295f01f32484d2dd0b8f027
              }
              return o;
          },
-@@ -464,7 +529,7 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
-                         for (let [o, n] = e.$(0); o <= n; o++) if (t.A(o)) return;
-                         f();
-                     }
--                    e.h(8), r(p(o()), n);
-+                    e.h(8), r(p(edgeOffset(o())), n);
-                 }
-             };
-             if (n && e.h(9, o()), !s) {
-@@ -478,7 +543,27 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
+@@ -478,7 +540,27 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
          }
      };
  }, G = (e, t, o) => {
@@ -208,7 +196,7 @@ index b4a8a1f5d7065a6acb9344cd3f3a07e1c428c172..1848f5f68295f01f32484d2dd0b8f027
      const i = /* @__PURE__ */ new Map, c = /* @__PURE__ */ new WeakMap, f = J(s => {
          const l = [], f = [];
          for (const {target: a, contentRect: {width: u, height: d}} of s) if (a === n) (u || d) && (r.F(), 
-@@ -492,7 +577,13 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
+@@ -492,7 +574,13 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
      });
      return {
          U(l, i = l.parentElement) {
@@ -223,7 +211,7 @@ index b4a8a1f5d7065a6acb9344cd3f3a07e1c428c172..1848f5f68295f01f32484d2dd0b8f027
                  const e = o ? "overflowX" : "overflowY", t = i.style, n = t[e];
                  t[e] = "hidden", w(() => {
                      t[e] = n;
-@@ -500,7 +591,9 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
+@@ -500,7 +588,9 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
              }), s[1](!0);
          },
          R() {
@@ -234,7 +222,7 @@ index b4a8a1f5d7065a6acb9344cd3f3a07e1c428c172..1848f5f68295f01f32484d2dd0b8f027
          },
          Z: (e, t) => (i.set(e, t), f.j(e), () => {
              i.delete(e), f.G(e);
-@@ -602,7 +695,8 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
+@@ -602,7 +692,8 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
          },
          U(c, a = c.parentElement) {
              f.j(r = a);
@@ -244,7 +232,7 @@ index b4a8a1f5d7065a6acb9344cd3f3a07e1c428c172..1848f5f68295f01f32484d2dd0b8f027
                  const e = o ? "overflowX" : "overflowY", t = a.style, n = t[e];
                  t[e] = "hidden", w(() => {
                      t[e] = n;
-@@ -1271,4 +1365,3 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
+@@ -1271,4 +1362,3 @@ a), x = e => h(e.t(), e.o()), I = (e, t, o, n) => {
  });
 
  export { ce as VGrid, ne as VList, ue as VMasonry, oe as Virtualizer, he as WindowMasonry, re as WindowVirtualizer };

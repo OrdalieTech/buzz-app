@@ -209,7 +209,7 @@ it("preserves absolute edge correction and RTL axis normalization", () => {
 });
 
 it.each(["MacIntel", "Linux x86_64"])(
-  "rounds fractional end corrections outward on %s, including RTL",
+  "passes fractional end corrections directly on %s, including RTL",
   (platform) => {
     for (const horizontal of [false, true]) {
       const c = setup({
@@ -223,7 +223,7 @@ it.each(["MacIntel", "Linux x86_64"])(
       expect(c.calls.at(-1)).toMatchObject({
         method: "scrollTo",
         options: {
-          [horizontal ? "left" : "top"]: horizontal ? -1501 : 1501,
+          [horizontal ? "left" : "top"]: horizontal ? -1500.75 : 1500.75,
           behavior: "instant",
         },
       });
@@ -232,7 +232,7 @@ it.each(["MacIntel", "Linux x86_64"])(
   },
 );
 
-it("rounds imperative end targets without rounding interior reading positions", async () => {
+it("passes imperative interior and end targets directly without rounding", async () => {
   const c = setup({ platform: "Linux x86_64", offset: 0 });
   c.store.h(
     3,
@@ -240,7 +240,7 @@ it("rounds imperative end targets without rounding interior reading positions", 
   );
   for (const [target, expected] of [
     [900.25, 900.25],
-    [1500.75, 1501],
+    [1500.75, 1500.75],
   ]) {
     await c.driver.ee(null, { offset: target });
     await vi.advanceTimersByTimeAsync(0);
