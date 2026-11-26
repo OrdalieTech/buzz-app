@@ -47,6 +47,13 @@
 		reverse_proxy webpush:8080
 	}
 
+	# A native app built for this deployment enrolls with its own push gateway
+	# (buzz-push-gateway); wake delivery stays internal there too.
+	@push_gateway path /v1/installations /v1/installations/* /v1/delegations /v1/delegations/*
+	handle @push_gateway {
+		reverse_proxy push-gateway:8080
+	}
+
 	@relay_socket {
 		header Connection *Upgrade*
 		header Upgrade websocket
